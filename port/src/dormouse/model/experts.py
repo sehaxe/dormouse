@@ -110,6 +110,21 @@ Dispatch has FOUR arms over ONE permute, and the log line says which ran:
   timing). The dropless cap is one host scalar (`counts.max()`), because a bank
   shape needs a Python int; it is the only host read in the arm (see
   `_batched_cap`).
+* **bucketed (the batched bank without the memory cliff)**: the same arithmetic
+  as `batched`, over a PLAN of smaller banks instead of ONE `[E, cap, ·]`. The
+  bank's row bill is `E · max_group · d`, and `max_group` is the routing's, not
+  the model's: one expert holding 4 096 of 16 384 assignments asks for a 12 GiB
+  fp32 bank (measured 2026-11-04 on a collapsed router). This arm partitions the
+  experts into row-count classes (all counts within 2x share a bucket), splits a
+  class when its rows pass `MOE_BUCKET_ROWS`, and runs three `bmm`s per bucket
+  against `[n_b, cap_b, ·]`; the count is O(log(max/mean)) for a power-of-2
+  routing and one for a uniform one. A bucket's bank holds at most
+  `2 · MOE_BUCKET_ROWS` rows (an expert past the budget gets a bucket of its
+  own, so a single-expert collapse is `1 · count · d`, 25 MB at 8 192 rows /
+  d=1536 / bf16). `MOE_BUCKET_BYTES` is the LOUD refusal when even that is too
+  large; `moe_buckets` and `moe_bank_bytes` are the counters that prove the
+  shape. The plan costs ONE host read of the `counts` vector (`E` ints — bank
+  shapes are Python ints) and is a deterministic function of the counts.
 * **naive (the CPU path and the correctness reference)**: gather → per-expert
   matmul → scatter over a capacity-bound permute. The day-one implementation,
   kept because it is what the padded arm is compared against — the same rows,
@@ -147,8 +162,9 @@ what makes the average width the compute that actually happens on the ragged
 arms. Counters: `moe_k1`..`moe_k{max}` (per-token histogram, device
 accumulators) and `moe_k_mean_x100` (the mean width × 100, an INT).
 
-All of them count: `moe_padded_bmm`, `moe_batched_calls`, `moe_triton_gemm`,
-`moe_gather_forward` or `moe_naive_dispatch`
+All of them count: `moe_padded_bmm`, `moe_batched_calls`, `moe_buckets` +
+`moe_bank_bytes`, `moe_triton_gemm`, `moe_gather_forward` or
+`moe_naive_dispatch`
 (with the reason attached to the counter object) on the step's counter line, so
 a reader never has to guess which one produced the loss.
 
@@ -628,6 +644,21 @@ class DualLatentGLU(nn.Module):
 #: before the arm refuses. 8x is generous for a healthy router (measured 3.1x at
 #: 150k: 126 rows against a uniform 40) and refuses a collapsed one.
 MOE_BANK_SAFETY = 8
+
+
+#: The bucketed arm's ROW budget for one bank. Experts whose counts are within
+#: 2x of each other share a bucket, so a bucket's `[n_b, cap, d]` bank holds at
+#: most `2 · MOE_BUCKET_ROWS` rows: `n_b · cap <= 2 · n_b · min_count <= 2 ·
+#: total_rows`. 2 048 rows is 6 MiB at m400's `d=1536` in bf16, i.e. the bank
+#: stops following `E · max_group` and follows the number of ROWS instead.
+MOE_BUCKET_ROWS = 2048
+
+#: The bucketed arm's total bank budget (bytes, the bank's own dtype). The
+#: smallest card this project runs is 16 GB; a bank above 256 MiB is not the
+#: activation peak's problem any more. Exceeding it is LOUD (`_bucketed_dispatch`
+#: names the busiest bucket and the measured bytes), never a silent clamp: a
+#: clamped bank would drop rows and look exactly like a capacity arm.
+MOE_BUCKET_BYTES = 256 << 20
 
 
 class SparseMoE(nn.Module):
@@ -1418,6 +1449,162 @@ class SparseMoE(nn.Module):
             )
         return max(1, top)
 
+    def _bucket_plan(self, counts: torch.Tensor) -> list[tuple[list[int], int]]:
+        """Partition experts into row-count classes: `[(members, cap), …]`.
+
+        `counts` is the per-expert assignment count (`[E]`, zeros included). The
+        plan is a pure function of those numbers: experts sort by count
+        descending with the expert id as the tie-break, and a new bucket starts
+        when the next count is more than 2x below the bucket's largest (the
+        class rule: `n_b · cap <= 2 · rows`, so the padding is bounded by 2x) or
+        when the bucket's rows would pass `MOE_BUCKET_ROWS`. A bucket's `cap` is
+        its largest count, so the bank is `[len(members), cap, d]`; an expert
+        past `MOE_BUCKET_ROWS` necessarily gets a bucket of its own.
+
+        ONE host read: `counts.tolist()` (`E` ints), because an allocation shape
+        is a Python int. It is the arm's documented sync — the plan cannot be
+        built from device values alone, and pretending otherwise is how a
+        `[E, top, d]` allocation becomes 12 GiB.
+        """
+        values = [int(c) for c in counts.tolist()]
+        ranked = sorted(
+            (i for i, c in enumerate(values) if c > 0), key=lambda i: (-values[i], i)
+        )
+        plan: list[tuple[list[int], int]] = []
+        members: list[int] = []
+        rows = 0
+        cap = 0
+        for e in ranked:
+            c = values[e]
+            # `2 · c < cap` is the class bound: the smallest count in the bucket
+            # stays within 2x of the largest, so the padded rows are < the real
+            # ones. The row bound keeps the bank's absolute size flat.
+            if members and (2 * c < cap or rows + c > MOE_BUCKET_ROWS):
+                plan.append((members, cap))
+                members, rows, cap = [], 0, 0
+            members.append(e)
+            rows += c
+            cap = max(cap, c)
+        if members:
+            plan.append((members, cap))
+        return plan
+
+    def _bucket_bytes(self, plan: list[tuple[list[int], int]], dt: torch.dtype) -> int:
+        """The plan's bank bytes: `Σ n_b · cap_b · d · itemsize(dt)`."""
+        rows = sum(len(members) * cap for members, cap in plan)
+        return rows * self.d * dt.itemsize
+
+    def _bucketed_dispatch(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        index: torch.Tensor,
+        order: torch.Tensor,
+        keep: torch.Tensor | None,
+        counters: Counters,
+    ) -> torch.Tensor:
+        """`_bank_dispatch`'s arithmetic over a plan of `[n_b, cap_b, ·]` banks.
+
+        Every assignment is written ONCE into a flat scratch whose per-expert
+        base is `bucket_offset + local_id · cap_b`; a row past capacity (or an
+        adaptive padding slot) goes to the one dump row, exactly as the single
+        bank does. Each bucket's slice is then its own `bmm` triple, and the
+        per-bucket outputs are concatenated in the same order before the ONE
+        `slots` gather — so the output is the single-bank arithmetic split by
+        expert class, not a second definition of the expert.
+
+        `moe_capacity > 0`: a bucket's cap is the smaller of its largest count
+        and the capacity rule, so a dropped row's `pos` is past the bank and the
+        existing `keep` mask sends it to the dump slot (its router weight is 0,
+        so it contributes exactly 0 to the output and to every gradient).
+        """
+        self._assert_homogeneous()
+        n, k = index.shape
+        e = self.n_experts
+        dt = self._bank_dtype()
+        flat_w = weight.reshape(-1)
+        flat_e = index.reshape(-1)
+        if self.topk_mode == "off":
+            counts = _bincount(flat_e, e)
+            groups = e
+        else:
+            flat_e = flat_e.masked_fill(~(weight > 0).reshape(-1), e)
+            counts = _bincount(flat_e, e + 1)
+            groups = e + 1
+        plan = self._bucket_plan(counts[:e])
+        if self.capacity > 0:
+            # An expert past the rule's cap is dropped by `keep`; sizing its
+            # bank to the cap (not to the raw count) is what makes the capacity
+            # arm's memory the rule's, not the router's.
+            rule = self._capacity(n, k)
+            plan = [(members, min(cap, rule)) for members, cap in plan]
+        bank_bytes = self._bucket_bytes(plan, dt)
+        if bank_bytes > MOE_BUCKET_BYTES:
+            itemsize = dt.itemsize
+            members, cap = max(plan, key=lambda p: len(p[0]) * p[1])
+            largest = len(members) * cap * self.d * itemsize / 2**20
+            loud(
+                f"moe_kernel='bucketed': the plan's banks need {bank_bytes / 2**20:.1f} "
+                f"MiB, over the {MOE_BUCKET_BYTES / 2**20:.0f} MiB budget. Largest "
+                f"bucket: {len(members)} experts x {cap} rows x d={self.d} in "
+                f"{dt} = {largest:.1f} MiB; {len(plan)} buckets, busiest expert "
+                f"{int(counts[:e].max())} of {n * k} assignments. Escape: "
+                f"moe_kernel='naive' (the per-expert loop builds no bank), "
+                f"moe_capacity > 0 (drops by a rule you can see), or a router that "
+                f"spreads the rows."
+            )
+        counters.count("moe_buckets", len(plan))
+        counters.count("moe_bank_bytes", bank_bytes)
+        if not plan:
+            return torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
+        owner = order // k
+        starts = torch.cumsum(counts, 0) - counts
+        eid = flat_e[order]
+        pos = torch.arange(n * k, device=index.device) - starts[eid]
+        dump = sum(len(members) * cap for members, cap in plan)
+        # The per-expert base in the flat scratch: bucket offset + local index *
+        # cap. `groups` covers the adaptive-width sentinel (never kept, its
+        # `base` entry is 0 and unused — the same computed-but-masked slot the
+        # single bank gives it).
+        base = torch.zeros(groups, dtype=torch.long, device=index.device)
+        offset = 0
+        local = []
+        for members, cap in plan:
+            idx = torch.tensor(members, dtype=torch.long, device=index.device)
+            base.index_copy_(
+                0, idx, offset + torch.arange(len(members), device=index.device) * cap
+            )
+            local.append((idx, cap))
+            offset += len(members) * cap
+        if keep is None:
+            keep = torch.ones_like(owner, dtype=torch.bool)
+        slots = torch.where(keep, base[eid] + pos, dump)
+        xg = torch.zeros(dump + 1, self.d, dtype=dt, device=x.device)
+        xg = xg.index_put((slots,), self._gather_rows(x, owner, dt))
+        flat = xg.narrow(0, 0, dump)
+        gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+        ys = []
+        offset = 0
+        for idx, cap in local:
+            bank = flat.narrow(0, offset, idx.numel() * cap).view(idx.numel(), cap, self.d)
+            g = torch.bmm(bank, gate_u.index_select(0, idx)) * gate_s.index_select(
+                0, idx
+            )[:, None, :]
+            u = torch.bmm(bank, up_u.index_select(0, idx)) * up_s.index_select(0, idx)[
+                :, None, :
+            ]
+            h = F.silu(g) * u if self._glu is None else self._glu(g, u)
+            ys.append(torch.bmm(h, v.index_select(0, idx)).reshape(idx.numel() * cap, self.f))
+            offset += idx.numel() * cap
+        y = ys[0] if len(ys) == 1 else torch.cat(ys)
+        y = torch.cat((y, torch.zeros(1, self.f, dtype=dt, device=x.device)))
+        y = y[slots]
+        w = flat_w[order].unsqueeze(-1) * keep.to(flat_w.dtype).unsqueeze(-1)
+        y = y.to(torch.float32) * w
+        out = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
+        out.index_add_(0, owner, y)
+        return out
+
     def _batched_dispatch(
         self,
         x: torch.Tensor,
@@ -1690,6 +1877,15 @@ class SparseMoE(nn.Module):
         if self.capacity == 0:
             return self._dropless_dispatch(x, weight, index, order, keep, keep_rows, counters)
         notes = [] if gwhy is None else [f"gather: {gwhy}"]
+        if self.moe_kernel == "bucketed":
+            if notes:
+                counters.why = "; ".join(notes)  # type: ignore[attr-defined]
+            return self._expert_pass(
+                lambda: self._bucketed_dispatch(
+                    x, weight, index, order, keep_rows, counters
+                ),
+                counters,
+            )
         if self.moe_kernel == "batched":
             if notes:
                 counters.why = "; ".join(notes)  # type: ignore[attr-defined]
@@ -1773,6 +1969,13 @@ class SparseMoE(nn.Module):
         the only thing that can send it back to the previous adjoint, COUNTED).
         """
         counters.count("moe_dropless")
+        if self.moe_kernel == "bucketed":
+            return self._expert_pass(
+                lambda: self._bucketed_dispatch(
+                    x, weight, index, order, keep_rows, counters
+                ),
+                counters,
+            )
         if self.moe_kernel == "batched":
             counters.count("moe_batched_calls")
             return self._expert_pass(

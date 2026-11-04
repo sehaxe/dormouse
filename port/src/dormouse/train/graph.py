@@ -716,6 +716,12 @@ def full_graph_refusal(train, model) -> str | None:
                 "moe_kernel=naive is a PYTHON loop over `torch.unique(...).tolist()`, "
                 "i.e. a host read and a per-expert row count that changes with routing"
             )
+        elif kernel == "bucketed":
+            why = (
+                "moe_kernel=bucketed reads THIS batch's per-expert counts back to "
+                "build one `[n_b, cap_b, ·]` bank per row-count class, so both the "
+                "allocation shapes and the number of bucket GEMMs change with routing"
+            )
         elif gather == "kernel":
             why = (
                 "moe_gather=kernel's ABI is the PERMUTED (ragged) rows, so its row "

@@ -358,7 +358,7 @@ def test_unknown_moe_kernel_is_loud_and_the_literals_are_declared():
         validate(ModelConfig(moe_kernel="triton-please"))
     print(f"[config] {e.value}")
     assert "moe_kernel" in str(e.value) and "padded" in str(e.value)
-    assert MOE_KERNELS == ("padded", "triton", "naive", "batched")
+    assert MOE_KERNELS == ("padded", "triton", "naive", "batched", "bucketed")
     for name in MOE_KERNELS:
         validate(ModelConfig(moe_kernel=name))
 

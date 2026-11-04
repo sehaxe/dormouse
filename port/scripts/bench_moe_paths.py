@@ -1,25 +1,35 @@
-"""Time the routed expert pass: `naive` / `triton` / `batched`, one shape at a time.
+"""Time the routed expert pass: `naive` / `triton` / `batched` / `bucketed`, one shape at a time.
 
-    uv run --extra gpu python scripts/bench_moe_paths.py --geometry m400
+    uv run --extra gpu python scripts/bench_moe_paths.py --geometry all --routing uniform
+    uv run --extra gpu python scripts/bench_moe_paths.py --geometry m400 --routing pathological
+    uv run --extra gpu python scripts/bench_moe_paths.py --geometry m400 --arm bucketed
 
 The 2026-11-04 finding: at 8192 tokens, E=512, d=1536, f=4096, rank 64, top-2 the
 per-expert Python loop is ~99.6 ms of a ~107 ms iteration and the per-expert
 bank (`torch.bmm` over `[E, cap, ·]`) is ~11.5 ms — the same arithmetic, 8.7x.
-This script measures the three dispatch arms on the REAL module at that shape
-and at the b8-s1024 / b1-s8192 presets, forward and forward+backward, with the
-kernel launch count of ONE forward+backward pass. The owner runs it on the card;
-without a free card it prints the preflight reason and exits 0 (nothing measured).
+This script measures the dispatch arms on the REAL module at that shape and at
+the b8-s1024 / b1-s8192 presets, forward and forward+backward, with the kernel
+launch count of ONE forward+backward pass and the bank bytes of the arm.
+
+`--routing uniform` is the router's own top-2 (the shape every healthy run
+sees). `--routing pathological` puts 90% of the assignments on expert 0 — the
+2026-11-04 collapse — where `batched` REFUSES (`MOE_BANK_SAFETY`) and `bucketed`
+runs one bucket for the hot expert plus one for the tail. `--arm` filters the
+table; the default measures every arm that can run. The owner runs it on the
+card; without a free card it prints the preflight reason and exits 0 (nothing
+measured).
 
 Shapes: the MoE sees `[batch*seq, d]`, so b8 x s1024 and b1 x s8192 both route
 8192 tokens; the difference is the model geometry each preset names, not the MoE
 input length. `m400` is the measured 93%-shape.
 
-The arms share ONE routing (the router's top-k on the same `x`), the same
-weights and the same rows, so the table compares implementations, not samples.
-`moe_capacity=0` (dropless) is the config that needs the fix; `padded` refuses
-there, `naive` and `triton(dom/le)` are the current paths, `batched` is the new
-one. `triton` is reported as the reason it cannot run when the build/card cannot
-serve it; it is never silently omitted.
+The arms share ONE routing (the router's top-k on the same `x`, or the
+pathological fixture), the same weights and the same rows, so the table compares
+implementations, not samples. `moe_capacity=0` (dropless) is the config that
+needs the fix; `padded` refuses there, `naive` and `triton(dom/le)` are the
+current paths, `batched` is the one-bank arm, `bucketed` is the same bank split
+by row-count class. `triton` is reported as the reason it cannot run when the
+build/card cannot serve it; it is never silently omitted.
 """
 
 from __future__ import annotations
@@ -38,8 +48,8 @@ sys.path.append(str(Path(__file__).resolve().parent))
 from _lane import preflight, skip  # noqa: E402
 
 from dormouse.config import ModelConfig  # noqa: E402
-from dormouse.instrument import Counters  # noqa: E402
-from dormouse.model.experts import SparseMoE  # noqa: E402
+from dormouse.instrument import Counters, LoudError  # noqa: E402
+from dormouse.model.experts import MOE_BUCKET_BYTES, SparseMoE  # noqa: E402
 
 try:
     from dormouse.model import moe_kernels as mk
@@ -89,8 +99,8 @@ def _launches(fn) -> int | None:
     return sum(1 for e in prof.events() if e.name == "cudaLaunchKernel")
 
 
-def _arms(moe: SparseMoE, x, weight, index, order, keep):
-    """The three dispatch arms as closures, with the reason an arm cannot run."""
+def _arms(moe: SparseMoE, x, weight, index, order, keep, want: str):
+    """The dispatch arms as closures, with the reason an arm cannot run."""
 
     def naive():
         return moe._naive_dispatch(x, weight, index, order, keep, Counters())
@@ -98,10 +108,13 @@ def _arms(moe: SparseMoE, x, weight, index, order, keep):
     def batched():
         return moe._batched_dispatch(x, weight, index, order, keep)
 
+    def bucketed():
+        return moe._bucketed_dispatch(x, weight, index, order, keep, Counters())
+
     def triton():
         return moe._triton_dispatch(x, weight, index, order, keep, dropless=True)
 
-    arms = {"naive": naive, "batched": batched}
+    arms = {"naive": naive, "batched": batched, "bucketed": bucketed}
     why = None
     if mk is None:
         why = "no triton import"
@@ -109,7 +122,49 @@ def _arms(moe: SparseMoE, x, weight, index, order, keep):
         why = "no CUDA device"
     if why is None:
         arms["triton"] = triton
+    if want != "all":
+        arms = {name: fn for name, fn in arms.items() if name == want}
+        if not arms:
+            print(f"  arm {want!r} cannot run here: {why}", flush=True)
     return arms, why
+
+
+def _routing(moe: SparseMoE, x, mode: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """`(index, weight)` — the router's top-2, or the 90%-on-one-expert collapse."""
+    if mode == "uniform":
+        with torch.no_grad():
+            probs = F.softmax(moe.router(x), dim=-1)
+            weight, index = probs.topk(2, dim=-1)
+            weight = weight / weight.sum(dim=-1, keepdim=True)
+        return index, weight
+    n, k = x.shape[0], 2
+    flat = torch.zeros(n * k, dtype=torch.long, device=x.device)
+    cut = int(0.9 * n * k)
+    flat[cut:] = torch.arange(n * k - cut, device=x.device) % (moe.n_experts - 1) + 1
+    return flat.reshape(n, k), torch.ones(n, k, device=x.device) / k
+
+
+def _bank_bytes(moe: SparseMoE, arm: str, x, weight, index, order, keep):
+    """`(bank bytes, buckets)` for the arm's ONE real bank, or `(None, None)`.
+
+    A `[n_b, cap_b, ·]` allocation needs its numbers before the timing loop, so
+    this runs the arm once (`no_grad`, a warm-up the timing excludes anyway).
+    `batched` may REFUSE here — that is the row the pathological case exists to
+    show, and the arm's own call then prints the message.
+    """
+    itemsize = moe._bank_dtype().itemsize
+    if arm == "bucketed":
+        counters = Counters()
+        with torch.no_grad():
+            moe._bucketed_dispatch(x, weight, index, order, keep, counters)
+        return counters.get("moe_bank_bytes"), counters.get("moe_buckets")
+    if arm == "batched":
+        try:
+            cap = moe._batched_cap(index, weight)
+        except LoudError:
+            return None, None
+        return moe.n_experts * cap * moe.d * itemsize, None
+    return None, None
 
 
 def _backward(moe: SparseMoE, fn) -> None:
@@ -136,26 +191,29 @@ def _shape(name: str, args) -> int:
     )
     moe = SparseMoE(cfg, device=DEV)
     x = torch.randn(spec["tokens"], spec["d"], device=DEV)
-    with torch.no_grad():
-        probs = F.softmax(moe.router(x), dim=-1)
-        weight, index = probs.topk(2, dim=-1)
-        weight = weight / weight.sum(-1, keepdim=True)
+    index, weight = _routing(moe, x, args.routing)
     order, keep, _ = moe._permute(index)
     counts = torch.bincount(index.reshape(-1), minlength=moe.n_experts)
-    cap = moe._batched_cap(index, weight)
+    try:
+        cap_s = str(moe._batched_cap(index, weight))
+    except LoudError as e:
+        cap_s = f"REFUSED ({str(e).splitlines()[0][:72]})"
+    buckets = len(moe._bucket_plan(counts))
     print(
-        f"\n[{name}] tokens={spec['tokens']} d={spec['d']} f={spec['f']} "
-        f"E={spec['experts']} rank={spec['rank']} top2 | rows={int(keep.sum())} "
-        f"max_group={int(counts.max())} cap={cap}",
+        f"\n[{name}] routing={args.routing} tokens={spec['tokens']} d={spec['d']} "
+        f"f={spec['f']} E={spec['experts']} rank={spec['rank']} top2 | "
+        f"rows={int(keep.sum())} max_group={int(counts.max())} cap={cap_s} "
+        f"buckets={buckets} budget={MOE_BUCKET_BYTES / 2**20:.0f} MiB",
         flush=True,
     )
 
-    arms, why = _arms(moe, x, weight, index, order, keep)
+    arms, why = _arms(moe, x, weight, index, order, keep, args.arm)
     if why is not None:
         print(f"  triton: SKIP ({why}) — the arm is not in the table", flush=True)
     x.requires_grad_(True)
     rows = []
     for arm, fwd in arms.items():
+        bank, nb = _bank_bytes(moe, arm, x, weight, index, order, keep)
 
         def fwd_bwd(fwd=fwd):
             _backward(moe, fwd)
@@ -172,10 +230,13 @@ def _shape(name: str, args) -> int:
             print(f"  {arm:>8s}  FAILED: {type(e).__name__}: {e}", flush=True)
             continue
         rows.append((arm, f_ms, b_ms, nlaunch))
+        bank_s = f"{bank / 2**20:8.1f} MiB" if bank is not None else "       n/a"
+        bucket_s = f" buckets={nb}" if nb is not None else ""
         print(
             f"  {arm:>8s}  fwd {f_ms:8.2f} ms (min {f_min:7.2f})   "
             f"fwd+bwd {b_ms:8.2f} ms (min {b_min:7.2f})   "
-            f"launches {nlaunch if nlaunch is not None else 'n/a'}",
+            f"launches {nlaunch if nlaunch is not None else 'n/a'}   "
+            f"bank {bank_s}{bucket_s}",
             flush=True,
         )
     if len(rows) >= 2:
@@ -193,13 +254,25 @@ def _shape(name: str, args) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--geometry", choices=[*SHAPES, "all"], default="all")
+    ap.add_argument(
+        "--arm",
+        choices=["all", "naive", "batched", "bucketed", "triton"],
+        default="all",
+        help="measure ONE arm; the default measures every arm that can run",
+    )
+    ap.add_argument(
+        "--routing",
+        choices=["uniform", "pathological"],
+        default="uniform",
+        help="uniform = the router's top-2; pathological = 90%% of rows on expert 0",
+    )
     ap.add_argument("--allow-busy", action="store_true")
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--warm", type=int, default=2)
     ap.add_argument("--seed", type=int, default=11)
     args = ap.parse_args()
     why = preflight(DEV)
-    if why and a.allow_busy:
+    if why and args.allow_busy:
         print(f"[COUNTED] measuring with a foreign process on the card: {why}")
         print("[COUNTED] numbers below are an UPPER bound on ms/step, not a clean baseline")
         why = None
