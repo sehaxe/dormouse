@@ -136,6 +136,10 @@ DEAD_SNAPSHOT_KEYS = {
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive", "batched", "bucketed")
+#: The expert-pass arms `moe_shared_compute` can reshape: the arms whose bank
+#: reads a per-expert `[d, rank]` projection. `padded`/`bucketed` keep the old
+#: shape as their control, and `naive` is the per-expert reference loop.
+MOE_SHARED_COMPUTE_KERNELS = ("batched", "triton")
 #: The `moe_lb_mode` literals — WHICH load-balance controller moves the router
 #: (`experts.SparseMoE._lfb_step` and `switch_aux_loss`): `sign` is LFB's
 #: `-coef·sign(L−mean)` (the default, every existing pin), `prop` its
@@ -857,6 +861,34 @@ class ModelConfig:
     #: config load. `triton` falls back COUNTED to `padded` when the kernel
     #: cannot run (no triton import, input not on CUDA) — never silently.
     moe_kernel: str = "padded"
+    #: WHICH SHAPE the routed expert pass computes in, under `share_u` — OFF by
+    #: default, so every pin and checkpoint on disk is untouched.
+    #:
+    #: OFF: the dispatch materializes the shared basis E-fold and runs
+    #: `bmm(xg[E, cap, d], gate_u[E, d, r])` (and the same for `up_u`) — the
+    #: expensive `d -> r` projection is repeated for every expert, even though
+    #: `share_u` has ONE basis. ON: the same parameters are read ONCE as
+    #: `W = [gate_u | up_u] [d, 2r]`, `lat = x[n, d] @ W` is one GEMM over the
+    #: TOKENS (not the `n·k` assignments: two assignments of a token share the
+    #: latent), and the bank then gathers `[n·k, 2r]` and keeps today's
+    #: `silu(g)·u`, `@ v`, weighted scatter. The arithmetic is the same; the
+    #: projection stops depending on E and its MAC drops by the top-k factor.
+    #:
+    #: Only `moe_kernel` in `MOE_SHARED_COMPUTE_KERNELS` has this shape
+    #: (`batched` = the `[E, cap, ·]` bank, `triton` = the grouped GEMM fed the
+    #: latents through two constant selector matrices); `padded`/`bucketed`
+    #: stay the control. Refused LOUDLY with `share_u_mode='off'` (no shared
+    #: basis to read), `rank < 1`, `share_u_mode='dict'` (each expert reads a
+    #: different column subset, so there is no one `W`), a heterogeneous
+    #: per-expert rank, `moe_gather='kernel'` (that arm owns the forward), and
+    #: a `moe_kernel` outside the tuple — an arm asked for and silently not run
+    #: is the defect ADR-0019 bans.
+    #:
+    #: Counters: `moe_shared_compute_calls` (one per routed dispatch that took
+    #: this shape) and `moe_projection_rows` (the device-side row count of the
+    #: ONE projection, i.e. the token count) — a log line without them did not
+    #: run the arm it is labelled with.
+    moe_shared_compute: bool = False
     #: The gather-fused FORWARD (`model/moe_sonic.py`, SonicMoE arXiv:2512.14080
     #: §5.1.1): the grouped GEMM takes the routing's ROW MAP (`toks`/`offs` from
     #: `gather_abi`) instead of a materialised `[R, d]` copy, so the kernel's A
@@ -2428,6 +2460,52 @@ def validate(model: ModelConfig) -> None:
                 "patch latents, so a 'csa_chunk bytes' would silently be a chunk of "
                 "latents (a different unit, and a different window). Refused rather "
                 "than repurposed. Escape: use_byteflow=false, or use_csa=false."
+            )
+    if model.moe_shared_compute:
+        # This arm is a shape of the SHARED basis' projection: with no basis it
+        # would have nothing to read, and with the dictionary the per-expert
+        # column subset makes one `[d, 2r]` matrix impossible. The `rank < 1`
+        # check runs HERE (before the generic one below) so the refusal names
+        # the arm and its escape instead of a bare shape complaint.
+        if model.share_u_mode == "off":
+            loud(
+                "moe_shared_compute=true with share_u_mode='off': the arm reads "
+                "the ONE shared basis (`gate_u`/`up_u [d, rank]`) and projects "
+                "the tokens through it once; with no shared basis every expert "
+                "owns its own `U` and there is nothing to share. Escape: "
+                "share_u_mode='plane' (or share_u=true), or "
+                "moe_shared_compute=false."
+            )
+        if model.share_u_mode == "dict":
+            loud(
+                "moe_shared_compute=true with share_u_mode='dict': each expert "
+                "reads a different `rank`-column subset of the dictionary, so "
+                "there is no single `[d, 2r]` matrix to project the tokens with "
+                "once. Escape: share_u_mode='plane', or "
+                "moe_shared_compute=false (the dictionary's per-expert gather "
+                "stays the dispatch's shape)."
+            )
+        if model.rank < 1:
+            loud(
+                f"moe_shared_compute=true with rank={model.rank}: the projection "
+                f"produces a `[n, 2·rank]` latent and rank 0 has no columns. "
+                f"Escape: rank >= 1, or moe_shared_compute=false."
+            )
+        if model.moe_kernel not in MOE_SHARED_COMPUTE_KERNELS:
+            loud(
+                f"moe_shared_compute=true with moe_kernel={model.moe_kernel!r}: "
+                f"the shared projection is wired into "
+                f"{list(MOE_SHARED_COMPUTE_KERNELS)} only; `padded`/`bucketed` "
+                f"are the old shape's control and `naive` is the reference loop. "
+                f"Escape: moe_kernel='batched' (or 'triton'), or "
+                f"moe_shared_compute=false."
+            )
+        if model.moe_gather == "kernel":
+            loud(
+                "moe_shared_compute=true with moe_gather='kernel': the gather arm "
+                "owns the routed forward and reads `x` through the routing map, so "
+                "the shared projection would never run while the flag claimed it "
+                "did. Escape: moe_gather='off', or moe_shared_compute=false."
             )
     if model.rank < 1 or model.shared_rank < 1:
         loud(f"rank and shared_rank must be >= 1, got {model.rank}/{model.shared_rank}")
