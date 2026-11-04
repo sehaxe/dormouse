@@ -111,7 +111,7 @@ def main() -> int:
 
     import torch
 
-    from dormouse.config import load_preset, validate
+    from dormouse.config import RunConfig, TrainConfig, load_preset, validate
     from dormouse.model import DormouseModel
     from dormouse.train import train
 
@@ -127,17 +127,19 @@ def main() -> int:
 
     rows = []
     for name in names:
-        run = load_preset(a.preset)
         model_over = dict(known[name], moe_routing_health=True)
-        run = dataclasses.replace(
-            run,
-            model=dataclasses.replace(run.model, **model_over),
+        model_cfg = load_preset(a.preset)
+        model_cfg = dataclasses.replace(
+            model_cfg, max_seq_len=max(a.seq, model_cfg.max_seq_len), **model_over
+        )
+        run = RunConfig(
+            source=a.preset,
+            model=model_cfg,
             train=dataclasses.replace(
-                run.train,
+                TrainConfig(),
                 steps=a.steps,
                 batch=a.batch,
                 seq_len=a.seq,
-                max_seq_len=max(a.seq, run.model.max_seq_len),
                 data=a.data,
                 log_every=100,
                 ckpt_every=a.steps,

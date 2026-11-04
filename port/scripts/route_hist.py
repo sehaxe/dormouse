@@ -95,9 +95,12 @@ def main() -> int:
     # REAL bytes: random ids hide a collapse that only real hidden states show
     # (measured 2026-11-04: random gave max 126/4096, the live run's bank needed
     # 12 GiB, i.e. one expert held ~4096 of 16384 assignments).
-    raw = Path(a.data).read_bytes()
+    # A SEEK, not `read_bytes()`: the corpus is 12 GB and this needs one window.
     off = a.seed * a.batch * a.seq
-    chunk = raw[off : off + a.batch * a.seq + 1]
+    with open(a.data, "rb") as fh:
+        fh.seek(off)
+        chunk = fh.read(a.batch * a.seq + 1)
+    assert len(chunk) == a.batch * a.seq + 1, f"{a.data}: {off}+window past EOF"
     ids = torch.tensor(list(chunk[:-1]), device="cuda", dtype=torch.long).view(a.batch, a.seq)
     targets = torch.tensor(list(chunk[1:]), device="cuda", dtype=torch.long).view(a.batch, a.seq)
 

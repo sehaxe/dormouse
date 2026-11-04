@@ -137,9 +137,9 @@ def test_lfb_moves_the_bias_and_never_carries_grad(byte_tensor):
     counts_seen: list[torch.Tensor] = []
     real_step = moe._lfb_step
 
-    def spy(index, counters):
+    def spy(index, counters, counts=None):
         counts_seen.append(torch.bincount(index.reshape(-1), minlength=moe.n_experts).float())
-        return real_step(index, counters)
+        return real_step(index, counters, counts)
 
     moe._lfb_step = spy  # observe the counts the real path sees
 

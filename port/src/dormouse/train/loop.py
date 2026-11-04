@@ -324,7 +324,7 @@ def lfb_range(model: torch.nn.Module) -> tuple[float, float]:
     """The loaded bias's `(min, max)`, `(0, 0)` when no module carries one."""
     lo: list[float] = []
     hi: list[float] = []
-    for m in _lfb_modules(model).values():
+    for m in stepaudit.iterations("loop.lfb_range", _lfb_modules(model).values()):
         if m.lfb_bias.numel():
             lo.append(float(m.lfb_bias.min()))
             hi.append(float(m.lfb_bias.max()))
