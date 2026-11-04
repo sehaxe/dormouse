@@ -149,7 +149,7 @@ from torch.utils.checkpoint import checkpoint
 from .. import stepaudit
 from ..instrument import Counters, loud
 from ..losses import fixed_cross_entropy, logit_softcap
-from . import fused_residual
+from . import fused_kda, fused_residual
 from .csa import CompressedSelectiveAttention
 from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
@@ -476,6 +476,14 @@ class LoopBlock(nn.Module):
         #: the write half is the existing fused kernel, so one iteration is two
         #: launches across the body instead of the eager chain's ~dozens.
         self.fused_epilogue = bool(getattr(cfg, "fused_epilogue", False))
+        #: The WRITE-ASSEMBLY half of `fused_kda_tail` (`model/fused_kda.py`):
+        #: `y = attn·attn_write + branch·attn_write + ffn·mlp_write` in ONE
+        #: launch over the three branch outputs instead of five eager passes.
+        #: The KDA projection tail (`logsigmoid(g)`, `sigmoid(beta)`, the four
+        #: casts) is the same flag's other kernel, in `kda._fla_path`. OFF is
+        #: the eager lines, bit for bit; a CPU host or a non-fp32 branch is a
+        #: COUNTED `fused_kda_tail_fallback`.
+        self.fused_kda_tail = bool(getattr(cfg, "fused_kda_tail", False))
         self._fused_fell_back = False
         #: The DISTINCT bodies this driver cycles over (`DormouseModel` sets it
         #: to `(loop, *loop_extra)`); `None` means this block is the whole loop.
@@ -1195,20 +1203,36 @@ class LoopBlock(nn.Module):
         """
         b, t, d = h.shape
         ffn = blk._moe_branch(normed_mlp, counters) * w_ffn
-        if gains is not None:
-            # PAPER FORM's WRITE gains (`layerrope.py`): each branch's
-            # OUTPUT is scaled where it enters `y`, the residual UPDATE.
-            # `y` is exactly the `F(H_pre·x_l)` the residual operator
-            # deposits (mHC `H_post`, AttnRes' write, ReZero's `α`), and all
-            # three are LINEAR in `y`, so this is the paper's
-            # `h + write·F(...)` for every residual arm without touching a
-            # mixer's internals. `branch` (the Engram memory read) belongs to
-            # the attention side: same read of the same normalised state,
-            # same residual update (module docstring states the mapping).
-            attn = attn * gains[1]
-            branch = branch * gains[1]
-            ffn = ffn * gains[3]
-        y = (attn + branch + ffn).reshape(b, t, d)
+        # PAPER FORM's WRITE gains (`layerrope.py`): each branch's OUTPUT is
+        # scaled where it enters `y`, the residual UPDATE. `y` is exactly the
+        # `F(H_pre·x_l)` the residual operator deposits (mHC `H_post`, AttnRes'
+        # write, ReZero's `α`), and all three are LINEAR in `y`, so this is the
+        # paper's `h + write·F(...)` for every residual arm without touching a
+        # mixer's internals. `branch` (the Engram memory read) belongs to the
+        # attention side: same read of the same normalised state, same residual
+        # update (module docstring states the mapping).
+        gain_attn = gains[1] if gains is not None else None
+        gain_mlp = gains[3] if gains is not None else None
+        fused_y = self.fused_kda_tail and fused_kda.combine_supported(attn, branch, ffn) and (
+            gain_attn is None or fused_kda.combine_supported(gain_attn, gain_mlp)
+        )
+        if fused_y:
+            y = fused_kda.combine(
+                attn.reshape(b, t, d),
+                branch.reshape(b, t, d),
+                ffn.reshape(b, t, d),
+                gain_attn,
+                gain_mlp,
+                counters,
+            )
+        else:
+            if self.fused_kda_tail:
+                counters.count("fused_kda_tail_fallback")
+            if gains is not None:
+                attn = attn * gains[1]
+                branch = branch * gains[1]
+                ffn = ffn * gains[3]
+            y = (attn + branch + ffn).reshape(b, t, d)
 
         if self.loom:
             # LOOM (2610.01153): per-loop router conditioning + variance
