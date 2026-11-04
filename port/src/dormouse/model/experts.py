@@ -288,6 +288,39 @@ def _bincount(x: torch.Tensor, minlength: int) -> torch.Tensor:
     return out
 
 
+def switch_aux_loss(probs: torch.Tensor, index: torch.Tensor, n_experts: int) -> torch.Tensor:
+    """Switch/GShard load-balance term, weight-free: `E · Σ_e f_e · P_e`.
+
+    `f_e` is the fraction of the window's ASSIGNMENTS expert `e` took (`index`
+    is the top-k it was sent, so a hard count — a constant with respect to every
+    parameter); `P_e` is the mean gate probability over the tokens. The product
+    therefore carries a gradient into the ROUTER and into nothing else: an
+    expert that takes a large share raises the term in proportion to how
+    confidently the gate picks it, and the optimizer's way to lower it is to
+    move gate mass OFF that expert — including onto one the gate currently
+    never picks (`P_e ≈ 0` still has a gradient through the softmax).
+
+    That is the property the sign controller lacks on a collapsed bank (measured
+    2026-11-04: `m400`'s saved bias left **9 of 512** experts alive — the
+    bias-less router read 80/512, which was the instrument's view, not the
+    file's). A dead expert's weights get no expert gradient, so only a
+    routing-signal term can bring it back, and this one is differentiable.
+    `n_experts ×` is the paper's normalization: `f` sums to 1 over the bank, so a
+    uniform load and a uniform gate read exactly `1` (Switch's value) at ANY
+    `k`, and one expert taking every assignment reads up to `E` — one weight
+    means the same thing whatever the bank size.
+
+    Computed in fp32 whatever the bank's compute dtype: it is a scalar whose
+    gradient multiplies the router's logits, and 512 terms summed in bf16 would
+    lose exactly the small `P_e` of the dead experts this term exists to lift.
+    """
+    n, k = index.shape
+    assert n > 0 and k > 0, f"switch_aux_loss on an empty routing {tuple(index.shape)}"
+    f = _bincount(index.reshape(-1), n_experts).to(torch.float32) / float(n * k)
+    p = probs.to(torch.float32).mean(dim=0)
+    return n_experts * (f * p).sum()
+
+
 def expert_glu(
     act: str,
     g: torch.Tensor,
@@ -879,6 +912,34 @@ class SparseMoE(nn.Module):
         # `load_model_state` restores it. Unlike `lfb_counts` below it is NOT
         # derivable from anything else, so a resume that lost it would restart
         # the controller at zero — a different router under the same step count.
+        #: WHICH controller moves the bias (`config.MOE_LB_MODES`): `sign` is
+        #: LFB's `-coef·sign(L−mean L)` (the default: every pin, preset and
+        #: checkpoint on record), `prop` the proportional
+        #: `-gamma·(L−mean L)/max(1,mean L)` (a far-off expert moves at the full
+        #: step instead of one `coef` per forward), `aux` no bias controller at
+        #: all — the Switch/GShard term is added to the loss instead.
+        self.lb_mode = cfg.moe_lb_mode
+        self.lb_gamma = cfg.moe_lb_gamma
+        #: The `prop` controller's output bound, in LOGIT units. The measured
+        #: failure is unbounded: `m400`'s saved bias spans [-218, +73] and in
+        #: logit space that permanently overpowers a router whose own scores are
+        #: ±5, so 9 of 512 experts run. `sign` is the legacy arm and is NOT
+        #: clamped (its pins predate this field).
+        self.lb_clamp = cfg.moe_lb_clamp
+        self.aux_coef = cfg.moe_aux_coef
+        #: The routing-health counter set (`_route_health`). OFF by default: it
+        #: costs one `bincount` and four device scalars per routed forward.
+        self.health = cfg.moe_routing_health
+        #: The `aux` arm's per-forward terms, summed by `DormouseModel` after the
+        #: loop (`begin_step` clears them). One per routed forward, so a
+        #: T-iteration window sums T of them — the term is per forward, not per
+        #: model, and dividing it by T would make the weight depend on depth.
+        self._aux_terms: list[torch.Tensor] = []
+        #: The LAST forward's routing histogram, on device (one `bincount` the
+        #: routed path already pays for LFB). `scripts/route_hist.py` reads it —
+        #: a probe that rebuilt the top-k from the UNBIASED logits (the old
+        #: fallback) measures a router this model does not run.
+        self._last_counts: torch.Tensor | None = None
         self.lfb_coef = cfg.moe_lb_coef
         self.register_buffer(
             "lfb_bias", torch.zeros(cfg.n_experts, device=device), persistent=False
@@ -996,7 +1057,7 @@ class SparseMoE(nn.Module):
                 # measured before the policy existed).
                 index = raised.topk(self.topk, dim=-1).indices
                 weight = torch.gather(probs, 1, index)
-                self._lfb_step(index, counters)
+                real = index
             else:
                 # The adaptive width: the policy sees the UNbiased logits (the
                 # bias steers selection, never the confidence that picks k), the
@@ -1013,9 +1074,24 @@ class SparseMoE(nn.Module):
                 )
                 index, active = select_topk(raised, k, self.topk_max)
                 self._k_counters(k, counters)
-                # LFB reads REAL assignments: a weight-0 padding slot is not a load.
-                self._lfb_step(index[active], counters)
+                # A weight-0 padding slot is neither a load (LFB) nor a dispatch
+                # (the aux term): both read the REAL assignments only.
+                real = index[active]
                 weight = torch.gather(probs, 1, index) * active.to(probs.dtype)
+            # THIS forward's routing histogram, on device, computed ONCE: LFB's
+            # integrator, the health counters and `scripts/route_hist.py` all
+            # read it, and nothing here crosses to the host.
+            counts = _bincount(real.reshape(-1), self.n_experts)
+            self._last_counts = counts
+            self._lfb_step(real, counters, counts)
+            if self.health:
+                self._route_health(counts, counters)
+            if self.lb_mode == "aux" and self.training and torch.is_grad_enabled():
+                # COUNTED in `model.py`, exactly where the term is added to the
+                # loss (ADR-0019): a `pure` eval computes no term and must not
+                # report one. The coefficient is applied HERE so the arm's
+                # mechanism is one expression, not two.
+                self._aux_terms.append(self.aux_coef * switch_aux_loss(probs, real, self.n_experts))
             # Renormalized (burn's `topk_blend`): a top-1 token's gate is
             # exactly 1.0, so the sparse arm and the dense control run at the
             # same output magnitude — the A/B compares specialization, not scale.
@@ -1037,22 +1113,127 @@ class SparseMoE(nn.Module):
             counters,
         ).to(torch.float32)
 
-    def _lfb_step(self, index: torch.Tensor, counters: Counters) -> None:
-        """The LFB bias move: on-device, gradient-free, trains-mode only.
+    @property
+    def lb_active(self) -> float:
+        """The bias controller's per-forward step, `0.0` when it does not run.
 
+        `aux` has NO bias controller (`moe_lb_coef`/`moe_lb_gamma` are inert
+        there), and `sign`/`prop` read their own knob. ONE place answers "does
+        this run move the bias": the step below and the resume refusal
+        (`train/loop.py::load_model_state`) must never disagree — a refusal that
+        read `moe_lb_coef` while the arm reads `moe_lb_gamma` would refuse a file
+        it is about to use, or accept one it cannot reconstruct.
+        """
+        if self.lb_mode == "aux":
+            return 0.0
+        return self.lb_gamma if self.lb_mode == "prop" else self.lfb_coef
+
+    def begin_step(self) -> None:
+        """Open a model forward: the `aux` accumulator is PER FORWARD.
+
+        `DormouseModel` calls this before the loop, so a T-iteration window
+        accumulates T terms (the term is per routed forward; dividing it by T
+        would tie its weight to the depth) and the next window starts empty. A
+        recompute during backward appends its own copy AFTER the loss was read;
+        clearing here is what keeps that copy out of the next step.
+        """
+        self._aux_terms = []
+
+    def aux_loss(self) -> torch.Tensor | None:
+        """The `aux` term the forward just accumulated, or `None` when it ran none."""
+        if not self._aux_terms:
+            return None
+        return sum(self._aux_terms, torch.zeros((), device=self._aux_terms[0].device))
+
+    def _route_health(self, counts: torch.Tensor, counters: Counters) -> None:
+        """The routing-health counters: live experts, max share, normalized entropy.
+
+        `counts` is this forward's `[E]` histogram (already on the device). The
+        readings answer the question a LOSS cannot: a collapsed bank still
+        lowers its loss (9 of 512 experts did the work of the bank at `m400` —
+        `docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md`; the bias-less
+        router read 80/512, the file's own router 9/512), so the bank's health
+        has to be counted where the routing is decided.
+
+        All four counters are SUMS over the window (`count_device` accumulates:
+        one D2H read per window, at the log cadence, never on the step path), so
+        the reader divides by `moe_route_n`:
+
+        * `moe_route_live` — experts with at least one assignment;
+        * `moe_route_max_x1000` — the busiest expert's share of the forward's
+          assignments × 1000 (integer; 1000/`E` is uniform, 1000 is one expert);
+        * `moe_route_top10_x1000` — the ten busiest experts' share × 1000. This
+          is the number the 2026-11-04 finding is stated in (top-10 held 50.1%
+          of the bias-less router's tokens and 100% of the saved-controller
+          one), so it is counted, not left to a script;
+        * `moe_route_ent_x1000` — `H(p)/log(E)` × 1000, the histogram's entropy
+          normalized so 1000 IS a uniform bank and 0 is a single live expert.
+          Rounded, not truncated: uniform reads 1000, not 999;
+        * `moe_route_n` — the number of routed forwards accumulated.
+
+        Computed in float64: `H` is a sum of `E` logs, and this is the one place
+        a 1-unit reading (one per mille of the bank) is the difference between
+        "alive" and "collapsing". `p.clamp_min(...)` instead of a mask: a
+        boolean index's output LENGTH is a device value, i.e. a host sync.
+        """
+        total = counts.sum().clamp_min(1)
+        p = counts.to(torch.float64) / total.to(torch.float64)
+        ent = -(p * p.clamp_min(1e-300).log()).sum()
+        units = 1000.0 / math.log(self.n_experts) if self.n_experts > 1 else 0.0
+        one = torch.ones((), dtype=torch.int64, device=counts.device)
+        counters.count_device("moe_route_n", one)
+        counters.count_device("moe_route_live", (counts > 0).sum())
+        counters.count_device("moe_route_max_x1000", counts.max() * 1000 // total)
+        counters.count_device(
+            "moe_route_top10_x1000",
+            torch.topk(counts, min(10, self.n_experts)).values.sum() * 1000 // total,
+        )
+        counters.count_device("moe_route_ent_x1000", (ent * units).round().to(torch.int64))
+
+    def _lfb_step(
+        self, index: torch.Tensor, counters: Counters, counts: torch.Tensor | None = None
+    ) -> None:
+        """The bias move: on-device, gradient-free, trains-mode only.
+
+        `sign` (LFB, arXiv:2408.15664; the default) is
         `b_e -= coef · sign(L_e − mean L)` over the CUMULATIVE routed counts
         `L_e` — the integrator the paper specifies. The A/B of 2026-10-15
         caught the per-forward variant making drops WORSE (42,258→45,325 at
         cap 32): bang-bang control at one-step lag oscillates the whole
         bank; the cumulative mean is what converges. A MEASURED correction
         to the first implementation, not an opinion.
+
+        `prop` is `b_e -= gamma · (L_e − mean L) / max(1, mean L)` over THIS
+        forward's histogram, clamped to ±`moe_lb_clamp`. PER-WINDOW, not
+        cumulative: a cumulative ratio has no equilibrium under a bang-bang step
+        — the measured vector drifted for 150k steps and then froze the order.
+        The normalized deviation is scale-free (a dead expert is `-1`, an
+        overloaded one is `+share`), so `gamma` means the same thing at any batch
+        size, and the clamp keeps the controller inside the router's own logit
+        scale instead of the ±200 the sign arm reached. `aux` returns here: that
+        arm's controller is the loss term.
         """
-        if self.lfb_coef == 0.0 or not self.training:
+        if not self.training or self.lb_mode == "aux":
+            return
+        step = self.lb_active
+        if step == 0.0:
             return
         with torch.no_grad():
-            counts = _bincount(index.reshape(-1), self.n_experts).float()
-            self.lfb_counts.add_(counts)
-            self.lfb_bias.sub_(self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean()))
+            if counts is None:
+                counts = _bincount(index.reshape(-1), self.n_experts)
+            self.lfb_counts.add_(counts.float())
+            if self.lb_mode == "prop":
+                # PER-WINDOW, not cumulative: a cumulative ratio has no
+                # equilibrium under a bang-bang step (measured: `m400`'s saved
+                # bias spans [-218, +73] and the order froze at 9 live experts).
+                load = counts.float()
+                mean = load.mean()
+                moved = self.lb_gamma * (load - mean) / mean.clamp_min(1.0)
+                self.lfb_bias.sub_(moved).clamp_(-self.lb_clamp, self.lb_clamp)
+            else:
+                self.lfb_bias.sub_(
+                    self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean())
+                )
         counters.count("moe_lfb_updates")
 
     def _k_counters(self, k: torch.Tensor, counters: Counters) -> None:
@@ -1622,9 +1803,7 @@ class SparseMoE(nn.Module):
         rule's cap and drops exactly the rows the other capacity arms drop.
         """
         self._assert_homogeneous()
-        return self._bank_dispatch(
-            x, weight, index, order, keep, self._batched_cap(index, weight)
-        )
+        return self._bank_dispatch(x, weight, index, order, keep, self._batched_cap(index, weight))
 
     def _padded_dispatch(
         self,

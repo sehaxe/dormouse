@@ -292,17 +292,77 @@ def _refuse_missing_lfb(where: str, coef: float) -> None:
     default silently trains — or serves — a different router under the same step
     count. Measured on the 4+resume repro at `moe_lb_coef=0.01`: 50 of 51
     tensors differ; at `0.0` the run is bit-exact.
+
+    `coef` is the CONTROLLER'S STEP (`SparseMoE.lb_active`): `0.01` under `sign`,
+    `moe_lb_gamma` under `prop`, and `0` under `aux` — which is why an `aux` run
+    can resume from a file written before the `moe` section existed, while a
+    `sign`/`prop` run cannot.
     """
     loud(
-        f"{where} carries `lfb_counts` but no `lfb_bias`, and this run has "
-        f"moe_lb_coef={coef:g}. The bias is the routing controller's OUTPUT "
-        f"(`b_e -= coef·sign(L_e − mean L)`); it cannot be derived from the "
-        f"cumulative counts, so starting it at zero would train a DIFFERENT router "
-        f"from the one this step count claims (measured: 50/51 tensors differ after "
-        f"4+4 steps at coef=0.01, bit-exact at coef=0). Escape: resume this file on "
-        f"the commit that wrote it, set moe_lb_coef=0 (the controller then never "
-        f"moves the bias), or start a new ckpt_name."
+        f"{where} carries `lfb_counts` but no `lfb_bias`, and this run has a live "
+        f"bias controller (step={coef:g}). The bias is the routing controller's "
+        f"OUTPUT (`b_e -= step·(L_e, mean L)`; `moe_lb_mode` names the step); it "
+        f"cannot be derived from the cumulative counts, so starting it at zero "
+        f"would train a DIFFERENT router from the one this step count claims "
+        f"(measured: 50/51 tensors differ after 4+4 steps at coef=0.01, bit-exact "
+        f"at coef=0). Escape: resume this file on the commit that wrote it, set "
+        f"moe_lb_coef=0 (sign) or moe_lb_gamma=0 (prop) so the controller never "
+        f"moves the bias, or start a new ckpt_name."
     )
+
+
+#: The bias magnitude past which the controller has LEFT the router's own logit
+#: scale (±5). Measured on `m400` at step 149 999: the saved bias spans
+#: `[-218.27, +72.67]` (mean `+34.30`) and 9 of 512 experts carry every
+#: assignment, one of them 4096 of 8192 (`docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md`).
+#: A checkpoint past this bound cannot be resumed: the bias is added to the
+#: logits unconditionally, so its routing is what it is.
+LB_DIVERGED = 10.0
+
+
+def lfb_range(model: torch.nn.Module) -> tuple[float, float]:
+    """The loaded bias's `(min, max)`, `(0, 0)` when no module carries one."""
+    lo: list[float] = []
+    hi: list[float] = []
+    for m in _lfb_modules(model).values():
+        if m.lfb_bias.numel():
+            lo.append(float(m.lfb_bias.min()))
+            hi.append(float(m.lfb_bias.max()))
+    return (min(lo), max(hi)) if lo else (0.0, 0.0)
+
+
+def report_lfb_range(model: torch.nn.Module, *, where: str, refuse: bool) -> None:
+    """ONE `lfb_bias` line on a load, and a REFUSAL past [`LB_DIVERGED`].
+
+    The controller's OUTPUT is controller state a reader cannot infer from the
+    step count, so a load states it: the range is the one number that says
+    whether the loaded router is the router it trained. A training load
+    (`refuse=True`) DIES past the bound — the run's first step would route
+    through a bias 40x the router's logit scale, and no learning rate reaches it
+    — while a reader (`eval`, `decode`, `serve`) prints the same line and serves
+    the file as written, because inspecting a collapsed checkpoint is a legal
+    use and refusing it would destroy the evidence.
+    """
+    lo, hi = lfb_range(model)
+    where_range = f"{where}: lfb_bias range [{lo:+.3f}, {hi:+.3f}]"
+    if max(abs(lo), abs(hi)) <= LB_DIVERGED:
+        if refuse:
+            print(f"{where_range} over {len(_lfb_modules(model))} module(s)")
+        return
+    msg = (
+        f"{where_range} over {len(_lfb_modules(model))} module(s) is past "
+        f"±{LB_DIVERGED:g}: this controller DIVERGED, and the bias is added to the "
+        f"router logits unconditionally, so the file's routing is a collapsed one "
+        f"(measured on `m400`: 9 of 512 experts alive, one holding 4096 of 8192 "
+        f"assignments). No optimizer step repairs it — the dead experts carry no "
+        f"gradient. Escape: a FRESH run with moe_lb_mode='prop' (a bounded "
+        f"controller, ±moe_lb_clamp) and this file only as `--init-from` if you "
+        f"accept its collapsed routing as the starting point; or resume this file "
+        f"on the commit that wrote it."
+    )
+    if refuse:
+        loud(msg)
+    print(msg)
 
 
 def _restore_lfb(model: torch.nn.Module, moe: dict[str, torch.Tensor], *, where: str) -> int:
@@ -615,10 +675,17 @@ def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, stri
     result = model.load_state_dict(sd, strict=strict)
     if moe is not None:
         _restore_lfb(model, moe, where=f"{len(moe)}-module `moe` section")
+        report_lfb_range(model, where="checkpoint", refuse=refuse)
     elif refuse and _carries_lfb_counts(sd):
-        # The EFFECTIVE coefficient is the model's (the preset's, or the
-        # snapshot's after `init_controller` rewrote it) — not the CLI's guess.
-        coef = max((float(m.lfb_coef) for m in _lfb_modules(model).values()), default=0.0)
+        # The EFFECTIVE step is the model's (the preset's, or the snapshot's
+        # after `init_controller` rewrote it) — not the CLI's guess. `lb_active`
+        # is the ONE answer to "does this run move the bias": `prop` reads
+        # `moe_lb_gamma`, and `aux` has no bias controller at all, so neither may
+        # inherit the sign coefficient's answer.
+        coef = max(
+            (float(getattr(m, "lb_active", m.lfb_coef)) for m in _lfb_modules(model).values()),
+            default=0.0,
+        )
         if coef != 0.0:
             _refuse_missing_lfb("the checkpoint", coef)
     if cfg.engram_ram:
