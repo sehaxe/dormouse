@@ -41,7 +41,13 @@ PRESET_DIR = Path(__file__).resolve().parents[2] / "configs"
 #: `json_log` — the telemetry sink is WHERE the measurement goes and it reaches
 #: no forward (audit MINOR 23, 2026-10-17: the field's own docstring promised
 #: this exemption while `diff_keys` refused the flip).
+#: Keys a resume may change. `seq_len` joined on 2026-11-04: the window is not a
+#: parameter, and the KDA/CSA arms carry no positional table, so widening it is a
+#: curriculum step in the same class as extending `steps`. `max_seq_len` is the
+#: buffer bound beside it and may only GROW, and only when no positional table
+#: exists (byteflow/full attention size one) — see `_diff_keys`.
 PROGRESS_KEYS = (
+    "seq_len",
     "steps",
     "log_every",
     "ckpt_every",
@@ -1893,6 +1899,15 @@ class RunConfig:
         strict, including every knob that reaches a forward.
         """
         out: list[str] = []
+        # `max_seq_len` is a BUFFER bound, not a learned constant, and the
+        # KDA/CSA arms never index it. Growing it beside a growing `seq_len` is
+        # the same curriculum step; shrinking it would invalidate every decode
+        # caller. Arms that DO build a positional table (byteflow's RoPE table,
+        # full attention's) keep the strict refusal.
+        positional = self.model.use_byteflow or self.model.attn_kind == "full"
+        if not positional and self.model.max_seq_len != other.model.max_seq_len:
+            if other.model.max_seq_len < self.model.max_seq_len:
+                out.append("model.max_seq_len")  # a SHRINK is never a resume
         for section, a, b in (
             ("model", self.model, other.model),
             ("train", self.train, other.train),
@@ -1900,6 +1915,8 @@ class RunConfig:
             for f in dataclasses.fields(a):
                 if section == "train" and f.name in PROGRESS_KEYS:
                     continue
+                if section == "model" and f.name == "max_seq_len" and not positional:
+                    continue  # handled above: grow-only, and a grow is a resume
                 if getattr(a, f.name) != getattr(b, f.name):
                     out.append(f"{section}.{f.name}")
         return sorted(out)

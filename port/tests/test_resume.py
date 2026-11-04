@@ -82,3 +82,52 @@ def test_optimizer_state_round_trips(tiny, byte_tensor):
     other.load_state_dict(opt.state_dict())
     assert other.steps == 1
     assert other.adamw.state_dict()["state"], "AdamW moments must travel with the checkpoint"
+
+def test_the_window_is_a_progress_key_but_a_shrink_is_not(tmp_path):
+    """`seq_len` widens mid-run (curriculum); `max_seq_len` follows it up but
+    never down, and only on arms with no positional table.
+
+    Measured reason (2026-11-04): every pretrain run to date trained on a
+    1024-BYTE window while GPT-2's 1024 TOKENS is ~4096 bytes, and the 8 KB
+    `longctx1` run had come in 0.19 BPB lower. Being unable to widen the window
+    without throwing away the optimizer state is a policy bug, not safety.
+    """
+    from dormouse.config import PROGRESS_KEYS, load_run
+
+    base = load_run("configs/m400.toml", train_overrides={"seq_len": 1024})
+    wide = load_run(
+        "configs/m400.toml",
+        model_overrides={"max_seq_len": 8192},
+        train_overrides={"seq_len": 8192},
+    )
+    assert "seq_len" in PROGRESS_KEYS
+    assert "train.seq_len" not in base.diff_keys(wide)
+    # the window may not exceed the model's buffer bound
+    with pytest.raises(LoudError, match="exceeds max_seq_len"):
+        load_run("configs/m400.toml", train_overrides={"seq_len": 8192})
+
+    # a wider BUFFER bound is allowed on a KDA/CSA arm...
+    grown = load_run(
+        "configs/m400.toml",
+        model_overrides={"max_seq_len": 8192},
+        train_overrides={"seq_len": 8192},
+    )
+    assert "model.max_seq_len" not in base.diff_keys(grown)
+
+    # ...but a SHRINK is a different run, not a resume. `diff_keys(self=stored,
+    # other=incoming)`, so the incoming run is the narrow one.
+    narrowed = load_run("configs/m400.toml", model_overrides={"max_seq_len": 512},
+                        train_overrides={"seq_len": 512})
+    assert "model.max_seq_len" in base.diff_keys(narrowed)
+
+    # an arm that BUILDS a positional table keeps the strict refusal
+    bf = load_run(
+        "configs/m400.toml",
+        model_overrides={
+            "use_byteflow": True,
+            "byteflow_k_tokens": 64,
+            "use_engram": False,
+        },
+        train_overrides={"seq_len": 1024},
+    )
+    assert "model.max_seq_len" in bf.diff_keys(wide)
