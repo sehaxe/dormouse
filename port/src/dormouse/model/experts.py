@@ -1078,15 +1078,20 @@ class SparseMoE(nn.Module):
                 # (the aux term): both read the REAL assignments only.
                 real = index[active]
                 weight = torch.gather(probs, 1, index) * active.to(probs.dtype)
-            # THIS forward's routing histogram, on device, computed ONCE: LFB's
-            # integrator, the health counters and `scripts/route_hist.py` all
-            # read it, and nothing here crosses to the host.
-            counts = _bincount(real.reshape(-1), self.n_experts)
+            # THIS forward's routing histogram, on device, computed ONCE: the
+            # bias controller, the aux term and the health counters all read it,
+            # and nothing here crosses to the host. A run that armed none of them
+            # pays nothing — an OFF run's allocation count is pinned by
+            # `tests/test_step_audit.py`, and an unconditional bincount here
+            # pushed it over (measured: 30 vs the bound 27).
+            aux_armed = self.lb_mode == "aux" and self.training and torch.is_grad_enabled()
+            need = self.lb_active != 0.0 or self.health or aux_armed
+            counts = _bincount(real.reshape(-1), self.n_experts) if need else None
             self._last_counts = counts
             self._lfb_step(real, counters, counts)
-            if self.health:
+            if counts is not None and self.health:
                 self._route_health(counts, counters)
-            if self.lb_mode == "aux" and self.training and torch.is_grad_enabled():
+            if counts is not None and aux_armed:
                 # COUNTED in `model.py`, exactly where the term is added to the
                 # loss (ADR-0019): a `pure` eval computes no term and must not
                 # report one. The coefficient is applied HERE so the arm's
