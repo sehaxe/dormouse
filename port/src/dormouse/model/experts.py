@@ -735,6 +735,12 @@ class SparseMoE(nn.Module):
         self.capacity = cfg.moe_capacity
         self.router_jitter = getattr(cfg, "moe_router_jitter", 0.0)
         self.moe_kernel = cfg.moe_kernel
+        #: The shared-basis COMPUTE shape (`config.ModelConfig.
+        #: moe_shared_compute`): `gate_u`/`up_u` are read once as one
+        #: `[d, 2·rank]` matrix and every token is projected once, instead of
+        #: `_banks` materializing the E-fold stack and each expert repeating the
+        #: same `d -> rank` product on its own rows. OFF is every pin on record.
+        self.moe_shared_compute = cfg.moe_shared_compute
         #: The gather-fused FORWARD (`model/moe_sonic.py`, SonicMoE §5.1.1): a
         #: second switch on the same pass. `moe_kernel` is what runs when this
         #: arm cannot (`_gather_reason` → COUNTED `moe_gather_fallback`), and
@@ -953,6 +959,12 @@ class SparseMoE(nn.Module):
         )
         # The shared write back to the residual width.
         self.down = nn.Linear(f, d, bias=False, device=device)
+        if self.moe_shared_compute:
+            # A hand-built config skips `config.validate`; the shape refusals
+            # have to live at the seam too (the same rule every other arm here
+            # follows), and a heterogeneous bank is only visible once the
+            # experts exist.
+            self._assert_shared_compute()
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         counters = Counters() if counters is None else counters
@@ -1341,6 +1353,124 @@ class SparseMoE(nn.Module):
     def _bank_dtype(self) -> torch.dtype:
         """The dtype the experts compute in (their own `bf16` switch, not the device's)."""
         return self.experts[0].compute_dtype
+
+    def _assert_shared_compute(self) -> None:
+        """Refuse every shape the shared projection cannot read — LOUD, with the escape.
+
+        `config.validate` owns the same refusals on the CLI path; this is the
+        seam a hand-built config and a hand-mutated bank reach (ADR-0019: an arm
+        asked for and silently not run is a defect). The heterogeneous check is
+        the one a config cannot see: a per-expert adaptive rank makes the E-fold
+        `gate_s`/`up_s`/`v` stacks impossible, and the projection's one `W`
+        would have to be E different matrices.
+        """
+        if self.share_u_mode == "off":
+            loud(
+                "moe_shared_compute=true with share_u_mode='off': the projection "
+                "reads the ONE shared `gate_u`/`up_u [d, rank]`; with no shared "
+                "basis every expert owns its own `U`. Escape: share_u_mode="
+                "'plane' (or share_u=true), or moe_shared_compute=false."
+            )
+        if self.share_u_mode == "dict":
+            loud(
+                "moe_shared_compute=true with share_u_mode='dict': each expert "
+                "reads a different column subset of the dictionary, so no single "
+                "[d, 2·rank] matrix exists to project the tokens with once. "
+                "Escape: share_u_mode='plane', or moe_shared_compute=false."
+            )
+        if self.experts[0].rank < 1:
+            loud(
+                f"moe_shared_compute=true with rank={self.experts[0].rank}: the "
+                f"projection's latent has no columns. Escape: rank >= 1, or "
+                f"moe_shared_compute=false."
+            )
+        shapes = [
+            (tuple(ex.gate_s.shape), tuple(ex.up_s.shape), tuple(ex.v.shape))
+            for ex in self.experts
+        ]
+        if any(s != shapes[0] for s in shapes[1:]):
+            loud(
+                "moe_shared_compute=true with a per-expert ADAPTIVE RANK: the "
+                f"bank's factor shapes differ (expert 0 {shapes[0]}, first "
+                f"mismatch {next(s for s in shapes[1:] if s != shapes[0])}), so "
+                "one shared [d, 2·rank] projection cannot feed every expert's "
+                "bank. Escape: one rank for every routed expert, or "
+                "moe_shared_compute=false."
+            )
+        if self.moe_gather == "kernel":
+            loud(
+                "moe_shared_compute=true with moe_gather='kernel': the gather "
+                "arm owns the routed forward, so the shared projection would "
+                "never run while the flag claimed it did. Escape: "
+                "moe_gather='off', or moe_shared_compute=false."
+            )
+
+    @torch.compiler.disable
+    def _shared_pair(self, dt: torch.dtype) -> torch.Tensor:
+        """`[gate_u | up_u]` as ONE `[d, 2·rank]` matrix — the bank's own parameters.
+
+        Not a copy kept on the side: `plane` mode owns these two tensors and the
+        bank materializes their E-fold stack elsewhere. Reading them here is
+        what makes the two shapes provably the same arithmetic; the parity gate
+        (`tests/test_moe_shared_compute.py`) is what proves the values agree.
+        `factor_qat` rides the SAME per-step `QuantCache` `_banks` uses, so the
+        one projection is quantized once, not once per call site.
+        """
+        assert self.share_u_mode == "plane", "the shared projection needs `plane`"
+        gate_u, up_u = self.gate_u, self.up_u
+        if self.factor_qat != "none":
+            gate_u = factor_qat_project(
+                gate_u, self.factor_qat, self.factor_qat_alpha, cache=self._qat_cache
+            )
+            up_u = factor_qat_project(
+                up_u, self.factor_qat, self.factor_qat_alpha, cache=self._qat_cache
+            )
+        return torch.cat((gate_u.to(dt), up_u.to(dt)), dim=1)
+
+    def _shared_projection(
+        self, x: torch.Tensor, dt: torch.dtype, counters: Counters | None
+    ) -> torch.Tensor:
+        """`lat = x @ [gate_u | up_u]` — ONE GEMM over the TOKEN rows `[n, 2·rank]`.
+
+        The old shape projected the `n·k` assignment rows through an E-fold
+        `[d, rank]` stack (twice — gate and up). The shared basis is the same
+        for every assignment of a token, so one projection per token is the
+        same math with the duplicated rows removed. Counters are DEVICE-side:
+        the row count never crosses to the host on the step path.
+        """
+        lat = x if x.dtype == dt else x.to(dt)
+        lat = lat @ self._shared_pair(dt)
+        if counters is not None:
+            counters.count("moe_shared_compute_calls")
+            counters.count_device(
+                "moe_projection_rows",
+                torch.full((), x.shape[0], dtype=torch.int64, device=x.device),
+            )
+        return lat
+
+    @torch.compiler.disable
+    def _shared_select(self, dt: torch.dtype, device: torch.device) -> tuple[torch.Tensor, ...]:
+        """The two constant `[E, 2·rank, rank]` selectors the grouped GEMM takes.
+
+        `[I; 0]` reads the gate half of the combined latent, `[0; I]` the up
+        half, so the shipped kernel's `xg @ gate_u` / `xg @ up_u` become column
+        selections — the projection they used to do already happened once, over
+        the tokens. Cached per `(dtype, device, rank, E)`: constants, not state,
+        and never in `state_dict`.
+        """
+        rank = self.experts[0].rank
+        key = (dt, str(device), rank, self.n_experts)
+        cached = getattr(self, "_shared_select_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
+        eye = torch.eye(rank, dtype=dt, device=device)
+        zero = torch.zeros_like(eye)
+        gate = torch.cat((eye, zero), dim=0).unsqueeze(0)
+        up = torch.cat((zero, eye), dim=0).unsqueeze(0)
+        gate = gate.expand(self.n_experts, -1, -1).contiguous()
+        up = up.expand(self.n_experts, -1, -1).contiguous()
+        self._shared_select_cache = (key, gate, up)
+        return gate, up
 
     def _gather_rows(self, x: torch.Tensor, owner: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
         """`x[owner]` in `dt` — one gather copy, and a cast ONLY when one is needed.
@@ -1798,6 +1928,7 @@ class SparseMoE(nn.Module):
         index: torch.Tensor,
         order: torch.Tensor,
         keep: torch.Tensor | None,
+        counters: Counters | None = None,
     ) -> torch.Tensor:
         """Gather → ONE `[E, cap, ·]` bmm bank → weighted scatter, dropless too.
 
@@ -1806,9 +1937,16 @@ class SparseMoE(nn.Module):
         row, so this arm is the per-expert loop's function with three batched
         GEMMs instead of E tiny ones. `moe_capacity > 0` uses the capacity
         rule's cap and drops exactly the rows the other capacity arms drop.
+
+        `moe_shared_compute` swaps the bank's `[E, cap, d]` operand for the
+        gathered `[E, cap, 2·rank]` latent and the two `d -> rank` bmms for the
+        one projection over the tokens — same weights, same output (the parity
+        gate's 1e-5, not bit-identity, because the reduction order moved).
         """
         self._assert_homogeneous()
-        return self._bank_dispatch(x, weight, index, order, keep, self._batched_cap(index, weight))
+        return self._bank_dispatch(
+            x, weight, index, order, keep, self._batched_cap(index, weight), counters
+        )
 
     def _padded_dispatch(
         self,
@@ -1817,6 +1955,7 @@ class SparseMoE(nn.Module):
         index: torch.Tensor,
         order: torch.Tensor,
         keep: torch.Tensor | None,
+        counters: Counters | None = None,
     ) -> torch.Tensor:
         """Gather → ONE capacity-padded `[E, cap, ·]` bank pass → weighted scatter.
 
@@ -1841,7 +1980,7 @@ class SparseMoE(nn.Module):
                 "every assignment)."
             )
         n, k = index.shape
-        return self._bank_dispatch(x, weight, index, order, keep, self._capacity(n, k))
+        return self._bank_dispatch(x, weight, index, order, keep, self._capacity(n, k), counters)
 
     def _bank_dispatch(
         self,
@@ -1851,6 +1990,7 @@ class SparseMoE(nn.Module):
         order: torch.Tensor,
         keep: torch.Tensor | None,
         cap: int,
+        counters: Counters | None = None,
     ) -> torch.Tensor:
         """The `[E, cap, ·]` bank body shared by `padded` and `batched`.
 
@@ -1899,17 +2039,30 @@ class SparseMoE(nn.Module):
         # Zero-filled, not `empty`: a row past capacity is never read, but a
         # zero row keeps the bank finite, and inf-garbage × 0 is NaN in the
         # backward (the spike measured exactly that — `probe_moe_variants.py`).
-        xg = torch.zeros(dump + 1, self.d, dtype=dt, device=x.device)
-        xg = xg.index_put((slots,), self._gather_rows(x, owner, dt))
-        # The bank the GEMM sees is EXACTLY the eager `[e, cap, d]` — the dump
+        # The bank the GEMM sees is EXACTLY the eager `[e, cap, ·]` — the dump
         # row is sliced off, so the expert pass keeps its shape, its kernel and
         # its bits. Only the lookup needs the extra row, and it gets a constant
         # zero row (the dumped assignments' output is 0 anyway).
-        bank = xg.narrow(0, 0, dump).view(e, cap, self.d)
-
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)
-        g = torch.bmm(bank, gate_u) * gate_s[:, None, :]
-        u = torch.bmm(bank, up_u) * up_s[:, None, :]
+        if self.moe_shared_compute:
+            self._assert_shared_compute()
+            rank = self.experts[0].rank
+            # `[n, 2·rank]`: ONE `d -> rank` projection per TOKEN (the shared
+            # basis is the same for both of a token's assignments), then the
+            # same expert-major gather into the bank, on `2·rank` columns
+            # instead of `d`. The rank-space GLU and the write are unchanged.
+            lat = self._shared_projection(x, dt, counters)
+            xg = torch.zeros(dump + 1, 2 * rank, dtype=dt, device=x.device)
+            xg = xg.index_put((slots,), self._gather_rows(lat, owner, dt))
+            bank = xg.narrow(0, 0, dump).view(e, cap, 2 * rank)
+            g = bank[..., :rank] * gate_s[:, None, :]
+            u = bank[..., rank:] * up_s[:, None, :]
+        else:
+            xg = torch.zeros(dump + 1, self.d, dtype=dt, device=x.device)
+            xg = xg.index_put((slots,), self._gather_rows(x, owner, dt))
+            bank = xg.narrow(0, 0, dump).view(e, cap, self.d)
+            g = torch.bmm(bank, gate_u) * gate_s[:, None, :]
+            u = torch.bmm(bank, up_u) * up_s[:, None, :]
         h = F.silu(g) * u if self._glu is None else self._glu(g, u)
         y = torch.bmm(h, v).reshape(dump, self.f)
         y = torch.cat((y, torch.zeros(1, self.f, dtype=dt, device=x.device)))
@@ -2075,7 +2228,10 @@ class SparseMoE(nn.Module):
                 counters.why = "; ".join(notes)  # type: ignore[attr-defined]
             counters.count("moe_batched_calls")
             return self._expert_pass(
-                lambda: self._batched_dispatch(x, weight, index, order, keep_rows), counters
+                lambda: self._batched_dispatch(
+                    x, weight, index, order, keep_rows, counters
+                ),
+                counters,
             )
         if self.moe_kernel == "triton":
             why = (
@@ -2096,10 +2252,19 @@ class SparseMoE(nn.Module):
                     counters.count("moe_triton_fallback")
                     counters.why = f"fused backward: {fwhy}"  # type: ignore[attr-defined]
                 counters.count("moe_triton_gemm")
-                self._count_tile(counters)
+                self._count_tile(
+                    counters,
+                    2 * self.experts[0].rank if self.moe_shared_compute else None,
+                )
                 return self._expert_pass(
                     lambda: self._triton_dispatch(
-                        x, weight, index, order, keep_rows, fused_bwd=fwhy is None
+                        x,
+                        weight,
+                        index,
+                        order,
+                        keep_rows,
+                        fused_bwd=fwhy is None,
+                        counters=counters,
                     ),
                     counters,
                 )
@@ -2113,7 +2278,10 @@ class SparseMoE(nn.Module):
                 counters.why = "; ".join(notes)  # type: ignore[attr-defined]
             counters.count("moe_padded_bmm")
             return self._expert_pass(
-                lambda: self._padded_dispatch(x, weight, index, order, keep_rows), counters
+                lambda: self._padded_dispatch(
+                    x, weight, index, order, keep_rows, counters
+                ),
+                counters,
             )
         counters.count("moe_naive_dispatch")
         counters.why = "; ".join([*notes, why])  # type: ignore[attr-defined]
@@ -2163,7 +2331,10 @@ class SparseMoE(nn.Module):
         if self.moe_kernel == "batched":
             counters.count("moe_batched_calls")
             return self._expert_pass(
-                lambda: self._batched_dispatch(x, weight, index, order, keep_rows), counters
+                lambda: self._batched_dispatch(
+                    x, weight, index, order, keep_rows, counters
+                ),
+                counters,
             )
         why = None
         if self.moe_kernel == "naive":
@@ -2193,10 +2364,19 @@ class SparseMoE(nn.Module):
                 prev = getattr(counters, "why", None)
                 counters.why = f"{prev}; {note}" if prev else note  # type: ignore[attr-defined]
             counters.count("moe_triton_gemm")
-            self._count_tile(counters)
+            self._count_tile(
+                counters, 2 * self.experts[0].rank if self.moe_shared_compute else None
+            )
             return self._expert_pass(
                 lambda: self._triton_dispatch(
-                    x, weight, index, order, keep_rows, dropless=True, fused_bwd=fwhy is None
+                    x,
+                    weight,
+                    index,
+                    order,
+                    keep_rows,
+                    dropless=True,
+                    fused_bwd=fwhy is None,
+                    counters=counters,
                 ),
                 counters,
             )
@@ -2210,7 +2390,7 @@ class SparseMoE(nn.Module):
             lambda: self._naive_dispatch(x, weight, index, order, keep, counters), counters
         )
 
-    def _count_tile(self, counters: Counters) -> None:
+    def _count_tile(self, counters: Counters, d: int | None = None) -> None:
         """COUNTED: the tile the search picked, as a counter NAME (`moe_tile_N…_M…_st…`).
 
         ADR-0019: the tile is a degradation of the ideal (the shape may have cost
@@ -2218,10 +2398,13 @@ class SparseMoE(nn.Module):
         which one ran without a profiler — `moe_tile_N128_M64_st1=<forwards>` on
         the log line says the arm gave up a stage, and `st2` says it kept it.
         Same seam as `moe_triton_gemm` (cardinality is one per tile set, so the
-        counter line stays short).
+        counter line stays short). `d` is the kernel's A width: `2·rank` under
+        `moe_shared_compute`, because the projection already happened.
         """
         counters.count(
-            moe_kernels.tile_name(self._bank_dtype(), self.d, self.f, self.experts[0].rank)
+            moe_kernels.tile_name(
+                self._bank_dtype(), self.d if d is None else d, self.f, self.experts[0].rank
+            )
         )
 
     def _triton_reason(self, x: torch.Tensor) -> str | None:
@@ -2324,6 +2507,7 @@ class SparseMoE(nn.Module):
         *,
         dropless: bool = False,
         fused_bwd: bool = True,
+        counters: Counters | None = None,
     ) -> torch.Tensor:
         """Gather → ONE unpadded grouped-GEMM pass (GLU fused) → weighted scatter.
 
@@ -2351,6 +2535,14 @@ class SparseMoE(nn.Module):
         way — only the graph the backward walks. `fused_bwd=False` is the
         previous path (a plain torch scatter and `_glu_backward`), kept as the
         parity gate and the bench's control.
+
+        `moe_shared_compute` feeds the SAME kernel the latent rows: the tokens
+        are projected once through `[gate_u | up_u] [d, 2·rank]`, the gathered
+        `[R, 2·rank]` rows become `xg`, and the kernel's two projections become
+        the constant selector matrices `[I; 0]` / `[0; I]` (`_shared_select`).
+        The kernel, its fused backward and the combine are unchanged — the
+        `d -> rank` product they used to do was already applied once, over the
+        tokens, by `_shared_projection`.
         """
         assert moe_kernels is not None, "the triton arm cannot be dispatched without it"
         n, k = index.shape
@@ -2364,7 +2556,13 @@ class SparseMoE(nn.Module):
         offs[1:] = torch.cumsum(counts, 0)
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)
         cap = None if dropless else self._capacity(n, k)
-        xg = self._gather_rows(x, owner, dt)
+        if self.moe_shared_compute:
+            self._assert_shared_compute()
+            lat = self._shared_projection(x, dt, counters)
+            xg = self._gather_rows(lat, owner, dt)
+            gate_u, up_u = self._shared_select(dt, x.device)
+        else:
+            xg = self._gather_rows(x, owner, dt)
         if not fused_bwd:
             y = moe_kernels.expert_gemm_glu(
                 xg, gate_u, up_u, gate_s, up_s, v, offs, cap=cap, fused_bwd=False

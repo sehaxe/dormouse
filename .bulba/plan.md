@@ -697,6 +697,28 @@ testable and A/B-able (ADR-0017).
       and the "E > 4x live" warning. Gates `tests/test_dashboard_routing.py`,
       `tests/test_plan_restart.py`.
 
+- [x] P-MOE-SHARED-COMPUTE. port (Python): `moe_shared_compute` (OFF by
+      default) stops materializing the plane's shared basis E-fold. The dispatch
+      reads the bank's OWN `gate_u`/`up_u` as one `[d, 2·rank]` matrix and does
+      `lat = x[n,d] @ W` ONCE over the tokens, then gathers `[n·k, 2·rank]` and
+      keeps today's `silu(g)·u`, `@ v`, weighted scatter (`batched` and `triton`;
+      the grouped GEMM takes two constant `[E, 2r, r]` selectors). Refused with
+      `Escape:` on `share_u_mode='off'`, `rank<1`, `dict`, a heterogeneous
+      per-expert rank, `moe_gather='kernel'` and a kernel outside
+      `{batched,triton}`. Counters `moe_shared_compute_calls` +
+      device `moe_projection_rows`. Gates `tests/test_moe_shared_compute.py`
+      (6 functions, 6 scratch reverts red): flag off is the pre-edit pin
+      (64 881 params, sd/logits sha), ON vs OFF fp32 logits rel `1.82e-7` and
+      worst parameter gradient rel `6.13e-7` at depth 1 (the test says why depth
+      2 is not used), matmul dispatches `3 -> 2`, no host reads, 45-tensor
+      checkpoint round-trip. CPU suite: only the pre-existing
+      `test_layerrope` counter (fixed by the uncommitted main-worktree edit) and
+      the untracked-`sft_pairs` failure. The GPU bench
+      (`scripts/bench_share_u_compute.py`) is written but UNRUN — the card is on
+      the multi-day job. Arithmetic at m400/b8-s1024 (n=8192, k=2, E=512,
+      r=64, d=1536, f=4096, cap=32): projection 3.221 -> 1.611 GMAC, write
+      4.295 GMAC, total 7.516 -> 5.905 GMAC (21 % fewer, −2 `bmm` launches).
+
 
 ## Critical Files
 
