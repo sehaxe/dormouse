@@ -71,6 +71,7 @@ def main() -> int:
 
     from dormouse.config import RunConfig
     from dormouse.model import DormouseModel
+    from dormouse.train.loop import load_model_half, load_model_state
 
     base = Path(a.ckpt_dir) / a.ckpt
     # The SNAPSHOT is the run: rebuild from it so `diff_keys` is empty and the
@@ -79,34 +80,31 @@ def main() -> int:
     run = RunConfig.from_snapshot((base / f"{a.ckpt}.config.toml").read_text())
     state = torch.load(base / f"{a.ckpt}.pt", map_location="cpu", weights_only=False)
     model = DormouseModel(run.model).to("cuda").eval()
-    if "model" in state:
-        model.load_state_dict(state["model"], strict=True)
-    print(f"loaded {a.ckpt} at step {state.get('step')}")
+    # THE ONE LOADER, not a raw `load_state_dict`: the LFB bias is a
+    # non-persistent buffer that travels in the checkpoint's `moe` section, and a
+    # probe that read `state["model"]` alone measured the BIAS-LESS router
+    # ("80 of 512 alive") while the file's own router had 9 (measured 2026-11-04).
+    weights = base / f"{a.ckpt}.pt"
+    load_model_state(model, run.train, load_model_half(weights))
+    bias = model.loop.moe.lfb_bias
+    print(
+        f"loaded {a.ckpt} at step {state.get('step')} · lfb_bias "
+        f"[{float(bias.min()):+.3f}, {float(bias.max()):+.3f}]"
+    )
 
     # REAL bytes: random ids hide a collapse that only real hidden states show
     # (measured 2026-11-04: random gave max 126/4096, the live run's bank needed
     # 12 GiB, i.e. one expert held ~4096 of 16384 assignments).
-    raw = Path(a.data).read_bytes()
+    # A SEEK, not `read_bytes()`: the corpus is 12 GB and this needs one window.
     off = a.seed * a.batch * a.seq
-    chunk = raw[off : off + a.batch * a.seq + 1]
+    with open(a.data, "rb") as fh:
+        fh.seek(off)
+        chunk = fh.read(a.batch * a.seq + 1)
+    assert len(chunk) == a.batch * a.seq + 1, f"{a.data}: {off}+window past EOF"
     ids = torch.tensor(list(chunk[:-1]), device="cuda", dtype=torch.long).view(a.batch, a.seq)
     targets = torch.tensor(list(chunk[1:]), device="cuda", dtype=torch.long).view(a.batch, a.seq)
 
     moe = model.loop.moe
-    # THE SAVED CONTROLLER. `lfb_bias` is a non-persistent buffer, so it is NOT
-    # in `ck["model"]` — it travels in its own `moe` section. Loading the weights
-    # alone silently measures the *router without the controller*, which on
-    # 2026-11-04 read 80/512 alive while the real routing had 9.
-    bias = torch.zeros(moe.n_experts, device="cuda")
-    saved = (state.get("moe") or {}).get("loop.moe")
-    if saved is not None:
-        bias = saved.to(device="cuda", dtype=torch.float32)
-        print(
-            f"lfb_bias from the checkpoint: min {bias.min():.2f} "
-            f"max {bias.max():.2f} mean {bias.mean():.2f}"
-        )
-    else:
-        print("lfb_bias: NOT in the checkpoint (the controller state is missing)")
     # The router is a dense Linear on the block input; walk the model's own
     # entry point so the hidden state is exactly the training one.
     grabbed: list[torch.Tensor] = []

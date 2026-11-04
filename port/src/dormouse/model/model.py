@@ -868,6 +868,11 @@ class DormouseModel(nn.Module):
                 f"— a state from a different window is a different objective. "
                 f"Escape: segment_len=0, or jepa_weight=0.0."
             )
+        # The routing controller's PER-FORWARD state: the `aux` arm accumulates
+        # one term per routed forward (the loop's T iterations) and the loss
+        # below reads the sum. Cleared here, before the loop, so a recompute's
+        # copy (backward) can never leak into the next step.
+        self.loop.moe.begin_step()
         out, rec_sum, counters = self.loop(
             h0,
             input_ids,
@@ -998,6 +1003,17 @@ class DormouseModel(nn.Module):
             # (Σ_i CE_i + CE_final) / (T + 1), unweighted, with T the depth this
             # forward ACTUALLY ran (computed above, before the CE expression).
             loss = (rec_sum + ce_final) / (T + 1)
+            if not pure and self.cfg.moe_lb_mode == "aux":
+                # The Switch/GShard load-balance term (`experts.switch_aux_loss`,
+                # weighted by `moe_aux_coef` in the MoE): a ROUTING signal, so it
+                # is added to the objective exactly like z-loss, and `pure` (the
+                # held-out number) skips it. The counter is bumped where the term
+                # enters the loss, not where it is computed (ADR-0019): a `pure`
+                # eval must not report an arm it never added.
+                moe_aux = self.loop.moe.aux_loss()
+                if moe_aux is not None:
+                    loss = loss + moe_aux
+                    counters.count("moe_aux")
             if not pure and self.cfg.z_loss > 0.0:
                 # z-loss (PaLM §5 / Gemma-2 §9): keep the pre-softmax logits
                 # from drifting tall. It is added AFTER the CE mean that is the

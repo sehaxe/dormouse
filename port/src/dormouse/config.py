@@ -136,6 +136,12 @@ DEAD_SNAPSHOT_KEYS = {
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive", "batched", "bucketed")
+#: The `moe_lb_mode` literals — WHICH load-balance controller moves the router
+#: (`experts.SparseMoE._lfb_step` and `switch_aux_loss`): `sign` is LFB's
+#: `-coef·sign(L−mean)` (the default, every existing pin), `prop` its
+#: proportional form `-gamma·(L−mean)/max(1,mean)`, `aux` no bias controller at
+#: all plus the Switch/GShard loss term. A name that is not here is LOUD.
+MOE_LB_MODES = ("sign", "prop", "aux")
 #: The `moe_gather` literals — the gather-fused FORWARD (`model/moe_sonic.py`,
 #: SonicMoE §5.1.1): `off` is today's pass, `kernel` reads the expert rows
 #: THROUGH the permute's row map instead of a materialised `[R, d]` copy. It is
@@ -778,11 +784,64 @@ class ModelConfig:
     moe_router_jitter: float = 0.0
     moe_capacity: float = 1.0
     #: Loss-Free Balancing step (arXiv:2408.15664): before the top-k decision
-    #: the scores read `probs + b_e`, and after the forward `b_e` moves by
+    #: the LOGITS read `logits + b_e`, and after the forward `b_e` moves by
     #: `-coef · sign(load_e − mean load)` — a bias, NOT an aux loss (no
     #: interference gradients; the field converged here away from Switch-style
     #: losses). 0.0 = off. The update is on-device per routed forward.
+    #: INERT under `moe_lb_mode="aux"` (that arm has no bias controller; the
+    #: `moe_aux` term is its whole mechanism).
     moe_lb_coef: float = 0.0
+    #: WHICH load-balance controller runs (`MOE_LB_MODES`, `experts._lfb_step`):
+    #: `sign` (the default — every existing preset, pin and checkpoint) moves the
+    #: bias by `-moe_lb_coef · sign(L_e − mean L)` from the CUMULATIVE counts
+    #: `L`; `prop` by `-moe_lb_gamma · (L_e − mean L) / max(1, mean L)` on THIS
+    #: window's histogram, clamped to ±`moe_lb_clamp`; `aux` turns the bias
+    #: controller OFF and adds the Switch/GShard term
+    #: `moe_aux_coef · E · Σ_e f_e · P_e` to the training loss (differentiable
+    #: through the router only).
+    #: Why `prop` exists (measured 2026-11-04, `docs/reviews/2026-11-04-routing-
+    #: collapse-CONFIRMED.md`): `m400` at step 149 999 carries a saved bias of
+    #: `[-218.27, +72.67]` and its router keeps **9 of 512** experts alive
+    #: (top-10 = 100% of all assignments). The bias-less router reads 80/512, so
+    #: the controller is what collapsed the bank. `sign` is a cumulative
+    #: bang-bang integrator with no equilibrium and no bound — it drifted there;
+    #: `prop` is a bounded, scale-free P loop on the current window.
+    moe_lb_mode: str = "sign"
+    #: The `prop` controller's step, in units of the RELATIVE deviation: a dead
+    #: expert is `-1`, so it gains `moe_lb_gamma` per routed forward until the
+    #: clamp. `0.001` is the paper's γ (2408.15664) and the value the
+    #: routing-collapse note asks for; `0.0` disables the controller under this
+    #: mode (the escape `moe_lb_coef=0` is for `sign`). Inert under `sign`/`aux`.
+    moe_lb_gamma: float = 0.001
+    #: The `prop` controller's output bound, in LOGIT units. The measured
+    #: divergence this field exists for: `m400`'s saved bias spans
+    #: `[-218, +73]` (mean `+34`) and its routing froze at 9 of 512 live
+    #: experts — in logit space a ±200 bias permanently overpowers a router
+    #: whose own scores are ±5. A bounded controller cannot do that. `sign` is
+    #: the legacy arm and is NOT clamped (its pins predate this field). Inert
+    #: under `sign`/`aux`.
+    moe_lb_clamp: float = 2.0
+    #: The `aux` term's weight. The term is `E · Σ_e f_e · P_e` with `f` summing
+    #: to 1 over the bank, so it reads exactly `1` at a uniform load and a
+    #: uniform gate (the Switch value, at any top-k) and up to `E` when one
+    #: expert takes every assignment — one weight means the same thing at any
+    #: bank size. `0.01` is the Switch value and its gradient reaches the router
+    #: and nothing else. Inert unless `moe_lb_mode="aux"`.
+    moe_aux_coef: float = 0.01
+    #: The routing-HEALTH counter set (`experts._route_health`): per routed
+    #: forward, FIVE device counters, drained on the log cadence like every other
+    #: device counter (no host read on the step path) —
+    #: `moe_route_live` = experts with at least one assignment,
+    #: `moe_route_max_x1000` = the busiest expert's share × 1000,
+    #: `moe_route_top10_x1000` = the ten busiest experts' share × 1000,
+    #: `moe_route_ent_x1000` = the histogram's entropy normalized by `log E`
+    #: × 1000 (1000 = uniform, 0 = one expert), and `moe_route_n` = the number of
+    #: forwards accumulated. Each is a SUM over the window, so the reader divides
+    #: by `moe_route_n`: `moe_route_live/moe_route_n` is the mean live count the
+    #: collapse is measured by. OFF by default (it costs one `bincount`, one
+    #: `topk` and five scalars per forward); a run that wants the reading turns
+    #: it on.
+    moe_routing_health: bool = False
     #: Which expert-pass arm the routed forward runs, and the A/B switch
     #: (`docs/research/2026-10-15-tsct-super-kernel.md` step 2):
     #: `padded` = the cap-padded `[E, cap, ·]` bank of bmms — the reference and
@@ -2422,6 +2481,44 @@ def validate(model: ModelConfig) -> None:
             f"is the DROPLESS mode (every assignment reaches its expert, the padded "
             f"bank refuses, the ragged arm runs COUNTED). Escape: 0, or a positive "
             f"capacity (2.0 is the presets')."
+        )
+    if model.moe_lb_mode not in MOE_LB_MODES:
+        loud(
+            f"moe_lb_mode={model.moe_lb_mode!r} is not a router controller. Known: "
+            f"{list(MOE_LB_MODES)} — `sign` the LFB bias integrator "
+            f"(`-moe_lb_coef·sign(L−mean L)`, every existing preset), `prop` its "
+            f"proportional form (`-moe_lb_gamma·(L−mean L)/max(1,mean L)`), `aux` "
+            f"the Switch/GShard loss term instead of a bias. Escape: name one of "
+            f"those, or land the controller and its gate before the config can lie "
+            f"about it."
+        )
+    if model.moe_lb_gamma < 0.0:
+        loud(
+            f"moe_lb_gamma={model.moe_lb_gamma}: the proportional controller's step "
+            f"is subtracted from the bias, so a negative step REINFORCES the "
+            f"imbalance it is meant to cancel (the busiest expert gains bias). "
+            f"Escape: 0.0 (off), or a positive step (0.05 is the arm's value)."
+        )
+    if model.moe_lb_clamp <= 0.0:
+        loud(
+            f"moe_lb_clamp={model.moe_lb_clamp}: the prop controller's bound is a "
+            f"LOGIT budget and must be positive (`clamp_(-c, c)` with c <= 0 is the "
+            f"wrong band). Escape: a positive bound (2.0 is the arm's)."
+        )
+    if model.moe_aux_coef < 0.0:
+        loud(
+            f"moe_aux_coef={model.moe_aux_coef}: a negative load-balance weight "
+            f"rewards exactly the imbalance the term penalizes (`E·Σ_e f_e·P_e` is "
+            f"minimized by a uniform load). Escape: 0.0, or a positive weight "
+            f"(0.01 is Switch's)."
+        )
+    if model.moe_lb_mode == "aux" and model.moe_topk <= 0:
+        loud(
+            f"moe_lb_mode='aux' with moe_topk={model.moe_topk}: the aux term is a "
+            f"function of the DISPATCH (`f_e` is the fraction of the window's "
+            f"top-k assignments expert e took), and topk=0 is the dense blend, "
+            f"which dispatches nothing — the arm would be inert while its counter "
+            f"claimed it ran. Escape: moe_topk > 0, or moe_lb_mode='sign'."
         )
     if model.moe_kernel not in MOE_KERNELS:
         loud(

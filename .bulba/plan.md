@@ -222,6 +222,27 @@ testable and A/B-able (ADR-0017).
       loop and counts `halt_skipped`; `max_iter=8` builds/trains/evaluates;
       `port/scripts/ab_depth8.py` (`mi4` vs `mi8`, 3 seeds x 2 000, medium,
       `eval_depths`) written and **NOT run** (card busy). Landed 2026-10-21.
+- [x] P-MOE-BALANCE. port (Python): the routing controller that collapsed the
+      bank, and the counters that make it visible. Evidence: `m400` step 149 999
+      carries `lfb_bias ∈ [-218.27, +72.67]` (mean +34) and keeps **9 of 512**
+      experts alive (one holding 4096 of 8192 assignments); the bias-less router
+      reads 80/512, so the SIGN controller is the cause (the first histogram
+      measured the wrong thing — `route_hist.py` skipped the `moe` section).
+      Mechanism: `sign` is a cumulative bang-bang integrator with no equilibrium
+      and no bound. Added, all behind flags and default OFF (`sign` untouched):
+      `moe_lb_mode="prop"` (per-WINDOW relative deviation, `gamma=0.001`,
+      clamped ±`moe_lb_clamp=2.0`), `moe_lb_mode="aux"` (Switch/GShard
+      `coef·E·Σ f·P` added to the loss, gradient to the router only),
+      `moe_routing_health` (live / max-share / top-10 / normalized-entropy
+      device counters per forward, drained on the log cadence) and a resume
+      refusal past `max|bias| > 10` plus a one-line range statement. Gate
+      `port/tests/test_moe_balance.py` (a-f + the divergence reproduction):
+      3 000 pinned-skew steps end at ±150 under `sign` and exactly ±2.0 under
+      `prop`, which then recovers 15/16 live; the OFF path is bit-identical to
+      main's digests captured before the edit. `port/scripts/ab_balance.py`
+      (sign / prop / aux, 2 000 steps, b4×s1024) written; the 2 000-step run is
+      **NOT run** — the acceptance number (live ≥ 80% of E, top-10 ≤ 30%) is
+      outstanding.
 - [x] P-JEPA. port (Python): JEPA as ONE mechanism. `port/src/dormouse/model/
       jepa.py` — a causal latent predictor (`d(x) -> d/4 -> d`, `1 - cos(pred(h[p]),
       sg(h[p+h]))`) with an INTERNAL SIGReg anti-collapse term on the predicted
