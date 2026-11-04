@@ -978,17 +978,10 @@ class LoopBlock(nn.Module):
             counters.count("mhc")
         else:
             ctx = h + self.iter_embed[i].view(1, 1, d)
-        gains = None
-        if blk._paper is not None:
-            # PAPER FORM (`layerrope.py`): the two READ gains are the norm's
-            # affine — `normalize(ctx) · attn_read` folded into one fused
-            # `F.rms_norm` call, which with `read == ones` is the OFF path's
-            # bits. The depth index is the ACTUAL iteration (v1's choice) or
-            # the body's network POSITION, independent of the iteration.
-            gains = blk._paper.for_iteration(
-                blk._paper_block,
-                i if blk._paper_index == "iteration" else blk._paper_position,
-            )
+        # `gains` was resolved ONCE at the top of this iteration (it is the same
+        # `for_iteration` call the fused route already paid for); resolving it
+        # again here cost one extra call per iteration — measured 2026-11-04 as
+        # a counter reading 24 where 12 is right.
         if fuse != "epilogue":
             # The fused read kernel already emitted `normed`/`normed_mlp` from
             # the same pass that mixed the lanes; computing them again here
