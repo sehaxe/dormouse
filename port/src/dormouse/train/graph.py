@@ -689,9 +689,11 @@ def full_graph_refusal(train, model) -> str | None:
     # (`tests/test_full_graph.py` captures it) and a replay would keep the
     # first call's shape while the data changed. `_padded_dispatch` now keeps
     # `n·k` rows and masks the cap, which is why IT can be captured; the other
-    # three arms are built around the ragged kept count itself (`offs`, the
-    # per-expert loop's `unique`, the gather ABI's permuted rows), so they are
-    # refused HERE, loudly, instead of falling back mid-capture.
+    # arms are built around the ragged kept count itself (`offs`, the
+    # per-expert loop's `unique`, the gather ABI's permuted rows), and
+    # `moe_kernel="batched"` sizes its bank from the batch's largest group (a
+    # D2H scalar) when dropless, so they are refused HERE, loudly, instead of
+    # falling back mid-capture.
     if getattr(model, "moe_topk", 0) > 0:
         kernel = getattr(model, "moe_kernel", "padded")
         cap = getattr(model, "moe_capacity", 0.0)
@@ -699,8 +701,10 @@ def full_graph_refusal(train, model) -> str | None:
         why = None
         if cap == 0:
             why = (
-                "moe_capacity=0 (dropless) routes the routed pass to the RAGGED arms, "
-                "whose row count is the capacity's own (there is no cap to pad to)"
+                "moe_capacity=0 (dropless) routes the routed pass to a "
+                "batch-sized bank (`moe_kernel=batched` reads `counts.max()` "
+                "back to size `[E, cap, ·]`) or a RAGGED arm, whose row count "
+                "is the routing's own (there is no static cap to pad to)"
             )
         elif kernel == "triton":
             why = (
@@ -720,8 +724,8 @@ def full_graph_refusal(train, model) -> str | None:
         if why is not None:
             return (
                 f"the routed MoE arm cannot be captured: {why}. Escape: moe_kernel="
-                f"'padded' with moe_capacity>0 and moe_gather='off' (the only arm whose "
-                f"rows are static), or full_graph=false."
+                f"'padded' or 'batched' with moe_capacity>0 and moe_gather='off' "
+                f"(the arms whose rows are static), or full_graph=false."
             )
     return None
 

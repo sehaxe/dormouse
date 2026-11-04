@@ -130,7 +130,7 @@ DEAD_SNAPSHOT_KEYS = {
 
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
-MOE_KERNELS = ("padded", "triton", "naive")
+MOE_KERNELS = ("padded", "triton", "naive", "batched")
 #: The `moe_gather` literals — the gather-fused FORWARD (`model/moe_sonic.py`,
 #: SonicMoE §5.1.1): `off` is today's pass, `kernel` reads the expert rows
 #: THROUGH the permute's row map instead of a materialised `[R, d]` copy. It is
@@ -755,9 +755,12 @@ class ModelConfig:
     #: `padded` = the cap-padded `[E, cap, ·]` bank of bmms — the reference and
     #: the fallback every other arm is compared against; `triton` = the unpadded
     #: grouped GEMM (`model/moe_kernels.py`, one program per ragged row-block,
-    #: GLU fused); `naive` = the per-expert loop (the CPU path). An unknown name
-    #: is LOUD at config load. `triton` falls back COUNTED to `padded` when the
-    #: kernel cannot run (no triton import, input not on CUDA) — never silently.
+    #: GLU fused); `naive` = the per-expert loop (the CPU path); `batched` = the
+    #: SAME bank with the cap chosen for this batch (the capacity rule when
+    #: `moe_capacity > 0`, the largest group when dropless) — the arm that turns
+    #: the dropless Python loop into three `bmm`s. An unknown name is LOUD at
+    #: config load. `triton` falls back COUNTED to `padded` when the kernel
+    #: cannot run (no triton import, input not on CUDA) — never silently.
     moe_kernel: str = "padded"
     #: The gather-fused FORWARD (`model/moe_sonic.py`, SonicMoE arXiv:2512.14080
     #: §5.1.1): the grouped GEMM takes the routing's ROW MAP (`toks`/`offs` from
@@ -2348,8 +2351,10 @@ def validate(model: ModelConfig) -> None:
             f"moe_kernel={model.moe_kernel!r} is not an arm. Known: "
             f"{list(MOE_KERNELS)} — `padded` the cap-padded bmm bank (reference "
             f"and fallback), `triton` the unpadded grouped GEMM "
-            f"(model/moe_kernels.py), `naive` the per-expert loop. Escape: name "
-            f"one of those, or add the arm before the config can lie about it."
+            f"(model/moe_kernels.py), `naive` the per-expert loop, `batched` the "
+            f"same [E, cap, ·] bank with cap = this batch's largest group (the "
+            f"dropless arm). Escape: name one of those, or add the arm before "
+            f"the config can lie about it."
         )
     if model.moe_gather not in MOE_GATHERS:
         loud(

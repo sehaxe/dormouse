@@ -166,6 +166,25 @@ testable and A/B-able (ADR-0017).
       TIMING EXISTS. Landed 2026-10-21. Supersedes P-GATHER's byte
       line: medium shipped forward 1715 -> 1235 MiB, shipped pass 2739 -> 2259;
       wired forward 1235 -> 1013, cache 382 -> 304, pass 2259 -> 2760 MiB.
+- [x] P-MOE-BATCH. port (Python): `moe_kernel="batched"` — the dropless MoE
+      bank. `experts._batched_dispatch` reuses the padded arm's `[E, cap, ·]`
+      body (now `_bank_dispatch`) and sizes `cap` to the batch's largest group
+      when `moe_capacity = 0` (`_batched_cap`), so the per-expert Python loop's
+      E tiny GEMMs become three `bmm`s. `moe_capacity > 0` uses the capacity
+      rule's cap and the padded arm's exact drops; heterogeneous expert shapes
+      are asserted LOUD (`_assert_homogeneous`, `Escape:` names per-expert
+      rank), the counter is `moe_batched_calls`, and the default stays `padded`
+      (batched is opt-in). Gates `tests/test_moe_batched.py` (a-h): batched vs
+      the loop 4.8e-7 fp32 / 0.0 bf16; the float64 reference worst 4.8e-6 on
+      logits and every parameter gradient; unequal 1/40 groups; capacity drops
+      bit-identical to `_padded_dispatch`; padded bank rows and dropped router
+      weights get exactly 0 gradient; heterogeneous refusal; zero host syncs on
+      the static-cap path (the dropless cap is ONE `counts.max().item()`, named);
+      `full_graph` allows static-cap batched and refuses dropless. Eight scratch
+      reverts each turned their named gate red and restored sha256. Bench
+      `scripts/bench_moe_paths.py` (m400 / b8s1024 / b1s8192; naive / triton /
+      batched; fwd + fwd+bwd + launches) written and **NOT run** (this task made
+      no GPU measurement). No GPU timing exists.
 - [ ] C12. `feat: smoke preset + --smoke`, `docs/README-model.md` (≤60 lines).
 - [x] P-HALT. port (Python): the halt head + the depth-8 path. `port/src/dormouse/
       model/halt.py` — BCE target read from the model's OWN per-iteration CE
