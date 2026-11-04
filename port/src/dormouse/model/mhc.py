@@ -56,6 +56,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .. import stepaudit
+
 __all__ = ["ALPHA_INIT", "EPS", "MHCMix", "SINKHORN_ITERS", "STATIC_INIT", "sinkhorn_knopp"]
 
 #: Sinkhorn-Knopp iterations (App. A.1: `t_max = 20`) — `sinkhorn.rs:5-6`.
@@ -80,7 +82,7 @@ def sinkhorn_knopp(logits: torch.Tensor, iters: int = SINKHORN_ITERS) -> torch.T
     (`sinkhorn.rs:8-21`). Burn: `sinkhorn.rs:22-71`.
     """
     m = logits
-    for _ in range(iters):
+    for _ in stepaudit.iterations("mhc.sinkhorn", range(iters)):
         # burn: sinkhorn.rs:48-68 — row then column, both `m -= logsumexp(m)`.
         m = m - torch.logsumexp(m, dim=-1, keepdim=True)
         m = m - torch.logsumexp(m, dim=-2, keepdim=True)

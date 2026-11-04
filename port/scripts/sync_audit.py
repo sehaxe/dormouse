@@ -8,6 +8,10 @@ launch count and shape effects. A host round trip (~20-50 us, and it drains the
 stream) is the remaining explanation. This patches `Tensor.item/.tolist/.cpu/
 __bool__` and then runs the REAL CLI, so the data path, device moves and the
 trainer are exactly the ones that are slow.
+
+`scripts/step_audit.py` is the successor: same read patch (plus `__float__`/
+`__int__`, which this one misses), and it also counts allocations and python
+loops per step. Keep this script for the run-level sync ratio it was built for.
 """
 
 from __future__ import annotations

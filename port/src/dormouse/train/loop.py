@@ -24,6 +24,7 @@ from pathlib import Path
 
 import torch
 
+from .. import stepaudit
 from ..config import (
     PROGRESS_KEYS,
     RunConfig,
@@ -65,6 +66,28 @@ def _host_scalar(value: torch.Tensor) -> float:
     function to allow the cadence and to fail on any other read).
     """
     return float(value)
+
+
+def _gate_grads(grads: list[torch.Tensor], gate: torch.Tensor, *, sanitize: bool = True) -> None:
+    """The NaN firewall's per-gradient write: sanitize, then ONE gated multiply.
+
+    `nan_to_num_` has no `_foreach` form, so it stays one kernel per tensor;
+    the MULTIPLY does, and it was the other half of the per-parameter launch
+    count (2 kernels × ~300 gradients at medium). `torch._foreach_mul_` issues
+    one launch per dtype group — one in practice, since every master is fp32 —
+    and `*1.0` on a healthy step is bit-identical to `g.mul_(gate)`.
+
+    `sanitize=False` is the `grad_accum>1` group gate: every micro-batch was
+    already sanitized on arrival, so the final multiply must not re-run it.
+    """
+    if sanitize:
+        for g in stepaudit.iterations("firewall.sanitize", grads):
+            g.nan_to_num_(0.0, 0.0, 0.0)
+    by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
+    for g in stepaudit.iterations("firewall.gate", grads):
+        by_dtype.setdefault(g.dtype, []).append(g)
+    for dtype, group in stepaudit.iterations("firewall.gate.dtypes", by_dtype.items()):
+        torch._foreach_mul_(group, gate.to(dtype))
 
 
 def kda_field(counters: Counters) -> str:
@@ -746,9 +769,18 @@ def _ema_update(model: torch.nn.Module, shadow: dict, decay: float, flag_dev: to
     why `opt_graph` is legal with this arm — the EMA is outside the capture.
     """
     weight = flag_dev.to(torch.float32) * (1.0 - decay)
-    for name, p in model.named_parameters():
+    # ONE `_foreach_lerp_` per dtype instead of one kernel per parameter: the
+    # EMA arm was a per-module launch chain (815 launches at medium) for the
+    # same scalar recurrence. Grouping by dtype keeps the exact op —
+    # `t1 + w*(t2-t1)` — and `_foreach_lerp_` dispatches it unchanged.
+    groups: dict[torch.dtype, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
+    for name, p in stepaudit.iterations("ema.params", model.named_parameters()):
         s = shadow[name]
-        s.lerp_(p.detach(), weight.to(s.dtype))
+        dst, src = groups.setdefault(s.dtype, ([], []))
+        dst.append(s)
+        src.append(p.detach())
+    for dtype, (dst, src) in stepaudit.iterations("ema.dtypes", groups.items()):
+        torch._foreach_lerp_(dst, src, weight.to(dtype))
 
 
 def _eval_loss(
@@ -1398,9 +1430,7 @@ def train(
         # skipped step's direction exactly zero (a masked loss alone does not: a
         # NaN that came from an ACTIVATION would still be in the Jacobian).
         gate = finite.to(torch.float32)
-        for g in grads:
-            g.nan_to_num_(0.0, 0.0, 0.0)
-            g.mul_(gate.to(g.dtype))
+        _gate_grads(grads, gate)
         return step_counters, step_loss.detach(), grads
 
     #: ---- `full_graph`: ONE graph for the whole step --------------------
@@ -1482,6 +1512,12 @@ def train(
             f"are LOUD before the first step."
         )
     for step in range(start, cfg.steps):
+        # The step audit's bracket (`dormouse.stepaudit`, disarmed unless a
+        # script installs it): every host read, allocation and instrumented
+        # loop a step takes lands on THIS record, which is what makes "zero
+        # device reads on a non-report step" a per-step measurement instead of
+        # a ratio. One branch per step when disarmed.
+        stepaudit.begin_step(step + 1, report=(step + 1) % cfg.log_every == 0)
         lr = wsd_lr(
             step,
             total_steps=cfg.steps,
@@ -1615,8 +1651,7 @@ def train(
                 # the whole accumulated direction, which is the same "skip the
                 # step" the one-micro firewall makes.
                 gate = flag_dev.to(torch.float32)
-                for g in grads:
-                    g.mul_(gate.to(g.dtype))
+                _gate_grads(grads, gate, sanitize=False)
             # The last FINITE loss, carried on the DEVICE: the host reads it
             # when the cadence fires and never before. Same bits as the old
             # per-step `float(loss.detach())`.
@@ -1696,8 +1731,12 @@ def train(
             # is read NOW, in one batched GPU→CPU transfer, at the declared
             # cadence — never per pass. The last loss is the one other read,
             # and it happens here and nowhere else.
-            drained = window.drain()
-            total.drain()
+            drained = window.drain_if_due(step + 1, cfg.log_every)
+            assert drained is not None, "inside the report branch, the cadence must be due"
+            # The total accumulated the SAME device tensors (every
+            # `window.count_device` is paired with a `total.count_device`), so
+            # folding the one read is exact and saves the second transfer.
+            total.absorb(drained)
             nan_window = int(drained.get("nan_skipped", 0))
             if window_steps and nan_window >= window_steps:
                 drowning += 1
@@ -1779,6 +1818,7 @@ def train(
             weights, snapshot = save_ckpt(run, model, opt, step, ema=ema)
             sf("train")
             log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
+        stepaudit.end_step()
 
     # The report is a declared cadence: drain whatever the last (partial)
     # window gathered, and read the last finite loss. Both are host reads, and

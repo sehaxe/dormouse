@@ -146,6 +146,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from .. import stepaudit
 from ..instrument import Counters, loud
 from ..losses import fixed_cross_entropy, logit_softcap
 from . import fused_residual
@@ -466,6 +467,25 @@ class LoopBlock(nn.Module):
         #: Read by `_window`, so EVERY caller — one-shot, segmented, recurrent
         #: decode and prefill — resolves the same body per iteration.
         self._blocks = None
+        #: Cached constant ZEROS, one per (device, dtype, shape). The absent-arm
+        #: branches below used to allocate a fresh `[b*t, d]` zero EVERY
+        #: iteration; at `b8·s512·d1536` that is 25 MB of memset per branch per
+        #: iteration for a tensor that never changes. `requires_grad=False`, and
+        #: nothing writes through it — it is added, not mutated. Keyed by device
+        #: too, so a `.to(cuda)` cannot serve a stale CPU buffer.
+        self._zero_cache: dict[tuple, torch.Tensor] = {}
+
+    def _zero(
+        self, like: torch.Tensor, shape: tuple[int, ...], dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        """A constant zero on `like`'s device, allocated once per (dtype, shape)."""
+        dt = like.dtype if dtype is None else dtype
+        key = (like.device, dt, shape)
+        z = self._zero_cache.get(key)
+        if z is None:
+            z = torch.zeros(shape, dtype=dt, device=like.device)
+            self._zero_cache[key] = z
+        return z
 
     def forward(
         self,
@@ -711,10 +731,21 @@ class LoopBlock(nn.Module):
             # iteration — the reference computes the whole `[L, d]` table per
             # forward, and `for_iteration` slices it (`layerrope.py`).
             self._paper.begin_forward()
-        for i in range(T):
+        #: `slots_for(input_ids)` is a pure function of the window's ids, and
+        #: the loop calls the memory once per ITERATION over those same ids.
+        #: ONE key pass per body per window (was `max_iter` passes: 3 orders ×
+        #: up to 3 lag folds each, every iteration). `None` bodies key normally.
+        slots_by_engram: dict[int, torch.Tensor] = {}
+        for i in stepaudit.iterations("loopblock.iterations", range(T), modules=bodies):
             counters.count("iter")
             ran = i + 1
             blk = bodies[i % len(bodies)]
+            mem_slots = None
+            if blk.engram is not None and input_ids is not None:
+                mem_slots = slots_by_engram.get(id(blk.engram))
+                if mem_slots is None:
+                    mem_slots = blk.engram.slots_for(input_ids)
+                    slots_by_engram[id(blk.engram)] = mem_slots
             # The state slot is read ONLY for a block that has an attention arm:
             # a block without one (`attn_kind` off, the recurrent test's fixture)
             # is legal with a shorter `states`, and reading it unconditionally is
@@ -722,7 +753,7 @@ class LoopBlock(nn.Module):
             attn_state = states[i] if (blk.attn is not None and states is not None) else None
             if self.iter_checkpoint and torch.is_grad_enabled():
 
-                def body(h_in, streams_in, sources_in, attn_in, fuse_in, blk_in, i_in):
+                def body(h_in, streams_in, sources_in, attn_in, fuse_in, blk_in, i_in, slots_in):
                     """The checkpointed unit: its counters are its own (see above)."""
                     cnt = Counters()
                     out = self._step(
@@ -744,6 +775,7 @@ class LoopBlock(nn.Module):
                         loss_mask=loss_mask,
                         ce_fixed=ce_fixed,
                         compose=compose,
+                        mem_slots=slots_in,
                     )
                     return (*out, cnt)
 
@@ -762,6 +794,7 @@ class LoopBlock(nn.Module):
                     fuse,
                     blk,
                     i,
+                    mem_slots,
                     use_reentrant=False,
                 )
                 counters.merge(cnt)
@@ -789,6 +822,7 @@ class LoopBlock(nn.Module):
                     loss_mask=loss_mask,
                     ce_fixed=ce_fixed,
                     compose=compose,
+                    mem_slots=mem_slots,
                 )
             if self.use_attnres and not compose:
                 sources.append(y)
@@ -836,6 +870,7 @@ class LoopBlock(nn.Module):
         loss_mask: torch.Tensor | None,
         ce_fixed: bool,
         compose: bool,
+        mem_slots: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -902,6 +937,10 @@ class LoopBlock(nn.Module):
             # (`layerrope.py` module docstring).
             normed = blk.norm(ctx, depth=blk._layerrope_depth + i)
             normed_mlp = normed
+        #: The controller reads `[ctx; h0]` as ONE GEMM. It is a fresh allocation
+        #: per iteration and it is KEPT: splitting it into `ctx@W1ᵀ + h0@W2ᵀ` would
+        #: change the accumulation order and therefore the bits. Escape: a model
+        #: change with its own pin, not a step optimisation.
         ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
         # MAGMA fix: fp32 masters with fp32 activations would run the slow
         # fp32 lane; `mm_mixed` casts to the compute dtype per forward.
@@ -937,7 +976,7 @@ class LoopBlock(nn.Module):
             )
             attn = attn_out.reshape(b * t, d) * w_attn
         else:
-            attn = torch.zeros(b * t, d, dtype=torch.float32, device=h.device)
+            attn = self._zero(h, (b * t, d), torch.float32)
         if blk.csa is not None:
             csa_state = prev[1] if isinstance(prev, tuple) else None
             if recurrent:
@@ -991,7 +1030,7 @@ class LoopBlock(nn.Module):
                     attn = attn + msa_out.reshape(b * t, d) * w_attn
 
         if blk.engram is not None and input_ids is not None:
-            mem = blk._memory(normed, input_ids, drop, counters).reshape(b * t, d)
+            mem = blk._memory(normed, input_ids, drop, counters, slots=mem_slots).reshape(b * t, d)
             dense = (
                 (
                     mm_mixed(
@@ -1012,7 +1051,7 @@ class LoopBlock(nn.Module):
             )
             branch = memory_floor_mix(mem, dense, w_mem, self.lam_max)
         else:
-            branch = torch.zeros(b * t, d, dtype=torch.float32, device=h.device)
+            branch = self._zero(h, (b * t, d), torch.float32)
 
         ffn = blk._moe_branch(normed_mlp, counters) * w_ffn
         if gains is not None:
@@ -1057,7 +1096,7 @@ class LoopBlock(nn.Module):
                     blk.mhc, self.attnres[i], streams, y, mhc_raw, True, self.eps, counters
                 )
             else:
-                updates = [torch.zeros_like(y), y]
+                updates = [self._zero(y, tuple(y.shape)), y]
                 update = depth_attend(updates, self.attnres[i], self.eps, scale=float(len(updates)))
                 streams = blk.mhc(streams, update)
                 # 2409.19606 §2.1: our K full-width lanes re-sum to K times the
@@ -1193,7 +1232,13 @@ class LoopBlock(nn.Module):
         return self.attn.forward_state(normed, state, counters=counters, carry=True)
 
     def _memory(
-        self, normed: torch.Tensor, input_ids: torch.Tensor, drop: int, counters: Counters
+        self,
+        normed: torch.Tensor,
+        input_ids: torch.Tensor,
+        drop: int,
+        counters: Counters,
+        *,
+        slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The Engram read for one window, with the left context its n-grams need.
 
@@ -1216,10 +1261,10 @@ class LoopBlock(nn.Module):
         segment per order, i.e. ≤ 3/segment_len of the rows.
         """
         if drop == 0:
-            return self.engram(normed, input_ids, counters)  # type: ignore[misc]
+            return self.engram(normed, input_ids, counters, slots=slots)  # type: ignore[misc]
         assert input_ids.shape[1] == normed.shape[1] + drop, "the window slice is misaligned"
         hidden = F.pad(normed, (0, 0, drop, 0))
-        return self.engram(hidden, input_ids, counters)[:, drop:]  # type: ignore[misc]
+        return self.engram(hidden, input_ids, counters, slots=slots)[:, drop:]  # type: ignore[misc]
 
     def _forward_segmented(
         self,
@@ -1307,7 +1352,7 @@ class LoopBlock(nn.Module):
         outs: list[torch.Tensor] = []
         rec_sum = torch.zeros((), dtype=torch.float32, device=h0.device)
         per_iter_sum: list[torch.Tensor] | None = None
-        for s in range(segments):
+        for s in stepaudit.iterations("loopblock.segments", range(segments)):
             lo, hi = s * segment_len, (s + 1) * segment_len
             drop = min(ctx, lo)
             ids = None if input_ids is None else input_ids[:, lo - drop : hi]
