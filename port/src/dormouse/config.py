@@ -537,6 +537,17 @@ class ModelConfig:
     #: Refused LOUDLY: `h_kv < 0`, `h_kv > n_heads`, `n_heads % h_kv != 0`
     #: (a ragged group has no valid expansion), `use_kda = false`.
     n_kv_heads: int = 0
+    #: ONE latent projection for q/k/v/g (`kda.KDAAttention.projections`): the
+    #: four weights are concatenated to `[d + 2·kv_width + d, in]` and multiplied
+    #: with ONE GEMM, then split by a view. OFF is the four `nn.Linear` calls
+    #: every number on record ran, bit for bit. ON is NOT bit-identical to those
+    #: four GEMMs: a single GEMM may reorder the K reduction, so the gate is a
+    #: 1e-6 fp32 / 1e-2 bf16 relative match, stated rather than papered over
+    #: (`tests/test_fused_epilogue.py`). Works with `attn_latent_rank` (the four
+    #: read the shared latent) and with the QAT arm (each master is projected
+    #: first, then concatenated). Needs `use_kda = true`; there is no module to
+    #: reach otherwise.
+    fused_latent_proj: bool = False
     #: Low-rank `out_proj` (the loop readout): `d → r → d`, cost `2·d·r`
     #: instead of `d²`. `0` (off) is the readout exactly as before — TSCT at
     #: `rank` on the default rung, a dense `DenseLinear(d, d)` when
@@ -627,6 +638,16 @@ class ModelConfig:
     #: `validate` refuses the pair), K=2, and fp32 lanes; a CPU host is a
     #: COUNTED fallback (`fused_residual_fallback`), not a silent one.
     fused_residual: bool = False
+    #: The per-iteration NORM CHAIN as ONE Triton read kernel
+    #: (`model/fused_residual.epilogue_read`): the lane RMSNorm, the eight
+    #: hyper-network dots, `ctx`, and the body's `RMSNorm(ctx)·LayerRoPE gain`
+    #: in a single pass over the lanes/row instead of 6+ elementwise passes.
+    #: The write half (AttnRes score, Sinkhorn, `H_post`/`H_res`, readout) is
+    #: the existing `fused_residual` kernel: the loop body sits between the
+    #: two, so one kernel per side is the floor, not a missed fusion. OFF is the
+    #: eager lines, bit for bit. Needs `use_mhc` and fp32 lanes (same refusals
+    #: as `fused_residual`); a CPU host is a COUNTED `fused_epilogue_fallback`.
+    fused_epilogue: bool = False
     #: LOOM (`2610.01153`, 2026-10-01; scanned in
     #: `docs/research/2026-10-16-new-tech-scan.md` §2.1, whose row names our
     #: own `max_iter 4` / operating depth 2 as exactly the regime that paper
@@ -2598,6 +2619,22 @@ def validate(model: ModelConfig) -> None:
             f"mhc_streams={model.mhc_streams} with use_mhc=false is inert — the "
             f"field would name a K no lane carries. Escape: use_mhc=true (K=2), or "
             f"leave mhc_streams at its default 2."
+        )
+    if model.fused_epilogue and not model.use_mhc:
+        loud(
+            "fused_epilogue=true with use_mhc=false: the fused read kernel IS the "
+            "lane chain (RMSNorm over K lanes, H_pre's mix, and the body's normed "
+            "read), so with no lanes there is nothing it can replace and the flag "
+            "would report an arm that never ran. Escape: use_mhc=true, or "
+            "fused_epilogue=false."
+        )
+    if model.fused_latent_proj and (not model.use_kda or model.attn_kind != "kda"):
+        loud(
+            "fused_latent_proj=true without the KDA arm: the four projections it "
+            "concatenates (q/k/v/g) are KDAAttention's, and `attn_kind='full'` "
+            "builds FullAttention instead (with `use_kda=false` there is no "
+            "attention at all) — the flag would name a GEMM that never runs. "
+            "Escape: use_kda=true and attn_kind='kda', or fused_latent_proj=false."
         )
     if model.fused_residual and not model.use_mhc:
         loud(

@@ -84,7 +84,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters, loud
-from .tsct import dense_qat_kind, qat_linear
+from .tsct import dense_qat_kind, dense_qat_weight, qat_linear
 
 #: Cached warmup verdict per device TYPE: `{"cuda": (ok, why), "cpu": (ok, why)}`.
 _FLA: dict[str, tuple[bool, str]] = {}
@@ -248,6 +248,12 @@ class KDAAttention(nn.Module):
             "loop.attn.beta_proj",
         )
         self.dense_qat_alpha = cfg.factor_qat_alpha
+        #: ONE concatenated q/k/v/g GEMM (`config.fused_latent_proj`). OFF is
+        #: the four `nn.Linear` calls, bit for bit; ON is one `F.linear` over
+        #: `cat([W_q, W_k, W_v, W_g])` and a view-split, which is NOT bitwise
+        #: identical (a GEMM may reorder the K reduction) — the gates pin 1e-6
+        #: fp32 / 1e-2 bf16, never "equal".
+        self.fused_latent_proj = bool(getattr(cfg, "fused_latent_proj", False))
         #: `None` when the latent is off — no module, no RNG draw, no state key.
         self.latent_down = (
             nn.Linear(d, self.attn_latent_rank, bias=False, device=device)
@@ -273,6 +279,40 @@ class KDAAttention(nn.Module):
         if self.latent_down is None:
             return x
         return qat_linear(self.latent_down, x, *dq)
+
+    def _qkvg(
+        self, c: torch.Tensor, dq: tuple[str, float]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`q, k, v, g` from the SAME input `c`, one GEMM on the fused arm.
+
+        The four projections read one tensor (`x`, or the shared latent when
+        `attn_latent_rank` is on), so their weights concatenate along the output
+        dimension: `[d + 2·kv_width + d, in]` is ONE `F.linear` and the four
+        slices are views (no copy). `dense_qat` projects each master first, so
+        the QAT arm keeps one STE per matrix; `beta_proj` reads `x` on its own
+        line and is not part of this concatenation.
+        """
+        if not self.fused_latent_proj:
+            return (
+                qat_linear(self.q_proj, c, *dq),
+                qat_linear(self.k_proj, c, *dq),
+                qat_linear(self.v_proj, c, *dq),
+                qat_linear(self.g_proj, c, *dq),
+            )
+        weights = [
+            dense_qat_weight(
+                lin.weight, dq[0], dq[1], cache=getattr(lin, "_qat_cache", None)
+            )
+            for lin in (self.q_proj, self.k_proj, self.v_proj, self.g_proj)
+        ]
+        out = F.linear(c, torch.cat(weights, dim=0))
+        d, kv = self.n_heads * self.head_dim, self.kv_width
+        return (
+            out[..., :d],
+            out[..., d : d + kv],
+            out[..., d + kv : d + 2 * kv],
+            out[..., d + 2 * kv :],
+        )
 
     def _kv(self, x: torch.Tensor, b: int, t: int) -> torch.Tensor:
         """`[b,t,kv_heads,hd]` → `[b,t,n_heads,hd]`, immediately before the kernel.
@@ -307,10 +347,11 @@ class KDAAttention(nn.Module):
         h, hd = self.n_heads, self.head_dim
         dq = (self.dense_qat, self.dense_qat_alpha)
         c = self._latent_base(x, dq)
-        q = qat_linear(self.q_proj, c, *dq).reshape(b, t, h, hd)
-        k = self._kv(qat_linear(self.k_proj, c, *dq), b, t)
-        v = self._kv(qat_linear(self.v_proj, c, *dq), b, t)
-        g = F.logsigmoid(qat_linear(self.g_proj, c, *dq).float()).reshape(b, t, h, hd)
+        q, k, v, g = self._qkvg(c, dq)
+        q = q.reshape(b, t, h, hd)
+        k = self._kv(k, b, t)
+        v = self._kv(v, b, t)
+        g = F.logsigmoid(g.float()).reshape(b, t, h, hd)
         beta = torch.sigmoid(qat_linear(self.beta_proj, x, *dq).float())  # [b, t, h]
         return q, k, v, g, beta
 
@@ -567,9 +608,10 @@ class KDAAttention(nn.Module):
         """
         dq = (self.dense_qat, self.dense_qat_alpha)
         c = self._latent_base(x, dq)
-        q = F.normalize(self._heads(qat_linear(self.q_proj, c, *dq), b, t), dim=-1)
-        k = F.normalize(self._heads(self._kv(qat_linear(self.k_proj, c, *dq), b, t), b, t), dim=-1)
-        v = self._heads(self._kv(qat_linear(self.v_proj, c, *dq), b, t), b, t)
+        qf, kf, vf, gf = self._qkvg(c, dq)
+        q = F.normalize(self._heads(qf, b, t), dim=-1)
+        k = F.normalize(self._heads(self._kv(kf, b, t), b, t), dim=-1)
+        v = self._heads(self._kv(vf, b, t), b, t)
         if state is None:
             kk, vv = k, v
             y = F.scaled_dot_product_attention(q * self.scale, kk, vv, is_causal=True)
@@ -584,7 +626,7 @@ class KDAAttention(nn.Module):
             cols = torch.arange(tp + t, device=x.device).view(1, -1)
             rows = torch.arange(t, device=x.device).view(-1, 1) + tp
             y = F.scaled_dot_product_attention(q * self.scale, kk, vv, attn_mask=cols <= rows)
-        gate = torch.sigmoid(qat_linear(self.g_proj, c, *dq))  # [b, t, d]
+        gate = torch.sigmoid(gf)  # [b, t, d]
         y = y.transpose(1, 2).reshape(b, t, d) * gate
         # The state returned is the ACCUMULATED context, not this window's own
         # keys: a third segment would otherwise read only the second one's keys

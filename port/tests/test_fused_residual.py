@@ -389,7 +389,7 @@ def test_unsupported_reason_names_cause_and_escape() -> None:
         (torch.bfloat16, 2, 2048),  # not fp32
         (torch.float32, 4, 4096),  # not a 2x2 Sinkhorn
         (torch.float32, 2, 8192),  # wider than the register tile
-        (torch.float32, 2, 2 * 768),  # d_model not a power of two
+        (torch.float32, 2, 2 * 769),  # odd d_model: no adjacent-pair rotation
     ):
         why = fr.unsupported_reason(dtype, streams, kd)
         if not fr.fused_available():
