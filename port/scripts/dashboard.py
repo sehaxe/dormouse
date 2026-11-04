@@ -66,6 +66,10 @@ STATUS_LOG = LOGS / f"{RUN}_status.log"
 CKPT = REPO / "checkpoints" / RUN
 SFT_MANIFEST = ROOT / "sft_pairs" / "v2" / "full" / "manifest.json"
 STATIC = ROOT / "dashboard" / "static"
+# The LAST routing histogram (`scripts/route_hist.py --json PATH`). The panel
+# prefers the live counters and falls back to this file, so a dead run still
+# shows what its bank looked like without a second model load.
+ROUTING_JSON = Path(os.environ.get("DASH_ROUTE_JSON", LOGS / f"{RUN}_route.json"))
 
 REFRESH_S = 2.0
 CACHE_S = 1.4
@@ -165,6 +169,104 @@ def _git() -> list[dict]:
     return rows
 
 
+def _number(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_number(d: dict, keys: tuple[str, ...]) -> float | None:
+    for k in keys:
+        if k in d:
+            v = _number(d[k])
+            if v is not None:
+                return v
+    return None
+
+
+def _share(d: dict, keys: tuple[str, ...]) -> float | None:
+    """A share as 0..1, from an `_x100`/`_pct` counter or a fraction."""
+    for k in keys:
+        if k not in d:
+            continue
+        v = _number(d[k])
+        if v is None:
+            continue
+        if k.endswith("_x100") or k.endswith("_pct"):
+            return v / 100.0
+        return v / 100.0 if v > 1.0 else v
+    return None
+
+
+def routing_data(s: dict) -> dict:
+    """Routing health from the run's counters, else the LAST route_hist JSON.
+
+    Counter names are the sibling MoE lane's (`moe_live_experts`,
+    `moe_top10_share_x100`, `moe_max_share_x100`); the file carries the same
+    fields from `scripts/route_hist.py --json`. Missing data renders an
+    instruction, never an exception.
+    """
+    counters = s.get("counters") or {}
+    run = s.get("run") or {}
+    live = _first_number(
+        counters, ("moe_live_experts", "live_experts", "moe_experts_live")
+    )
+    top10 = _share(
+        counters,
+        ("moe_top10_share_x100", "moe_top10_share_pct", "moe_top10_share",
+         "top10_share_x100", "top10_share"),
+    )
+    max_share = _share(
+        counters,
+        ("moe_max_share_x100", "moe_max_share_pct", "moe_max_share",
+         "max_share_x100", "max_share"),
+    )
+    experts = _first_number(counters, ("moe_n_experts", "n_experts", "moe_experts"))
+    source = "counters" if live is not None else ""
+    if live is None:
+        try:
+            hist = json.loads(ROUTING_JSON.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            hist = {}
+        if hist:
+            source = str(ROUTING_JSON)
+            live = _first_number(hist, ("live_experts", "moe_live_experts"))
+            top10 = top10 if top10 is not None else _share(
+                hist, ("top10_share_x100", "top10_share")
+            )
+            max_share = max_share if max_share is not None else _share(
+                hist, ("max_share_x100", "max_share")
+            )
+            experts = _first_number(hist, ("n_experts", "moe_n_experts")) or experts
+            counts = hist.get("counts")
+            if live is None and counts:
+                n = int(experts or len(counts))
+                live = float(sum(1 for v in counts[:n] if v))
+    if experts is None:
+        experts = _number(run.get("experts"))
+    e = int(experts) if experts else None
+    live_i = int(live) if live is not None else None
+    frac = live_i / e if (live_i is not None and e) else None
+    if frac is None:
+        state = "missing"
+    elif frac < 0.5:
+        state = "bad"
+    elif frac < 0.8:
+        state = "warn"
+    else:
+        state = "ok"
+    return {
+        "live": live_i,
+        "experts": e,
+        "frac": frac,
+        "top10": top10,
+        "max_share": max_share,
+        "state": state,
+        "source": source,
+    }
+
+
 # ------------------------------------------------------------------ snapshot
 
 
@@ -257,6 +359,7 @@ def snapshot() -> dict:
                 f" · it{run_cfg.get('max_iter','?')}"
             ),
             "params": run_cfg.get("params"),
+            "experts": run_cfg.get("n_experts"),
             "step": step,
             "total_steps": total_steps,
             "decay_at": int(total_steps * (1.0 - float(run_cfg.get("decay_frac", 0.15)))),
@@ -285,6 +388,7 @@ def snapshot() -> dict:
         "git": CACHE.git or [],
         "tail": _tail(TRAIN_LOG, 9),
     }
+    value["routing"] = routing_data(value)
     CACHE.value, CACHE.at = value, now
     return value
 
@@ -437,6 +541,33 @@ def frag_chart(s: dict) -> str:
 </svg></div>"""
 
 
+def frag_routing(s: dict) -> str:
+    r = s.get("routing") or routing_data(s)
+    if r["live"] is None or not r["experts"]:
+        cmd = f"scripts/route_hist.py --json {ROUTING_JSON}"
+        return f'<div class="void">[–] no routing health yet — <code>{html.escape(cmd)}</code></div>'
+    pct = 100.0 * r["frac"]
+    label = {"ok": "healthy", "warn": "degraded", "bad": "collapsed"}[r["state"]]
+    top10 = "—" if r["top10"] is None else f"{100 * r['top10']:.1f}%"
+    mx = "—" if r["max_share"] is None else f"{100 * r['max_share']:.1f}%"
+    source = (
+        f' · source {html.escape(r["source"])}' if r.get("source") else ""
+    )
+    return f"""<div class="routing route-{r['state']}">
+  <div class="gauge">
+    <div class="row"><span class="lab">live</span>
+      <div class="track"><div class="mk {r['state']}" style="width:{pct:.1f}%"></div></div>
+      <span class="val">{r['live']} / {r['experts']}</span></div>
+  </div>
+  <div class="kv">
+    <div class="k">live experts</div><div class="v">{r['live']} / {r['experts']} · {pct:.1f}%</div>
+    <div class="k">top-10 share</div><div class="v">{top10}</div>
+    <div class="k">max share</div><div class="v">{mx}</div>
+  </div>
+  <div class="route-state {r['state']}"><b>{label}</b> · live &lt; 50% of E is the red line{source}</div>
+</div>"""
+
+
 def frag_panels(s: dict) -> str:
     c = s["counters"]
     g = s["gpu"]
@@ -565,6 +696,7 @@ FRAGS = {
     "hero": frag_hero,
     "chart": frag_chart,
     "panels": frag_panels,
+  "routing": frag_routing,
     "evals": frag_evals,
 }
 
@@ -630,7 +762,10 @@ def page(s: dict, query: str = "") -> str:
 <div class="block" style="--i:3"><h2>held-out bpb <span class="hint">eval every 2k steps ·
       64 KiB window</span></h2>
     <div id="chart" sse-swap="chart">{frag_chart(s)}</div></div>
-  <div class="block" style="--i:4;padding:0;border:0" id="panels" sse-swap="panels">{frag_panels(s)}</div>
+  <div class="block" style="--i:4" id="routing" sse-swap="routing">
+    <h2>routing health <span class="hint">live experts / E · below 50% is a dead bank</span></h2>
+    {frag_routing(s)}</div>
+  <div class="block" style="--i:5;padding:0;border:0" id="panels" sse-swap="panels">{frag_panels(s)}</div>
 
   <div class="foot">
     <span>read-only · SSE every {REFRESH_S:.0f}s · no torch, no GPU lock</span>

@@ -641,6 +641,14 @@ testable and A/B-able (ADR-0017).
       1.5 % of launches there — the big win (290 → 35) is `forward_state`,
       which is the decode/prefill path, not the one-shot training step.
 
+- [x] P-ROUTING-HEALTH. port (Python): make the dead-expert collapse impossible to
+      miss. `scripts/dashboard.py` gains a routing panel (live/E bar, top-10 and
+      max share, RED below 50 % live) fed by the live counters or the last
+      `scripts/route_hist.py --json PATH`; `scripts/plan_restart.py` prints the
+      fresh-run command, the 20 B/param and 22.2 GB budgets, the 22 000 B/s ETA
+      and the "E > 4x live" warning. Gates `tests/test_dashboard_routing.py`,
+      `tests/test_plan_restart.py`.
+
 
 ## Critical Files
 
