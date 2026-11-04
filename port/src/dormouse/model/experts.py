@@ -624,6 +624,12 @@ class DualLatentGLU(nn.Module):
         return y if dt == torch.float32 else y.to(torch.float32)
 
 
+#: How far the batched bank's row cap may exceed the uniform per-expert share
+#: before the arm refuses. 8x is generous for a healthy router (measured 3.1x at
+#: 150k: 126 rows against a uniform 40) and refuses a collapsed one.
+MOE_BANK_SAFETY = 8
+
+
 class SparseMoE(nn.Module):
     """The expert bank + its router + the shared write.
 
@@ -1391,7 +1397,26 @@ class SparseMoE(nn.Module):
             flat_e = flat_e.masked_fill(~(weight > 0).reshape(-1), self.n_experts)
             groups += 1
         counts = _bincount(flat_e, groups)
-        return max(1, int(counts[: self.n_experts].max().item()))
+        top = int(counts[: self.n_experts].max().item())
+        # A BOUND on the bank, because `max_group` is unbounded: a fresh router
+        # whose experts are near-identical can put thousands of rows on one
+        # expert, and `[E, max_group, d]` then asks for terabytes. The bound is
+        # the uniform share times a generous factor; exceeding it is refused
+        # LOUDLY rather than silently dropping rows (a silent drop here would
+        # look exactly like a capacity arm with a bad rule).
+        uniform = max(1.0, n * k / self.n_experts)
+        bound = int(math.ceil(uniform * MOE_BANK_SAFETY))
+        if top > bound:
+            loud(
+                f"moe_kernel='batched': the busiest expert holds {top} of {n * k} "
+                f"assignments ({top / max(1, n * k):.1%}), and the bank's bound is "
+                f"{bound} (= {MOE_BANK_SAFETY}x the uniform share {uniform:.1f}). "
+                f"A [E, {top}, d] bank would not fit, and clamping would drop rows "
+                f"silently. Escape: `moe_kernel=padded` (the correct but slower "
+                f"arm), or `moe_capacity` above {top / uniform:.1f} (a capacity "
+                f"arm that drops by a rule you can see)."
+            )
+        return max(1, top)
 
     def _batched_dispatch(
         self,
