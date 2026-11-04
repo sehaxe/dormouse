@@ -93,6 +93,20 @@ def main() -> int:
     targets = torch.tensor(list(chunk[1:]), device="cuda", dtype=torch.long).view(a.batch, a.seq)
 
     moe = model.loop.moe
+    # THE SAVED CONTROLLER. `lfb_bias` is a non-persistent buffer, so it is NOT
+    # in `ck["model"]` — it travels in its own `moe` section. Loading the weights
+    # alone silently measures the *router without the controller*, which on
+    # 2026-11-04 read 80/512 alive while the real routing had 9.
+    bias = torch.zeros(moe.n_experts, device="cuda")
+    saved = (state.get("moe") or {}).get("loop.moe")
+    if saved is not None:
+        bias = saved.to(device="cuda", dtype=torch.float32)
+        print(
+            f"lfb_bias from the checkpoint: min {bias.min():.2f} "
+            f"max {bias.max():.2f} mean {bias.mean():.2f}"
+        )
+    else:
+        print("lfb_bias: NOT in the checkpoint (the controller state is missing)")
     # The router is a dense Linear on the block input; walk the model's own
     # entry point so the hidden state is exactly the training one.
     grabbed: list[torch.Tensor] = []
@@ -111,7 +125,7 @@ def main() -> int:
         w = moe.router.weight
         x = grabbed[0].to(torch.bfloat16)
         logits = x @ w.t().to(torch.bfloat16)
-        idx = logits.topk(moe.topk, dim=-1).indices
+        idx = (logits + bias).topk(moe.topk, dim=-1).indices
         counts = torch.bincount(idx.reshape(-1), minlength=moe.n_experts)
     else:
         counts = counts_holder
@@ -124,12 +138,17 @@ def main() -> int:
         f"· mean {total / moe.n_experts:.2f}"
     )
     top = torch.topk(c, min(10, c.numel()))
+    live_bias = bias.detach().float()
     print("top-10 experts by assignments:")
     pairs = zip(top.values.tolist(), top.indices.tolist(), strict=True)
     for rank, (val, ix) in enumerate(pairs, 1):
         print(f"  {rank:2}. expert {ix:4}  {val:8.0f}  {100 * val / max(1, total):5.1f}%")
     share = top.values.sum().item()
     print(f"\ntop-10 hold {100 * share / max(1, total):.1f}% of all tokens")
+    print(
+        f"bias range {live_bias.min():.2f} … {live_bias.max():.2f} "
+        f"· |bias|>2 on {(live_bias.abs() > 2).sum().item()}/{moe.n_experts} experts"
+    )
     if a.json:
         payload = summary(
             counts[: moe.n_experts].tolist(),
@@ -138,6 +157,9 @@ def main() -> int:
             step=state.get("step"),
             batch=a.batch,
             seq=a.seq,
+            bias_min=float(live_bias.min()),
+            bias_max=float(live_bias.max()),
+            bias_over_2=int((live_bias.abs() > 2).sum().item()),
         )
         write_json(a.json, payload)
         print(f"wrote {a.json}")
