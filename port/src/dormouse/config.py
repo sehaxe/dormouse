@@ -153,6 +153,10 @@ MOE_LB_MODES = ("sign", "prop", "aux")
 #: what runs when the gather arm does not, and `moe_gather` is refused (LOUD)
 #: off the bf16 loop-stack route, with the adaptive width, and with `factor_qat`.
 MOE_GATHERS = ("off", "kernel")
+#: The `moe_permute` literals — the routing permute's algorithm
+#: (`experts.SparseMoE._permute`): `argsort` is the stable sort every number on
+#: record runs, `count` the counting sort (`model/route_fused.py`). Same tensor.
+MOE_PERMUTES = ("argsort", "count")
 #: The `share_u_mode` literals — how the routed experts' INPUT basis is shaped
 #: (`experts.py`'s module docstring): `off` is one `U` per expert, `plane` is
 #: one `U` for the bank, `dict` is one dictionary plus a per-expert column
@@ -924,6 +928,27 @@ class ModelConfig:
     #: rows — `moe_sonic.gather_glu` says what that costs and why. No speed claim
     #: exists until `scripts/bench_gather.py` runs.
     moe_gather: str = "off"
+    #: The fused ROUTE HEAD (`model/route_fused.py`): ONE kernel for the
+    #: unbiased softmax, the LFB bias add, the top-k and the gathered gate,
+    #: instead of 4 tensor ops over the same `[n, E]` (topk alone is 5-6 CUDA
+    #: kernels on this stack). Same result: the selection reads the RAISED
+    #: logits (`logits + lfb_bias`), the weight is the unbiased softmax at the
+    #: chosen ids, and among equal raised scores the LOWEST expert id wins (the
+    #: one rule `torch.topk` leaves unspecified — `route_fused`'s docstring).
+    #: OFF, and the OFF path's bits are untouched. Refused LOUDLY with
+    #: `moe_topk = 0` (the dense blend has no top-k), `moe_topk_mode != "off"`
+    #: (the adaptive width zeroes padding slots and keeps `probs`) and
+    #: `moe_lb_mode = "aux"` (its term reads `probs`); a call the kernel cannot
+    #: serve is COUNTED (`moe_route_fused_fallback` + reason) and runs the old
+    #: path. Counters: `moe_route_fused_calls`, `moe_route_fused_fallback`.
+    moe_route_fused: bool = False
+    #: The permute's algorithm: `argsort` is today's `torch.argsort(stable=True)`
+    #: (a CUB radix sort, ~12 kernels at n·k = 16 384) and `count` is the stable
+    #: counting sort in `model/route_fused.py` (bincount + cumsum + one program
+    #: per expert). The PERMUTATION IS IDENTICAL — stable within an expert, which
+    #: the bank rows and the drop set depend on — so this is a cost knob, not a
+    #: semantics one. Counters: `moe_permute_count`, `moe_permute_fallback`.
+    moe_permute: str = "argsort"
     #: The expert GLU's activation, the 2026-10-16 activation tournament arm
     #: (`docs/research` scan; formula sources named in `experts.expert_glu`):
     #: `silu` = SwiGLU's gate, the control and every number on record;
@@ -2107,10 +2132,14 @@ class RunConfig:
                         continue
                 if section == "model" and f.name == "max_seq_len" and not positional:
                     continue  # handled above: grow-only, and a grow is a resume
-                if section == "model" and f.name in ("moe_kernel",):
+                if section == "model" and f.name in ("moe_kernel", "moe_permute"):
                     # implementation keys: `moe_kernel`'s arms are proven equal
                     # to 1e-6, and the balancing rule decides selection, not
-                    # representation
+                    # representation. `moe_permute` changes no VALUE at all —
+                    # `tests/test_moe_route_fused.py` pins the counting
+                    # permutation element-wise against the stable argsort — so a
+                    # resume may switch it. `moe_route_fused` is NOT here: its
+                    # tie rule is a (measured, tiny) numeric difference.
                     continue
                 if getattr(a, f.name) != getattr(b, f.name):
                     out.append(f"{section}.{f.name}")
@@ -2683,6 +2712,38 @@ def validate(model: ModelConfig) -> None:
                 f"the quantization rung, whose alpha anneals every step, and no "
                 f"gather-parity gate covers that pair. Escape: factor_qat='none', or "
                 f"moe_gather='off'."
+            )
+    if model.moe_permute not in MOE_PERMUTES:
+        loud(
+            f"moe_permute={model.moe_permute!r} is not an algorithm. Known: "
+            f"{list(MOE_PERMUTES)} — `argsort` today's stable sort, `count` the "
+            f"stable counting sort (`model/route_fused.py`). Escape: name one."
+        )
+    if model.moe_route_fused:
+        # The three shapes the fused head has no code for, each stated as what
+        # it would otherwise cost a reader: a silent non-fusion, or a value the
+        # kernel does not produce.
+        if model.moe_topk <= 0:
+            loud(
+                f"moe_route_fused=true with moe_topk={model.moe_topk}: the dense "
+                f"blend runs every expert and has no top-k to fuse — the flag would "
+                f"be inert while its counter claimed it ran. Escape: moe_topk > 0, "
+                f"or moe_route_fused=false."
+            )
+        if model.moe_topk_mode != "off":
+            loud(
+                f"moe_route_fused=true with moe_topk_mode={model.moe_topk_mode!r}: the "
+                f"adaptive width masks the raised logits, moves unused slots to a "
+                f"sentinel expert and ZEROES their gate — the fused kernel selects a "
+                f"constant width from the raised row and would drop that mask. "
+                f"Escape: moe_topk_mode='off', or moe_route_fused=false."
+            )
+        if model.moe_lb_mode == "aux":
+            loud(
+                "moe_route_fused=true with moe_lb_mode='aux': the Switch/GShard term "
+                "reads the softmax `probs`, and the fused route deliberately does not "
+                "materialize them (that omission is the traffic it saves). Escape: "
+                "moe_lb_mode='prop' or 'sign', or moe_route_fused=false."
             )
     if model.expert_act not in EXPERT_ACTS:
         loud(
