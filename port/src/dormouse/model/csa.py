@@ -411,6 +411,30 @@ class CSAState:
         self.v[self.n] = v.to(self.v.dtype)
         self.n += 1
 
+    def append_many(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Append `n` finalised chunks in TWO writes — the bulk twin of `append`.
+
+        `k`, `v` are `[n, batch, csa_kv_dim]`. Same cast and same slot order as
+        calling `append` in a loop, so the ring after both is bit-identical; the
+        difference is the dispatch count: the loop pays one cast + one copy per
+        chunk (2·n launches at a 8 KiB window with `csa_chunk=8` that is 2 048
+        per level per iteration), this pays one cast + one copy per tensor.
+        """
+        n_new = k.shape[0]
+        assert k.shape == (n_new, self.batch, self.kv_dim), (
+            k.shape,
+            n_new,
+            self.batch,
+            self.kv_dim,
+        )
+        assert v.shape == k.shape, (v.shape, k.shape)
+        if n_new == 0:
+            return
+        self.reserve(self.n + n_new)
+        self.k[self.n : self.n + n_new] = k.to(self.k.dtype)
+        self.v[self.n : self.n + n_new] = v.to(self.v.dtype)
+        self.n += n_new
+
     def bytes(self) -> int:
         """The ACTUAL allocated ring bytes (k + v), what the memory claim is about."""
         return self.k.numel() * self.k.element_size() + self.v.numel() * self.v.element_size()
@@ -441,6 +465,13 @@ class CompressedSelectiveAttention(nn.Module):
         self.kv_dim = kv
         self.scale = 1.0 / math.sqrt(kv)
         self.fine = bool(getattr(cfg, "csa_fine", True))
+        #: The fused fine-selection arm (`csa_fused`, OFF by default). Read
+        #: here so a hand-built module can never diverge from the config flag.
+        self.fused = bool(getattr(cfg, "csa_fused", False))
+        assert not self.fused or self.fine, (
+            "csa_fused=true needs the fine level: the fused path is the fine "
+            "selection's; with csa_fine=false it would compute nothing."
+        )
         self.coarse_chunk = int(getattr(cfg, "csa_coarse_chunk", 0))
         self.coarse_kv_dim = int(getattr(cfg, "csa_coarse_kv_dim", 64))
         self.mid_chunk = int(getattr(cfg, "csa_mid_chunk", 0))
@@ -528,7 +559,8 @@ class CompressedSelectiveAttention(nn.Module):
             return q.new_zeros(b, qn, self.kv_dim)
         scores = (q @ k.transpose(1, 2)) * self.scale  # [b,Q,N]
         scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
-        return self._select(scores, v, allowed, min(self.topk, n), self.kv_dim)
+        select = self._select_fused if self.fused else self._select
+        return select(scores, v, allowed, min(self.topk, n), self.kv_dim)
 
     def _select(
         self,
@@ -558,6 +590,53 @@ class CompressedSelectiveAttention(nn.Module):
         # the clamped sum, not by softmax's own (which is uniform on garbage).
         w = w / w.sum(-1, keepdim=True).clamp_min(torch.finfo(w.dtype).tiny)
         return (w.unsqueeze(-1) * vv).sum(-2)
+
+    def _select_fused(
+        self,
+        scores: torch.Tensor,
+        v: torch.Tensor,
+        allowed: torch.Tensor,
+        k_eff: int,
+        width: int,
+    ) -> torch.Tensor:
+        """`_select`, with the redundant gathers removed and the sum batched.
+
+        `scores` is ALREADY masked (both callers `masked_fill` it before this
+        point), which is what lets the mask be recovered from the top-k VALUES
+        instead of gathered a second time. The reductions, each arithmetic-
+        preserving:
+
+        1. `topk` already returns the selected VALUES, so `scores.gather(2, idx)`
+           is deleted. A masked entry is exactly `finfo.min`, so
+           `values > finfo.min` is the `allowed` mask restricted to the
+           selection — the third gather is deleted too, and the selected rows
+           keep their order (softmax and the sum are permutation-invariant).
+        2. Masking the selected scores BEFORE the softmax makes the weights sum
+           to 1 already, so the reference's post-softmax renormalisation
+           (`sum` + `clamp_min` + `div`) is deleted as well; an all-masked row
+           is zeroed by the same `× ok` the reference applies.
+        3. `(w.unsqueeze(-1) * vv).sum(-2)` is the same contraction as
+           `w @ vv`, one batched matmul (on a flattened batch) instead of
+           mul + reduce.
+
+        Same softmax over the same selected values, same zero-weight rule for
+        an all-masked row, same dtype. The contract is `1e-6` in fp32 against
+        `_select`, not bit-identity: (2) and (3) change the op order.
+        """
+        b, qn, n = scores.shape
+        if k_eff == 0 or qn == 0:
+            return scores.new_zeros(b, qn, width)
+        neg = torch.finfo(scores.dtype).min
+        top = scores.topk(k_eff, dim=-1)  # values AND indices in one op
+        ok = top.values > neg  # the selected entries that were not masked
+        sel = top.values.masked_fill(~ok, neg)
+        take = top.indices.unsqueeze(-1).expand(b, qn, k_eff, width)
+        pool = v if v.dim() == 4 else v.unsqueeze(1).expand(b, qn, n, width)
+        vv = pool.gather(2, take)
+        w = torch.softmax(sel, dim=-1) * ok
+        rows = b * qn
+        out = torch.bmm(w.reshape(rows, 1, k_eff), vv.reshape(rows, k_eff, width))
+        return out.reshape(b, qn, width)
 
     def _level_scores(
         self,
@@ -694,7 +773,8 @@ class CompressedSelectiveAttention(nn.Module):
         # attention then ran over.
         counters.count("csa_scan_fine", b * qn * cand.shape[-1])
         counters.count("csa_sel_fine", b * qn * k_eff)
-        return self._select(scores, v_g, ok, k_eff, self.kv_dim)
+        select = self._select_fused if self.fused else self._select
+        return select(scores, v_g, ok, k_eff, self.kv_dim)
 
     def _coarse_on(self) -> bool:
         return self.coarse_chunk > 0 and getattr(self, "coarse_enabled", True)
@@ -814,9 +894,14 @@ class CompressedSelectiveAttention(nn.Module):
             n_full_c = t // self.coarse_chunk
             ck, cv = self._pool_coarse(x)
             if n_full_c:
-                cs.reserve(cs.n + n_full_c)
-                for i in range(n_full_c):
-                    cs.append(ck[:, i], cv[:, i])
+                if self.fused:
+                    cs.append_many(
+                        ck[:, :n_full_c].transpose(0, 1), cv[:, :n_full_c].transpose(0, 1)
+                    )
+                else:
+                    cs.reserve(cs.n + n_full_c)
+                    for i in range(n_full_c):
+                        cs.append(ck[:, i], cv[:, i])
             if t % self.coarse_chunk:
                 cs.sum = cs.sum + x[:, n_full_c * self.coarse_chunk :].sum(1)
                 cs.count = t - n_full_c * self.coarse_chunk
@@ -844,9 +929,14 @@ class CompressedSelectiveAttention(nn.Module):
             n_full_m = t // self.mid_chunk
             mk, mv = self._pool_mid(x)
             if n_full_m:
-                ms.reserve(ms.n + n_full_m)
-                for i in range(n_full_m):
-                    ms.append(mk[:, i], mv[:, i])
+                if self.fused:
+                    ms.append_many(
+                        mk[:, :n_full_m].transpose(0, 1), mv[:, :n_full_m].transpose(0, 1)
+                    )
+                else:
+                    ms.reserve(ms.n + n_full_m)
+                    for i in range(n_full_m):
+                        ms.append(mk[:, i], mv[:, i])
             if t % self.mid_chunk:
                 ms.sum = ms.sum + x[:, n_full_m * self.mid_chunk :].sum(1)
                 ms.count = t - n_full_m * self.mid_chunk
@@ -877,9 +967,12 @@ class CompressedSelectiveAttention(nn.Module):
             # The last chunk is partial: it is a key for nothing in this window (no
             # position after it exists), so it is carried, not appended.
             if n_full:
-                fs.reserve(fs.n + n_full)
-                for i in range(n_full):
-                    fs.append(k[:, i], v[:, i])
+                if self.fused:
+                    fs.append_many(k[:, :n_full].transpose(0, 1), v[:, :n_full].transpose(0, 1))
+                else:
+                    fs.reserve(fs.n + n_full)
+                    for i in range(n_full):
+                        fs.append(k[:, i], v[:, i])
             if t % self.chunk:
                 fs.sum = fs.sum + x[:, n_full * self.chunk :].sum(1)
                 fs.count = t - n_full * self.chunk

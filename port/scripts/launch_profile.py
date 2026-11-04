@@ -42,20 +42,43 @@ banner and exits 0: nothing was measured, so there is no number to quote.
 
 **Not run by this task's author**: the card is busy. Every number this file
 will print is a tool waiting for a free card.
+
+**The CPU twin — a shape-diffable launch counter.** With no `--device cuda`
+this script runs ONE forward + backward + optimizer step of a CPU model under a
+`TorchDispatchMode` and prints the launch GROUPS: `(aten op, module)` pairs,
+where the module is the one whose forward (or backward) is executing — the
+`nn.Module` hook stack. An op with no module scope is resolved from the output's
+`grad_fn`, then from the nearest mapped ancestor in the arguments' `grad_fn`
+chains. Metadata-only ops (`view`,
+`expand`, `transpose`, `detach`, …) enqueue no kernel and are excluded from the
+launch count, so the rows are a CPU *proxy* for what the card would launch — one
+aten op is one kernel on the eager GPU path, which is the shape of the problem
+this file exists to measure. `--json PATH` writes the full group table and
+`--diff A.json B.json` prints the per-group delta sorted by absolute change, so
+two shapes (b8×s1024 vs b1×s8192) are compared without a profiler or a card.
+
+    CUDA_VISIBLE_DEVICES="" uv run python scripts/launch_profile.py \
+        --preset tiny --batch 2 --seq 64 --set use_csa=true --json a.json
 """
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import dataclasses
 import functools
+import json
 import re
 import statistics
 import subprocess
 import sys
 import time
+import warnings
+from collections import Counter
 from pathlib import Path
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from dormouse.config import load_run
 from dormouse.model import DormouseModel
@@ -392,6 +415,480 @@ def arm(name: str, run, state: dict) -> None:
     torch.cuda.empty_cache()
 
 
+# ---------------------------------------------------------------------------
+# The CPU twin: a TorchDispatchMode launch counter and its JSON/diff protocol
+# ---------------------------------------------------------------------------
+
+#: Ops that only move metadata: they enqueue no kernel on the eager CUDA path
+#: (the same rule `tests/test_muon_launch.py` uses for `_foreach_*`). A composite
+#: that COPIES internally is not in this set — it is counted at the decomposed
+#: op that does the copy.
+METADATA_OPS = frozenset(
+    {
+        "alias",
+        "as_strided",
+        "chunk",
+        "detach",
+        "detach_",
+        "expand",
+        "expand_as",
+        "imag",
+        "lift_fresh",
+        "narrow",
+        "permute",
+        "ravel",
+        "real",
+        "reshape",
+        "resolve_conj",
+        "resolve_neg",
+        "select",
+        "slice",
+        "split",
+        "split_with_sizes",
+        "squeeze",
+        "squeeze_",
+        "t",
+        "transpose",
+        "transpose_",
+        "unbind",
+        "unsqueeze",
+        "unsqueeze_",
+        "view",
+        "view_as",
+        "_unsafe_view",
+    }
+)
+
+
+#: Device→host reads: not a kernel launch, and the one class the step path must
+#: not have (AGENTS §1.3). Counted separately so a sync cannot hide in a launch
+#: row, and so the optimizer's `.item()` reads are visible in the JSON.
+SYNC_OPS = frozenset({"aten::_local_scalar_dense"})
+
+
+def aten_name(func) -> str:
+    """`aten::addmm` for an `OpOverload`, else `str(func)` — the group key."""
+    schema = getattr(func, "_schema", None)
+    name = getattr(schema, "name", None)
+    return name if name else str(func)
+
+
+def is_metadata(op: str) -> bool:
+    """True when `op` is a metadata-only aten op (no kernel launch)."""
+    return op.rsplit("::", 1)[-1] in METADATA_OPS
+
+
+def _tensors(value):
+    """Every tensor in a hook output/arg, including one nesting level of tuples."""
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            if isinstance(item, torch.Tensor):
+                yield item
+
+
+class DispatchCounter(TorchDispatchMode):
+    """Count one step's aten dispatches, grouped by `(op, module)`.
+
+    Module attribution, in order:
+
+    1. the `nn.Module` call stack: the module whose forward (or backward) is
+       executing. The hooks fire around the module's own ops, so this is the
+       exact scope — an op's OUTPUT node has no `grad_fn` until the module
+       returns, and its arguments' nodes belong to the module BELOW it, so a
+       graph-only rule is off by one at a module boundary;
+    2. the OUTPUT's `grad_fn`, when the op runs outside any module scope but a
+       forward hook recorded that node (a custom Function's backward, a head
+       called directly);
+    3. the nearest recorded node in the ARGUMENTS' `grad_fn` chains (an op whose
+       module produced no scope — the generic fallback);
+    4. `<forward>` / `<backward>` / `<optimizer>` — the stage the op ran in
+       (the loss head, the optimizer; no module owns them).
+
+    Hooks are installed for the counted step only. They add ~0.4% metadata
+    dispatches (they `detach()` bookkeeping tensors); non-metadata ops — the
+    number this table reports — are unaffected (measured on tiny, 1283 vs 1288).
+    """
+
+    def __init__(self) -> None:
+        self.dispatches: Counter[tuple[str, str]] = Counter()
+        self.launches: Counter[tuple[str, str]] = Counter()
+        self.stages: Counter[str] = Counter()
+        self.syncs: Counter[tuple[str, str]] = Counter()
+        self.stage = "step"
+        self._stack: list[str] = []
+        self._node_module: dict[object, str] = {}
+        self._hooks: list[object] = []
+        self._warnings = None
+
+    # -- hooks ------------------------------------------------------------
+    def attach(self, model: torch.nn.Module) -> None:
+        self._warnings = warnings.catch_warnings()
+        self._warnings.__enter__()
+        warnings.filterwarnings("ignore", message="Full backward hook is firing.*")
+        for name, module in model.named_modules():
+            label = name or "<root>"
+            self._hooks.append(module.register_forward_pre_hook(self._pre(label)))
+            self._hooks.append(module.register_forward_hook(self._post(label)))
+            self._hooks.append(module.register_full_backward_pre_hook(self._bpre(label)))
+            self._hooks.append(module.register_full_backward_hook(self._bpost(label)))
+        self._stack.clear()
+
+    def detach(self) -> None:
+        for hook in reversed(self._hooks):
+            hook.remove()
+        self._hooks.clear()
+        if self._warnings is not None:
+            self._warnings.__exit__(None, None, None)
+            self._warnings = None
+
+    @contextlib.contextmanager
+    def observe(self, model: torch.nn.Module):
+        self.attach(model)
+        try:
+            with self:
+                yield self
+        finally:
+            self.detach()
+
+    def _pre(self, label: str):
+        def hook(_module, _inputs):
+            self._stack.append(label)
+
+        return hook
+
+    def _post(self, label: str):
+        def hook(_module, _inputs, output):
+            self._pop(label)
+            for tensor in _tensors(output):
+                if tensor.grad_fn is not None:
+                    # `setdefault`: the innermost module to produce the tensor
+                    # owns the node; an enclosing container must not overwrite it.
+                    self._node_module.setdefault(tensor.grad_fn, label)
+
+        return hook
+
+    def _bpre(self, label: str):
+        def hook(_module, _grad_inputs):
+            self._stack.append(label)
+
+        return hook
+
+    def _bpost(self, label: str):
+        def hook(_module, _grad_inputs, _grad_outputs):
+            self._pop(label)
+
+        return hook
+
+    def _pop(self, label: str) -> None:
+        if self._stack and self._stack[-1] == label:
+            self._stack.pop()
+        elif label in self._stack:  # a hook that fired out of order; stay balanced
+            self._stack.remove(label)
+
+    # -- resolution -------------------------------------------------------
+    def _walk_grad_fn(self, node):
+        """Nearest module along a `grad_fn` closure (BFS, bounded)."""
+        frontier = [node] if node is not None else []
+        seen: set[object] = set()
+        for _ in range(12):
+            nxt = []
+            for current in frontier:
+                if current is None or current in seen:
+                    continue
+                seen.add(current)
+                module = self._node_module.get(current)
+                if module is not None:
+                    return module
+                nxt.extend(parent for parent, _ in current.next_functions if parent is not None)
+            frontier = nxt
+            if not frontier:
+                break
+        return None
+
+    def _resolve(self, args, out) -> str:
+        if self._stack:
+            return self._stack[-1]
+        for tensor in _tensors(out):
+            if tensor.grad_fn is not None:
+                module = self._node_module.get(tensor.grad_fn)
+                if module is not None:
+                    return module
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                module = self._walk_grad_fn(arg.grad_fn)
+                if module is not None:
+                    return module
+        return f"<{self.stage}>"
+
+    # -- the counter ------------------------------------------------------
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        op = aten_name(func)
+        if self._stack:
+            # Record the node while the module scope is known; a later backward
+            # op can then be resolved by its arguments' `grad_fn` chain even if
+            # the backward hook does not fire (a custom Function).
+            for tensor in _tensors(out):
+                if tensor.grad_fn is not None:
+                    self._node_module.setdefault(tensor.grad_fn, self._stack[-1])
+        module = self._resolve(args, out)
+        self.dispatches[(op, module)] += 1
+        if op in SYNC_OPS:
+            self.syncs[(op, module)] += 1
+        elif not is_metadata(op):
+            self.launches[(op, module)] += 1
+            self.stages[self.stage] += 1
+        return out
+
+    # -- reporting --------------------------------------------------------
+    def rows(self, top: int | None = 25) -> list[tuple[str, str, int, int]]:
+        rows = [
+            (op, module, self.launches[(op, module)], self.dispatches[(op, module)])
+            for op, module in set(self.launches) | set(self.dispatches)
+        ]
+        rows.sort(key=lambda row: (-row[2], -row[3], row[0], row[1]))
+        return rows[:top] if top else rows
+
+
+def _sorted_pairs(counter: Counter) -> list[tuple[tuple[str, str], int]]:
+    return sorted(counter.items(), key=lambda item: (-item[1], item[0][0], item[0][1]))
+
+
+def _summary(counter: DispatchCounter) -> dict:
+    total = sum(counter.launches.values())
+    rows = counter.rows(None)
+    return {
+        "syncs": [
+            {"op": op, "module": module, "count": count}
+            for (op, module), count in _sorted_pairs(counter.syncs)
+        ],
+        "groups": [
+            {
+                "op": op,
+                "module": module,
+                "launches": launches,
+                "dispatches": dispatches,
+                "share": (launches / total) if total else 0.0,
+            }
+            for op, module, launches, dispatches in rows
+        ],
+        "stages": dict(counter.stages),
+    }
+
+
+def dispatch_report(counter: DispatchCounter, top: int = 25) -> dict:
+    """Print the table; return the JSON payload (the `--json` body)."""
+    total = sum(counter.launches.values())
+    dispatches = sum(counter.dispatches.values())
+    syncs = sum(counter.syncs.values())
+    print(
+        f"\nlaunches/step (non-metadata aten ops) {total:6d}   "
+        f"dispatches {dispatches:6d}   metadata {dispatches - total - syncs:6d}"
+    )
+    stages = "  ".join(f"{name}={n}" for name, n in sorted(counter.stages.items()))
+    print(f"stages: {stages}")
+    if counter.syncs:
+        print(f"host syncs/step: {sum(counter.syncs.values())}  (excluded from launches)")
+    print(f"\n{'rank':>4s} {'launches':>9s} {'share':>6s}  {'op':34s} module")
+    for rank, (op, module, launches, _disp) in enumerate(counter.rows(top), 1):
+        share = 100.0 * launches / max(total, 1)
+        print(f"{rank:4d} {launches:9d} {share:5.1f}%  {op:34s} {module}")
+    return _summary(counter)
+
+
+def write_profile(path: str | Path, meta: dict, counter: DispatchCounter) -> None:
+    meta = {
+        **meta,
+        "total_launches": sum(counter.launches.values()),
+        "total_dispatches": sum(counter.dispatches.values()),
+    }
+    payload = {"meta": meta, **_summary(counter)}
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def diff_profiles(a_path: str | Path, b_path: str | Path, top: int | None = None) -> int:
+    """Per-group delta `B − A`, sorted by absolute change; 0 on success."""
+    a = json.loads(Path(a_path).read_text())
+    b = json.loads(Path(b_path).read_text())
+
+    def keyed(doc: dict) -> dict[tuple[str, str], int]:
+        return {(g["op"], g["module"]): int(g["launches"]) for g in doc.get("groups", [])}
+
+    ka, kb = keyed(a), keyed(b)
+    total_a = sum(ka.values())
+    total_b = sum(kb.values())
+    rows = []
+    for key in set(ka) | set(kb):
+        delta = kb.get(key, 0) - ka.get(key, 0)
+        rows.append((delta, ka.get(key, 0), kb.get(key, 0), key[0], key[1]))
+    rows.sort(key=lambda row: (-abs(row[0]), row[3], row[4]))
+
+    def meta(doc, name):
+        m = doc.get("meta", {})
+        return (
+            f"{name}: {m.get('preset', '?')} b{m.get('batch', '?')} s{m.get('seq', '?')} "
+            f"{m.get('device', '?')} {m.get('dtype', '?')}"
+        )
+
+    print(f"{meta(a, 'A')}  ->  {meta(b, 'B')}")
+    print(f"total launches {total_a} -> {total_b}  ({total_b - total_a:+d})")
+    print(f"\n{'delta':>9s} {'A':>9s} {'B':>9s} {'shareB':>7s}  {'op':34s} module")
+    for delta, na, nb, op, module in rows[:top] if top else rows:
+        share = 100.0 * nb / max(total_b, 1)
+        print(f"{delta:+9d} {na:9d} {nb:9d} {share:6.1f}%  {op:34s} {module}")
+    return 0
+
+
+def parse_set(items: list[str]) -> dict:
+    """`["use_csa=true", "csa_chunk=8"]` -> `{"use_csa": True, ...}`."""
+
+    def literal(raw: str):
+        low = raw.lower()
+        if low in ("true", "false"):
+            return low == "true"
+        if low in ("none", "null"):
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+
+    overrides: dict = {}
+    for item in items:
+        key, sep, raw = item.partition("=")
+        if not sep or not key:
+            raise SystemExit(f"--set {item!r}: expected KEY=VALUE")
+        overrides[key] = literal(raw)
+    return overrides
+
+
+def _resolve_device(name: str) -> torch.device:
+    """`auto`/`cpu` stay on the CPU; `cuda` is REFUSED when the card is taken.
+
+    The dispatch counter is a CPU instrument by default on purpose: the owner's
+    training run owns the card, and a counter that executes on CUDA is still a
+    counter of HOST dispatches — the card buys nothing and the lane rule
+    (AGENTS §1.5) is one GPU process at a time.
+    """
+    if name in ("auto", "cpu"):
+        return torch.device("cpu")
+    if name != "cuda":
+        raise RuntimeError(f"--device {name}: use auto|cpu|cuda")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "--device cuda but torch.cuda.is_available() is False (is "
+            "CUDA_VISIBLE_DEVICES empty?). Escape: --device cpu, or a visible card."
+        )
+    why = _lane_preflight("cuda")
+    if why is not None:
+        raise RuntimeError(
+            f"--device cuda and the card is not ours:\n{why}\n"
+            "ONE GPU PROCESS AT A TIME (AGENTS 1.5). Escape: --device cpu."
+        )
+    return torch.device("cuda")
+
+
+def _dispatch_step(model, opt, train, ids, counter: DispatchCounter | None):
+    """One trainer-shaped step: fwd, bwd, clip, optimizer — the counted unit."""
+
+    def stage(name: str) -> None:
+        if counter is not None:
+            counter.stage = name
+
+    model.zero_grad(set_to_none=True)
+    stage("forward")
+    _logits, loss, counters = model(ids, targets=ids)
+    assert loss is not None, "a training forward with targets must return a loss"
+    stage("backward")
+    loss.backward()
+    stage("optimizer")
+    if train.grad_clip > 0:
+        clip_grads(model.parameters(), train.grad_clip)
+    opt.step()
+    stage("step")
+    return counters
+
+
+def dispatch_main(args: argparse.Namespace, device: torch.device) -> int:
+    overrides = parse_set(args.set)
+    run = load_run(args.preset, model_overrides=overrides, train_overrides={"seq_len": args.seq})
+    torch.manual_seed(args.seed)
+    model = DormouseModel(run.model, device=device).train()
+    opt = _optimizer(model, run.train)
+    ids = torch.randint(0, 256, (args.batch, args.seq), device=device)
+    dtype = next(model.parameters()).dtype
+
+    for _ in range(args.warm):
+        _dispatch_step(model, opt, run.train, ids, None)
+
+    counter = DispatchCounter()
+    with counter.observe(model):
+        _dispatch_step(model, opt, run.train, ids, counter)
+
+    print(
+        f"\n=== dispatch profile: {args.preset}, b{args.batch} x s{args.seq}, "
+        f"{device.type}, {dtype} ==="
+    )
+    if overrides:
+        print(f"overrides: {overrides}")
+    dispatch_report(counter, top=args.top)
+    if args.json_path:
+        meta = {
+            "preset": args.preset,
+            "batch": args.batch,
+            "seq": args.seq,
+            "device": device.type,
+            "dtype": str(dtype),
+            "overrides": overrides,
+            "warm": args.warm,
+            "torch": torch.__version__,
+            "total_launches": sum(counter.launches.values()),
+            "total_dispatches": sum(counter.dispatches.values()),
+            "metadata_ops": sorted(METADATA_OPS),
+        }
+        write_profile(args.json_path, meta, counter)
+        print(f"\nwrote {args.json_path}")
+    return 0
+
+
+def cli(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--preset", default="tiny")
+    ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--seq", type=int, default=64)
+    ap.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--warm", type=int, default=1)
+    ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--json", dest="json_path", default=None)
+    ap.add_argument("--diff", nargs=2, metavar=("A.json", "B.json"))
+    ap.add_argument(
+        "--gpu-profile",
+        action="store_true",
+        help="the two-arm card profile (needs the card; SKIPs when it is busy)",
+    )
+    args = ap.parse_args(argv)
+    if args.diff:
+        return diff_profiles(args.diff[0], args.diff[1], top=args.top)
+    if args.gpu_profile:
+        return main()
+    try:
+        device = _resolve_device(args.device)
+    except RuntimeError as exc:
+        print(f"\nREFUSED: {exc}\n", file=sys.stderr)
+        return 2
+    return dispatch_main(args, device)
+
+
 def main() -> int:
     why = preflight()
     if why is None:
@@ -427,4 +924,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

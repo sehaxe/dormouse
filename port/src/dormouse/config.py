@@ -1013,6 +1013,18 @@ class ModelConfig:
     #: exact-attention parity gate's configuration); refused without a coarse
     #: level, because it would build a branch that computes nothing.
     csa_fine: bool = True
+    #: ---- the FUSED fine-selection path (off by default) ----
+    #: `false` is the reference chain, statement for statement. `true` collapses
+    #: the fine selection's score → top-k → gather → softmax → weighted sum into
+    #: fewer dispatches (`_select_fused`: top-k's own values replace the score
+    #: gather and supply the mask as `values > finfo.min`, masking before the
+    #: softmax removes the renormalisation, and one batched matmul replaces the
+    #: multiply-plus-reduce), and hoists the per-chunk ring append in
+    #: `forward_state` into one bulk write per level (`append_many`).
+    #: Arithmetic is the same; the parity is `1e-6` (fp32) against the reference,
+    #: NOT bit-identity — the op order in the weighted sum changes. Refused
+    #: without `use_csa` and with `csa_fine=false` (nothing would run).
+    csa_fused: bool = False
     #: ---- the THIRD level (the MIDDLE one in cost, the OUTERMOST by chunk) ----
     #: `csa_mid_chunk=0` (OFF) keeps the two-level arm bit-identical. When on it
     #: must be a MULTIPLE of `csa_coarse_chunk` (of `csa_chunk` when coarse is
@@ -2170,6 +2182,12 @@ def validate(model: ModelConfig) -> None:
             f"the third level of the CSA arm, so alone it would build no module and "
             f"the flag would lie. Escape: use_csa=true, or csa_mid_chunk=0."
         )
+    if model.csa_fused and not model.use_csa:
+        loud(
+            "csa_fused=true without use_csa: the fused path is the CSA arm's fine "
+            "selection, and the arm is not built — the flag would run nothing. "
+            "Escape: use_csa=true, or csa_fused=false."
+        )
     if model.csa_hierarchical:
         if not model.use_csa:
             loud(
@@ -2217,6 +2235,13 @@ def validate(model: ModelConfig) -> None:
                 "csa_fine=false without a coarse level: the arm would build no "
                 "level at all while paying its gate. Escape: csa_fine=true, or "
                 "csa_coarse_chunk>0, or use_csa=false."
+            )
+        if model.csa_fused and not model.csa_fine:
+            loud(
+                "csa_fused=true with csa_fine=false: the fused path is the FINE "
+                "selection, and the fine level is off — the flag would select for "
+                "an attention that does not run. Escape: csa_fine=true, or "
+                "csa_fused=false."
             )
         if model.csa_mid_chunk:
             contained = model.csa_coarse_chunk or model.csa_chunk

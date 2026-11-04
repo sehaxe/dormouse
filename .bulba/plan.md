@@ -569,6 +569,58 @@ testable and A/B-able (ADR-0017).
       (card busy). Suite diff vs clean `21a97d2`: the same single pre-existing
       `test_sft_v2::test_the_manifest_accounts_for_every_row` failure; ruff
       clean.
+- [x] P-CSA-FUSE. port (Python): the CPU launch instrument + the fused CSA
+      fine-selection arm, both CPU-proven, **NO GPU PROFILE** (the card is
+      owned by a live 8 KB-context run; every command here ran with
+      `CUDA_VISIBLE_DEVICES=""`). `scripts/launch_profile.py` keeps the old
+      `--gpu-profile` (the two-arm card trace) and gains the CPU twin:
+      `DispatchCounter(TorchDispatchMode)` counts ONE fwd+bwd+optimizer step,
+      groups by `(aten op, module)` (module = the executing hook scope; the
+      output/argument `grad_fn` chain is the fallback outside a module),
+      excludes metadata ops, prints the top 25 and stages, `--json PATH` writes
+      the full table, `--diff A.json B.json` prints the per-group delta sorted
+      by `|Δ|`; `--device cuda` is REFUSED with the reason when `_lane.preflight`
+      sees another process on the card. `ModelConfig.csa_fused` (OFF; refused
+      without `use_csa` and with `csa_fine=false`): `_select_fused` uses
+      `topk`'s own values for both the score and the mask (`values > finfo.min`),
+      masks before the softmax (deletes `sum`/`clamp_min`/`div`) and contracts
+      with one batched matmul; `CSAState.append_many` hoists `forward_state`'s
+      `for i in range(n_full)` ring append into one cast+copy per tensor.
+      CPU arithmetic, tiny b2×s64 chunk4/topk4: step launches 1764 → 1738
+      (−1.5 %), the `loop.csa` group 124 → 98 (−20.9 %); module fwd+bwd
+      56 → 43 (−13) and gather 3 → 1; `forward_state` at t=256 chunk4
+      290 → 35 launches with ring copies 260 → 8, and the fused count is the
+      same at t=64 and t=256 (the per-chunk Python work is gone). Parity:
+      fp32 output `7.45e-8`, gradients `7.63e-6` absolute on a `31.4` scale
+      (`2.4e-7` relative); bf16 `1.95e-3` = **one bf16 ulp** — a 1e-6 bf16 gate
+      is below `2^-8` and would be a gate that cannot fail, so the test pins
+      one ulp and prints the number. Ring wrap (state carried across a chunk
+      boundary): outputs `7.45e-8` / `8.94e-8`, ring keys/values bit-equal,
+      `n=5`; the hierarchical tail agrees to `8.94e-8`. Gates
+      `tests/test_csa_fused.py` (8 functions / 9 cases), each red on a scratch
+      revert: delegating `_select_fused` to `_select` reddens 1/6, restoring the
+      append loop reddens 6b, defaulting the flag ON reddens 1/4, a mask that is
+      always true reddens 1/2/3. FOLLOW-UP, not this arm:
+      `_hier_fine`'s `sel = zeros(b, qn, keep.shape[-1]); sel.scatter_(2, keep,
+      True)` indexes a `topk`-wide buffer with parent-entry indices, so any
+      `csa_hierarchical` run with `csa_topk < entries` raises out of bounds
+      (`csa.py:741`); the hierarchical parity gate uses `topk=64` to stay on the
+      specified shape. Instrument gates
+      `tests/test_launch_dispatch.py` (6). Suite: 5 reds, all pre-existing or
+      worktree-local — `test_lr_tail` (`seq_len` joined `PROGRESS_KEYS` in
+      `cd65540`, its closed-set test was not updated) and `test_dashboard`
+      (live `~/logs` state) also red on clean `1549e14`;
+      `test_decode_recurrent::test_per_byte_cost_does_not_grow_with_context` is
+      the recorded wall-clock gate that reddens under the live training run and
+      skipped on rerun; `test_resume` (`configs/m400.toml`) and `test_sft_v2`
+      (`sft_pairs/`) are untracked files a clean worktree does not carry.
+      ruff clean. **The launch-count claim on the card is still unmeasured**:
+      one aten op is one kernel on the eager GPU path, but the 8 KB-shape
+      profile is the owner's to run. The CPU counter does NOT reproduce the
+      premise that the CSA group is the largest: at tiny it is 124 of 1764
+      (7.0 %) while the optimizer stage alone is 476, so the fused step saves
+      1.5 % of launches there — the big win (290 → 35) is `forward_state`,
+      which is the decode/prefill path, not the one-shot training step.
 
 
 ## Critical Files
