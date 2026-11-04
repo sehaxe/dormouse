@@ -80,6 +80,7 @@ import torch
 from torch import nn
 from torch.optim import AdamW, Optimizer
 
+from .. import stepaudit
 from ..instrument import Counters, loud
 
 #: The paper's Jordan triple, `burn-muon-plus::NS_COEFFS`, verbatim.
@@ -334,7 +335,7 @@ def _classic_ns_batch(tensors: list[torch.Tensor], steps: int, ns_dtype: str) ->
     a, b, c = JORDAN_NS_COEFFS
     pre: list[torch.Tensor] = []
     transposed: list[bool] = []
-    for t in tensors:
+    for t in stepaudit.iterations("muon.ns_pre", tensors):
         x = t.to(torch.float32)
         if x.ndim == 2:
             x = x / (x.norm() + 1e-7)
@@ -360,7 +361,7 @@ def _classic_ns_batch(tensors: list[torch.Tensor], steps: int, ns_dtype: str) ->
         return torch._foreach_add(xs, ys) if fused else [x + y for x, y in zip(xs, ys, strict=True)]
 
     work = pre
-    for _ in range(steps):
+    for _ in stepaudit.iterations("muon.ns_steps", range(steps)):
         grams = [_gram(x) for x in work]
         # `gram @ gram`, NOT `_gram(gram)`: the Gram is symmetric in exact
         # arithmetic, but a bmm's two triangles are independently rounded, so
@@ -376,7 +377,7 @@ def _classic_ns_batch(tensors: list[torch.Tensor], steps: int, ns_dtype: str) ->
         ax = scale(work, a)
         work = add(ax, px)
     out: list[torch.Tensor] = []
-    for x, tall in zip(work, transposed, strict=True):
+    for x, tall in stepaudit.iterations("muon.ns_post", zip(work, transposed, strict=True)):
         if tall:
             x = x.transpose(-2, -1).contiguous()
         out.append(x.to(torch.float32))
@@ -426,18 +427,24 @@ def _classic_ns_many(
     batch: list[torch.Tensor] = []
     batch_idx: list[int] = []
     elems = 0
-    for i in order:
+    for i in stepaudit.iterations("muon.ns_split", order):
         t = tensors[i]
         n = t.numel()
         if batch and elems + n > MUON_CHUNK_ELEMS:
-            for j, u in zip(batch_idx, _classic_ns_batch(batch, steps, ns_dtype), strict=True):
+            for j, u in stepaudit.iterations(
+                "muon.ns_take_inner",
+                zip(batch_idx, _classic_ns_batch(batch, steps, ns_dtype), strict=True),
+            ):
                 out[j] = u
             batch, batch_idx, elems = [], [], 0
         batch.append(t)
         batch_idx.append(i)
         elems += n
     if batch:
-        for j, u in zip(batch_idx, _classic_ns_batch(batch, steps, ns_dtype), strict=True):
+        for j, u in stepaudit.iterations(
+            "muon.ns_take",
+            zip(batch_idx, _classic_ns_batch(batch, steps, ns_dtype), strict=True),
+        ):
             out[j] = u
     return out  # type: ignore[return-value]
 
@@ -795,10 +802,10 @@ def _momentum_update_(mom: torch.Tensor, params: list, mu: float) -> None:
     n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // mom[0].numel()))
     if mom.dtype != torch.bfloat16:
         mom.mul_(mu)
-        for start in range(0, n, n_chunk):
+        for start in stepaudit.iterations("muon.momentum_chunks", range(0, n, n_chunk)):
             _add_grads_(mom[start : start + n_chunk], params[start : start + n_chunk], 1.0 - mu)
         return
-    for start in range(0, n, n_chunk):
+    for start in stepaudit.iterations("muon.momentum_chunks_bf16", range(0, n, n_chunk)):
         chunk = params[start : start + n_chunk]
         acc = mom[start : start + n_chunk].to(torch.float32)
         acc.mul_(mu)
@@ -1197,7 +1204,7 @@ class Muon(Optimizer):
         # instead of once per group. A job is
         # `(params, tensor_to_orthogonalize, lr, scale, ns_steps, singleton)`.
         jobs: list[tuple[list, torch.Tensor, float, float, int, bool]] = []
-        for grp in self._groups:
+        for grp in stepaudit.iterations("muon.groups", self._groups):
             group = self.param_groups[grp.gi]
             lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
             scale = max(1.0, grp.shape[0] / grp.shape[1]) ** 0.5
@@ -1206,7 +1213,7 @@ class Muon(Optimizer):
                 # A 2-D parameter with no gradient falls back to the definition
                 # (inventing a "zero gradient" row would move the momentum).
                 if any(p.grad is None for p in params):
-                    for p in params:
+                    for p in stepaudit.iterations("muon.singletons", params):
                         if p.grad is not None:
                             self._step_one(p, lr, mu, ns, scale, flag)
                     continue
@@ -1244,13 +1251,13 @@ class Muon(Optimizer):
                 # group's accumulator once and write it back once, rather than
                 # per chunk, so a chunk boundary cannot move the average.
                 s_new, c = self._sf_ckp(lr, float(self.state[params[0]].get("sf_s", 0.0)))
-                for p in params:
+                for p in stepaudit.iterations("muon.sf_scalars", params):
                     self.state[p]["sf_s"] = s_new
             # Chunk the shape stack: the cap is fp32 ELEMENTS per stacked
             # buffer (`MUON_CHUNK_ELEMS`), so NS never materializes the whole
             # shape group's chain at once.
             n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // (grp.shape[0] * grp.shape[1])))
-            for start in range(0, n, n_chunk):
+            for start in stepaudit.iterations("muon.chunks", range(0, n, n_chunk)):
                 params_c = params[start : start + n_chunk]
                 pieces = mom[start : start + n_chunk]
                 if self.sf:
@@ -1268,14 +1275,16 @@ class Muon(Optimizer):
             # Group by the step count (every group normally shares `ns_steps`,
             # but a param group may override it): one lockstep chain per count.
             by_steps: dict[int, list[int]] = {}
-            for i, job in enumerate(jobs):
+            for i, job in stepaudit.iterations("muon.jobs", enumerate(jobs)):
                 by_steps.setdefault(job[4], []).append(i)
             updates: list[torch.Tensor | None] = [None] * len(jobs)
-            for steps, idxs in by_steps.items():
+            for steps, idxs in stepaudit.iterations("muon.ns_groups", by_steps.items()):
                 outs = self._orthogonalize_many([jobs[i][1] for i in idxs], steps)
-                for i, update in zip(idxs, outs, strict=True):
+                for i, update in stepaudit.iterations("muon.ns_out", zip(idxs, outs, strict=True)):
                     updates[i] = update
-            for job, update in zip(jobs, updates, strict=True):
+            for job, update in stepaudit.iterations(
+                "muon.writeback", zip(jobs, updates, strict=True)
+            ):
                 params_c, _, lr, scale, _, singleton = job
                 assert update is not None
                 if singleton:
@@ -1323,7 +1332,7 @@ class Muon(Optimizer):
 
         out: list[torch.Tensor | None] = [None] * len(tensors)
         classic: list[int] = []
-        for i, g in enumerate(tensors):
+        for i, g in stepaudit.iterations("muon.ns_dispatch", enumerate(tensors)):
             why = path_reason(g, self.ns_dtype)
             if why is None:
                 try:
@@ -1338,7 +1347,9 @@ class Muon(Optimizer):
             self.counters.why = f"triton: {why}"  # type: ignore[attr-defined]
         if classic:
             outs = _classic_ns_many([tensors[i] for i in classic], steps, self.ns_dtype)
-            for i, update in zip(classic, outs, strict=True):
+            for i, update in stepaudit.iterations(
+                "muon.ns_classic_out", zip(classic, outs, strict=True)
+            ):
                 out[i] = update
         return out  # type: ignore[return-value]
 
@@ -1666,7 +1677,7 @@ class MixOptimizer:
         keep = flag.to(torch.bool)
         one = torch.ones_like(scale)
         zeroed: list[tuple[dict, float]] = []
-        for group in self.adamw.param_groups:
+        for group in stepaudit.iterations("adamw.groups", self.adamw.param_groups):
             params = [p for p in group["params"] if p.grad is not None]
             if not params:
                 continue
@@ -1698,7 +1709,7 @@ class MixOptimizer:
             if moments:
                 torch._foreach_mul_(moments, scale)
         self.adamw.step()
-        for group, wd in zeroed:
+        for group, wd in stepaudit.iterations("adamw.restore_wd", zeroed):
             group["weight_decay"] = wd
 
     def group_grad_norms(self) -> dict[str, torch.Tensor]:

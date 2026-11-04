@@ -46,6 +46,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .. import stepaudit
+
 #: Refresh telemetry, per step. `qat_refresh_calls` is how many times the
 #: quantizer ran (`tsct.qat_values`); `qat_refresh_tensors` is how many weight
 #: tensors those calls covered. ONE stacked call over `[E, ·, ·]` is one call
@@ -230,10 +232,20 @@ def invalidate_qat_cache_all(model: nn.Module) -> int:
     moves a parameter's VALUE without bumping `_version` (measured 2026-10-19),
     so no version-keyed cache can outlive a step in which the optimizer ran.
     This one does not even look at `_version`; the call is the invalidation.
+
+    `DormouseModel` already holds the deduplicated cache list
+    (`_qat_caches`, built once by `attach_qat_caches`), so the per-step call
+    walks caches, not modules. A hand-built module without that list keeps the
+    walk — the only caller that reaches it is a test or a custom model.
     """
+    caches = getattr(model, "_qat_caches", None)
+    if caches is not None:
+        for c in stepaudit.iterations("qat.invalidate", caches):
+            c.invalidate()
+        return len(caches)
     seen: set[int] = set()
     n = 0
-    for m in model.modules():
+    for m in stepaudit.iterations("qat.invalidate.walk", model.modules()):
         c = getattr(m, "_qat_cache", None)
         if c is not None and id(c) not in seen:
             seen.add(id(c))

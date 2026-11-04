@@ -24,6 +24,8 @@ from typing import NoReturn
 
 import torch
 
+from . import stepaudit
+
 
 class LoudError(RuntimeError):
     """A degradation that stops the run, naming cause and escape.
@@ -77,15 +79,31 @@ class Counters(dict):
 
         This is the 0-sync rule (the port's rule 1.3): a counter built from a
         device value must never call `.item()`. The drain happens ONCE per
-        window — `drain()` is called by the trainer on the log cadence only.
+        window — `drain_if_due()` is called by the trainer on the log cadence.
+
+        The accumulator is updated IN PLACE after the first call: the old
+        `get(name, 0) + n` allocated a fresh tensor per count, i.e. per step per
+        counter per counter object. The first tensor is cloned so a caller's
+        scalar (a firewall flag view) can never be mutated through the counter.
         """
-        self._device[name] = self._device.get(name, 0) + n
+        cur = self._device.get(name)
+        if cur is None:
+            self._device[name] = n.detach().clone()
+        else:
+            cur.add_(n)
 
     def drain(self) -> dict[str, int]:
-        """Read every pending device counter ONE time, as a batch.
+        """Read every pending device counter with ONE host read for the window.
 
         One GPU→CPU transfer for the whole window, at the log cadence's
         declared cost. The pending state empties; counters stay honest.
+
+        The read is batched on purpose: the first version called `.item()` /
+        `.tolist()` once per counter, so a 12-counter window paid 12 device
+        syncs (`scripts/sync_audit.py` measured exactly that) while the
+        docstring claimed one. Every value is cast to float64 and concatenated
+        on the device, then `.tolist()` crosses ONCE — counts stay exact below
+        2**53; float32 readings widen exactly.
 
         Integer tensors accumulate as integer counters (a zero is not an
         entry). A 0-dim FLOAT tensor is kept as a float under the same name,
@@ -95,33 +113,89 @@ class Counters(dict):
         `train/optim.py::group_grad_norms`); an all-zero group is a statement
         ("every gradient in it was gated"), not an absence.
         """
+        if not self._device:
+            return {}
+        items = list(self._device.items())
+        self._device.clear()
+        meta: list[tuple[str, bool, int]] = []
+        flats: list[torch.Tensor] = []
+        for name, t in stepaudit.iterations("counters.drain.pack", items):
+            meta.append((name, t.dtype.is_floating_point, t.numel()))
+            flats.append(t.detach().reshape(-1).to(torch.float64))
+        # THE ONE READ of the window: a single `.tolist()` on a CPU tensor (one
+        # stream drain on CUDA), not one per counter.
+        values = torch.cat(flats).tolist()
         out: dict[str, float | int | list[int]] = {}
-        for name, t in list(self._device.items()):
-            out[name] = t.item() if t.numel() == 1 else [int(x) for x in t.tolist()]
-            del self._device[name]
-        for name, value in out.items():
+        pos = 0
+        for name, is_float, n in stepaudit.iterations("counters.drain", meta):
+            chunk = values[pos : pos + n]
+            pos += n
+            if n == 1:
+                out[name] = chunk[0] if is_float else int(chunk[0])
+            else:
+                out[name] = [int(v) for v in chunk]
+        self._fold(out)
+        return out
+
+    def _fold(self, out: dict[str, float | int | list[int]]) -> None:
+        """Merge already-drained values into the host counters (the ONE policy)."""
+        for name, value in stepaudit.iterations("counters.fold", out.items()):
             if isinstance(value, list):
-                for i, v in enumerate(value):
+                for i, v in stepaudit.iterations("counters.fold.list", enumerate(value)):
                     if v:
                         self.count(f"{name}[{i}]", v)
             elif isinstance(value, float):
                 self[name] = self.get(name, 0) + value
             elif value:
                 self.count(name, value)
-        return out
+
+    def absorb(self, drained: dict[str, float | int | list[int]]) -> None:
+        """Fold a window's drained values without a second device read.
+
+        The trainer keeps a WINDOW counter and a run-TOTAL counter, and both
+        accumulate the same device tensors (`window.merge(step)` and
+        `total.merge(step)` sit side by side). `window.drain()` reads them
+        once; the total's copy is dropped here and the values are folded
+        instead, so a report step costs ONE GPU→CPU transfer, not two. Only
+        valid when the two counters hold the same window — which is the
+        trainer's construction, not an assumption callers may make.
+        """
+        extra = set(self._device) - set(drained)
+        assert not extra, f"absorb would drop device counters {sorted(extra)}"
+        self._device.clear()
+        self._fold(drained)
+
+    def drain_if_due(self, step: int, every: int) -> dict[str, int] | None:
+        """Drain only on a REPORT step — the cadence owns the sync cost.
+
+        `step` is the 1-based count of completed steps (the trainer's
+        `step + 1`). A non-report step returns `None` without touching
+        `_device`, so the audit can assert ZERO host reads on it rather than
+        trusting a ratio. `every <= 0` is LOUD: a zero cadence would silently
+        never report.
+        """
+        if every <= 0:
+            loud(
+                f"log_every={every}: a zero/negative cadence never drains the device "
+                f"counters, so the log line would silently lose every arm reading. "
+                f"Escape: log_every >= 1."
+            )
+        if step % every != 0:
+            return None
+        return self.drain()
 
     def line(self) -> str:
         """The one-line form, deterministic (sorted) so two runs' lines diff."""
         return " ".join(f"{k}={self[k]}" for k in sorted(self))
 
     def merge(self, other: Counters) -> None:
-        for k, v in other.items():
+        for k, v in stepaudit.iterations("counters.merge.host", other.items()):
             if isinstance(v, float):
                 self[k] = self.get(k, 0) + v
             else:
                 self.count(k, v)
-        for k, v in other._device.items():
-            self._device[k] = self._device.get(k, 0) + v
+        for k, v in stepaudit.iterations("counters.merge.device", other._device.items()):
+            self.count_device(k, v)
 
 
 class StepTimer:

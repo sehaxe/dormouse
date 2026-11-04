@@ -69,6 +69,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .. import stepaudit
 from ..instrument import Counters, loud
 from .tsct import qat_linear
 
@@ -128,10 +129,16 @@ def slot_keys_gpu(input_ids: torch.Tensor, orders: Sequence[int]) -> torch.Tenso
     b, t = input_ids.shape
     dev = input_ids.device
     out = torch.empty(b, t, len(orders), dtype=torch.int64, device=dev)
-    for oi, order in enumerate(orders):
+    # ONE pad for every lag: `lag` reads `[p-lag]`, so a window padded to the
+    # widest lag and sliced is the same tensor `F.pad(..., (lag, 0))[:, :t]`
+    # built, without a fresh full copy per (order, lag) pair.
+    max_lag = max(orders) - 1
+    padded = F.pad(input_ids, (max_lag, 0), value=_PAD_BYTE) if max_lag else input_ids
+    for oi, order in stepaudit.iterations("engram.slot_keys.orders", enumerate(orders)):
         h = torch.full((b, t), FNV_OFFSET_BASIS, dtype=torch.int64, device=dev)
-        for lag in range(order - 1, -1, -1):
-            byte = F.pad(input_ids, (lag, 0), value=_PAD_BYTE)[:, :t]
+        for lag in stepaudit.iterations("engram.slot_keys.lags", range(order - 1, -1, -1)):
+            start = max_lag - lag
+            byte = padded[:, start : start + t]
             folded = ((h ^ byte) * FNV_PRIME) & FNV_MASK64
             h = torch.where(byte < _PAD_BYTE, folded, h)
         out[:, :, oi] = h & KEY_MASK
@@ -281,6 +288,15 @@ class Engram(nn.Module):
         self.query_proj = nn.Linear(self.d, self.dim, bias=False, device=device)
         self.key_proj = nn.Linear(self.dim, self.dim, bias=False, device=device)
         self.value_proj = nn.Linear(self.dim, self.d, bias=False, device=device)
+        #: `[1, 1, orders]` broadcast index, built ONCE: the gather used to
+        #: rebuild it every forward (once per loop iteration per step) for a
+        #: constant that never moves. Non-persistent, so the checkpoint format
+        #: and the parameter count are untouched.
+        self.register_buffer(
+            "_order_idx",
+            torch.arange(len(self.orders), device=device).view(1, 1, -1),
+            persistent=False,
+        )
         #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
         #: as the factor rung): the three projections are plain `nn.Linear`s,
         #: so their weights are read through the annealed STE. The TABLES
@@ -315,8 +331,16 @@ class Engram(nn.Module):
         hidden: torch.Tensor,
         input_ids: torch.Tensor,
         counters: Counters | None = None,
+        slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """`hidden [b,t,d]` + the byte ids of the SAME positions → `[b,t,d]`.
+
+        `slots` is the window's precomputed `slots_for(input_ids)`. The loop
+        calls this once per ITERATION over the same `input_ids`, and the keys
+        are a pure function of them — `LoopBlock._window` computes them once
+        and passes them down, so `max_iter` iterations cost ONE key pass, not
+        `max_iter` (`slot_keys_gpu` is 3 orders × up to 3 lag folds of device
+        ops). `None` keeps the single-call API: compute them here.
 
         fp32 end to end, table and projections alike: on the burn stack the
         Engram kernels are f32-only (ILLEGAL_ADDRESS on bf16, measured
@@ -331,10 +355,10 @@ class Engram(nn.Module):
         """
         counters = Counters() if counters is None else counters
         if self.host is not None:
-            return self._forward_host(hidden, input_ids, counters)
-        slots = self.slots_for(input_ids)  # [b, t, n_orders]
-        order_idx = torch.arange(len(self.orders), device=hidden.device).view(1, 1, -1)
-        emb = self.tables[order_idx, slots]  # [b, t, n_orders, dim]
+            return self._forward_host(hidden, input_ids, counters, slots=slots)
+        if slots is None:
+            slots = self.slots_for(input_ids)  # [b, t, n_orders]
+        emb = self.tables[self._order_idx, slots]  # [b, t, n_orders, dim]
         return self._read(hidden, emb, counters)
 
     def _read(self, hidden: torch.Tensor, emb: torch.Tensor, counters: Counters) -> torch.Tensor:
@@ -360,7 +384,11 @@ class Engram(nn.Module):
         return (value * gate.unsqueeze(-1)).sum(2)  # [b, t, d]
 
     def _forward_host(
-        self, hidden: torch.Tensor, input_ids: torch.Tensor, counters: Counters
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        counters: Counters,
+        slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The host-table read: dedup the batch's rows, gather them to a leaf.
 
@@ -378,8 +406,9 @@ class Engram(nn.Module):
         """
         b, t, _ = hidden.shape
         orders = len(self.orders)
-        slots = self.slots_for(input_ids)  # [b, t, orders], device
-        order_idx = torch.arange(orders, device=slots.device).view(1, 1, -1)
+        if slots is None:
+            slots = self.slots_for(input_ids)  # [b, t, orders], device
+        order_idx = self._order_idx
         flat = (order_idx * self.slots + slots).reshape(-1).detach().to("cpu")
         uniq, inverse = torch.unique(flat, return_inverse=True)
         assert self.host is not None
