@@ -118,7 +118,20 @@ def test_the_window_is_a_progress_key_but_a_shrink_is_not(tmp_path):
     # other=incoming)`, so the incoming run is the narrow one.
     narrowed = load_run("configs/m400.toml", model_overrides={"max_seq_len": 512},
                         train_overrides={"seq_len": 512})
-    assert "model.max_seq_len" in base.diff_keys(narrowed)
+    # direction-agnostic: BOTH call sites must agree (`load_ckpt` passes
+    # (new, stored), the test below passes (stored, new))
+    assert base.diff_keys(narrowed) == narrowed.diff_keys(base) == []
+    # a SHRUNKEN training window is still legal on such an arm — the field only
+    # bounds decode; `validate_train` keeps seq_len <= max_seq_len
+    assert "train.seq_len" not in base.diff_keys(narrowed)
+
+    # the TOKEN BUDGET per step is the real identity: re-shard it freely...
+    reshard = load_run("configs/m400.toml", model_overrides={"max_seq_len": 8192},
+                       train_overrides={"batch": 1, "seq_len": 8192})
+    assert base.diff_keys(reshard) == []
+    # ...but a different budget is a different run
+    smaller = load_run("configs/m400.toml", train_overrides={"batch": 1, "seq_len": 1024})
+    assert "train.batch" in base.diff_keys(smaller)
 
     # an arm that BUILDS a positional table keeps the strict refusal
     bf = load_run(

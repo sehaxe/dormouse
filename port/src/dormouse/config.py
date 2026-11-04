@@ -1904,10 +1904,16 @@ class RunConfig:
         # the same curriculum step; shrinking it would invalidate every decode
         # caller. Arms that DO build a positional table (byteflow's RoPE table,
         # full attention's) keep the strict refusal.
+        # `max_seq_len` bounds buffers (decode's window, byteflow's RoPE table),
+        # not what the model learns. On an arm that builds NO positional table it
+        # is excluded from the resume identity entirely — direction-agnostic,
+        # because the two callers pass (new, stored) and (stored, new) and a
+        # direction-sensitive rule was wrong for one of them (measured
+        # 2026-11-04: the 8 KB resume refused on a field it had just allowed).
+        # `validate_train` still keeps `seq_len <= max_seq_len`.
         positional = self.model.use_byteflow or self.model.attn_kind == "full"
         if not positional and self.model.max_seq_len != other.model.max_seq_len:
-            if other.model.max_seq_len < self.model.max_seq_len:
-                out.append("model.max_seq_len")  # a SHRINK is never a resume
+            pass  # allowed: a buffer bound is not an experiment
         for section, a, b in (
             ("model", self.model, other.model),
             ("train", self.train, other.train),
@@ -1915,6 +1921,16 @@ class RunConfig:
             for f in dataclasses.fields(a):
                 if section == "train" and f.name in PROGRESS_KEYS:
                     continue
+                if section == "train" and f.name in ("batch", "grad_accum"):
+                    # the resume may re-shard the SAME bytes per step across a
+                    # different window/batch split (b8 x s1024 == b1 x s8192);
+                    # a different token budget is still a different run, and
+                    # that is caught below by comparing the product.
+                    if (
+                        self.train.batch * self.train.seq_len * self.train.grad_accum
+                        == other.train.batch * other.train.seq_len * other.train.grad_accum
+                    ):
+                        continue
                 if section == "model" and f.name == "max_seq_len" and not positional:
                     continue  # handled above: grow-only, and a grow is a resume
                 if getattr(a, f.name) != getattr(b, f.name):
