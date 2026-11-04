@@ -488,19 +488,73 @@ class DormouseModel(nn.Module):
             )
         return n
 
-    def configure_actmem(self, *, iter_checkpoint: bool, activation_offload: float) -> None:
-        """Install both TrainConfig activation-memory arms in one call.
+    def set_recompute(self, mode: str) -> int:
+        """Enable `activation_recompute` on every loop block; return the count.
+
+        `none` is the historical graph; `full` is `iter_checkpoint`'s whole-
+        iteration checkpoint; `selective` keeps the read half (q/k/v/g outputs
+        and the KDA/CSA boundary state) and recomputes only the write half.
+        A model with no loop block refuses the two recompute modes instead of
+        running them inert.
+        """
+        from .recompute import check_mode
+
+        check_mode(mode)
+        n = 0
+        for module in self.modules():
+            if isinstance(module, LoopBlock):
+                module.recompute = mode
+                n += 1
+        if mode != "none" and n == 0:
+            loud(
+                f"activation_recompute={mode!r} but this model builds no loop block "
+                f"(use_byteflow Option A returns before the loop), so the arm would "
+                f"recompute nothing while the log line reported it on. Escape: "
+                f"use_byteflow=false, or activation_recompute='none'."
+            )
+        return n
+
+    def configure_actmem(
+        self,
+        *,
+        iter_checkpoint: bool,
+        activation_offload: float,
+        activation_recompute: str = "none",
+    ) -> None:
+        """Install the TrainConfig activation-memory arms in one call.
 
         Called once by the trainer. `activation_offload=0.0` leaves the hook pair
         uninstalled (`self._act_offload is None`), which is the bit-identical
         default; a positive budget refuses the byteflow shapes because their
         chunked head's save set is not measured (see `model/act_mem.py`).
+
+        `activation_recompute` is the named arm. The historical
+        `iter_checkpoint=True` means `full` when the enum is `none`; naming two
+        different modes at once is refused by `config.validate_train` (the same
+        rule reaches a hand-built call here).
         """
-        if iter_checkpoint:
-            self.set_iter_checkpoint(True)
+        if iter_checkpoint and activation_recompute not in ("none", "full"):
+            loud(
+                f"iter_checkpoint=true with activation_recompute="
+                f"{activation_recompute!r}: two names for one recompute arm, and they "
+                f"do not name the same one. Escape: iter_checkpoint=false and the "
+                f"enum, or activation_recompute='full'."
+            )
+        mode = activation_recompute
+        if mode == "none" and iter_checkpoint:
+            mode = "full"
+        self.set_recompute(mode)
         if activation_offload == 0.0:
             self._act_offload = None
             return
+        if not self.cfg.bf16:
+            loud(
+                f"activation_offload={activation_offload} with bf16=false: the arm "
+                f"parks fp32 activations, i.e. twice the pinned bytes and twice the "
+                f"PCIe traffic of the measured bf16 arm, and the budget's arithmetic "
+                f"would describe a different tensor set. Escape: bf16=true, or "
+                f"activation_offload=0.0."
+            )
         mech = ActivationOffload(activation_offload)
         if self.bf is not None or self.bf_net is not None:
             loud(

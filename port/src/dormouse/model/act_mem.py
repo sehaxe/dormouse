@@ -121,6 +121,16 @@ class ActivationOffload:
         self._param_storages: set[int] = set()
         self._pinned_ok = bool(torch.cuda.is_available())
         self._pageable_fallback = False
+        #: EXACT budget arithmetic, per forward. `_forward_bytes` is the bytes
+        #: this region parked; `_skipped_bytes` is what the budget refused to
+        #: park after the profile (a non-zero value means the profile's tensor
+        #: set was not representative — refused loudly at the region's end).
+        self._forward_bytes = 0
+        self._skipped_bytes = 0
+        self._peak_forward_bytes = 0
+        self._allocations = 0
+        self._reuses = 0
+        self.profile_bytes = 0
 
     # --- setup ----------------------------------------------------------
 
@@ -136,16 +146,32 @@ class ActivationOffload:
         """A host buffer of exactly `nbytes`: pooled first, pinned when possible."""
         free = self._pool.get(nbytes)
         if free:
+            self._reuses += 1
             return free.pop()
         if self._pinned_ok:
             try:
-                return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-            except RuntimeError:
+                buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+                self._allocations += 1
+                return buf
+            except RuntimeError as e:
+                if torch.cuda.is_available():
+                    # The arm's premise is PINNED host memory: a pageable
+                    # fallback would silently halve the PCIe bandwidth the
+                    # budget was priced on, while the log still said the arm
+                    # was on. Refuse with the measured size instead.
+                    loud(
+                        f"activation_offload: the pinned allocator failed for a "
+                        f"{nbytes} B buffer ({type(e).__name__}: {e}). The arm is "
+                        f"specified as pinned host traffic; a pageable fallback is a "
+                        f"different mechanism. Escape: lower activation_offload, or "
+                        f"0.0."
+                    )
                 # A CUDA build with no visible device: the pinned allocator is
                 # unavailable. Pageable memory still holds the values; the
                 # degradation is COUNTED so a reader can tell the arms apart.
                 self._pinned_ok = False
                 self._pageable_fallback = True
+        self._allocations += 1
         return torch.empty(nbytes, dtype=torch.uint8)
 
     def _release(self, host: torch.Tensor) -> None:
@@ -167,16 +193,26 @@ class ActivationOffload:
         if not self._profiled:
             self._sizes.append(nbytes)
             return t
-        if self.threshold is None or nbytes < self.threshold or used + nbytes > self.budget:
+        if self.threshold is None or nbytes < self.threshold:
+            return t
+        if used + nbytes > self.budget:
+            # The profile's tensor set was not representative of this forward
+            # (a deeper `rand_depth` step, a different loop block). Silently
+            # parking a prefix would leave the arm on while part of the
+            # activation set stayed on device; the accounting below refuses at
+            # the end of the region with the exact bytes.
+            self._skipped_bytes += nbytes
             return t
         host = self._acquire(nbytes)
         # Exact copy: same dtype, same bits, no codec. `non_blocking` is what
         # makes the pinned buffer worth having (D2H overlaps the forward).
         host.view(t.dtype).view(t.shape).copy_(t.detach(), non_blocking=True)
         self._regions[-1][1] = used + nbytes
+        self._forward_bytes += nbytes
         self._live += 1
         counters.count("offload_tensors")
         counters.count("offload_gib_x100", nbytes * 100 // GIB)
+        counters.count("offload_bytes", nbytes)
         return _Offloaded(host, t.shape, t.dtype, t.device, self)
 
     def _unpack(self, packed: object) -> object:
@@ -199,14 +235,40 @@ class ActivationOffload:
         is what makes the counters land on the micro-batch that produced the
         saves under `grad_accum`.
         """
+        top = not self._regions
+        if top:
+            self._forward_bytes = 0
+            self._skipped_bytes = 0
         self._regions.append([counters, 0])
+        ok = False
         try:
             with saved_tensors_hooks(self._pack, self._unpack):
                 yield
             if not self._profiled:
                 self._finish_profile(counters)
+            ok = True
         finally:
             self._regions.pop()
+            if top:
+                self._peak_forward_bytes = max(self._peak_forward_bytes, self._forward_bytes)
+                if ok and self._profiled and self._skipped_bytes:
+                    # An exact refusal, not a silent partial arm: the profile
+                    # forward saved fewer/other sizes than this one, so the
+                    # budget cannot hold this forward's selected set. The
+                    # number is the measured overflow.
+                    budget = self.budget
+                    skipped = self._skipped_bytes
+                    self._skipped_bytes = 0
+                    loud(
+                        f"activation_offload={budget / GIB:g} GiB: this forward's "
+                        f"selected set exceeded the budget by {skipped} bytes "
+                        f"({skipped / GIB:.4f} GiB) and part of it stayed on device. "
+                        f"The budget is a per-forward cap and a partial arm is not "
+                        f"the mechanism. Escape: activation_offload >= "
+                        f"{(self._forward_bytes + skipped) / GIB:.4f} GiB, or 0.0."
+                    )
+                if self._forward_bytes:
+                    counters.count("offload_forward_bytes", self._forward_bytes)
 
     def _finish_profile(self, counters: Counters) -> None:
         """Pick the largest-first threshold that fits `budget`, once.
@@ -240,6 +302,7 @@ class ActivationOffload:
             total += size
             threshold = size
         self.threshold = threshold
+        self.profile_bytes = total
         counters.count("offload_profile_forward")
         if self._pageable_fallback:
             counters.count("offload_pageable")
@@ -255,4 +318,9 @@ class ActivationOffload:
             "live": self._live,
             "budget_bytes": self.budget,
             "pinned": self._pinned_ok,
+            "profile_bytes": self.profile_bytes,
+            "last_forward_bytes": self._forward_bytes,
+            "peak_forward_bytes": self._peak_forward_bytes,
+            "allocations": self._allocations,
+            "reuses": self._reuses,
         }

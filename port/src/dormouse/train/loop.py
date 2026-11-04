@@ -1007,21 +1007,30 @@ def train(
             "stream stays flat (the held-out window is the comparable number)."
         )
     model.train()
-    if cfg.iter_checkpoint or cfg.activation_offload > 0.0:
-        # The two activation-memory arms (`model/act_mem.py` and
-        # `loopblock._window`): both off by default and both installed ONCE here,
+    recompute = cfg.activation_recompute
+    if recompute == "none" and cfg.iter_checkpoint:
+        recompute = "full"
+    if recompute != "none" or cfg.activation_offload > 0.0:
+        # The activation-memory arms (`model/act_mem.py`,
+        # `model/recompute.py`): off by default and installed ONCE here,
         # before any forward, so a run that says `false`/`0.0` takes no branch.
         model.configure_actmem(
             iter_checkpoint=cfg.iter_checkpoint,
             activation_offload=cfg.activation_offload,
+            activation_recompute=cfg.activation_recompute,
         )
-        if cfg.iter_checkpoint:
+        if recompute != "none":
             log(
-                "iter_checkpoint: each loop iteration runs in "
-                "checkpoint(use_reentrant=False); only the iteration's input state "
-                "survives the forward and the backward recomputes the body. "
-                "`iter_checkpoint_saved` on the log line counts the recomputed "
-                "iterations per window."
+                f"activation_recompute={recompute}: each loop iteration runs in "
+                f"checkpoint(use_reentrant=False); "
+                + (
+                    "the whole body is recomputed"
+                    if recompute == "full"
+                    else "the read half (q/k/v/g projections, KDA/CSA state) is "
+                    "KEPT and only the write half (MoE + out_proj) is recomputed"
+                )
+                + ". `iter_checkpoint_saved` counts the recomputed iterations per "
+                "window."
             )
         if cfg.activation_offload > 0.0:
             log(

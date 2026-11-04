@@ -757,7 +757,10 @@ def _foreach_add_mixed_(params: list, update: torch.Tensor, alpha: float = 1.0) 
             f"promote them through one common dtype. Escape: one dtype per group."
         )
     if update.dtype == dtype:
-        torch._foreach_add_([p.detach() for p in params], torch.unbind(update), alpha=alpha)
+        # No `p.detach()`: the caller is under `torch.no_grad()`, so an in-place
+        # leaf op is legal, and a detach list is one DISPATCH PER PARAMETER
+        # (781 on the medium shape) before the fused add even starts.
+        torch._foreach_add_(params, torch.unbind(update), alpha=alpha)
         return
     if update.dtype != torch.float32:
         loud(
@@ -769,11 +772,11 @@ def _foreach_add_mixed_(params: list, update: torch.Tensor, alpha: float = 1.0) 
     if len(params) <= 3:
         # The stack is 3 launches; a handful of per-tensor mixed adds is fewer.
         for p, u in zip(params, torch.unbind(update), strict=True):
-            p.detach().add_(u, alpha=alpha)
+            p.add_(u, alpha=alpha)
         return
-    stacked = torch.stack([p.detach() for p in params])
+    stacked = torch.stack(list(params))
     stacked.add_(update, alpha=alpha)
-    torch._foreach_copy_([p.detach() for p in params], torch.unbind(stacked))
+    torch._foreach_copy_(params, torch.unbind(stacked))
 
 
 def _momentum_update_(mom: torch.Tensor, params: list, mu: float) -> None:
@@ -1368,7 +1371,7 @@ class Muon(Optimizer):
         with torch.no_grad():
             if self.wd:
                 torch._foreach_mul_(
-                    [p.detach() for p in params_c],
+                    params_c,
                     [_gate_identity(flag, 1.0 - lr * self.wd, p) for p in params_c],
                 )
             _foreach_add_mixed_(params_c, update, alpha=-lr)
@@ -1401,10 +1404,9 @@ class Muon(Optimizer):
                 z.mul_(1.0 - lr * self.wd)
             z.add_(p_hat)  # Z_{t+1} = Z_t - ηλZ_t - η̂P̂
             x.mul_(1.0 - c).add_(z, alpha=c)  # X_{t+1} = (1-c)X_t + c Z_{t+1}
-            heads = [p.detach() for p in params_c]
-            torch._foreach_copy_(heads, torch.unbind(z))
-            torch._foreach_mul_(heads, 1.0 - self.sf_beta)  # params <- Y
-            torch._foreach_add_(heads, torch.unbind(x), alpha=self.sf_beta)
+            torch._foreach_copy_(params_c, torch.unbind(z))
+            torch._foreach_mul_(params_c, 1.0 - self.sf_beta)  # params <- Y
+            torch._foreach_add_(params_c, torch.unbind(x), alpha=self.sf_beta)
 
 
 def is_muon_param(name: str, p: torch.Tensor) -> bool:
@@ -1545,6 +1547,10 @@ class MixOptimizer:
         self.model = model
         self.steps = 0
         self.steps_batched = 0
+        #: The AdamW step count as a HOST int, so `_foreach_adamw_step` never
+        #: reads a state scalar during a step. `load_state_dict` restores it
+        #: from the checkpoint's per-parameter `step` tensors once.
+        self._adamw_t = 0
 
     def enable_bnb8bit(self) -> None:
         """Swap the plain AdamW for bitsandbytes' 8-bit state, LOUD on absence.
@@ -1630,11 +1636,118 @@ class MixOptimizer:
             else:
                 n_batched = self.muon.batched_step_from_model(self.model, flag)
                 self.steps_batched = n_batched
-        if flag is None:
+        if self._fast_adamw_ok():
+            # The fused AdamW: ~10 dispatches for the whole group instead of
+            # torch's per-tensor walk (or its foreach route, which still reads
+            # each parameter's step scalar to the host). Gated and healthy steps
+            # share ONE definition, so the firewall cannot change the arithmetic.
+            self._foreach_adamw_step(flag)
+        elif flag is None:
             self.adamw.step()
         else:
             self._gated_adamw_step(flag)
         self.steps += 1
+
+    def _fast_adamw_ok(self) -> bool:
+        """Can the fused writer reproduce torch's AdamW on every live param?
+
+        One dtype and one device per group (the foreach kernels' contract), no
+        amsgrad/maximize/differentiable/capturable/tensor-lr arms, and the plain
+        fp32 AdamW the trainer builds. Anything else keeps the torch path —
+        a fallback, not a silent second definition.
+        """
+        if self.bnb8bit:
+            return False
+        for group in self.adamw.param_groups:
+            if torch.is_tensor(group["lr"]) or any(torch.is_tensor(b) for b in group["betas"]):
+                return False
+            if (
+                group.get("amsgrad")
+                or group.get("maximize")
+                or group.get("differentiable")
+                or group.get("capturable")
+            ):
+                return False
+            params = [p for p in group["params"] if p.grad is not None]
+            if not params:
+                continue
+            dtype, device = params[0].dtype, params[0].device
+            if any(p.dtype != dtype or p.device != device for p in params):
+                return False
+            if dtype not in (torch.float32, torch.bfloat16, torch.float16):
+                return False
+        return True
+
+    @torch.no_grad()
+    def _foreach_adamw_step(self, flag: torch.Tensor | None) -> None:
+        """AdamW as a handful of `_foreach_*` launches, bit-identical to torch.
+
+        `torch.optim.AdamW` walks the group one parameter at a time on CPU and,
+        even on CUDA's foreach route, reads every parameter's step tensor to
+        the host (`_local_scalar_dense`, 528 syncs on the medium shape) to form
+        the bias correction. Here the step count is `self._adamw_t` (a Python
+        int) and the state tensors are incremented in ONE `_foreach_add_`, so
+        no step value crosses PCIe. The arithmetic is the same statements in
+        the same order: decoupled decay, `lerp_`, `mul_`+`addcmul_`, `sqrt`/
+        `div`/`add`, `addcdiv_`.
+
+        The `flag` gate is the trainer's device firewall: the decay factor and
+        the first moment become the multiply identity on a healthy step and
+        zero on a skipped one, exactly as `_gated_adamw_step` does. The state
+        is created with torch's own shapes/dtypes (`exp_avg`, `exp_avg_sq`,
+        `step`) so a checkpoint is readable by `torch.optim.AdamW` and a resume
+        from one is readable here.
+        """
+        if not any(p.grad is not None for g in self.adamw.param_groups for p in g["params"]):
+            return
+        # ONE step advance for the whole optimizer, not one per param group:
+        # the bias correction is a function of the optimizer's step, and every
+        # group shares it.
+        self._adamw_t += 1
+        t = self._adamw_t
+        for group in self.adamw.param_groups:
+            params = [p for p in group["params"] if p.grad is not None]
+            if not params:
+                continue
+            grads = [p.grad for p in params]
+            lr, wd = group["lr"], group["weight_decay"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            states = [self.adamw.state[p] for p in params]
+            for p, st in zip(params, states, strict=True):
+                if "step" not in st:
+                    st["step"] = torch.zeros((), dtype=torch.float32)
+                    st["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    st["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            # ONE step increment for the whole group; the Python counter is the
+            # bias-correction source, so no state scalar is read to the host.
+            torch._foreach_add_([st["step"] for st in states], 1)
+            if wd:
+                if flag is None:
+                    factor: float | torch.Tensor = 1.0 - lr * wd
+                else:
+                    one = torch.ones((), dtype=params[0].dtype, device=params[0].device)
+                    kept = torch.as_tensor(
+                        1.0 - lr * wd, dtype=params[0].dtype, device=params[0].device
+                    )
+                    factor = torch.where(flag.to(torch.bool), kept, one)
+                torch._foreach_mul_(params, factor)
+            exp = [st["exp_avg"] for st in states]
+            sq = [st["exp_avg_sq"] for st in states]
+            torch._foreach_lerp_(exp, grads, 1.0 - beta1)
+            torch._foreach_mul_(sq, beta2)
+            torch._foreach_addcmul_(sq, grads, grads, 1.0 - beta2)
+            if flag is not None:
+                # The documented skip semantics: a non-finite step zeroes the
+                # first moment (the step after restarts momentum from the
+                # current gradient) and keeps the second decaying.
+                torch._foreach_mul_(exp, flag.to(exp[0].dtype))
+            bc1 = 1.0 - beta1**t
+            bc2_sqrt = (1.0 - beta2**t) ** 0.5
+            denom = torch._foreach_sqrt(sq)
+            torch._foreach_div_(denom, bc2_sqrt)
+            torch._foreach_add_(denom, eps)
+            torch._foreach_addcdiv_(params, exp, denom, -lr / bc1)
 
     @torch.no_grad()
     def _gated_adamw_step(self, flag: torch.Tensor) -> None:
@@ -1739,8 +1852,8 @@ class MixOptimizer:
                 if not grads:
                     out[name] = torch.zeros((), device=device)
                     continue
-                norms = torch._foreach_norm(grads, 2)
-                out[name] = torch.linalg.vector_norm(torch.stack([n.float() for n in norms]))
+                norms = torch._foreach_norm(grads, 2, dtype=torch.float32)
+                out[name] = torch.linalg.vector_norm(torch.stack(norms))
         return out
 
     def state_dict(self) -> dict:
@@ -1756,6 +1869,16 @@ class MixOptimizer:
             self.muon.load_state_dict(state["muon"])
         self.adamw.load_state_dict(state["adamw"])
         self.steps = int(state["steps"])
+        # The fused writer's bias correction reads `self._adamw_t`, while the
+        # checkpoint carries one `step` tensor per parameter. Read ONE of them
+        # here (at load, not per step) and trust the group's shared count.
+        steps = [
+            st["step"]
+            for group in self.adamw.param_groups
+            for p in group["params"]
+            if (st := self.adamw.state.get(p)) is not None and "step" in st
+        ]
+        self._adamw_t = int(steps[0]) if steps else 0
 
 
 def _gate_identity(flag: torch.Tensor | None, value: float, like: torch.Tensor):
@@ -1773,11 +1896,18 @@ def _gate_identity(flag: torch.Tensor | None, value: float, like: torch.Tensor):
 
 
 def _grad_vector_norm(grads: list[torch.Tensor]) -> torch.Tensor:
-    """`‖g‖₂` over a list of GRADIENT tensors as ONE device scalar."""
+    """`‖g‖₂` over a list of GRADIENT tensors as ONE device scalar.
+
+    `dtype=torch.float32` makes `_foreach_norm` compute every norm in fp32 in
+    the same fused call. Without it a bf16 gradient list comes back as bf16
+    scalars and `[n.float() for n in norms]` is one cast DISPATCH PER TENSOR
+    (815 on the medium shape) — the per-tensor walk this function exists to
+    delete, hiding inside the list comprehension.
+    """
     if not grads:
         return torch.zeros(())
-    norms = torch._foreach_norm(grads, 2)
-    return torch.linalg.vector_norm(torch.stack([n.float() for n in norms]))
+    norms = torch._foreach_norm(grads, 2, dtype=torch.float32)
+    return torch.linalg.vector_norm(torch.stack(norms))
 
 
 def grad_norm(params) -> torch.Tensor:
@@ -1839,8 +1969,8 @@ def agc_clip(params, clipping: float, eps: float = AGC_EPS) -> None:
         return
     grads = [p.grad for p in live]
     with torch.no_grad():
-        p_norm = torch.stack([n.float() for n in torch._foreach_norm(live, 2)])
-        g_norm = torch.stack([n.float() for n in torch._foreach_norm(grads, 2)])
+        p_norm = torch.stack(torch._foreach_norm(live, 2, dtype=torch.float32))
+        g_norm = torch.stack(torch._foreach_norm(grads, 2, dtype=torch.float32))
         scale = (clipping * p_norm / g_norm.clamp_min(eps)).clamp_(max=1.0)
         torch._foreach_mul_(grads, list(scale.unbind()))
 
