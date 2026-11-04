@@ -84,6 +84,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters, loud
+from . import fused_kda
 from .tsct import dense_qat_kind, dense_qat_weight, qat_linear
 
 #: Cached warmup verdict per device TYPE: `{"cuda": (ok, why), "cpu": (ok, why)}`.
@@ -254,6 +255,11 @@ class KDAAttention(nn.Module):
         #: identical (a GEMM may reorder the K reduction) — the gates pin 1e-6
         #: fp32 / 1e-2 bf16, never "equal".
         self.fused_latent_proj = bool(getattr(cfg, "fused_latent_proj", False))
+        #: The projection tail (`model/fused_kda.py`): `q/k/v`'s cast,
+        #: `logsigmoid(g)` and `sigmoid(beta)` as ONE Triton launch instead of
+        #: six eager passes. OFF is the eager code, bit for bit; a CPU host or
+        #: a bf16 input is a COUNTED `fused_kda_tail_fallback`.
+        self.fused_kda_tail = bool(getattr(cfg, "fused_kda_tail", False))
         #: `None` when the latent is off — no module, no RNG draw, no state key.
         self.latent_down = (
             nn.Linear(d, self.attn_latent_rank, bias=False, device=device)
@@ -345,14 +351,31 @@ class KDAAttention(nn.Module):
         """
         b, t, _ = x.shape
         h, hd = self.n_heads, self.head_dim
-        dq = (self.dense_qat, self.dense_qat_alpha)
-        c = self._latent_base(x, dq)
-        q, k, v, g = self._qkvg(c, dq)
+        q, k, v, g, beta = self.projections_raw(x)
         q = q.reshape(b, t, h, hd)
         k = self._kv(k, b, t)
         v = self._kv(v, b, t)
         g = F.logsigmoid(g.float()).reshape(b, t, h, hd)
-        beta = torch.sigmoid(qat_linear(self.beta_proj, x, *dq).float())  # [b, t, h]
+        beta = torch.sigmoid(beta.float())  # [b, t, h]
+        return q, k, v, g, beta
+
+    def projections_raw(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`x [b,t,d]` -> the projections' RAW outputs, before the elementwise tail.
+
+        `q [b,t,d]`, `k/v [b,t,kv_width]`, the decay logits `g [b,t,d]` and the
+        write strength `beta [b,t,h]`, all fp32: the projections are plain
+        `nn.Linear`s over the fp32 residual, so `q.to(bf16)` / `logsigmoid` /
+        `sigmoid` are elementwise passes after the GEMM. This call is the split
+        those passes hang off: [`projections`] is this plus the eager tail (the
+        shipped arithmetic, unchanged), and `fused_kda.tail` does the same tail
+        in ONE launch (`fused_kda_tail=true`).
+        """
+        dq = (self.dense_qat, self.dense_qat_alpha)
+        c = self._latent_base(x, dq)
+        q, k, v, g = self._qkvg(c, dq)
+        beta = qat_linear(self.beta_proj, x, *dq)
         return q, k, v, g, beta
 
     def _heads(self, x: torch.Tensor, b: int, t: int) -> torch.Tensor:
@@ -400,7 +423,7 @@ class KDAAttention(nn.Module):
         ok, why = fla_status(x.device)
         if ok:
             counters.count("kda_fla")
-            return self._fla_path(x, state, carry=carry)
+            return self._fla_path(x, state, carry=carry, counters=counters)
         counters.count("kda_sdpa")
         # The reason is attached to the counter object, not printed per forward:
         # `log line` prints one `kda=` field, and the reason belongs there.
@@ -514,6 +537,7 @@ class KDAAttention(nn.Module):
         x: torch.Tensor,
         state: torch.Tensor | None = None,
         carry: bool = False,
+        counters: Counters | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The real arm: FLA 0.5.2's chunked per-channel gated-delta kernel.
 
@@ -534,9 +558,31 @@ class KDAAttention(nn.Module):
 
         b, t, d = x.shape
         dt = self.compute_dtype
-        q, k, v, g, beta = self.projections(x)
-        if dt != torch.float32:
-            q, k, v, beta = q.to(dt), k.to(dt), v.to(dt), beta.to(dt)
+        # The tail is fp32-input only: the projections are fp32 under bf16=true,
+        # so the training arm qualifies; a whole-model bf16 cast or a CPU host
+        # takes the eager lines and says so (`fused_kda_tail_fallback`).
+        # `fused_latent_proj` returns q/k/v/g as VIEWS of one concatenated
+        # output, so they are not row-contiguous and the row-program cannot
+        # read them without a copy (which would eat the whole win). That pair
+        # is a COUNTED fallback, not a hidden `.contiguous()`.
+        fuse = (
+            self.fused_kda_tail
+            and not self.fused_latent_proj
+            and fused_kda.unsupported_reason(x.dtype, x.device.type) is None
+        )
+        if fuse:
+            qr, kr, vr, gr, br = self.projections_raw(x)
+            q, k, v, g, beta = fused_kda.tail(qr, kr, vr, gr, br, dt, counters)
+            q = q.reshape(b, t, self.n_heads, self.head_dim)
+            k = self._kv(k, b, t)
+            v = self._kv(v, b, t)
+            g = g.reshape(b, t, self.n_heads, self.head_dim)
+        else:
+            if self.fused_kda_tail and counters is not None:
+                counters.count("fused_kda_tail_fallback")
+            q, k, v, g, beta = self.projections(x)
+            if dt != torch.float32:
+                q, k, v, beta = q.to(dt), k.to(dt), v.to(dt), beta.to(dt)
         if not carry:
             out, _ = chunk_kda(
                 q,

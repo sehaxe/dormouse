@@ -663,6 +663,27 @@ class ModelConfig:
     #: eager lines, bit for bit. Needs `use_mhc` and fp32 lanes (same refusals
     #: as `fused_residual`); a CPU host is a COUNTED `fused_epilogue_fallback`.
     fused_epilogue: bool = False
+    #: The KDA-side elementwise chain as TWO Triton kernels
+    #: (`model/fused_kda.py`; `scripts/pass_census.py` ranks every group):
+    #:
+    #: 1. `tail` — the four fp32 projection outputs are the kernel's inputs:
+    #:    `q/k/v` cast to the compute dtype, `g = logsigmoid(g)` fp32 and
+    #:    `beta = sigmoid(beta)` become ONE launch per iteration instead of the
+    #:    six eager passes (`kda.projections` + the four casts in `_fla_path`).
+    #:    The traffic is unchanged (a cast reads its source and writes its
+    #:    destination either way); five launches leave.
+    #: 2. `combine` — `y = attn·attn_write + branch·attn_write + ffn·mlp_write`
+    #:    is ONE launch over the three branch outputs instead of five eager
+    #:    passes (`loopblock._step_post`). On the m400b run this is the census's
+    #:    #2 group by bytes: 604 MB -> 201 MB per iteration, ~212 us at 1.9 TB/s.
+    #:
+    #: OFF by default and bit-identical when off: the eager lines run unchanged.
+    #: fp32 inputs only (the residual stream and the KDA projections are fp32
+    #: even under `bf16=true`, so the training arm qualifies); a CPU host or a
+    #: bf16-cast model is a COUNTED `fused_kda_tail_fallback`. The census's #1
+    #: group by traffic is the Engram read (982 MB/iteration), NOT this one —
+    #: the flag is named for the arm it fuses, not for the ranking.
+    fused_kda_tail: bool = False
     #: LOOM (`2610.01153`, 2026-10-01; scanned in
     #: `docs/research/2026-10-16-new-tech-scan.md` §2.1, whose row names our
     #: own `max_iter 4` / operating depth 2 as exactly the regime that paper
