@@ -39,7 +39,7 @@ from dormouse.instrument import Counters, LoudError
 from dormouse.model import DormouseModel
 from dormouse.model.experts import SparseMoE, switch_aux_loss
 from dormouse.train import train
-from dormouse.train.loop import ckpt_paths
+from dormouse.train.loop import ckpt_paths, load_model_half, load_model_state
 
 #: Captured on clean `main` (`34f1460`) with `torch.manual_seed(0/1/2)` and the
 #: `conftest` tiny fixture — the pin the OFF path must keep reproducing.
@@ -462,6 +462,53 @@ def test_the_sign_arm_winds_past_the_clamp_and_prop_does_not():
     assert max(live) >= 12, f"prop never spread the routing: {live}"
     sign._lfb_step(torch.tensor([[0, 1]] * 64), Counters())
     assert float(sign.lfb_bias.abs().max()) > 150.0, "the sign arm stopped winding"
+
+
+def test_a_diverged_bias_refuses_a_training_resume(tmp_path):
+    """`max|bias| > 10` — the `m400` shape — is not resumable, and says why.
+
+    The bias is added to the logits unconditionally, so a file past the bound
+    routes 9 of 512 experts whatever the optimizer does next. Revert: drop the
+    `loud(msg)` for `refuse=True` and this resume succeeds silently on the
+    collapsed router.
+    """
+    run = run_of(tmp_path, "div", moe_lb_mode="sign", moe_lb_coef=0.01)
+    torch.manual_seed(0)
+    train(DormouseModel(run.model), run, log=lambda *_: None)
+    weights, _snap = ckpt_paths(run.train)
+    ck = torch.load(weights, map_location="cpu", weights_only=False)
+    ck["moe"] = {name: torch.full_like(b, -218.27) for name, b in ck["moe"].items()}
+    torch.save(ck, weights)
+
+    longer = run_of(tmp_path, "div", moe_lb_mode="sign", moe_lb_coef=0.01)
+    longer = dataclasses.replace(longer, train=dataclasses.replace(longer.train, steps=4))
+    with pytest.raises(LoudError) as e:
+        train(DormouseModel(longer.model), longer, resume=True, log=lambda *_: None)
+    msg = str(e.value)
+    assert "lfb_bias" in msg and "DIVERGED" in msg and "Escape:" in msg
+
+
+def test_a_reader_serves_a_diverged_bias_and_says_so(tmp_path, capsys):
+    """`eval`/`decode`/`serve` must still be able to INSPECT the evidence.
+
+    Same file, reader path: one LOUD line, the file served as written, no raise.
+    Revert: make `report_lfb_range` raise for readers too and a collapsed
+    checkpoint becomes uninspectable.
+    """
+    run = run_of(tmp_path, "read", moe_lb_mode="sign", moe_lb_coef=0.01)
+    torch.manual_seed(0)
+    train(DormouseModel(run.model), run, log=lambda *_: None)
+    weights, _snap = ckpt_paths(run.train)
+    ck = torch.load(weights, map_location="cpu", weights_only=False)
+    ck["moe"] = {name: torch.full_like(b, +72.67) for name, b in ck["moe"].items()}
+    torch.save(ck, weights)
+
+    torch.manual_seed(0)
+    fresh = DormouseModel(run.model)
+    load_model_state(fresh, run.train, load_model_half(weights))
+    out = capsys.readouterr().out
+    assert "DIVERGED" in out and "72.670" in out
+    assert float(fresh.loop.moe.lfb_bias.max()) == pytest.approx(72.67, abs=1e-3)
 
 
 # --- f. the routing path reads nothing back -----------------------------------
