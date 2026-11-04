@@ -248,6 +248,7 @@ def test_progress_keys_are_a_closed_set() -> None:
     """
     assert set(PROGRESS_KEYS) == {
         "seq_len",
+        "moe_kernel",
         "steps",
         "log_every",
         "ckpt_every",

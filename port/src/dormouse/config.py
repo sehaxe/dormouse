@@ -48,6 +48,11 @@ PRESET_DIR = Path(__file__).resolve().parents[2] / "configs"
 #: exists (byteflow/full attention size one) — see `_diff_keys`.
 PROGRESS_KEYS = (
     "seq_len",
+    # `moe_kernel` is an IMPLEMENTATION key, not an experiment: the three arms
+    # are proven equal to 1e-6 (tests/test_moe_batched.py gates a/b), the way two
+    # cuBLAS thread counts are. Switching it on a resume is a kernel change on
+    # the same math — and on 2026-11-04 it was worth 8.6x on the step.
+    "moe_kernel",
     "steps",
     "log_every",
     "ckpt_every",
