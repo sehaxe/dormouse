@@ -75,21 +75,43 @@ deliberate departures, both printed by [`parity`]:
 2. The AttnRes weight is `2σ(s)` instead of `2·softmax([0, s])[1]`: the same
    number in exact arithmetic, possibly the last ulp apart in fp32.
 
+**The EPILOGUE read** ([`epilogue_read`], `fused_epilogue=true`). The same
+`_pre_kernel` also emits the body's NORMED inputs: `ctx = H_pre x_l` is still
+in registers, so `RMSNorm(ctx)` and its LayerRoPE gain multiply happen in that
+one pass instead of a second kernel over `[b,t,d]`. Two gains when the paper
+form owns separate `attn_read`/`mlp_read` sites, one when v1/plain RMSNorm does.
+The gain VECTOR is built by the caller (the existing `LayerRoPENorm` /
+`LayerRoPEPaperGains` call, O(d) = 6 kB): moving the trig into the kernel would
+re-read the same vector once per row and buy nothing. Its gradient is a
+per-channel reduction the backward kernel already has `normed` for
+(`atomic_add`, 1.5 k adds/row).
+
 **Refusals** ([`unsupported_reason`]) name the combinations that cannot be
 fused legally, each with its escape; the caller routes those to eager. A host
-without Triton/CUDA is a **COUNTED** fallback (`fused_residual_fallback`), not a
-silent one.
+without Triton/CUDA is a **COUNTED** fallback (`fused_residual_fallback` for
+the write chain, `fused_epilogue_fallback` for the read chain), not a silent
+one.
+
+**Tiling.** Every program holds one row, so the block width is the row's
+`next_power_of_2` and elements past `d` are masked: `d = 1536` (the m400
+operating width) is not a power of two and the kernel has no reason to refuse
+it. `MAX_TILE` is the register ceiling, and `d` must be even because LayerRoPE
+rotates adjacent channel pairs.
 """
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 __all__ = [
     "EPS_XN",
     "SINKHORN_ITERS",
+    "epilogue_read",
+    "epilogue_reference",
     "fused_available",
     "parity",
+    "parity_read",
     "pre",
     "unsupported_reason",
     "write",
@@ -103,6 +125,9 @@ SINKHORN_ITERS = 20
 K = 2
 #: Register ceiling: a program holds one whole lane vector (2·D floats).
 MAX_KD = 4096
+#: Register ceiling for ONE row tile (`next_power_of_2(d)`): 2 048 floats hold
+#: `d = 1536` with a 33 % mask, at 8 warps = 8 floats/thread/lane.
+MAX_TILE = 2048
 #: The eight hyper-network outputs, in the order the kernels use them:
 #: `[H̃_pre(2), H̃_post(2), H̃_res(4)]`, `H̃_res` row-major.
 COLS = 8
@@ -169,19 +194,38 @@ def unsupported_reason(
             "has no such limit)."
         )
     d = kd // max(streams, 1)
-    if d < 16 or (d & (d - 1)) != 0:
+    if d < 32 or (d & 1):
         return (
-            f"fused_residual's tile is the whole lane row, so d must be a power of two "
-            f">= 16; d_model={d}. Escape: fused_residual=false (the eager chain has no "
-            "such limit), or a power-of-two d_model."
+            f"fused_residual's tile is the whole lane row and LayerRoPE rotates "
+            f"adjacent pairs, so d must be even and >= 32; d_model={d}. Escape: "
+            "fused_residual=false (the eager chain has no such limit), or an even "
+            "d_model of at least 32."
+        )
+    tile = tile_for(d)
+    if tile > MAX_TILE:
+        return (
+            f"fused_residual holds one lane row in registers: d_model={d} pads to a "
+            f"{tile}-wide tile, and the ceiling is {MAX_TILE}. Escape: "
+            "fused_residual=false (the eager chain has no such limit)."
         )
     return None
 
 
-def _warps(d: int) -> int:
-    """Threads per program: one lane vector is 2·D floats, 4-8 floats per lane."""
-    assert d >= 32 and (d & (d - 1)) == 0, f"D={d} must be a power of two (the tile is)"
-    return 4 if d <= 512 else 8
+def tile_for(d: int) -> int:
+    """`next_power_of_2(d)` — the block width a row-tile kernel must use."""
+    return 1 << (int(d) - 1).bit_length()
+
+
+def _warps(tile: int) -> int:
+    """Threads per program: one lane vector is 2·tile floats, 4 floats per lane.
+
+    `tile > 1024` is the masked `d = 1536` case: at 8 warps each thread would
+    hold 8 elements of every one of the eight φ columns, which spills; 16 warps
+    keeps the per-thread footprint at the 1024/8-warp level. Unmeasured here
+    (the card is the owner's) — `scripts/bench_epilogue.py` is the check.
+    """
+    assert tile >= 32 and (tile & (tile - 1)) == 0, f"tile={tile} must be a power of two"
+    return 4 if tile <= 512 else (8 if tile <= 1024 else 16)
 
 
 if _TRITON:  # pragma: no cover - compiled at import
@@ -210,40 +254,57 @@ if _TRITON:  # pragma: no cover - compiled at import
         XN,
         RAW,
         DOT,
+        NORMED,
+        GAIN,
+        NORMED_MLP,
+        GAIN_MLP,
         CNT,
         D: tl.constexpr,
+        B: tl.constexpr,
         EPS: tl.constexpr,
+        EPS_NORM: tl.constexpr,
+        HAS_NORM: tl.constexpr,
+        HAS_MLP: tl.constexpr,
     ):
-        """One row: lane norm, the eight hyper-network dots, `h_pre`, `ctx`."""
+        """One row: lane norm, the eight hyper-network dots, `h_pre`, `ctx`, and
+        (the epilogue arm) the body's `RMSNorm(ctx)·gain` from the same registers.
+        """
         row = tl.program_id(0).to(tl.int64)
-        i = tl.arange(0, D)
+        i = tl.arange(0, B)
+        m = i < D
         base = row * (2 * D)
-        x0 = tl.load(XL + base + i)
-        x1 = tl.load(XL + base + D + i)
+        x0 = tl.load(XL + base + i, mask=m, other=0.0)
+        x1 = tl.load(XL + base + D + i, mask=m, other=0.0)
         inv = tl.rsqrt((tl.sum(x0 * x0) + tl.sum(x1 * x1)) / (2 * D) + EPS)
         xn0 = x0 * inv
         xn1 = x1 * inv
-        tl.store(XN + base + i, xn0)
-        tl.store(XN + base + D + i, xn1)
+        tl.store(XN + base + i, xn0, mask=m)
+        tl.store(XN + base + D + i, xn1, mask=m)
 
         # phi_* are [2·D, C] row-major: column c of row j is at j*C + c.
-        p0 = tl.sum(xn0 * tl.load(PHI_PRE + i * 2)) + tl.sum(xn1 * tl.load(PHI_PRE + (D + i) * 2))
-        p1 = tl.sum(xn0 * tl.load(PHI_PRE + i * 2 + 1)) + tl.sum(
-            xn1 * tl.load(PHI_PRE + (D + i) * 2 + 1)
+        p0 = tl.sum(xn0 * tl.load(PHI_PRE + i * 2, mask=m, other=0.0)) + tl.sum(
+            xn1 * tl.load(PHI_PRE + (D + i) * 2, mask=m, other=0.0)
         )
-        q0 = tl.sum(xn0 * tl.load(PHI_POST + i * 2)) + tl.sum(xn1 * tl.load(PHI_POST + (D + i) * 2))
-        q1 = tl.sum(xn0 * tl.load(PHI_POST + i * 2 + 1)) + tl.sum(
-            xn1 * tl.load(PHI_POST + (D + i) * 2 + 1)
+        p1 = tl.sum(xn0 * tl.load(PHI_PRE + i * 2 + 1, mask=m, other=0.0)) + tl.sum(
+            xn1 * tl.load(PHI_PRE + (D + i) * 2 + 1, mask=m, other=0.0)
         )
-        r0 = tl.sum(xn0 * tl.load(PHI_RES + i * 4)) + tl.sum(xn1 * tl.load(PHI_RES + (D + i) * 4))
-        r1 = tl.sum(xn0 * tl.load(PHI_RES + i * 4 + 1)) + tl.sum(
-            xn1 * tl.load(PHI_RES + (D + i) * 4 + 1)
+        q0 = tl.sum(xn0 * tl.load(PHI_POST + i * 2, mask=m, other=0.0)) + tl.sum(
+            xn1 * tl.load(PHI_POST + (D + i) * 2, mask=m, other=0.0)
         )
-        r2 = tl.sum(xn0 * tl.load(PHI_RES + i * 4 + 2)) + tl.sum(
-            xn1 * tl.load(PHI_RES + (D + i) * 4 + 2)
+        q1 = tl.sum(xn0 * tl.load(PHI_POST + i * 2 + 1, mask=m, other=0.0)) + tl.sum(
+            xn1 * tl.load(PHI_POST + (D + i) * 2 + 1, mask=m, other=0.0)
         )
-        r3 = tl.sum(xn0 * tl.load(PHI_RES + i * 4 + 3)) + tl.sum(
-            xn1 * tl.load(PHI_RES + (D + i) * 4 + 3)
+        r0 = tl.sum(xn0 * tl.load(PHI_RES + i * 4, mask=m, other=0.0)) + tl.sum(
+            xn1 * tl.load(PHI_RES + (D + i) * 4, mask=m, other=0.0)
+        )
+        r1 = tl.sum(xn0 * tl.load(PHI_RES + i * 4 + 1, mask=m, other=0.0)) + tl.sum(
+            xn1 * tl.load(PHI_RES + (D + i) * 4 + 1, mask=m, other=0.0)
+        )
+        r2 = tl.sum(xn0 * tl.load(PHI_RES + i * 4 + 2, mask=m, other=0.0)) + tl.sum(
+            xn1 * tl.load(PHI_RES + (D + i) * 4 + 2, mask=m, other=0.0)
+        )
+        r3 = tl.sum(xn0 * tl.load(PHI_RES + i * 4 + 3, mask=m, other=0.0)) + tl.sum(
+            xn1 * tl.load(PHI_RES + (D + i) * 4 + 3, mask=m, other=0.0)
         )
         tl.store(DOT + row * 8 + 0, p0)
         tl.store(DOT + row * 8 + 1, p1)
@@ -276,7 +337,18 @@ if _TRITON:  # pragma: no cover - compiled at import
         tl.store(RAW + row * 8 + 6, ar * r2 + b2)
         tl.store(RAW + row * 8 + 7, ar * r3 + b3)
         # Eq. 3's H_pre x_l: the sigmoid-weighted mix down to the body's width.
-        tl.store(CTX + row * D + i, tl.sigmoid(pre0) * x0 + tl.sigmoid(pre1) * x1)
+        ctx_v = tl.sigmoid(pre0) * x0 + tl.sigmoid(pre1) * x1
+        tl.store(CTX + row * D + i, ctx_v, mask=m)
+        if HAS_NORM:
+            # The epilogue: the body's read is RMSNorm(ctx) with the caller's
+            # LayerRoPE gain, computed while `ctx_v` is still in registers.
+            invn = tl.rsqrt(tl.sum(ctx_v * ctx_v) / D + EPS_NORM)
+            nrm = ctx_v * invn
+            g = tl.load(GAIN + i, mask=m, other=0.0)
+            tl.store(NORMED + row * D + i, nrm * g, mask=m)
+            if HAS_MLP:
+                g2 = tl.load(GAIN_MLP + i, mask=m, other=0.0)
+                tl.store(NORMED_MLP + row * D + i, nrm * g2, mask=m)
         if tl.program_id(0) == 0:
             tl.store(CNT, 1)
 
@@ -294,17 +366,19 @@ if _TRITON:  # pragma: no cover - compiled at import
         W1,
         CNT,
         D: tl.constexpr,
+        B: tl.constexpr,
         EPS: tl.constexpr,
         COMPOSE: tl.constexpr,
         ITERS: tl.constexpr,
     ):
         """One row: Sinkhorn, the AttnRes write, `H_res xl + H_postᵀ a`, readout."""
         row = tl.program_id(0).to(tl.int64)
-        i = tl.arange(0, D)
+        i = tl.arange(0, B)
+        m = i < D
         base = row * (2 * D)
-        x0 = tl.load(XL + base + i)
-        x1 = tl.load(XL + base + D + i)
-        y = tl.load(Y + row * D + i)
+        x0 = tl.load(XL + base + i, mask=m, other=0.0)
+        x1 = tl.load(XL + base + D + i, mask=m, other=0.0)
+        y = tl.load(Y + row * D + i, mask=m, other=0.0)
 
         hp0 = 2.0 * tl.sigmoid(tl.load(RAW + row * 8 + 2))
         hp1 = 2.0 * tl.sigmoid(tl.load(RAW + row * 8 + 3))
@@ -346,7 +420,7 @@ if _TRITON:  # pragma: no cover - compiled at import
             # 2603.15031 Eq. 1/3 with S = 2 sources and u_0 = 0: `S·softmax` on
             # the one non-zero source is `2σ(s)`.
             ry = y * tl.rsqrt(tl.sum(y * y) / D + EPS)
-            w1 = 2.0 * tl.sigmoid(tl.sum(ry * tl.load(QEFF + i)))
+            w1 = 2.0 * tl.sigmoid(tl.sum(ry * tl.load(QEFF + i, mask=m, other=0.0)))
         else:
             w1 = 1.0
         a = w1 * y
@@ -357,9 +431,9 @@ if _TRITON:  # pragma: no cover - compiled at import
             h = (o0 + o1) * 0.5
         else:
             h = o0 + o1
-        tl.store(SN + base + i, o0)
-        tl.store(SN + base + D + i, o1)
-        tl.store(H + row * D + i, h)
+        tl.store(SN + base + i, o0, mask=m)
+        tl.store(SN + base + D + i, o1, mask=m)
+        tl.store(H + row * D + i, h, mask=m)
         tl.store(HRES + row * 4 + 0, hr00)
         tl.store(HRES + row * 4 + 1, hr01)
         tl.store(HRES + row * 4 + 2, hr10)
@@ -386,18 +460,20 @@ if _TRITON:  # pragma: no cover - compiled at import
         DA,
         DQROW,
         D: tl.constexpr,
+        B: tl.constexpr,
         EPS: tl.constexpr,
         COMPOSE: tl.constexpr,
         ITERS: tl.constexpr,
     ):
         """VJP of the write phase: readout → `H_post`/`H_res` → Sinkhorn → AttnRes."""
         row = tl.program_id(0).to(tl.int64)
-        i = tl.arange(0, D)
+        i = tl.arange(0, B)
+        m = i < D
         base = row * (2 * D)
-        x0 = tl.load(XL + base + i)
-        x1 = tl.load(XL + base + D + i)
-        y = tl.load(Y + row * D + i)
-        dh = tl.load(DH + row * D + i)
+        x0 = tl.load(XL + base + i, mask=m, other=0.0)
+        x1 = tl.load(XL + base + D + i, mask=m, other=0.0)
+        y = tl.load(Y + row * D + i, mask=m, other=0.0)
+        dh = tl.load(DH + row * D + i, mask=m, other=0.0)
         hp0 = tl.load(HPOST + row * 2 + 0)
         hp1 = tl.load(HPOST + row * 2 + 1)
         hr00 = tl.load(HRES + row * 4 + 0)
@@ -408,12 +484,12 @@ if _TRITON:  # pragma: no cover - compiled at import
 
         # h = (o0 + o1)/K (compose) or o0 + o1 (mhc only)
         if COMPOSE:
-            g0 = tl.load(DSN + base + i) + dh * 0.5
-            g1 = tl.load(DSN + base + D + i) + dh * 0.5
+            g0 = tl.load(DSN + base + i, mask=m, other=0.0) + dh * 0.5
+            g1 = tl.load(DSN + base + D + i, mask=m, other=0.0) + dh * 0.5
             a = w1 * y
         else:
-            g0 = tl.load(DSN + base + i) + dh
-            g1 = tl.load(DSN + base + D + i) + dh
+            g0 = tl.load(DSN + base + i, mask=m, other=0.0) + dh
+            g1 = tl.load(DSN + base + D + i, mask=m, other=0.0) + dh
             a = y
         dal = hp0 * g0 + hp1 * g1
         dhp0 = tl.sum(g0 * a)
@@ -467,17 +543,17 @@ if _TRITON:  # pragma: no cover - compiled at import
         if COMPOSE:
             ry = y * tl.rsqrt(tl.sum(y * y) / D + EPS)
             ds1 = tl.sum(dal * y) * (w1 - 0.5 * w1 * w1)
-            g_rms = ds1 * tl.load(QEFF + i)
+            g_rms = ds1 * tl.load(QEFF + i, mask=m, other=0.0)
             dyq = dal * w1
-            tl.store(DQROW + row * D + i, ds1 * ry)
+            tl.store(DQROW + row * D + i, ds1 * ry, mask=m)
         else:
-            g_rms = tl.zeros([D], dtype=tl.float32)
+            g_rms = tl.zeros([B], dtype=tl.float32)
             dyq = dal
         inv_y = tl.rsqrt(tl.sum(y * y) / D + EPS)
         cy = inv_y * inv_y * inv_y * tl.sum(y * g_rms) / D
-        tl.store(DY + row * D + i, dyq + inv_y * g_rms - cy * y)
-        tl.store(DX + base + i, dx0)
-        tl.store(DX + base + D + i, dx1)
+        tl.store(DY + row * D + i, dyq + inv_y * g_rms - cy * y, mask=m)
+        tl.store(DX + base + i, dx0, mask=m)
+        tl.store(DX + base + D + i, dx1, mask=m)
 
     @triton.jit
     def _bwd_pre_kernel(
@@ -491,23 +567,44 @@ if _TRITON:  # pragma: no cover - compiled at import
         A_PRE,
         A_POST,
         A_RES,
+        GAIN,
+        GAIN_MLP,
+        DNORMED,
+        DNORMED_MLP,
         DX,
         DPRE,
         D: tl.constexpr,
+        B: tl.constexpr,
         EPS: tl.constexpr,
+        EPS_NORM: tl.constexpr,
+        HAS_NORM: tl.constexpr,
+        HAS_MLP: tl.constexpr,
     ):
-        """VJP of the pre phase: `H_pre` → the eight φ dots → the lane RMSNorm."""
+        """VJP of the pre phase: the norm read → `H_pre` → the eight φ dots → the lane RMSNorm."""
         row = tl.program_id(0).to(tl.int64)
-        i = tl.arange(0, D)
+        i = tl.arange(0, B)
+        m = i < D
         base = row * (2 * D)
-        x0 = tl.load(XL + base + i)
-        x1 = tl.load(XL + base + D + i)
-        dctx = tl.load(DCTX + row * D + i)
+        x0 = tl.load(XL + base + i, mask=m, other=0.0)
+        x1 = tl.load(XL + base + D + i, mask=m, other=0.0)
+        dctx = tl.load(DCTX + row * D + i, mask=m, other=0.0)
         h0 = tl.sigmoid(tl.load(RAW + row * 8 + 0))
         h1 = tl.sigmoid(tl.load(RAW + row * 8 + 1))
         ap = tl.load(A_PRE)
         aq = tl.load(A_POST)
         ar = tl.load(A_RES)
+        if HAS_NORM:
+            # VJP of `normed = RMSNorm(ctx)·gain`: ONE reduction over the two
+            # read sites (attn_read + mlp_read when the paper form splits them).
+            ctxv = h0 * x0 + h1 * x1
+            invn = tl.rsqrt(tl.sum(ctxv * ctxv) / D + EPS_NORM)
+            dn = tl.load(DNORMED + row * D + i, mask=m, other=0.0)
+            gv = dn * tl.load(GAIN + i, mask=m, other=0.0)
+            if HAS_MLP:
+                dn2 = tl.load(DNORMED_MLP + row * D + i, mask=m, other=0.0)
+                gv += dn2 * tl.load(GAIN_MLP + i, mask=m, other=0.0)
+            cd = tl.sum(ctxv * gv)
+            dctx += invn * gv - (invn * invn * invn / D) * cd * ctxv
         # `ctx = Σ h_pre_k·xl_k` contributes to the pre-activation gradient the
         # write kernel cannot see (it never reads RAW columns 0:2).
         dpre0 = tl.load(D_RAW + row * 8 + 0) + tl.sum(dctx * x0) * (h0 * (1.0 - h0))
@@ -524,46 +621,79 @@ if _TRITON:  # pragma: no cover - compiled at import
         gr2 = tl.load(D_RAW + row * 8 + 6) * ar
         gr3 = tl.load(D_RAW + row * 8 + 7) * ar
         dxn0 = (
-            gp0 * tl.load(PHI_PRE + i * 2)
-            + gp1 * tl.load(PHI_PRE + i * 2 + 1)
-            + gq0 * tl.load(PHI_POST + i * 2)
-            + gq1 * tl.load(PHI_POST + i * 2 + 1)
-            + gr0 * tl.load(PHI_RES + i * 4)
-            + gr1 * tl.load(PHI_RES + i * 4 + 1)
-            + gr2 * tl.load(PHI_RES + i * 4 + 2)
-            + gr3 * tl.load(PHI_RES + i * 4 + 3)
+            gp0 * tl.load(PHI_PRE + i * 2, mask=m, other=0.0)
+            + gp1 * tl.load(PHI_PRE + i * 2 + 1, mask=m, other=0.0)
+            + gq0 * tl.load(PHI_POST + i * 2, mask=m, other=0.0)
+            + gq1 * tl.load(PHI_POST + i * 2 + 1, mask=m, other=0.0)
+            + gr0 * tl.load(PHI_RES + i * 4, mask=m, other=0.0)
+            + gr1 * tl.load(PHI_RES + i * 4 + 1, mask=m, other=0.0)
+            + gr2 * tl.load(PHI_RES + i * 4 + 2, mask=m, other=0.0)
+            + gr3 * tl.load(PHI_RES + i * 4 + 3, mask=m, other=0.0)
         )
         dxn1 = (
-            gp0 * tl.load(PHI_PRE + (D + i) * 2)
-            + gp1 * tl.load(PHI_PRE + (D + i) * 2 + 1)
-            + gq0 * tl.load(PHI_POST + (D + i) * 2)
-            + gq1 * tl.load(PHI_POST + (D + i) * 2 + 1)
-            + gr0 * tl.load(PHI_RES + (D + i) * 4)
-            + gr1 * tl.load(PHI_RES + (D + i) * 4 + 1)
-            + gr2 * tl.load(PHI_RES + (D + i) * 4 + 2)
-            + gr3 * tl.load(PHI_RES + (D + i) * 4 + 3)
+            gp0 * tl.load(PHI_PRE + (D + i) * 2, mask=m, other=0.0)
+            + gp1 * tl.load(PHI_PRE + (D + i) * 2 + 1, mask=m, other=0.0)
+            + gq0 * tl.load(PHI_POST + (D + i) * 2, mask=m, other=0.0)
+            + gq1 * tl.load(PHI_POST + (D + i) * 2 + 1, mask=m, other=0.0)
+            + gr0 * tl.load(PHI_RES + (D + i) * 4, mask=m, other=0.0)
+            + gr1 * tl.load(PHI_RES + (D + i) * 4 + 1, mask=m, other=0.0)
+            + gr2 * tl.load(PHI_RES + (D + i) * 4 + 2, mask=m, other=0.0)
+            + gr3 * tl.load(PHI_RES + (D + i) * 4 + 3, mask=m, other=0.0)
         )
         inv = tl.rsqrt((tl.sum(x0 * x0) + tl.sum(x1 * x1)) / (2 * D) + EPS)
         c = inv * inv * inv * (tl.sum(x0 * dxn0) + tl.sum(x1 * dxn1)) / (2 * D)
-        tl.store(DX + base + i, h0 * dctx + inv * dxn0 - c * x0)
-        tl.store(DX + base + D + i, h1 * dctx + inv * dxn1 - c * x1)
+        tl.store(DX + base + i, h0 * dctx + inv * dxn0 - c * x0, mask=m)
+        tl.store(DX + base + D + i, h1 * dctx + inv * dxn1 - c * x1, mask=m)
 
 
 class _Pre(torch.autograd.Function):
-    """`ctx = H_pre·xl`, plus the six other hyper-network dots for the write."""
+    """`ctx = H_pre·xl`, plus the six other hyper-network dots for the write.
+
+    The EPILOGUE arm (`HAS_NORM`) also returns `normed = RMSNorm(ctx)·gain` and,
+    when the paper form splits the read site, `normed_mlp = RMSNorm(ctx)·gain_mlp`
+    — both computed while `ctx` is in registers, so the body's read costs no
+    second pass over `[b,t,d]`.
+    """
 
     @staticmethod
     def forward(
-        ctx, xl, phi_pre, phi_post, phi_res, a_pre, a_post, a_res, b_pre, b_post, b_res, cnt
+        ctx,
+        xl,
+        phi_pre,
+        phi_post,
+        phi_res,
+        a_pre,
+        a_post,
+        a_res,
+        b_pre,
+        b_post,
+        b_res,
+        cnt,
+        gain,
+        gain_mlp,
+        eps_norm,
+        has_norm,
+        has_mlp,
     ):  # type: ignore[override]
         bt, kd = xl.shape
         d = kd // K
+        tile = tile_for(d)
         assert xl.is_contiguous() and kd == K * d, f"xl must be [bt, K·d] contiguous, {xl.shape}"
         assert cnt.dtype == torch.int32, "the launch counter is int32"
         ctx_t = torch.empty((bt, d), device=xl.device, dtype=torch.float32)
         xn = torch.empty((bt, kd), device=xl.device, dtype=torch.float32)
         raw = torch.empty((bt, COLS), device=xl.device, dtype=torch.float32)
         dot = torch.empty((bt, COLS), device=xl.device, dtype=torch.float32)
+        normed = (
+            torch.empty((bt, d), device=xl.device, dtype=torch.float32)
+            if has_norm
+            else None
+        )
+        normed_mlp = (
+            torch.empty((bt, d), device=xl.device, dtype=torch.float32)
+            if has_norm and has_mlp
+            else None
+        )
         _pre_kernel[(bt,)](
             xl,
             phi_pre,
@@ -579,24 +709,80 @@ class _Pre(torch.autograd.Function):
             xn,
             raw,
             dot,
+            ctx_t if normed is None else normed,
+            xl if normed is None else gain,
+            ctx_t if normed_mlp is None else normed_mlp,
+            xl if normed_mlp is None else gain_mlp,
             cnt,
             D=d,
+            B=tile,
             EPS=EPS_XN,
-            num_warps=_warps(d),
+            EPS_NORM=float(eps_norm),
+            HAS_NORM=bool(has_norm),
+            HAS_MLP=bool(has_mlp),
+            num_warps=_warps(tile),
         )
-        ctx.save_for_backward(xl, xn, raw, dot, phi_pre, phi_post, phi_res, a_pre, a_post, a_res)
+        ctx.save_for_backward(
+            xl, xn, raw, dot, phi_pre, phi_post, phi_res, a_pre, a_post, a_res, gain, gain_mlp,
+            ctx_t,
+        )
         ctx.cnt = cnt
-        return ctx_t, raw
+        ctx.has_norm = bool(has_norm)
+        ctx.has_mlp = bool(has_mlp)
+        ctx.eps_norm = float(eps_norm)
+        return ctx_t, raw, normed, normed_mlp
 
     @staticmethod
-    def backward(ctx, dctx, d_raw):  # type: ignore[override]
-        xl, xn, raw, dot, phi_pre, phi_post, phi_res, a_pre, a_post, a_res = ctx.saved_tensors
+    def backward(ctx, dctx, d_raw, dnormed, dnormed_mlp):  # type: ignore[override]
+        (
+            xl,
+            xn,
+            raw,
+            dot,
+            phi_pre,
+            phi_post,
+            phi_res,
+            a_pre,
+            a_post,
+            a_res,
+            gain,
+            gain_mlp,
+            ctx_t,
+        ) = ctx.saved_tensors
         bt, kd = xl.shape
         d = kd // K
+        tile = tile_for(d)
         if dctx is None:
-            dctx = torch.zeros_like(xn[:, :d])
+            dctx = torch.zeros((bt, d), device=xl.device, dtype=torch.float32)
+        else:
+            dctx = dctx.contiguous()
         if d_raw is None:
             d_raw = torch.zeros((bt, COLS), device=xl.device, dtype=torch.float32)
+        has_norm = ctx.has_norm
+        has_mlp = ctx.has_mlp
+        dgain = dgain_mlp = None
+        if not has_norm:
+            dnormed = dctx
+            dnormed_mlp = dctx
+        else:
+            if dnormed is None:
+                dnormed = torch.zeros((bt, d), device=xl.device, dtype=torch.float32)
+            else:
+                dnormed = dnormed.contiguous()
+            # The gain gradient is a reduction over rows — done in torch, not in
+            # the kernel: float atomics make the sum order nondeterministic, and
+            # this is the same expression `F.rms_norm`'s autograd uses.
+            invn = torch.rsqrt(ctx_t.pow(2).mean(-1, keepdim=True) + ctx.eps_norm)
+            nrm = ctx_t * invn
+            dgain = (dnormed * nrm).sum(0)
+            if has_mlp:
+                if dnormed_mlp is None:
+                    dnormed_mlp = torch.zeros((bt, d), device=xl.device, dtype=torch.float32)
+                else:
+                    dnormed_mlp = dnormed_mlp.contiguous()
+                dgain_mlp = (dnormed_mlp * nrm).sum(0)
+            else:
+                dnormed_mlp = dctx
         dx = torch.empty_like(xl)
         dpre = torch.empty((bt, K), device=xl.device, dtype=torch.float32)
         _bwd_pre_kernel[(bt,)](
@@ -610,11 +796,19 @@ class _Pre(torch.autograd.Function):
             a_pre,
             a_post,
             a_res,
+            gain,
+            gain_mlp,
+            dnormed,
+            dnormed_mlp,
             dx,
             dpre,
             D=d,
+            B=tile,
             EPS=EPS_XN,
-            num_warps=_warps(d),
+            EPS_NORM=ctx.eps_norm,
+            HAS_NORM=has_norm,
+            HAS_MLP=has_mlp,
+            num_warps=_warps(tile),
         )
         # The parameter gradients: ONE GEMM (the eight columns are α·d_raw, the
         # pre-columns using the total pre-activation gradient from the kernel)
@@ -636,6 +830,11 @@ class _Pre(torch.autograd.Function):
             db[2:4].contiguous(),
             db[4:8].reshape(K, K).contiguous(),
             None,
+            dgain,
+            dgain_mlp,
+            None,
+            None,
+            None,
         )
 
 
@@ -646,6 +845,7 @@ class _Write(torch.autograd.Function):
     def forward(ctx, xl, y, raw, qeff, compose, eps, iters, cnt):  # type: ignore[override]
         bt, kd = xl.shape
         d = kd // K
+        tile = tile_for(d)
         assert y.shape == (bt, d) and raw.shape == (bt, COLS), (
             f"the write's three shapes must agree: y {tuple(y.shape)} vs {(bt, d)}, "
             f"raw {tuple(raw.shape)} vs {(bt, COLS)}"
@@ -671,10 +871,11 @@ class _Write(torch.autograd.Function):
             w1,
             cnt,
             D=d,
+            B=tile,
             EPS=eps,
             COMPOSE=compose,
             ITERS=iters,
-            num_warps=_warps(d),
+            num_warps=_warps(tile),
         )
         ctx.save_for_backward(xl, y, traj, hres, hpost, w1, qeff, raw)
         ctx.cnt = cnt
@@ -688,6 +889,7 @@ class _Write(torch.autograd.Function):
         xl, y, traj, hres, hpost, w1, qeff, raw = ctx.saved_tensors
         bt, kd = xl.shape
         d = kd // K
+        tile = tile_for(d)
         if dsn is None:
             dsn = torch.zeros_like(xl)
         if dh is None:
@@ -711,10 +913,11 @@ class _Write(torch.autograd.Function):
             da,
             dqrow,
             D=d,
+            B=tile,
             EPS=ctx.eps,
             COMPOSE=ctx.compose,
             ITERS=ctx.iters,
-            num_warps=_warps(d),
+            num_warps=_warps(tile),
         )
         dq = dqrow.sum(0) if ctx.compose else None
         return dx, dy, da, dq, None, None, None, None
@@ -740,6 +943,11 @@ def pre(mhc, xl: torch.Tensor, counters) -> tuple[torch.Tensor, torch.Tensor]:
         mhc.b_post,
         mhc.b_res,
         cnt,
+        xl,
+        xl,
+        0.0,
+        False,
+        False,
     )
     # PREFIX-FORWARD COUNTER: `Counters.count_device` snapshots the value at
     # registration, so only kernels that have already run can be counted here —
@@ -747,8 +955,54 @@ def pre(mhc, xl: torch.Tensor, counters) -> tuple[torch.Tensor, torch.Tensor]:
     # profiler instead (`scripts/bench_fused_residual.py`, and the test that
     # pins both numbers).
     counters.count_device("fused_residual_launches", cnt)
-    ctx, raw = out
+    ctx, raw = out[0], out[1]
     return ctx.reshape(b, t, d), raw
+
+
+def epilogue_read(
+    mhc,
+    xl: torch.Tensor,
+    gain: torch.Tensor,
+    gain_mlp: torch.Tensor | None,
+    eps_norm: float,
+    counters,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """`(ctx, raw, normed, normed_mlp)` — the read half of one iteration, in ONE kernel.
+
+    `xl [b,t,K,d]` fp32 lanes, `gain [d]` the LayerRoPE gain at THIS depth (built
+    by the caller's existing `LayerRoPENorm`/paper-site call), `gain_mlp` the
+    second read site when the paper form splits attn/mlp (`None` for v1 and the
+    plain norm, where one gain serves both). The returned `ctx` is the
+    controller's input, `normed*` the body's; `raw` is the write's hand-off.
+    """
+    b, t, k, d = xl.shape
+    assert k == K, f"epilogue_read is the K=2 lane chain, got {k}"
+    cnt = torch.empty(1, dtype=torch.int32, device=xl.device)
+    ctx_t, raw, normed, normed_mlp = _Pre.apply(
+        xl.reshape(b * t, k * d),
+        mhc.phi_pre,
+        mhc.phi_post,
+        mhc.phi_res,
+        mhc.alpha_pre,
+        mhc.alpha_post,
+        mhc.alpha_res,
+        mhc.b_pre,
+        mhc.b_post,
+        mhc.b_res,
+        cnt,
+        gain,
+        gain if gain_mlp is None else gain_mlp,
+        float(eps_norm),
+        True,
+        gain_mlp is not None,
+    )
+    counters.count_device("fused_epilogue_launches", cnt)
+    return (
+        ctx_t.reshape(b, t, d),
+        raw,
+        normed.reshape(b, t, d),
+        None if normed_mlp is None else normed_mlp.reshape(b, t, d),
+    )
 
 
 def write(
@@ -772,7 +1026,120 @@ def write(
     return sn.reshape(b, t, k, d), h.reshape(b, t, d)
 
 
-def parity(b: int = 2, t: int = 8, d: int = 64, *, compose: bool = True, seed: int = 0) -> dict:
+def epilogue_reference(
+    mhc, xl: torch.Tensor, gain: torch.Tensor, gain_mlp: torch.Tensor | None, eps_norm: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """The `_pre_kernel` read formula in torch — the CPU PARITY gate's fused arm.
+
+    Deliberately NOT the eager modules: this is the arithmetic the kernel
+    performs (one lane norm, one `ctx`, one `RMSNorm(ctx)·gain`), so a gate over
+    it measures the fusion PLAN on a CPU host. The card's [`parity`] gate runs
+    the actual kernel against the same numbers. Autograd through both gives the
+    parameter gradients the rule also pins.
+    """
+    b, t, k, d = xl.shape
+    flat = xl.reshape(b, t, k * d)
+    inv = torch.rsqrt(flat.pow(2).sum(-1, keepdim=True) / (k * d) + EPS_XN)
+    xn = flat * inv
+    pre = mhc.alpha_pre * (xn @ mhc.phi_pre) + mhc.b_pre
+    ctx = (torch.sigmoid(pre).unsqueeze(-1) * xl).sum(-2)
+    n = ctx * torch.rsqrt(ctx.pow(2).mean(-1, keepdim=True) + eps_norm)
+    return ctx, n * gain, None if gain_mlp is None else n * gain_mlp
+
+
+def parity_read(
+    b: int = 2,
+    t: int = 8,
+    d: int = 64,
+    *,
+    separate: bool = False,
+    seed: int = 0,
+    use_kernel: bool = False,
+) -> dict:
+    """`epilogue_read` (or its CPU mirror) vs the eager pre-norm chain, outputs + grads.
+
+    `use_kernel=False` compares [`epilogue_reference`] against `MHCMix.pre_mix` +
+    `F.rms_norm` — the CPU gate. `use_kernel=True` (the card) compares the real
+    Triton kernel against the SAME eager calls; that is the kernel gate.
+    """
+    from .mhc import MHCMix
+
+    dev = "cuda" if use_kernel else "cpu"
+    if use_kernel and not fused_available():
+        raise AssertionError("parity_read(use_kernel=True) needs Triton + a CUDA device")
+    torch.manual_seed(seed)
+    mhc = MHCMix(d, K, device=dev)
+    with torch.no_grad():
+        mhc.phi_pre.normal_(0, 0.02)
+        mhc.phi_post.normal_(0, 0.02)
+        mhc.phi_res.normal_(0, 0.02)
+        mhc.alpha_pre.fill_(0.3)
+        mhc.alpha_post.fill_(0.2)
+        mhc.alpha_res.fill_(1.0)
+        mhc.b_pre.normal_(0, 0.5)
+        mhc.b_res.normal_(0, 1.5)
+    eps = 1e-3
+    gain = (torch.randn(d, device=dev) * 0.1 + 1.0).requires_grad_(True)
+    gain2 = (torch.randn(d, device=dev) * 0.1 + 1.0).requires_grad_(True)
+    base = (torch.randn(b, t, K, d, device=dev) * 0.5).requires_grad_(True)
+    g1 = torch.randn(b, t, d, device=dev)
+    g2 = torch.randn(b, t, d, device=dev)
+    gc = torch.randn(b, t, d, device=dev)
+
+    def run(fused: bool):
+        for p in mhc.parameters():
+            p.grad = None
+        gain.grad = gain2.grad = None
+        gain_mlp = gain2 if separate else None
+        if fused:
+            if use_kernel:
+                from ..instrument import Counters
+
+                ctx, _raw, n1, n2 = epilogue_read(mhc, base, gain, gain_mlp, eps, Counters())
+            else:
+                ctx, n1, n2 = epilogue_reference(mhc, base, gain, gain_mlp, eps)
+        else:
+            ctx = mhc.pre_mix(base)
+            n1 = F.rms_norm(ctx, (d,), gain, eps)
+            n2 = F.rms_norm(ctx, (d,), gain2, eps) if separate else None
+        loss = (ctx * gc).sum() + (n1 * g1).sum()
+        if n2 is not None:
+            loss = loss + (n2 * g2).sum()
+        loss.backward()
+        grads = {n: p.grad.clone() for n, p in mhc.named_parameters() if p.grad is not None}
+        grads["gain"] = gain.grad.clone()
+        if separate:
+            grads["gain_mlp"] = gain2.grad.clone()
+        grads["xl"] = base.grad.clone()
+        base.grad = None
+        out = (ctx.detach(), n1.detach(), None if n2 is None else n2.detach())
+        return out, grads
+
+    (c0, n0, m0), g0 = run(False)
+    (c1, n1, m1), g1 = run(True)
+    out: dict[str, tuple[float, float]] = {
+        "ctx": ((c0 - c1).abs().max().item(), c0.abs().max().item()),
+        "normed": ((n0 - n1).abs().max().item(), n0.abs().max().item()),
+    }
+    if separate:
+        assert m0 is not None and m1 is not None
+        out["normed_mlp"] = ((m0 - m1).abs().max().item(), m0.abs().max().item())
+    for k, v in g0.items():
+        out["d_" + k] = ((v - g1[k]).abs().max().item(), v.abs().max().item())
+    out["scale"] = (0.0, max(v[1] for k, v in out.items() if k.startswith("d_")))
+    return out
+
+
+def parity(
+    b: int = 2,
+    t: int = 8,
+    d: int = 64,
+    *,
+    compose: bool = True,
+    seed: int = 0,
+    epilogue: bool = False,
+    separate: bool = False,
+) -> dict:
     """Max |Δ| of the fused chain against eager, on outputs AND on gradients.
 
     Both arms run the same inputs through autograd; the eager arm is the shipped
@@ -781,6 +1148,10 @@ def parity(b: int = 2, t: int = 8, d: int = 64, *, compose: bool = True, seed: i
     The init is deliberately NOT the model's (`b_pre = 10` saturates σ, which
     would make an `H_pre` defect invisible): `b_pre ~ N(0, 0.5)` and
     `b_res ~ N(0, 1.5)` keep every gate live.
+
+    `epilogue=True` swaps the read half for [`epilogue_read`] and adds the
+    body's `normed` (and, with `separate`, `normed_mlp`) to the compared
+    tensors and the gains to the compared gradients.
 
     Returns `{name: (max|Δ|, max|ref|)}` plus `scale` (the largest reference
     gradient). [`assert_parity`] is the rule that turns it into a gate.
@@ -807,42 +1178,67 @@ def parity(b: int = 2, t: int = 8, d: int = 64, *, compose: bool = True, seed: i
     eps = 1e-3
     base = (torch.randn(b, t, K, d, device=dev) * 0.5).requires_grad_(True)
     y0 = (torch.randn(b, t, d, device=dev) * 0.5).requires_grad_(True)
+    gain = (torch.randn(d, device=dev) * 0.1 + 1.0).requires_grad_(True)
+    gain2 = (torch.randn(d, device=dev) * 0.1 + 1.0).requires_grad_(True)
     gc = torch.randn(b, t, d, device=dev)
+    gn = torch.randn(b, t, d, device=dev)
+    gn2 = torch.randn(b, t, d, device=dev)
     gh = torch.randn(b, t, d, device=dev)
 
     def run(fused: bool):
         for p in mhc.parameters():
             p.grad = None
         slot.query.grad = slot.gain.grad = None
+        gain.grad = gain2.grad = None
         xl, y = base * 1.0, y0 * 1.0
+        gain_mlp = gain2 if separate else None
         if fused:
             from ..instrument import Counters
 
             c = Counters()
-            ctx, raw = pre(mhc, xl, c)
+            ctx, raw, normed, normed_mlp = epilogue_read(mhc, xl, gain, gain_mlp, eps, c)
             sn, h = write(mhc, slot, xl, y, raw, compose, eps, c)
         else:
             ctx = mhc.pre_mix(xl)
+            normed = F.rms_norm(ctx, (d,), gain, eps)
+            normed_mlp = F.rms_norm(ctx, (d,), gain2, eps) if separate else None
             upd = depth_attend([torch.zeros_like(y), y], slot, eps, float(K)) if compose else y
             sn = mhc(xl, upd)
             h = sn.sum(dim=-2) / K if compose else sn.sum(dim=-2)
-        ((ctx * gc).sum() + (h * gh).sum()).backward()
+        loss = (ctx * gc).sum() + (h * gh).sum() + (normed * gn).sum()
+        if normed_mlp is not None:
+            loss = loss + (normed_mlp * gn2).sum()
+        loss.backward()
         grads = {n: p.grad.clone() for n, p in mhc.named_parameters() if p.grad is not None}
         if compose:
             grads["query"] = slot.query.grad.clone()
             grads["gain"] = slot.gain.grad.clone()
+        if gain.grad is not None:
+            grads["gain_read"] = gain.grad.clone()
+        if separate:
+            grads["gain_read_mlp"] = gain2.grad.clone()
         grads["xl"] = base.grad.clone()
         grads["y"] = y0.grad.clone()
         base.grad = y0.grad = None
-        return (ctx.detach(), sn.detach(), h.detach()), grads
+        return (
+            ctx.detach(),
+            sn.detach(),
+            h.detach(),
+            normed.detach(),
+            None if normed_mlp is None else normed_mlp.detach(),
+        ), grads
 
-    (c0, s0, h0), g0 = run(False)
-    (c1, s1, h1), g1 = run(True)
+    (c0, s0, h0, n0, m0), g0 = run(False)
+    (c1, s1, h1, n1, m1), g1 = run(True)
     out: dict[str, tuple[float, float]] = {
         "ctx": ((c0 - c1).abs().max().item(), c0.abs().max().item()),
         "streams": ((s0 - s1).abs().max().item(), s0.abs().max().item()),
         "h": ((h0 - h1).abs().max().item(), h0.abs().max().item()),
+        "normed": ((n0 - n1).abs().max().item(), n0.abs().max().item()),
     }
+    if separate:
+        assert m0 is not None and m1 is not None
+        out["normed_mlp"] = ((m0 - m1).abs().max().item(), m0.abs().max().item())
     for k, v in g0.items():
         out["d_" + k] = ((v - g1[k]).abs().max().item(), v.abs().max().item())
     out["scale"] = (0.0, max(v[1] for k, v in out.items() if k.startswith("d_")))

@@ -460,6 +460,14 @@ class LoopBlock(nn.Module):
         #: it without `use_mhc` (there would be no lanes to fuse); a host without
         #: CUDA/Triton is a COUNTED fallback (`_fused_ok`).
         self.fused_residual = bool(getattr(cfg, "fused_residual", False))
+        #: The NORM CHAIN as one fused read kernel (`epilogue_read`): the lane
+        #: norm, the eight hyper-network dots, `ctx`, and the body's
+        #: `RMSNorm(ctx)·LayerRoPE-gain` in the same pass. Requires `use_mhc`
+        #: (the read is over the lanes) and fp32 lanes; a CPU host is a COUNTED
+        #: fallback (`fused_epilogue_fallback`). If `fused_residual` is ALSO on,
+        #: the write half is the existing fused kernel, so one iteration is two
+        #: launches across the body instead of the eager chain's ~dozens.
+        self.fused_epilogue = bool(getattr(cfg, "fused_epilogue", False))
         self._fused_fell_back = False
         #: The DISTINCT bodies this driver cycles over (`DormouseModel` sets it
         #: to `(loop, *loop_extra)`); `None` means this block is the whole loop.
@@ -560,33 +568,45 @@ class LoopBlock(nn.Module):
         self._per_iter_ce = per_iter
         return out, (None if targets is None else rec), counters
 
-    def _fused_ok(self, xl: torch.Tensor, counters: Counters) -> bool:
-        """Can the fused chain run on this tensor? A host check is COUNTED, a
-        shape/dtype mismatch is LOUD.
+    def _fused_ok(self, xl: torch.Tensor, counters: Counters) -> str | None:
+        """Which fused route runs on this tensor: `"epilogue"`, `"residual"`, or
+        `None` (eager). A host check is COUNTED, a shape/dtype mismatch is LOUD.
 
         The distinction is the repo's one mark per degradation: "this host has
         no CUDA" is a legal place to run the model (the CPU suite is), so it must
         not stop the run — but a reader has to be able to tell the arm did not
-        run, so it increments `fused_residual_fallback` **once** per window. A
-        `[b,t,K,d]` the kernel cannot hold, or a non-fp32 lane, is a config that
-        lies about the arm, so it dies with the escape.
+        run, so it increments `fused_epilogue_fallback` / `fused_residual_fallback`
+        **once** per window. A `[b,t,K,d]` the kernel cannot hold, or a non-fp32
+        lane, is a config that lies about the arm, so it dies with the escape.
         """
-        if not self.fused_residual or self.mhc is None:
-            return False
         if self._fused_fell_back:
-            return False
+            return None
+        if self.fused_epilogue and self.mhc is not None:
+            if fused_residual.host_reason(xl.device.type) is not None:
+                counters.count("fused_epilogue_fallback")
+                self._fused_fell_back = True
+                return None
+            why = fused_residual.unsupported_reason(
+                xl.dtype, self.mhc.n_streams, xl.shape[-1] * self.mhc.n_streams, xl.device.type
+            )
+            if why is None:
+                counters.count("fused_epilogue")
+                return "epilogue"
+            loud(why)
+        if not self.fused_residual or self.mhc is None:
+            return None
         if fused_residual.host_reason(xl.device.type) is not None:
             counters.count("fused_residual_fallback")
             self._fused_fell_back = True
-            return False
+            return None
         why = fused_residual.unsupported_reason(
             xl.dtype, self.mhc.n_streams, xl.shape[-1] * self.mhc.n_streams, xl.device.type
         )
         if why is None:
             counters.count("fused_residual")
-            return True
+            return "residual"
         loud(why)
-        return False  # unreachable; `loud` raises
+        return None  # unreachable; `loud` raises
 
     def _moe_branch(self, normed: torch.Tensor, counters: Counters) -> torch.Tensor:
         """The MoE write at the SEAM: cast `normed` to the bank dtype ONCE, cast back to fp32.
@@ -688,9 +708,9 @@ class LoopBlock(nn.Module):
         streams = (
             h0.unsqueeze(-2).expand(b, t, self.mhc.n_streams, d) if self.mhc is not None else None
         )
-        #: `None` until the first pre-mix decides it (`_fused_ok`); `False` for
-        #: a block with no lanes, where neither fused nor eager chain exists.
-        fuse: bool | None = None
+        #: `None` until the first pre-mix decides it (`_fused_ok`); stays
+        #: `None` for a block with no lanes, where neither fused chain exists.
+        fuse: str | None = None
         out_acc = torch.zeros_like(h0)
         rec = torch.zeros((), dtype=torch.float32, device=h0.device)
         per_iter: list[torch.Tensor] = []
@@ -824,7 +844,7 @@ class LoopBlock(nn.Module):
         i: int,
         h0_flat: torch.Tensor,
         attn_state: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
-        fuse: bool | None,
+        fuse: str | None,
         counters: Counters,
         input_ids: torch.Tensor | None,
         targets: torch.Tensor | None,
@@ -843,7 +863,7 @@ class LoopBlock(nn.Module):
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | tuple[torch.Tensor, ...] | None,
-        bool | None,
+        str | None,
     ]:
         """ONE iteration of the loop — the body `_window` runs `T` times.
 
@@ -861,6 +881,24 @@ class LoopBlock(nn.Module):
         b, t, d = h.shape
         mhc_raw = None
         st = None
+        gains = None
+        #: The body's read gain(s), resolved ONLY on the fused route so the
+        #: eager path keeps its one `gain` call (and the arm's application
+        #: counter) exactly as before.
+        read_gain = None
+        read_gain_mlp = None
+        if blk._paper is not None:
+            # PAPER FORM (`layerrope.py`): the two READ gains are the norm's
+            # affine — `normalize(ctx) · attn_read` folded into one `F.rms_norm`
+            # call, which with `read == ones` is the OFF path's bits. The depth
+            # index is the ACTUAL iteration (v1's choice) or the body's network
+            # POSITION, independent of the iteration — the paper's looped-model
+            # reading.
+            gains = blk._paper.for_iteration(
+                blk._paper_block,
+                i if blk._paper_index == "iteration" else blk._paper_position,
+            )
+            read_gain, read_gain_mlp = gains[0], gains[2]
         if streams is not None:
             # x_l = h_ctx: the iteration embedding joins the LANES, and
             # H_pre (applied by the caller, `mhc.py`) aggregates them into
@@ -871,37 +909,39 @@ class LoopBlock(nn.Module):
                 # `streams` is the post-add tensor the kernels see, so the
                 # dtype/shape check runs here and not on `h0`.
                 fuse = self._fused_ok(streams, counters)
-            if fuse:
+            if fuse == "epilogue":
+                if read_gain is None:
+                    if blk._layerrope_depth is None:
+                        read_gain = blk.norm.weight
+                    else:
+                        # The ACTUAL iteration number (`i`), never the run's
+                        # compacted position: a shorter rand-depth run uses a
+                        # PREFIX of the depth table and the coda/final depths
+                        # stay anchored to `max_iter` (`layerrope.py`). ONE
+                        # `gain` call also keeps the application counter at its
+                        # eager value.
+                        read_gain = blk._gains.gain(blk._layerrope_depth + i, blk.norm.site)
+                ctx, mhc_raw, normed, normed_mlp = fused_residual.epilogue_read(
+                    blk.mhc, streams, read_gain, read_gain_mlp, blk.eps, counters
+                )
+                normed_mlp = normed if normed_mlp is None else normed_mlp
+            elif fuse == "residual":
                 ctx, mhc_raw = fused_residual.pre(blk.mhc, streams, counters)
             else:
                 ctx = blk.mhc.pre_mix(streams)
             counters.count("mhc")
         else:
             ctx = h + self.iter_embed[i].view(1, 1, d)
-        gains = None
-        if blk._paper is not None:
-            # PAPER FORM (`layerrope.py`): the two READ gains are the norm's
-            # affine — `normalize(ctx) · attn_read` folded into one fused
-            # `F.rms_norm` call, which with `read == ones` is the OFF path's
-            # bits. The depth index is the ACTUAL iteration (v1's choice) or
-            # the body's network POSITION, independent of the iteration —
-            # the paper's looped-model reading.
-            gains = blk._paper.for_iteration(
-                blk._paper_block,
-                i if blk._paper_index == "iteration" else blk._paper_position,
-            )
-            normed = F.rms_norm(ctx, (d,), gains[0], blk.eps)
-            normed_mlp = F.rms_norm(ctx, (d,), gains[2], blk.eps)
-        elif blk._layerrope_depth is None:
-            normed = blk.norm(ctx)
-            normed_mlp = normed
-        else:
-            # The ACTUAL iteration number (`i`), never the run's compacted
-            # position: a shorter rand-depth run uses a PREFIX of the depth
-            # table and the coda/final depths stay anchored to `max_iter`
-            # (`layerrope.py` module docstring).
-            normed = blk.norm(ctx, depth=blk._layerrope_depth + i)
-            normed_mlp = normed
+        if fuse != "epilogue":
+            if blk._paper is not None:
+                normed = F.rms_norm(ctx, (d,), gains[0], blk.eps)
+                normed_mlp = F.rms_norm(ctx, (d,), gains[2], blk.eps)
+            elif blk._layerrope_depth is None:
+                normed = blk.norm(ctx)
+                normed_mlp = normed
+            else:
+                normed = blk.norm(ctx, depth=blk._layerrope_depth + i)
+                normed_mlp = normed
         ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
         # MAGMA fix: fp32 masters with fp32 activations would run the slow
         # fp32 lane; `mm_mixed` casts to the compute dtype per forward.
@@ -1040,6 +1080,11 @@ class LoopBlock(nn.Module):
             counters.count("loom")
             y = y + _rms_no_gain(y, self.eps) * self.loom_gate[i].view(1, 1, 1)
 
+        #: The WRITE half runs the fused kernel when the residual arm is on
+        #: (`fuse == "residual"`) or when the epilogue arm is on AND the write
+        #: half is enabled too (`fused_residual`). `epilogue_read`'s `raw` is
+        #: the same 8-column hand-off, so the two halves compose.
+        fused_write = fuse == "residual" or (fuse == "epilogue" and self.fused_residual)
         if compose:
             # THE COMPOSITION (module docstring): AttnRes mixes the write
             # UPDATES — `u_0 = 0` (the embedding's update: H_res already
@@ -1052,7 +1097,7 @@ class LoopBlock(nn.Module):
             assert blk.mhc is not None, "compose => mhc"
             counters.count("attnres_write")
             counters.count("mhc_attnres_write")
-            if fuse:
+            if fused_write:
                 streams, h = fused_residual.write(
                     blk.mhc, self.attnres[i], streams, y, mhc_raw, True, self.eps, counters
                 )
@@ -1072,7 +1117,7 @@ class LoopBlock(nn.Module):
             # Eq. 3's residual: H_res x_l + H_postᵀ F(H_pre x_l). The
             # readout is the SUM of the lanes (2409.19606 §2.1); the crate's
             # concat is its D/n-slicing layout, not this one (`mhc.py`).
-            if fuse:
+            if fused_write:
                 streams, h = fused_residual.write(
                     blk.mhc,
                     self.attnres[i] if self.attnres is not None else None,
