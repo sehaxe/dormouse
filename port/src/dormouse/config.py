@@ -2240,6 +2240,8 @@ class RunConfig:
                     # normalisation as one ATen op (2.4e-7, test_mhc_write_launches).
                     "fused_residual",
                     "fused_epilogue",
+                    "fused_kda_tail",
+                    "fused_latent_proj",
                     "mhc_sinkhorn",
                 ):
                     # implementation keys: `moe_kernel`'s arms are proven equal
