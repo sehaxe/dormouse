@@ -2216,7 +2216,13 @@ class RunConfig:
                 if section == "model" and f.name == "max_seq_len" and not positional:
                     continue  # handled above: grow-only, and a grow is a resume
                 if section == "model" and f.name in (
-                    "moe_kernel", "moe_permute", "moe_bank_epoch"
+                    "moe_kernel",
+                    "moe_permute",
+                    "moe_bank_epoch",
+                    # `moe_combine="fused"` in fp32 is `torch.equal` on logits and
+                    # every gradient (tests/test_moe_combine_fused.py), so it is an
+                    # implementation key exactly like `moe_kernel`.
+                    "moe_combine",
                 ):
                     # implementation keys: `moe_kernel`'s arms are proven equal
                     # to 1e-6, and the balancing rule decides selection, not
