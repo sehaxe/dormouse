@@ -74,24 +74,27 @@ def active_macs_per_token(cfg: ModelConfig) -> int:
     module-level import alias) so a test can monkeypatch the project's function
     and prove this path really calls it rather than a private copy.
     """
-    from dormouse.width import macs_per_token
+    from dormouse.width import active_macs_per_token as width_active
 
     c = as_model(cfg)
-    d, f, r = c.d_model, c.d_ffn, c.rank
+    d, r = c.d_model, c.rank
     out_rank = c.out_proj_rank or (r if c.use_tsct else 0)
-    body = macs_per_token(
+    return width_active(
         d,
         iters=c.max_iter,
         n_heads=c.n_heads,
         attn_latent_rank=c.attn_latent_rank,
         n_kv_heads=c.n_kv_heads,
         out_proj_rank=out_rank,
-        f=f,
+        f=c.d_ffn,
+        ffn_form=c.ffn_form,
+        ffn_rank=r,
+        ffn_rank_gate=c.ffn_rank_gate,
+        ffn_rank_down=c.ffn_rank_down,
+        n_experts=c.n_experts,
+        topk=c.moe_topk,
+        shared_rank=c.shared_rank,
     )
-    routed = assignments_per_token(c) * (2 * d * r + r * f)
-    shared = 2 * d * c.shared_rank + c.shared_rank * f
-    router = d * c.n_experts
-    return body + routed + shared + router
 
 
 def routed_bank_params(model: DormouseModel) -> int:
@@ -103,6 +106,10 @@ def routed_bank_params(model: DormouseModel) -> int:
     expert is NOT counted: it runs in every arm and is not the bank whose size
     is the question.
     """
+    if model.cfg.ffn_form == "dense":
+        # One active FFN, not a bank: counting it as "routed capacity" would
+        # price the baseline as if it carried the thing it replaced.
+        return 0
     total = 0
     for name, p in model.named_parameters():
         if name.startswith("loop.moe.experts.") or name in (
@@ -113,6 +120,22 @@ def routed_bank_params(model: DormouseModel) -> int:
             total += p.numel()
     assert total >= 0, "a negative bank is impossible; the name filter is wrong"
     return total
+
+
+def _ffn_slot(cfg: ModelConfig) -> int:
+    """The expert slot's parameter bill, by form (`width.ffn_params`)."""
+    from dormouse.width import ffn_params
+
+    return ffn_params(
+        cfg.ffn_form,
+        cfg.d_model,
+        cfg.d_ffn,
+        rank=cfg.rank,
+        rank_gate=cfg.ffn_rank_gate,
+        rank_down=cfg.ffn_rank_down,
+        n_experts=cfg.n_experts,
+        shared_rank=cfg.shared_rank,
+    )
 
 
 def measure(
@@ -164,6 +187,10 @@ def measure(
         "moe_topk": cfg.moe_topk,
         "use_tsct": cfg.use_tsct,
         "share_u_mode": cfg.share_u_mode,
+        "ffn_form": cfg.ffn_form,
+        "ffn_rank_gate": cfg.ffn_rank_gate,
+        "ffn_rank_down": cfg.ffn_rank_down,
+        "ffn_slot": _ffn_slot(cfg),
     }
 
 
@@ -174,7 +201,8 @@ def print_row(row: dict, *, budget_gb: float = BUDGET_GB) -> None:
     print(
         f"geometry              d={row['d_model']} f={row['d_ffn']} "
         f"E={row['n_experts']} rank={row['rank']} topk={row['moe_topk']} "
-        f"tsct={row['use_tsct']} share_u={row['share_u_mode']}"
+        f"tsct={row['use_tsct']} share_u={row['share_u_mode']} "
+        f"ffn={row['ffn_form']}"
     )
     print(f"params                {row['params']:,}")
     print(f"bank                  {row['bank']:,}  ({100 * row['bank_share']:.1f}% of params)")

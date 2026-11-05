@@ -271,7 +271,7 @@ from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
 from torch.utils.checkpoint import checkpoint
 
-from ..config import FACTOR_QATS, SHARE_U_MODES
+from ..config import FACTOR_QATS, SHARE_U_MODES, validate_ffn
 from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
 from .adaptive_topk import check_policy, choose_k, select_topk
@@ -796,6 +796,109 @@ class DualLatentGLU(nn.Module):
         return y if dt == torch.float32 else y.to(torch.float32)
 
 
+class TSCTGLU(nn.Module):
+    """The `ffn_form="tsct"` expert: all THREE matrices independently factored.
+
+    `gate = U_g[d, r_g]·diag(s_g)·V_g[r_g, f]`, the same form for `up`, and
+    `down = U_d[f, r_d]·diag(s_d)·V_d[r_d, d]`. The GLU is applied at the full
+    hidden width `f` (that is the point: no rank bottleneck before the
+    nonlinearity). At `r_g = r_d = min(d, f)` the map is the DENSE GLU
+    reparameterised — same function class, more parameters (`r·(d + f + 1)`
+    versus `d·f` per matrix) — which is why "compression" here is a knob, not
+    an approximation.
+    """
+
+    ffn_form = "tsct"
+
+    def __init__(
+        self,
+        d: int,
+        f: int,
+        rank_gate: int,
+        rank_down: int,
+        *,
+        dtype: torch.dtype,
+        factor_qat: str = "none",
+        factor_qat_alpha: float = 1.0,
+        act_quant: str = "none",
+        act_group: int = 0,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        super().__init__()
+        lo = min(d, f)
+        if rank_gate > lo or rank_down > lo:
+            loud(
+                f"TSCTGLU ranks gate={rank_gate} down={rank_down} above "
+                f"min(d={d}, f={f})={lo}: a rank above either dimension is not a "
+                f"factorisation. Escape: both <= {lo}."
+            )
+        if rank_gate < 1 or rank_down < 1:
+            loud(
+                f"TSCTGLU ranks gate={rank_gate} down={rank_down}: a factor rank "
+                f"must be >= 1. Escape: positive ranks."
+            )
+        self.d, self.f = d, f
+        self.rank_gate, self.rank_down = rank_gate, rank_down
+        self.compute_dtype = dtype
+        self.factor_qat = factor_qat
+        self.factor_qat_alpha = factor_qat_alpha
+        self.act_quant = act_quant
+        self.act_group = act_group
+        self._qat_cache = QuantCache() if factor_qat != "none" else None
+        # The gate/up input bases and their shared-rank writes.
+        for name, rg in (("gate", rank_gate), ("up", rank_gate)):
+            setattr(self, f"{name}_u", nn.Parameter(init_u(d, rg, device)))
+            setattr(self, f"{name}_s", nn.Parameter(torch.ones(rg, device=device)))
+            setattr(
+                self,
+                f"{name}_v",
+                nn.Parameter(torch.randn(rg, f, device=device) / math.sqrt(rg)),
+            )
+        # The down map is f -> d; its `U` lives on the f side and its `V` writes d.
+        self.down_u = nn.Parameter(init_u(f, rank_down, device))
+        self.down_s = nn.Parameter(torch.ones(rank_down, device=device))
+        self.down_v = nn.Parameter(
+            torch.randn(rank_down, d, device=device) / math.sqrt(rank_down)
+        )
+        #: The dense form's two biases, kept here so the full-rank
+        #: reparameterisation is EXACT rather than "exact up to biases": the
+        #: hidden `f` bias enters the gate before the GLU, the `d` bias leaves
+        #: the down write. They do not factor (a bias has no rank).
+        self.gate_b = nn.Parameter(torch.zeros(f, device=device))
+        self.down_b = nn.Parameter(torch.zeros(d, device=device))
+
+    def _fq(self, t: torch.Tensor) -> torch.Tensor:
+        if self.factor_qat == "none":
+            return t
+        return factor_qat_project(
+            t, self.factor_qat, self.factor_qat_alpha, cache=self._qat_cache
+        )
+
+    def _proj(
+        self, x: torch.Tensor, u: torch.Tensor, s: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        dt = self.compute_dtype
+        u, v = self._fq(u), self._fq(v)
+        xu = x if x.dtype == dt else x.to(dt)
+        return ((xu @ u.to(dt)) * s.to(dt)) @ v.to(dt)
+
+    def forward(self, x: torch.Tensor, glu=None) -> torch.Tensor:
+        dt = self.compute_dtype
+        if self.act_quant != "none":
+            x = fake_quant_act(x, self.act_quant, self.act_group)
+        g = self._proj(x, self.gate_u, self.gate_s, self.gate_v) + self.gate_b.to(dt)
+        u = self._proj(x, self.up_u, self.up_s, self.up_v)
+        h = F.silu(g) * u if glu is None else glu(g, u)
+        y = self._proj(h, self.down_u, self.down_s, self.down_v) + self.down_b.to(dt)
+        return y if dt == torch.float32 else y.to(torch.float32)
+
+    def extra_repr(self) -> str:
+        return (
+            f"d={self.d}, f={self.f}, r_gate={self.rank_gate}, "
+            f"r_down={self.rank_down}, dtype={self.compute_dtype}"
+        )
+
+
 #: How far the batched bank's row cap may exceed the uniform per-expert share
 #: before the arm refuses. 8x is generous for a healthy router (measured 3.1x at
 #: 150k: 126 rows against a uniform 40) and refuses a collapsed one.
@@ -830,6 +933,10 @@ class SparseMoE(nn.Module):
         d, f = cfg.d_model, cfg.d_ffn
         dtype = torch.bfloat16 if cfg.bf16 else torch.float32
         self.d, self.f = d, f
+        self.ffn_form = getattr(cfg, "ffn_form", "bank")
+        #: The config layer's own refusals, repeated at the runtime seam: a
+        #: hand-built `ModelConfig` reaches this constructor without `validate`.
+        validate_ffn(cfg)
         self.n_experts = cfg.n_experts
         self.topk = cfg.moe_topk
         #: The adaptive width (`model/adaptive_topk.py`): `off` is the constant
@@ -856,6 +963,14 @@ class SparseMoE(nn.Module):
                     f"width above the bank cannot be filled. Escape: k_max <= n_experts."
                 )
         self.capacity = cfg.moe_capacity
+        #: The FFN form's own modules. `bank` continues into the historical
+        #: constructor below; the other two build ONLY their expert slot and
+        #: return, so no router/shared/down parameter exists for them to lie
+        #: about. The `ffn_form` branch lives here and at the top of `forward`
+        #: — never inside the bank's dispatch.
+        if self.ffn_form != "bank":
+            self._init_ffn_form(cfg, dtype, device)
+            return
         self.router_jitter = getattr(cfg, "moe_router_jitter", 0.0)
         self.moe_kernel = cfg.moe_kernel
         #: The shared-basis COMPUTE shape (`config.ModelConfig.
@@ -1217,8 +1332,136 @@ class SparseMoE(nn.Module):
             # experts exist.
             self._assert_shared_compute()
 
+    def _init_ffn_form(self, cfg, dtype: torch.dtype, device) -> None:
+        """Build the two non-bank expert slots: `dense` and `tsct`."""
+        self.capacity = 0.0
+        self._aux_terms: list[torch.Tensor] = []
+        self._bank_cache = None
+        self._bank_epoch = 0
+        self._bank_builds = 0
+        self.act_quant = cfg.act_quant
+        self.act_group = cfg.act_group
+        self.expert_act = cfg.expert_act
+        self._glu = (
+            None
+            if cfg.expert_act == "silu"
+            else (
+                lambda g, u: expert_glu(
+                    cfg.expert_act,
+                    g,
+                    u,
+                    beta1=cfg.expert_beta1,
+                    beta2=cfg.expert_beta2,
+                    c0=cfg.memglu_c0,
+                )
+            )
+        )
+        if self.ffn_form == "dense":
+            from .ffn import DenseFFN
+
+            self.topk = 0
+            self.experts = nn.ModuleList([DenseFFN(cfg, device=device)])
+            return
+        # ---- tsct -------------------------------------------------------
+        if self.n_experts == 1 and cfg.moe_topk != 0:
+            loud(
+                f"ffn_form='tsct' with n_experts=1 and moe_topk={cfg.moe_topk}: "
+                f"there is no second expert to route to. Escape: moe_topk=0 (the "
+                f"one expert IS the dense blend)."
+            )
+        if self.n_experts > 1 and cfg.moe_topk > self.n_experts:
+            loud(
+                f"ffn_form='tsct' with moe_topk={cfg.moe_topk} > "
+                f"n_experts={self.n_experts}: a width above the bank cannot be "
+                f"filled. Escape: moe_topk <= n_experts."
+            )
+        rg = cfg.ffn_rank_gate or cfg.rank
+        rd = cfg.ffn_rank_down or cfg.rank
+        self.experts = nn.ModuleList(
+            [
+                TSCTGLU(
+                    self.d,
+                    self.f,
+                    rg,
+                    rd,
+                    dtype=dtype,
+                    factor_qat=cfg.factor_qat,
+                    factor_qat_alpha=cfg.factor_qat_alpha,
+                    act_quant=cfg.act_quant,
+                    act_group=cfg.act_group,
+                    device=device,
+                )
+                for _ in range(self.n_experts)
+            ]
+        )
+        self.router = (
+            nn.Linear(self.d, self.n_experts, bias=False, device=device)
+            if self.n_experts > 1
+            else None
+        )
+        self.dense_qat = cfg.dense_qat
+        self.dense_qat_alpha = cfg.factor_qat_alpha
+        self._qat_cache = QuantCache() if cfg.dense_qat != "none" else None
+        if self.n_experts == 1:
+            self.topk = 0
+
+    def _tsct_forward(self, x: torch.Tensor, counters: Counters) -> torch.Tensor:
+        """The `ffn_form="tsct"` dispatch: one expert, dense blend, or top-k.
+
+        The routed arm is a bootstrap, not a kernel: one forward per expert
+        that owns at least one row. `ponytail:` the `rows.any()` below is a
+        host sync per expert; promote to a grouped/banked dispatch only if this
+        form's bank is ever the recipe.
+        """
+        n = x.shape[0]
+        if self.n_experts == 1:
+            counters.count("ffn_tsct_forward", n)
+            return self.experts[0](x, glu=self._glu)
+        dt = self.experts[0].compute_dtype
+        logits = mm_mixed(
+            x,
+            dense_qat_weight(
+                self.router.weight,
+                self.dense_qat,
+                self.dense_qat_alpha,
+                cache=self._qat_cache,
+            ),
+            dt,
+            counters,
+        )
+        probs = F.softmax(logits, dim=-1)
+        if self.topk == 0:
+            y = torch.zeros(n, self.d, dtype=torch.float32, device=x.device)
+            for e, expert in enumerate(self.experts):
+                y = y + expert(x, glu=self._glu) * probs[:, e : e + 1]
+            counters.count("ffn_tsct_dense_blend", n)
+            return y
+        index = logits.topk(self.topk, dim=-1).indices
+        weight = torch.gather(probs, 1, index)
+        weight = weight / weight.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        y = torch.zeros(n, self.d, dtype=torch.float32, device=x.device)
+        for e, expert in enumerate(self.experts):
+            mask = index == e
+            rows = mask.any(dim=-1)
+            if not bool(rows.any()):
+                continue
+            sel = rows.nonzero(as_tuple=True)[0]
+            ye = expert(x.index_select(0, sel), glu=self._glu)
+            w = (weight * mask.to(weight.dtype)).sum(dim=-1).index_select(0, sel)
+            y = y.index_add(0, sel, ye * w.unsqueeze(-1))
+        counters.count("ffn_tsct_routed", n)
+        return y
+
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         counters = Counters() if counters is None else counters
+        if self.ffn_form != "bank":
+            n = x.shape[0]
+            assert x.ndim == 2 and x.shape[1] == self.d, (
+                f"FFN input {tuple(x.shape)} != [n, {self.d}]"
+            )
+            if self.ffn_form == "dense":
+                return self.experts[0](x, counters=counters)
+            return self._tsct_forward(x, counters)
         if self.share_u_mode == "plane":
             # The shared-basis arm's evidence line (ADR-0019): `_banks` owns no
             # counters and the routed / dense arms reach the basis through

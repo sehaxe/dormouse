@@ -206,6 +206,11 @@ MOE_COMBINE_DTYPES = ("fp32", "bf16")
 #: one `U` for the bank, `dict` is one dictionary plus a per-expert column
 #: subset. A name that is not here is LOUD.
 SHARE_U_MODES = ("off", "plane", "dict")
+#: The `ffn_form` literals — what the expert slot is:
+#: `bank` (today's routed `SparseMoE`), `dense` (one plain GLU, no rank) and
+#: `tsct` (all three matrices independently factorised). A name that is not
+#: here is LOUD; `tests/test_ffn_form.py` pins the arithmetic of all three.
+FFN_FORMS = ("bank", "dense", "tsct")
 #: The `moe_topk_mode` literals — how many experts each TOKEN runs
 #: (`model/adaptive_topk.py`): `off` is the constant `moe_topk` width every
 #: number on record runs; `entropy`/`margin` are the per-token confidence
@@ -422,6 +427,42 @@ class ModelConfig:
     #: `halt_mode` without a halt head is LOUD.
     halt_mode: bool = False
     rank: int = 64
+    #: WHICH FFN sits in the expert slot (`model/experts.py`, `model/ffn.py`):
+    #:
+    #: * `bank` (the default, every run and checkpoint on record) — today's
+    #:   `SparseMoE`: routed `DualLatentGLU` experts at `rank`, ONE always-on
+    #:   shared expert at `shared_rank`, and ONE shared `down [f, d]`. The
+    #:   routed experts are a rank-`rank` bottleneck by construction; that is
+    #:   this form, not a "dense" one.
+    #: * `dense` — ONE plain GLU FFN in the expert slot: `gate [d, f]`,
+    #:   `up [d, f]`, `down [f, d]`, `3·d·f + f + d` parameters. No rank
+    #:   anywhere, no router, no shared expert, no bank. Only legal with
+    #:   `n_experts = 1` and `share_u_mode = "off"` (a dense FFN has nothing to
+    #:   route or share).
+    #: * `tsct` — THE factorised form, all three matrices independently:
+    #:   `gate = U_g[d, r_g]·diag(s_g)·V_g[r_g, f]`, same for `up`, and
+    #:   `down = U_d[f, r_d]·diag(s_d)·V_d[r_d, d]`. `ffn_rank_gate` sets
+    #:   `r_g` for BOTH gate and up (they are the same d→f map), `ffn_rank_down`
+    #:   sets `r_d`; `0` means `rank`. At
+    #:   `r_g = r_d = min(d, f)` this is an exact reparameterisation of the
+    #:   dense GLU (gate c of `tests/test_ffn_form.py`), not an approximation.
+    #:   With `n_experts = 1` it is one FFN; with `n_experts > 1` it is a bank
+    #:   of `tsct` experts (dense blend at `moe_topk = 0`, top-k dispatch at
+    #:   `moe_topk > 0` with `moe_capacity = 0` — the TSCT path is dropless).
+    #:
+    #: The default is `bank` ON PURPOSE: a new default would move every
+    #: existing run and checkpoint, and this field's job is to make the choice
+    #: visible, not to silently upgrade the model. `use_tsct` is a DIFFERENT
+    #: axis (which linears elsewhere are spectral); it never selected the FFN.
+    ffn_form: str = "bank"
+    #: The `tsct` form's gate/up rank `r_g`. `0` = `rank`. The same rank is
+    #: used for gate and up because they are the two halves of one d→f GLU.
+    #: Refused on the other forms (a rank knob on a form with no factors is an
+    #: inert key), and above `min(d_model, d_ffn)` (not a factorisation).
+    ffn_rank_gate: int = 0
+    #: The `tsct` form's down rank `r_d`. `0` = `rank`. Refused on the other
+    #: forms and above `min(d_model, d_ffn)`.
+    ffn_rank_down: int = 0
     norm_eps: float = 1e-3
     #: ---- LayerRoPE (`model/layerrope.py`, arXiv:2610.09179) ----
     #: Depth-wise magnitude + angular superposition of the norm gain. ONE shared
@@ -2434,9 +2475,163 @@ def _drop_dead_snapshot_keys(cls: type, table: dict[str, Any], where: str) -> di
     return {k: v for k, v in table.items() if k not in dead}
 
 
+def validate_ffn(model: ModelConfig) -> None:
+    """The `ffn_form` combinations that cannot work, LOUD with an `Escape`.
+
+    One function with two callers (`validate` and `SparseMoE.__init__`): a
+    hand-built `ModelConfig` reaches the module without the loader, and an arm
+    that is silently inert is the defect ADR-0019 bans.
+    """
+    if model.ffn_form not in FFN_FORMS:
+        loud(
+            f"ffn_form={model.ffn_form!r} is not an FFN form. Known: "
+            f"{list(FFN_FORMS)} — `bank` the routed SparseMoE on record, `dense` "
+            f"one plain GLU with no rank, `tsct` all three matrices factorised. "
+            f"Escape: name one of those."
+        )
+    if model.ffn_rank_gate < 0 or model.ffn_rank_down < 0:
+        loud(
+            f"ffn_rank_gate={model.ffn_rank_gate} / ffn_rank_down="
+            f"{model.ffn_rank_down}: a rank is a width and 0 is the `use rank` "
+            f"sentinel. Escape: >= 0."
+        )
+    d, f = model.d_model, model.d_ffn
+    if model.ffn_form != "tsct":
+        if model.ffn_rank_gate or model.ffn_rank_down:
+            loud(
+                f"ffn_rank_gate={model.ffn_rank_gate} / ffn_rank_down="
+                f"{model.ffn_rank_down} with ffn_form={model.ffn_form!r}: only "
+                f"the `tsct` form has factors to rank. Escape: ffn_form='tsct', "
+                f"or both ranks 0."
+            )
+    if getattr(model, "tsct_packed", False) and model.ffn_form != "bank":
+        loud(
+            f"tsct_packed is a BANK feature (it packs the routed bank's factors), "
+            f"and ffn_form={model.ffn_form!r} has no bank. Escape: "
+            f"ffn_form='bank', or tsct_packed=false."
+        )
+    if model.ffn_form == "dense":
+        if model.n_experts != 1:
+            loud(
+                f"ffn_form='dense' with n_experts={model.n_experts}: a dense FFN "
+                f"has no bank to route over. Escape: n_experts=1 (the form IS the "
+                f"expert), or ffn_form='bank'/'tsct'."
+            )
+        if model.share_u_mode != "off":
+            loud(
+                f"ffn_form='dense' with share_u_mode={model.share_u_mode!r}: "
+                f"`share_u` is the BANK's shared input basis, and a dense FFN has "
+                f"no factor basis to share. Escape: share_u_mode='off' (or "
+                f"share_u=false), or ffn_form='bank'."
+            )
+        if model.moe_topk != 0:
+            loud(
+                f"ffn_form='dense' with moe_topk={model.moe_topk}: there is no "
+                f"router and one expert, so a top-k would be an inert dispatch. "
+                f"Escape: moe_topk=0, or ffn_form='bank'."
+            )
+        if (
+            model.moe_shared_compute
+            or model.tsct_expert_basis
+            or model.tsct_expert_lr
+            or model.tsct_expert_revive
+        ):
+            loud(
+                "ffn_form='dense' with a bank-only arm (moe_shared_compute / "
+                "tsct_expert_basis / tsct_expert_lr / tsct_expert_revive): the "
+                "arm would reach no code. Escape: those fields off, or "
+                "ffn_form='bank'/'tsct'."
+            )
+        if model.moe_lb_mode == "aux" and model.moe_aux_coef != 0.0:
+            loud(
+                f"ffn_form='dense' with moe_lb_mode='aux' and moe_aux_coef="
+                f"{model.moe_aux_coef}: the Switch/GShard term needs a router "
+                f"and this form has none. Escape: moe_lb_mode='sign' with "
+                f"moe_lb_coef=0, or ffn_form='bank'."
+            )
+        if model.moe_lb_coef != 0.0 or (
+            model.moe_lb_mode == "prop" and model.moe_lb_gamma != 0.0
+        ):
+            loud(
+                f"ffn_form='dense' with a live LFB controller "
+                f"(moe_lb_mode={model.moe_lb_mode!r}, coef={model.moe_lb_coef}, "
+                f"gamma={model.moe_lb_gamma}): there is no router to rebalance. "
+                f"Escape: a zero controller step, or ffn_form='bank'."
+            )
+        return
+    if model.ffn_form == "bank":
+        return
+    # ---- tsct -----------------------------------------------------------
+    lo = min(d, f)
+    if model.rank > lo:
+        loud(
+            f"ffn_form='tsct' with rank={model.rank} > min(d_model, d_ffn)="
+            f"{lo}: a rank above either dimension is not a factorisation (the "
+            f"same rule `TSCTLinear` enforces). Escape: rank <= {lo}, or "
+            f"ffn_form='dense'/'bank'."
+        )
+    rg = model.ffn_rank_gate or model.rank
+    rd = model.ffn_rank_down or model.rank
+    if rg < 1 or rd < 1:
+        loud(
+            f"ffn_form='tsct' with ffn_rank_gate={rg} / ffn_rank_down={rd}: a "
+            f"factor rank must be >= 1. Escape: positive ranks."
+        )
+    if rg > lo or rd > lo:
+        loud(
+            f"ffn_form='tsct' with ffn_rank_gate={rg} / ffn_rank_down={rd} above "
+            f"min(d_model, d_ffn)={lo}: not a factorisation. Escape: both <= "
+            f"{lo}."
+        )
+    if model.share_u_mode != "off":
+        loud(
+            f"ffn_form='tsct' with share_u_mode={model.share_u_mode!r}: the "
+            f"shared input plane is a BANK-form arm (`SparseMoE._banks`), and the "
+            f"tsct form's gate/up already own their `V` factors. Escape: "
+            f"share_u_mode='off', or ffn_form='bank'."
+        )
+    if model.moe_shared_compute:
+        loud(
+            "ffn_form='tsct' with moe_shared_compute=true: that arm fuses the "
+            "BANK's shared input basis, which this form does not build. Escape: "
+            "moe_shared_compute=false, or ffn_form='bank'."
+        )
+    if model.tsct_expert_basis or model.tsct_expert_lr or model.tsct_expert_revive:
+        loud(
+            "ffn_form='tsct' with a TSCT-2 bank arm (tsct_expert_basis / "
+            "tsct_expert_lr / tsct_expert_revive): those read the routed bank's "
+            "`_banks` and LFB counts, and this form is its own dispatch. Escape: "
+            "those fields off, or ffn_form='bank'."
+        )
+    if model.moe_topk != 0 and model.moe_capacity > 0:
+        loud(
+            f"ffn_form='tsct' with moe_topk={model.moe_topk} at "
+            f"moe_capacity={model.moe_capacity}: this dispatch is DROPLESS (it "
+            f"has no capacity bank), so a capacity rule would silently do "
+            f"nothing. Escape: moe_capacity=0 (dropless), or moe_topk=0 (dense "
+            f"blend)."
+        )
+    if model.moe_lb_mode == "aux" and model.moe_aux_coef != 0.0:
+        loud(
+            f"ffn_form='tsct' with moe_lb_mode='aux' and moe_aux_coef="
+            f"{model.moe_aux_coef}: the TSCT dispatch has no Switch/GShard term. "
+            f"Escape: moe_lb_mode='sign' with moe_lb_coef=0, or ffn_form='bank'."
+        )
+    if model.moe_lb_coef != 0.0 or (
+        model.moe_lb_mode == "prop" and model.moe_lb_gamma != 0.0
+    ):
+        loud(
+            f"ffn_form='tsct' with a live LFB controller "
+            f"(moe_lb_mode={model.moe_lb_mode!r}, coef={model.moe_lb_coef}, "
+            f"gamma={model.moe_lb_gamma}): the TSCT dispatch does not move a "
+            f"routing bias. Escape: a zero controller step, or ffn_form='bank'."
+        )
+
+
 def validate(model: ModelConfig) -> None:
     """Coherence checks the burn side does in `config::validate`. Loud, never
     clamped: a clamped width is exactly the silent collapse ADR-0011 bans."""
+    validate_ffn(model)
     if model.d_model <= 0 or model.vocab <= 0:
         loud(f"d_model and vocab must be > 0, got {model.d_model}/{model.vocab}")
     if model.n_heads * model.head_dim != model.d_model:

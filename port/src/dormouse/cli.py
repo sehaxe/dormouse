@@ -19,6 +19,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from . import width
 from .config import PROGRESS_KEYS, ModelConfig, RunConfig, TrainConfig, load_run
 from .instrument import LoudError
 from .model import DormouseModel, param_count
@@ -204,6 +205,66 @@ def _param_table(model: DormouseModel) -> Table:
     return t
 
 
+def _ffn_table(cfg: ModelConfig) -> Table:
+    """The three FFN forms' bills, computed by the same `width` ledger the tests gate.
+
+    The active row is marked. `dense` is priced with ONE expert (its own
+    legality rule), `bank`/`tsct` with the config's `n_experts`/`moe_topk`.
+    The MAC column is the ACTIVE model bill: attention + out_proj + the FFN
+    slot, one byte = one token. For `bank` the routed/shared terms keep the
+    historical `capacity_math` convention (counted once per token); for
+    `dense`/`tsct` the slot is priced per loop iteration. The unit is printed
+    so the two are never subtracted from one another by accident.
+    """
+    d, f = cfg.d_model, cfg.d_ffn
+    out_rank = cfg.out_proj_rank or (cfg.rank if cfg.use_tsct else 0)
+    t = Table(title=f"FFN forms (d={d:,}, f={f:,})", title_style="bold")
+    t.add_column("form", style="cyan")
+    t.add_column("params (slot)", justify="right")
+    t.add_column("active MAC/B", justify="right")
+    t.add_column("note")
+    for form in width.FFN_FORMS:
+        n_experts = 1 if form == "dense" else cfg.n_experts
+        topk = 0 if form == "dense" else cfg.moe_topk
+        params = width.ffn_params(
+            form,
+            d,
+            f,
+            rank=cfg.rank,
+            rank_gate=cfg.ffn_rank_gate,
+            rank_down=cfg.ffn_rank_down,
+            n_experts=n_experts,
+            shared_rank=cfg.shared_rank,
+        )
+        macs = width.active_macs_per_token(
+            d,
+            iters=cfg.max_iter,
+            n_heads=cfg.n_heads,
+            attn_latent_rank=cfg.attn_latent_rank,
+            n_kv_heads=cfg.n_kv_heads,
+            out_proj_rank=out_rank,
+            f=f,
+            ffn_form=form,
+            ffn_rank=cfg.rank,
+            ffn_rank_gate=cfg.ffn_rank_gate,
+            ffn_rank_down=cfg.ffn_rank_down,
+            n_experts=n_experts,
+            topk=topk,
+            shared_rank=cfg.shared_rank,
+        )
+        if form == "dense":
+            note = "3·d·f + f + d, no rank"
+        elif form == "tsct":
+            rg = cfg.ffn_rank_gate or cfg.rank
+            rd = cfg.ffn_rank_down or cfg.rank
+            note = f"r_gate={rg}, r_down={rd}"
+        else:
+            note = f"rank={cfg.rank}, shared_rank={cfg.shared_rank}"
+        label = f"{form} ← active" if form == cfg.ffn_form else form
+        t.add_row(label, f"{params:,}", f"{macs:,}", note)
+    return t
+
+
 def _train_table(run) -> Table:
     t = Table(title="train", title_style="bold", show_header=False)
     for f in dataclasses.fields(TrainConfig):
@@ -288,6 +349,7 @@ def info(
     model = DormouseModel(run.model, device="meta")
     console.print(Panel(f"[bold]{run.source}[/]", subtitle=f"{param_count(model):,} params"))
     console.print(_param_table(model))
+    console.print(_ffn_table(run.model))
     console.print(_train_table(run))
 
 
