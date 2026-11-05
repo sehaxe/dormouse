@@ -2233,6 +2233,14 @@ class RunConfig:
                     # every gradient (tests/test_moe_combine_fused.py), so it is an
                     # implementation key exactly like `moe_kernel`.
                     "moe_combine",
+                    # The fused residual/epilogue kernels are the SAME arithmetic in
+                    # one launch: parity 8.5e-7 on logits and every gradient
+                    # (tests/test_fused_epilogue.py, test_fused_kda.py), and the off
+                    # path is bit-identical. `mhc_sinkhorn="log_softmax"` is the same
+                    # normalisation as one ATen op (2.4e-7, test_mhc_write_launches).
+                    "fused_residual",
+                    "fused_epilogue",
+                    "mhc_sinkhorn",
                 ):
                     # implementation keys: `moe_kernel`'s arms are proven equal
                     # to 1e-6, and the balancing rule decides selection, not
