@@ -356,17 +356,25 @@ def test_g_declared_refusals_are_loud_and_name_the_key():
     with pytest.raises(LoudError) as e:
         DormouseModel(tiny_cfg(layerrope=True, d_model=65, n_heads=5, head_dim=13))
     assert "d_model=65" in str(e.value) and "Escape:" in str(e.value)
-    # `full_graph` / `opt_graph`: MODEL×TRAIN, after the overrides.
-    for key in ("full_graph", "opt_graph"):
-        with pytest.raises(LoudError) as e:
-            load_run(
-                "tiny",
-                model_overrides={"layerrope": True},
-                train_overrides={key: True},
-            )
-        msg = str(e.value)
-        assert key in msg and "layerrope" in msg and "Escape:" in msg, msg
-        print(f"[layerrope] refused {key}: {msg.splitlines()[0][:120]}")
+    # MODEL×TRAIN, after the overrides. `full_graph` is allowed when the depth
+    # index is FIXED (`rand_depth`/`segment_len` are refused first), which is
+    # the m400b recipe; `opt_graph` is still refused.
+    allowed = load_run(
+        "tiny",
+        model_overrides={"layerrope": True},
+        train_overrides={"full_graph": True, "seq_len": 64, "batch": 2},
+    )
+    assert allowed.train.full_graph and allowed.model.layerrope
+    print("[layerrope] allowed full_graph (fixed depth)")
+    with pytest.raises(LoudError) as e:
+        load_run(
+            "tiny",
+            model_overrides={"layerrope": True},
+            train_overrides={"opt_graph": True, "seq_len": 64, "batch": 2},
+        )
+    msg = str(e.value)
+    assert "opt_graph" in msg and "layerrope" in msg and "Escape:" in msg, msg
+    print(f"[layerrope] refused opt_graph: {msg.splitlines()[0][:120]}")
     # `muon_sf` does NOT conflict: the gain table is 1-D, so it routes to AdamW.
     run = load_run(
         "tiny",
@@ -881,16 +889,21 @@ def test_paper_j_counter_and_refusals():
     with pytest.raises(LoudError) as e:
         DormouseModel(tiny_cfg(layerrope=True, layerrope_form="paper", layerrope_index="nope"))
     assert "layerrope_index" in str(e.value)
-    # `full_graph`/`opt_graph` are refused for BOTH forms (the depth index is a
-    # host-selected slice, so a capture would freeze it).
-    for key in ("full_graph", "opt_graph"):
-        with pytest.raises(LoudError) as e:
-            load_run(
-                "tiny",
-                model_overrides={"layerrope": True, "layerrope_form": "paper"},
-                train_overrides={key: True},
-            )
-        assert key in str(e.value) and "Escape:" in str(e.value)
+    # `full_graph` is allowed for both forms when the depth is fixed (the
+    # capture records one slice per fixed iteration); `opt_graph` stays refused.
+    allowed = load_run(
+        "tiny",
+        model_overrides={"layerrope": True, "layerrope_form": "paper"},
+        train_overrides={"full_graph": True, "seq_len": 64, "batch": 2},
+    )
+    assert allowed.train.full_graph and allowed.model.layerrope_form == "paper"
+    with pytest.raises(LoudError) as e:
+        load_run(
+            "tiny",
+            model_overrides={"layerrope": True, "layerrope_form": "paper"},
+            train_overrides={"opt_graph": True, "seq_len": 64, "batch": 2},
+        )
+    assert "opt_graph" in str(e.value) and "Escape:" in str(e.value)
 
 
 def test_paper_j_no_host_sync_in_the_step():

@@ -1544,6 +1544,20 @@ def train(
             )
         _captured: dict = {}
 
+        def drop_caches() -> None:
+            """Make the captured forward BUILD the bank/QAT stacks it will read.
+
+            A cache HIT at capture records no `torch.stack`/projection op at
+            all, so every replay would read the capture step's stacked snapshot
+            while the optimizer moves the parameters underneath it — the
+            `medbig2`/`b1night` freeze, with `moe_bank_epoch` making the cache
+            look healthy from Python. The trainer already calls these after
+            every step; this call covers the one window it does not: an eval (or
+            any eager forward) between the last warmup step and the capture.
+            """
+            invalidate_banks_all(model)
+            invalidate_qat_cache_all(model)
+
         def full_body() -> None:
             """The captured region. A capture EXECUTES it, so a host read here
             would surface at capture time (and `tests/test_full_graph.py` traps
@@ -1586,6 +1600,7 @@ def train(
             # capturing. `graph._check_participants` catches the real hazard.
             allow_frozen=True,
             on_counters=full_counters,
+            pre_capture=drop_caches,
         )
         log(
             f"full_graph: the WHOLE step (forward + backward + firewall + zero_grad + "
@@ -1594,8 +1609,9 @@ def train(
             f"{cfg.batch}x{cfg.seq_len} device buffer this loop fills with `copy_`; the "
             f"LR is a device tensor filled IN PLACE; every `.grad` is pre-allocated and "
             f"zeroed in place. Refused arms (grad_accum>1, rand_depth, segment_len, "
-            f"use_byteflow, halt, use_msa, engram_ram, jepa, dspark, act_quant, QAT, EMA) "
-            f"are LOUD before the first step."
+            f"use_byteflow, halt, use_msa, engram_ram, jepa, dspark, act_quant, QAT, EMA, "
+            f"and every ragged MoE dispatch) are LOUD before the first step; paper "
+            f"LayerRoPE is allowed because its depth indices are fixed."
         )
     for step in range(start, cfg.steps):
         # The step audit's bracket (`dormouse.stepaudit`, disarmed unless a
