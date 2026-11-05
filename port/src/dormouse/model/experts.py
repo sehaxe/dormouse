@@ -1013,6 +1013,15 @@ class SparseMoE(nn.Module):
         #: — never inside the bank's dispatch.
         if self.ffn_form != "bank":
             self._init_ffn_form(cfg, dtype, device)
+            # The bank-only attributes are set AFTER this early return, but
+            # `state_dict(packed_form=...)`, `_load_from_state_dict` and the
+            # checkpoint translation read `tsct_packed` for EVERY form — the
+            # dense and `tsct` forms went `AttributeError` on save/load the day
+            # this seam landed (caught by `test_checkpoints_round_trip_per_form`).
+            # A non-bank form has no bank to pack, so `False` is the truth, not
+            # a default chosen to silence the error.
+            self.tsct_packed = False
+            self._packed_params = ()
             return
         self.router_jitter = getattr(cfg, "moe_router_jitter", 0.0)
         self.moe_kernel = cfg.moe_kernel
