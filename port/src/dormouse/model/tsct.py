@@ -687,6 +687,10 @@ class TSCTLinear(nn.Module):
         u, v = self._factors()
         x = self._act(x)  # a4.8: the activation feeding the factor matmuls
         if dt == torch.float32:
+            # The fp32 lane needs an operand matching the factors: a bf16
+            # residual (`residual_dtype="bf16"`) widens here, and a module
+            # whose factors were cast in a test keeps that dtype.
+            x = x if x.dtype is u.dtype else x.to(u.dtype)
             y = ((x @ u) * self.s) @ v
         else:
             # Matmuls in the factor dtype with fp32 accumulate (torch's own

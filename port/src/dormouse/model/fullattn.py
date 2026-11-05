@@ -129,6 +129,10 @@ class FullAttention(nn.Module):
     def projections(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """`x [b, t, d]` → `q, k, v [b, t, h, head_dim]` (the FLA/port head layout)."""
         b, t, _ = x.shape
+        # The module's own weight dtype decides the seam: fp32 masters widen a
+        # bf16 residual, a bf16 module keeps bf16 (identity when they match).
+        pdt = self.q_proj.weight.dtype
+        x = x if x.dtype is pdt else x.to(pdt)
         dq = (self.dense_qat, self.dense_qat_alpha)
         q = qat_linear(self.q_proj, x, *dq).reshape(b, t, self.n_heads, self.head_dim)
         k = qat_linear(self.k_proj, x, *dq).reshape(b, t, self.n_heads, self.head_dim)
@@ -185,6 +189,8 @@ class FullAttention(nn.Module):
         the gate prints max|Δ| against the unchunked call.
         """
         counters.count("attn_window_forward")
+        pdt = self.q_proj.weight.dtype
+        x = x if x.dtype is pdt else x.to(pdt)
         b, t, d = x.shape
         dq = (self.dense_qat, self.dense_qat_alpha)
         q, k, v = self.projections(x)
@@ -234,6 +240,10 @@ class FullAttention(nn.Module):
         if self.window:
             return self._window_forward(x, counters)
         counters.count("attn_full_forward")
+        # The module's own weight dtype decides the seam (identity when they
+        # match): fp32 masters widen a bf16 residual, a bf16 module keeps bf16.
+        pdt = self.q_proj.weight.dtype
+        x = x if x.dtype is pdt else x.to(pdt)
         b, t, d = x.shape
         dq = (self.dense_qat, self.dense_qat_alpha)
         q, k, v = self.projections(x)

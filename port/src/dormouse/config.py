@@ -322,6 +322,15 @@ OPT_DTYPES = ("fp32", "bf16")
 #: reason on `counters.why`) and the no-grad forwards (eval, decode, the bench)
 #: run it. A name that is not here is LOUD.
 MM_DTYPES = ("bf16", "fp8")
+#: The `residual_dtype` literals — the STORAGE dtype of the loop's residual
+#: stream (`streams`, `h`, `ctx`, `normed`, the three branch writes, `y` and
+#: `step_out`). `fp32` is the default and every number on record. `bf16` stores
+#: those tensors at half the bytes and widens each arm at its own seam; it does
+#: NOT change the compute dtype (`bf16` does that) and it does not touch the
+#: state-carrying paths, which stay fp32 (see the field's docstring for the
+#: list). It is refused with the fp32-only Triton chains (the fused residual /
+#: epilogue kernels and the KDA tail's combine), never silently dropped.
+RESIDUAL_DTYPES = ("fp32", "bf16")
 #: The `muon_variant` literals — the DIRECTION arms (`optim.MUON_VARIANTS`, which
 #: is where they execute; the list is duplicated here the way `NS_KINDS` is, so
 #: the config layer does not import the trainer). `muon` is the update every
@@ -489,6 +498,32 @@ class ModelConfig:
     #: unlike burn's `small.toml`, which still ships fp32 (listed in the port
     #: report as a deliberate deviation).
     bf16: bool = True
+    #: The STORAGE dtype of the loop's residual stream (`RESIDUAL_DTYPES`).
+    #:
+    #: `fp32` (the default, every number on record) keeps the whole loop in
+    #: fp32. `bf16` stores the tensors every iteration carries at half the
+    #: bytes: the mHC lanes and the body state (`h`, `ctx`), the body's normed
+    #: reads, the three branch writes (`attn`/`branch`/`ffn`), the residual
+    #: update `y` and the readout `step_out`. `scripts/precision_census.py`
+    #: prices the table; `tests/test_residual_bf16.py` measures the drift.
+    #:
+    #: **What stays fp32, and why** (the census's `required` column): the mHC
+    #: lane RMSNorm, the hyper-network sigmoids and the Sinkhorn-Knopp
+    #: projection (log-domain, 40 `logsumexp`), the lane mix; AttnRes' key norm
+    #: and softmax; the KDA projections' input (fp32 masters, and the fused tail
+    #: is fp32-input only), the log-decay `g` and the gated-delta state `S`; the
+    #: CSA chunk scores and ring `sum`; the Engram read (fp32 tables and the
+    #: order reduction); the readout accumulator `out_acc`; the final norm, the
+    #: head and the CE. Those are the reductions and state updates, not the
+    #: stream.
+    #:
+    #: This field is INDEPENDENT of `bf16`: `bf16` chooses the GEMM compute
+    #: dtype, this chooses what the loop stores. Both combinations are legal.
+    #: REFUSED, each with `Escape:`: `fused_residual` and `fused_epilogue`
+    #: (their Triton chains are fp32-only) and `fused_kda_tail` (its `combine`
+    #: kernel is fp32-only); the projection tail alone is not separately
+    #: switchable, so the escape is `fused_kda_tail=false`.
+    residual_dtype: str = "fp32"
     #: TSCT factor format. `none` resolves to bf16 factors at init; every
     #: ladder rung (fp8 → NVFP4 → LittleBit) is a REFUSAL, not a fallback.
     quant: str = "none"
@@ -3145,6 +3180,39 @@ def validate(model: ModelConfig) -> None:
             "iteration's local chain either. Escape: use_mhc=true (the composition, "
             "where the write is local: u_0 = 0, u_1 = y), or fused_residual=false "
             "(the ReZero write is three elementwise ops and needs no kernel)."
+        )
+    if model.residual_dtype not in RESIDUAL_DTYPES:
+        loud(
+            f"residual_dtype={model.residual_dtype!r} is not a dtype. Known: "
+            f"{', '.join(RESIDUAL_DTYPES)}. Escape: one of those; the value names "
+            f"the STORAGE dtype of the loop's residual stream "
+            f"(scripts/precision_census.py prices it)."
+        )
+    if model.residual_dtype == "bf16" and model.fused_residual:
+        loud(
+            "residual_dtype='bf16' with fused_residual=true: the fused residual "
+            "chain (`model/fused_residual.py`: _Pre/_Write and their two VJPs) "
+            "reproduces the fp32 arithmetic only — its kernel refuses a non-fp32 "
+            "lane (`unsupported_reason`), and the lanes it would read are now "
+            "bf16. Silently falling back would report an arm that never ran, so "
+            "this is refused. Escape: fused_residual=false (the eager mHC chain "
+            "widens the lanes itself), or residual_dtype='fp32'."
+        )
+    if model.residual_dtype == "bf16" and model.fused_epilogue:
+        loud(
+            "residual_dtype='bf16' with fused_epilogue=true: the fused epilogue "
+            "read kernel (`model/fused_residual.py::epilogue_read`) is fp32-only "
+            "and refuses a bf16 lane. Escape: fused_epilogue=false, or "
+            "residual_dtype='fp32'."
+        )
+    if model.residual_dtype == "bf16" and model.fused_kda_tail:
+        loud(
+            "residual_dtype='bf16' with fused_kda_tail=true: the tail's `combine` "
+            "kernel (`model/fused_kda.py::combine`, the y = attn + branch + ffn "
+            "pass) is fp32-only, and the loop's three branch writes are now bf16. "
+            "The projection tail alone is not separately switchable, so the pair "
+            "is refused rather than run half its kernels. Escape: "
+            "fused_kda_tail=false, or residual_dtype='fp32'."
         )
     # The codec selector is checked even when `use_byteflow = false`: an
     # unknown name must not fall back to attention, and `conv` with nothing to

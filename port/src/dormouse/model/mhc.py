@@ -175,7 +175,15 @@ class MHCMix(nn.Module):
         # burn: block.rs:109-118 — h / sqrt(mean(h²) + 1e-20), ε from App. A.1.
         b, t = x_streams.shape[:2]
         flat = x_streams.reshape(b, t, self.n_streams * self.d_model)
-        return flat / torch.sqrt(flat.pow(2).mean(-1, keepdim=True) + EPS)
+        # The lane norm is a REDUCTION: fp32 even when the lanes are stored
+        # bf16 (`residual_dtype="bf16"`); `.float()` is the identity on the
+        # fp32 path, so the OFF bits do not move. The result returns in the
+        # module's OWN weight dtype (fp32 here; a bf16 test module keeps bf16)
+        # because the hyper-network's next op is a matmul with those weights.
+        flat = flat.float()
+        return (flat / torch.sqrt(flat.pow(2).mean(-1, keepdim=True) + EPS)).to(
+            self.phi_pre.dtype
+        )
 
     def _pre_tilde(self, x_streams: torch.Tensor) -> torch.Tensor:
         """Eq. 7's `H̃_pre`, unconstrained — `block.rs:158-168`."""
@@ -233,5 +241,11 @@ class MHCMix(nn.Module):
         h_post = (2.0 * torch.sigmoid(post)).unsqueeze(-2)  # [b, t, 1, n]
         h_res = sinkhorn_knopp(res, impl=self.sinkhorn)
         # burn: block.rs:213-226 — H_res x_l, then H_postᵀ F added per lane.
-        mixed = torch.einsum("btij,btjd->btid", h_res, x_streams)
-        return mixed + h_post.transpose(-1, -2) * x_in.unsqueeze(-2)
+        # The MIX is a reduction against the fp32 Sinkhorn matrix, so the lanes
+        # and the branch output are widened here; `.float()` is the identity on
+        # the fp32 path (`residual_dtype="fp32"`), so its bits do not move.
+        pdt = self.phi_pre.dtype
+        xs = x_streams if x_streams.dtype is pdt else x_streams.to(pdt)
+        xi = x_in if x_in.dtype is pdt else x_in.to(pdt)
+        mixed = torch.einsum("btij,btjd->btid", h_res, xs)
+        return mixed + h_post.transpose(-1, -2) * xi.unsqueeze(-2)

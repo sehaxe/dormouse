@@ -213,13 +213,16 @@ def depth_attend(
     which at the zero-query init makes every weight exactly `1` and therefore
     the mixture exactly the residual SUM of the same sources it scored.
     """
-    q_eff = slot.gain * slot.query
-    keys = torch.stack([_rms_no_gain(s, eps) for s in sources], dim=-2)  # [b,t,S,d]
+    q_eff = (slot.gain * slot.query).float()
+    # `.float()` is the identity on fp32 sources (the OFF path's bits), and it
+    # is the FP32 REDUCTION the census requires when the residual is stored
+    # bf16: the key norm and the softmax are not allowed to run in bf16.
+    keys = torch.stack([_rms_no_gain(s.float(), eps) for s in sources], dim=-2)  # [b,t,S,d]
     scores = (keys * q_eff).sum(-1)  # [b,t,S]
     w = F.softmax(scores, dim=-1)
     if scale != 1.0:  # not `w * 1.0`: the single-arm path must stay bit-identical
         w = w * scale
-    return (w.unsqueeze(-1) * torch.stack(sources, dim=-2)).sum(-2)
+    return (w.unsqueeze(-1) * torch.stack([s.float() for s in sources], dim=-2)).sum(-2)
 
 
 class LoopBlock(nn.Module):
@@ -282,6 +285,43 @@ class LoopBlock(nn.Module):
         #: The compute dtype the bf16 plan names for the block's small mixed
         #: projections (controller, mem_dense) — the experts' own choice.
         self.compute_dtype = torch.bfloat16 if cfg.bf16 else torch.float32
+        #: The STORAGE dtype of the residual stream (`cfg.residual_dtype`).
+        #: fp32 is the default and OFF is the identity: `_res` returns its
+        #: argument unchanged, so the pre-flag forward is byte-for-byte today's.
+        #: bf16 stores `h`, the mHC lanes, `ctx`, the normed reads, the branch
+        #: writes and `y` at half the bytes; every arm that needs fp32 widens
+        #: its own input and the reductions/state stay fp32 (see
+        #: `scripts/precision_census.py`, which is the change list's source).
+        res_name = getattr(cfg, "residual_dtype", "fp32")
+        if res_name not in ("fp32", "bf16"):
+            loud(
+                f"residual_dtype={res_name!r} is not a dtype. Known: fp32, bf16. "
+                f"Escape: one of those (the value names the loop's residual STORAGE "
+                f"dtype, not the compute dtype — `bf16` is that switch)."
+            )
+        self.residual_dtype = torch.bfloat16 if res_name == "bf16" else torch.float32
+        if self.residual_dtype is torch.bfloat16:
+            # The runtime seam a hand-built model reaches (`config.validate`
+            # owns the same refusals; ADR-0019 says both must hold). Name the
+            # fp32-only kernel, never fall back to it silently.
+            if getattr(cfg, "fused_residual", False):
+                loud(
+                    "residual_dtype='bf16' with fused_residual=true: the "
+                    "fused_residual Triton chain (_Pre/_Write + the two VJPs) is "
+                    "fp32-only. Escape: fused_residual=false, or residual_dtype='fp32'."
+                )
+            if getattr(cfg, "fused_epilogue", False):
+                loud(
+                    "residual_dtype='bf16' with fused_epilogue=true: the "
+                    "fused_epilogue Triton kernel (epilogue_read) is fp32-only. "
+                    "Escape: fused_epilogue=false, or residual_dtype='fp32'."
+                )
+            if getattr(cfg, "fused_kda_tail", False):
+                loud(
+                    "residual_dtype='bf16' with fused_kda_tail=true: the "
+                    "fused_kda_tail combine kernel is fp32-only. Escape: "
+                    "fused_kda_tail=false, or residual_dtype='fp32'."
+                )
         #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
         #: as the factor rung): every plain `nn.Linear` weight the block owns —
         #: the controller, `mem_dense`, and `out_proj` when it is a
@@ -500,6 +540,19 @@ class LoopBlock(nn.Module):
         #: too, so a `.to(cuda)` cannot serve a stale CPU buffer.
         self._zero_cache: dict[tuple, torch.Tensor] = {}
 
+    def _res(self, x: torch.Tensor) -> torch.Tensor:
+        """Store a residual-stream tensor in `residual_dtype`; OFF is identity.
+
+        The whole flag lives in this one cast: with `residual_dtype="fp32"` it
+        returns `x` untouched (so `bf16=true` keeps storing its branch outputs
+        in bf16 exactly as today), and with `"bf16"` it is the half-bytes
+        write. No consumer is allowed to infer precision from this tensor — it
+        widens at its own seam.
+        """
+        if self.residual_dtype is torch.float32:
+            return x
+        return x.to(self.residual_dtype)
+
     def _zero(
         self, like: torch.Tensor, shape: tuple[int, ...], dtype: torch.dtype | None = None
     ) -> torch.Tensor:
@@ -624,7 +677,11 @@ class LoopBlock(nn.Module):
                 self._fused_fell_back = True
                 return None
             why = fused_residual.unsupported_reason(
-                xl.dtype, self.mhc.n_streams, xl.shape[-1] * self.mhc.n_streams, xl.device.type
+                xl.dtype,
+                self.mhc.n_streams,
+                xl.shape[-1] * self.mhc.n_streams,
+                xl.device.type,
+                kernel="fused_epilogue",
             )
             if why is None:
                 counters.count("fused_epilogue")
@@ -672,7 +729,13 @@ class LoopBlock(nn.Module):
         """
         dt = self.moe._bank_dtype()
         x = normed.reshape(-1, self.d)
-        return self.moe(x.to(dt), counters=counters).to(torch.float32)
+        out = self.moe(x.to(dt), counters=counters)
+        # The write's storage dtype: fp32 today (the block's contract), or the
+        # residual dtype under `residual_dtype="bf16"` (half the bytes, and the
+        # MoE's own bank dtype is bf16 already, so the cast is a no-op).
+        if self.residual_dtype is torch.bfloat16:
+            return out.to(torch.bfloat16)
+        return out.to(torch.float32)
 
     def _window(
         self,
@@ -729,8 +792,11 @@ class LoopBlock(nn.Module):
             blocks = self._blocks if self._blocks is not None else (self,)
         bodies: tuple[LoopBlock, ...] = tuple(blocks)
         b, t, d = h0.shape
-        h = h0
-        h0_flat = h0.reshape(b * t, d)
+        #: The residual stream's storage dtype (`residual_dtype`). OFF returns
+        #: `h0` itself, so the pre-flag forward is unchanged; ON casts once at
+        #: the loop boundary and the readout accumulator below stays fp32.
+        h = self._res(h0)
+        h0_flat = h.reshape(b * t, d)
         #: The COMPOSITION (`use_mhc` + `use_attnres`, module docstring): mHC
         #: owns the K-lane state, AttnRes owns the update `H_post` deposits.
         #: A local, not a cached field, so `loop.mhc = None` (the test's way of
@@ -743,12 +809,19 @@ class LoopBlock(nn.Module):
         # mHC's K lanes (`mhc.py`): replicated from h0 (2409.19606 §2.1), each
         # the FULL residual width. `None` is the flag-off path, byte-for-byte.
         streams = (
-            h0.unsqueeze(-2).expand(b, t, self.mhc.n_streams, d) if self.mhc is not None else None
+            h.unsqueeze(-2).expand(b, t, self.mhc.n_streams, d) if self.mhc is not None else None
         )
         #: `None` until the first pre-mix decides it (`_fused_ok`); stays
         #: `None` for a block with no lanes, where neither fused chain exists.
         fuse: str | None = None
-        out_acc = torch.zeros_like(h0)
+        #: The READOUT accumulator is fp32 by contract (`precision_census.py`),
+        #: even when the residual is stored bf16. Under fp32 this is exactly
+        #: `zeros_like(h0)` (today's allocation).
+        out_acc = (
+            torch.zeros_like(h0)
+            if self.residual_dtype is torch.float32
+            else torch.zeros(h0.shape, dtype=torch.float32, device=h0.device)
+        )
         rec = torch.zeros((), dtype=torch.float32, device=h0.device)
         per_iter: list[torch.Tensor] = []
         #: The per-iteration states the halt head reads (`model.py`'s loss);
@@ -760,7 +833,7 @@ class LoopBlock(nn.Module):
         # The AttnRes-ONLY history (`[h0]` + every body output). Unused by the
         # composition, which re-scores two write updates per iteration instead
         # of the whole depth history: mHC's lanes already hold that history.
-        sources: list[torch.Tensor] = [h0] if self.use_attnres and not compose else []
+        sources: list[torch.Tensor] = [h] if self.use_attnres and not compose else []
         new_states: list = []
         if self._paper is not None:
             # The paper form's gain table is a function of the parameters ONLY
@@ -960,7 +1033,7 @@ class LoopBlock(nn.Module):
             # H_pre (applied by the caller, `mhc.py`) aggregates them into
             # the body's input — the crate's `h_ctx` (`mhc-2026-09-30.md`
             # §3.4), with Eq. 3's H_pre moved out of `forward`.
-            streams = streams + self.iter_embed[i].view(1, 1, 1, d)
+            streams = streams + self._res(self.iter_embed[i].view(1, 1, 1, d))
             if fuse is None:
                 # `streams` is the post-add tensor the kernels see, so the
                 # dtype/shape check runs here and not on `h0`.
@@ -984,10 +1057,13 @@ class LoopBlock(nn.Module):
             elif fuse == "residual":
                 ctx, mhc_raw = fused_residual.pre(blk.mhc, streams, counters)
             else:
-                ctx = blk.mhc.pre_mix(streams)
+                # `pre_mix` widens the bf16 lanes internally (the lane norm is
+                # a reduction); the body's input is stored back in the residual
+                # dtype, which is a no-op under fp32.
+                ctx = self._res(blk.mhc.pre_mix(streams))
             counters.count("mhc")
         else:
-            ctx = h + self.iter_embed[i].view(1, 1, d)
+            ctx = self._res(h + self._res(self.iter_embed[i].view(1, 1, d)))
         # `gains` was resolved ONCE at the top of this iteration (it is the same
         # `for_iteration` call the fused route already paid for); resolving it
         # again here cost one extra call per iteration — measured 2026-11-04 as
@@ -996,17 +1072,21 @@ class LoopBlock(nn.Module):
             # The fused read kernel already emitted `normed`/`normed_mlp` from
             # the same pass that mixed the lanes; computing them again here
             # would be the very double pass the fusion removes.
+            # The RMSNorm mean is a reduction: it runs in fp32 even when the
+            # body's input is stored bf16, and the result goes back to the
+            # residual dtype (`_res` is the identity under fp32).
+            norm_in = ctx if self.residual_dtype is torch.float32 else ctx.float()
             if gains is not None:
-                normed = F.rms_norm(ctx, (d,), gains[0], blk.eps)
-                normed_mlp = F.rms_norm(ctx, (d,), gains[2], blk.eps)
+                normed = self._res(F.rms_norm(norm_in, (d,), gains[0], blk.eps))
+                normed_mlp = self._res(F.rms_norm(norm_in, (d,), gains[2], blk.eps))
             elif blk._layerrope_depth is None:
-                normed = blk.norm(ctx)
+                normed = self._res(blk.norm(norm_in))
                 normed_mlp = normed
             else:
                 # The ACTUAL iteration number (`i`), never the run's compacted
                 # position: a shorter rand-depth run uses a PREFIX of the depth
                 # table and the coda/final depths stay anchored to `max_iter`.
-                normed = blk.norm(ctx, depth=blk._layerrope_depth + i)
+                normed = self._res(blk.norm(norm_in, depth=blk._layerrope_depth + i))
                 normed_mlp = normed
         #: The controller reads `[ctx; h0]` as ONE GEMM. It is a fresh allocation
         #: per iteration and it is KEPT: splitting it into `ctx@W1ᵀ + h0@W2ᵀ` would
@@ -1047,7 +1127,7 @@ class LoopBlock(nn.Module):
             )
             attn = attn_out.reshape(b * t, d) * w_attn
         else:
-            attn = self._zero(h, (b * t, d), torch.float32)
+            attn = self._zero(h, (b * t, d), self.residual_dtype)
         if blk.csa is not None:
             csa_state = prev[1] if isinstance(prev, tuple) else None
             if recurrent:
@@ -1099,9 +1179,17 @@ class LoopBlock(nn.Module):
                 msa_out = blk.msa(normed, counters=counters)
                 if msa_out is not None:
                     attn = attn + msa_out.reshape(b * t, d) * w_attn
+        #: One store for every attention arm's write: the branch is in the
+        #: residual dtype from here on (`_res` is the identity under fp32).
+        attn = self._res(attn)
 
         if blk.engram is not None and input_ids is not None:
-            mem = blk._memory(normed, input_ids, drop, counters, slots=mem_slots).reshape(b * t, d)
+            # The Engram read widens internally (fp32 tables + the order
+            # reduction); its OUTPUT is residual storage, so it is stored at
+            # the stream's dtype. `_res` is the identity under fp32.
+            mem = self._res(
+                blk._memory(normed, input_ids, drop, counters, slots=mem_slots).reshape(b * t, d)
+            )
             dense = (
                 (
                     mm_mixed(
@@ -1117,12 +1205,12 @@ class LoopBlock(nn.Module):
                     )
                     + blk.mem_dense.bias.to(blk.compute_dtype)
                 )
-                .to(torch.float32)
+                .to(self.residual_dtype if self.residual_dtype is torch.bfloat16 else torch.float32)
                 .reshape(b * t, d)
             )
-            branch = memory_floor_mix(mem, dense, w_mem, self.lam_max)
+            branch = self._res(memory_floor_mix(mem, dense, w_mem, self.lam_max))
         else:
-            branch = self._zero(h, (b * t, d), torch.float32)
+            branch = self._zero(h, (b * t, d), self.residual_dtype)
 
         post = (
             h,
@@ -1166,7 +1254,7 @@ class LoopBlock(nn.Module):
         # them costs less than recomputing a d×d matmul per iteration. `full`
         # still checkpoints it as part of the whole body.
         b, t, _ = h.shape
-        step_out = blk.out_proj(h.reshape(b * t, d)).reshape(b, t, d)
+        step_out = self._res(blk.out_proj(h.reshape(b * t, d)).reshape(b, t, d))
         return h, streams, y, step_out, st, fuse
 
     def _step_post(
@@ -1197,7 +1285,7 @@ class LoopBlock(nn.Module):
         `fuse` stay with the caller (the read side's outputs, never recomputed).
         """
         b, t, d = h.shape
-        ffn = blk._moe_branch(normed_mlp, counters) * w_ffn
+        ffn = self._res(blk._moe_branch(normed_mlp, counters) * w_ffn)
         # PAPER FORM's WRITE gains (`layerrope.py`): each branch's OUTPUT is
         # scaled where it enters `y`, the residual UPDATE. `y` is exactly the
         # `F(H_pre·x_l)` the residual operator deposits (mHC `H_post`, AttnRes'
@@ -1224,10 +1312,14 @@ class LoopBlock(nn.Module):
             if self.fused_kda_tail:
                 counters.count("fused_kda_tail_fallback")
             if gains is not None:
-                attn = attn * gains[1]
-                branch = branch * gains[1]
-                ffn = ffn * gains[3]
-            y = (attn + branch + ffn).reshape(b, t, d)
+                # The write gains are [d] vectors; cast them once so the three
+                # products stay in the residual dtype (`_res` is identity under
+                # fp32, where this is byte-for-byte today's expression).
+                gain_a, gain_m = self._res(gains[1]), self._res(gains[3])
+                attn = attn * gain_a
+                branch = branch * gain_a
+                ffn = ffn * gain_m
+            y = self._res((attn + branch + ffn).reshape(b, t, d))
 
         if self.loom:
             # LOOM (2610.01153): per-loop router conditioning + variance
@@ -1237,7 +1329,10 @@ class LoopBlock(nn.Module):
             # `gate[i] == 0` adds an exact zero: the at-init forward IS the
             # `loom = false` forward, bit for bit.
             counters.count("loom")
-            y = y + _rms_no_gain(y, self.eps) * self.loom_gate[i].view(1, 1, 1)
+            # The normalized write's norm is a reduction: fp32 under a bf16
+            # residual (`_res` is the identity under fp32, today's bits).
+            y32 = y if self.residual_dtype is torch.float32 else y.float()
+            y = self._res(y32 + _rms_no_gain(y32, self.eps) * self.loom_gate[i].view(1, 1, 1))
 
         #: The WRITE half runs the fused kernel when the residual arm is on
         #: (`fuse == "residual"`) or when the epilogue arm is on AND the write
@@ -1263,15 +1358,16 @@ class LoopBlock(nn.Module):
             else:
                 updates = [self._zero(y, tuple(y.shape)), y]
                 update = depth_attend(updates, self.attnres[i], self.eps, scale=float(len(updates)))
-                streams = blk.mhc(streams, update)
+                streams = self._res(blk.mhc(streams, update))
                 # 2409.19606 §2.1: our K full-width lanes re-sum to K times the
                 # state, where the paper's K width-C lanes re-sum to C. The
                 # mHC-ONLY arm keeps its historical unnormalised sum (pinned);
-                # the composition applies the paper's 1/K.
-                h = streams.sum(dim=-2) / blk.mhc.n_streams
+                # the composition applies the paper's 1/K. The readout is a
+                # reduction over lanes: fp32, then stored in the residual dtype.
+                h = self._res(streams.float().sum(dim=-2) / blk.mhc.n_streams)
         elif self.use_attnres:
             counters.count("attnres_write")
-            h = depth_attend((*sources, y), self.attnres[i], self.eps)
+            h = self._res(depth_attend((*sources, y), self.attnres[i], self.eps))
         elif blk.mhc is not None:
             # Eq. 3's residual: H_res x_l + H_postᵀ F(H_pre x_l). The
             # readout is the SUM of the lanes (2409.19606 §2.1); the crate's
@@ -1288,11 +1384,11 @@ class LoopBlock(nn.Module):
                     counters,
                 )
             else:
-                streams = blk.mhc(streams, y)
-                h = streams.sum(dim=-2)
+                streams = self._res(blk.mhc(streams, y))
+                h = self._res(streams.float().sum(dim=-2))
         else:
             counters.count("rezero_write")
-            h = ctx + y * blk.residual_scale
+            h = self._res(ctx + y * blk.residual_scale)
 
         return h, streams, y
 

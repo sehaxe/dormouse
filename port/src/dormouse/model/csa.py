@@ -814,6 +814,11 @@ class CompressedSelectiveAttention(nn.Module):
         """
         counters = Counters() if counters is None else counters
         counters.count("csa_forward")
+        # The arm's own weights decide the seam dtype: the model builds them
+        # fp32 (so a bf16 residual widens once here); a bf16 module in a test
+        # keeps bf16. Identity on the matching-dtype path.
+        pdt = next(self.parameters()).dtype
+        x = x if x.dtype is pdt else x.to(pdt)
         b, t, _d = x.shape
         levels: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, str]] = []
         cout = mout = None
@@ -875,6 +880,8 @@ class CompressedSelectiveAttention(nn.Module):
         """
         counters = Counters() if counters is None else counters
         counters.count("csa_forward")
+        pdt = next(self.parameters()).dtype
+        x = x if x.dtype is pdt else x.to(pdt)
         b, t, d = x.shape
         fs, cs, ms = self._split_state(state)
         levels: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, str]] = []
@@ -1020,6 +1027,8 @@ class CompressedSelectiveAttention(nn.Module):
         """
         counters = Counters() if counters is None else counters
         counters.count("csa_step")
+        pdt = next(self.parameters()).dtype
+        x = x if x.dtype is pdt else x.to(pdt)
         b, t, d = x.shape
         assert t == 1, f"the decode step is one position, got {t}"
         fs, cs, ms = self._split_state(state)

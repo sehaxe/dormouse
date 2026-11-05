@@ -204,6 +204,10 @@ class BlockSparseAttention(nn.Module):
         return self._forward(x, counters, k_override=k)
 
     def _forward(self, x, counters, k_override) -> torch.Tensor:
+        # The module's own weight dtype decides the seam: fp32 masters widen a
+        # bf16 residual, a bf16 module keeps bf16 (identity when they match).
+        pdt = self.q_proj.weight.dtype
+        x = x if x.dtype is pdt else x.to(pdt)
         b, t, d = x.shape
         blocks, keep = self.selector(x, counters, k=k_override)
         counters.count("msa_blocks", b * t * blocks.shape[-1])
