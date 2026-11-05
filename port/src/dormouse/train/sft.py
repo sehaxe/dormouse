@@ -1115,6 +1115,7 @@ def sft_train(
         muon_variant=cfg.muon_variant,
         muon_sf=cfg.muon_sf,
         muon_sf_wd=cfg.muon_sf_wd,
+        muon_chunk_elems=cfg.muon_chunk_elems,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
@@ -1157,6 +1158,7 @@ def sft_train(
         # already refused a missing `.ngram` (`require_ngram`).
         load_model_state(model, cfg, ck["model"])
         opt.load_state_dict(ck["opt"])
+        opt.set_ns_steps(cfg.ns_steps)  # a PROGRESS key the loader would revert
         start = int(ck["step"]) + 1
         if start:
             # One OPTIMIZER step consumes `grad_accum x batch x (seq_len + 1)`

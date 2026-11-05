@@ -216,6 +216,11 @@ def test_the_chunk_boundary_is_bit_exact(monkeypatch):
     a, oa, b, ob = _pair(shapes)
     cap = 1 << 12  # [64,64] = 4096 elements -> exactly one param per chunk
     monkeypatch.setattr(optim, "MUON_CHUNK_ELEMS", cap)
+    # `Muon` captures the cap at construction (it is a config value now, not a
+    # module constant read at step time), so the instance is what the test
+    # turns down; the module patch keeps the transcribed old step's default in
+    # sync with it.
+    ob.chunk_elems = cap
     chunked = _dispatches(lambda: ob.batched_step_from_model(b))
     monkeypatch.undo()
     old_batched_step(oa, chunk_elems=cap)
@@ -659,7 +664,7 @@ def bench_muon_b1_step(device=None, reps: int = 5, warm: int = 2) -> None:
         print(f"  chunk cap sweep (new, precision {precision}):")
         muon = Muon(params, lr=1e-3)
         for cap in (1 << 25, 1 << 26, 1 << 27):
-            optim.MUON_CHUNK_ELEMS = cap
+            muon.chunk_elems = cap  # the cap is a config value on the optimizer
             for i, p in enumerate(params):
                 p.detach().copy_(init[i])
             try:
@@ -677,7 +682,7 @@ def bench_muon_b1_step(device=None, reps: int = 5, warm: int = 2) -> None:
                 f"    cap 2**{cap.bit_length() - 1:2d} ({cap / 2**20:7.1f}M elems): "
                 f"{ms:8.1f} ms   peak {peak:5.2f} GiB"
             )
-        optim.MUON_CHUNK_ELEMS = 1 << 25
+        muon.chunk_elems = 1 << 25
     torch.set_float32_matmul_precision("highest")
 
 

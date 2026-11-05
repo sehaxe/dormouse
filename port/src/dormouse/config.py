@@ -74,7 +74,41 @@ PROGRESS_KEYS = (
     # decay on a resume changes a view, never what was trained. It is a
     # progress key for that reason and is documented on `TrainConfig`.
     "ema_decay",
+    # `ns_steps` is the Newton-Schulz iteration count, i.e. WHERE the remaining
+    # steps sit on the same polynomial approximation. The gradient it produces
+    # is a function of the momentum, not of the step's history, so changing it
+    # on a resume is an A/B on the remaining budget rather than a new run. The
+    # optimizer's param groups are restored from the CHECKPOINT by torch's
+    # loader, so `train/loop.py` re-applies this key after `load_state_dict`
+    # (`MixOptimizer.set_ns_steps`) — without that line the progress key would
+    # be silently inert on a resume.
+    "ns_steps",
+    # `muon_chunk_elems` changes how many slices share ONE lockstep pass, not
+    # the per-slice arithmetic: the greedy split is over whole matrices and
+    # the NS chain is per slice, so a different cap is bit-identical
+    # (`tests/test_opt_region.py`). It is a kernel/memory selection, the same
+    # class as `moe_kernel`, and a preset that raises it must not refuse the
+    # resume of a run that used the schema value.
+    "muon_chunk_elems",
 )
+
+#: TRAIN defaults that ride a PRESET NAME (a preset file is model-only: the
+#: schema is the train default, not a second TOML file). Only the geometries
+#: where the arm was measured live here; `load_run` applies this AFTER the
+#: `TrainConfig()` defaults and BEFORE explicit `train_overrides`, so
+#: `--set key=...` still wins and a caller that passes a `TrainConfig` is not
+#: touched. The snapshot records the resolved value, so a checkpoint pins it.
+#:
+#: m400/medium: `muon_state_dtype=bf16` is the 2026-11-05 optimizer-region arm
+#: (the 100-step CPU gate and the launch census are in
+#: `docs/reviews/2026-11-05-opt-region.md`); `muon_chunk_elems=1<<26` is the
+#: same geometry's lockstep cap — it halves the chunk count (18 -> 14 at m400)
+#: and keeps the peak intermediate at half of the b1-cap OOM size. b1 and the
+#: smaller presets keep the historical schema values.
+PRESET_TRAIN_DEFAULTS: dict[str, dict[str, object]] = {
+    "m400": {"muon_state_dtype": "bf16", "muon_chunk_elems": 1 << 26},
+    "medium": {"muon_state_dtype": "bf16", "muon_chunk_elems": 1 << 26},
+}
 
 #: The commit that removed the stubs below (`port(cleanup): delete the six dead
 #: config stubs and the `_unsupported` machinery`, 2026-10-17).
@@ -1537,7 +1571,11 @@ class TrainConfig:
     #: is NON-MONOTONE with a <0.003 BPB spread -> a tie prediction, and this
     #: port's own 3-iteration NS sits 1.17e-15 from the manifold at a 10:1
     #: spectral spread (docs/reviews/..., 2026-10-15). A change of this
-    #: default goes through the standing 3-seed A/B, not a sentence.
+    #: default goes through the standing 3-seed A/B, not a sentence. It is a
+    #: PROGRESS KEY (`PROGRESS_KEYS`): an A/B may change it on a resume, and
+    #: `train/loop.py` re-applies it after the checkpoint's optimizer state is
+    #: loaded. The measured-parity driver is `scripts/ab_opt_region.py ab`
+    #: (`ns5` vs `ns3`), which prints both arms' held-out BPB.
     ns_steps: int = 5
     #: torch.compile(dynamic=True) around the model's forward — the one large
     #: speed lever left (the spike measured 273.5 vs 357.3 ms/step at the b1
@@ -1593,11 +1631,26 @@ class TrainConfig:
     #: only the store rounds (arXiv:2509.23106; the rung's provenance and the
     #: **not implemented** stochastic-rounding follow-up are in `optim`'s module
     #: docs, and the gate in `tests/test_muon_fast.py` holds the update to 1e-2
-    #: relative against the fp32 arm). Resume-safe by construction: a snapshot
-    #: that lacks the key fills this default, and a flip on a resume is refused
-    #: by the snapshot drift check (`diff_keys`), so a live run's semantics and
-    #: its resume do not move.
+    #: relative against the fp32 arm). The SCHEMA default stays `fp32`; the
+    #: measured presets override it through `PRESET_TRAIN_DEFAULTS` (m400 and
+    #: medium are `bf16` since 2026-11-05 — `docs/reviews/2026-11-05-opt-region.md`
+    #: carries the 100-step CPU gate, which is a TOLERANCE gate, not bit
+    #: equality). The snapshot records the resolved value, so a live run's
+    #: semantics and its resume do not move; an older fp32 snapshot resumes
+    #: with `--set muon_state_dtype=fp32` (the strict drift check refuses the
+    #: flip loudly rather than silently changing the state).
     muon_state_dtype: str = "fp32"
+    #: The lockstep Newton-Schulz batch cap, in fp32 ELEMENTS per stacked
+    #: buffer (`optim.MUON_CHUNK_ELEMS` is the schema default, 1<<25 = 33.5M =
+    #: 134 MiB per intermediate). It is a MEMORY/launch trade: the chain holds
+    #: ~6 temporaries per element alive for the whole batch, so a cap is what
+    #: makes b1 fit; at m400/medium the measured cap is 1<<26 (2 chunks per big
+    #: group instead of 4, ~203 fewer optimizer launches per step at the m400
+    #: shape, ~1.6 GiB peak). Lower it (never to 0) on a card that OOMs in the
+    #: optimizer stage. It is a PROGRESS KEY: a chunk split moves no value (the
+    #: NS chain is per slice; `tests/test_opt_region.py` gates the bit-equality
+    #: across caps), so the only thing a resume changes is the launch count.
+    muon_chunk_elems: int = 1 << 25
     #: The Newton–Schulz CHAIN's dtype (`OPT_DTYPES`): `fp32` (the default) is
     #: every number on record; `bf16` runs the polynomial — BOTH arms, `classic`
     #: and `gram` — in bf16 with explicit fp32 in/out casts (nanogpt's practice;
@@ -3911,6 +3964,14 @@ def load_run(
     """
     model = load_preset(preset)
     tcfg = train if train is not None else TrainConfig()
+    if train is None:
+        # The measured preset recipe (module comment above): a preset NAME (or
+        # a path whose stem is one) gets its TRAIN defaults here, before the
+        # explicit overrides, so `--set` remains the last word. A caller that
+        # passes a `TrainConfig` owns every value and is not touched.
+        preset_keys = PRESET_TRAIN_DEFAULTS.get(Path(preset).stem, {})
+        if preset_keys:
+            tcfg = dataclasses.replace(tcfg, **preset_keys)
     if train_overrides:
         known = {f.name for f in dataclasses.fields(TrainConfig)}
         unknown = [k for k in train_overrides if k not in known]
@@ -3967,6 +4028,23 @@ def load_run(
             f"per-param path). Escape: name one of those, or land the arm in "
             f"`optim.COLROW_3D` and its parity gate BEFORE the config can lie "
             f"about it."
+        )
+    if isinstance(tcfg.ns_steps, bool) or not isinstance(tcfg.ns_steps, int) or tcfg.ns_steps < 1:
+        loud(
+            f"ns_steps={tcfg.ns_steps!r}: the Newton-Schulz iteration count is a "
+            f"whole number >= 1 (`5` is Muon's default, `3` is the measured-parity "
+            f"arm). A float or a bool would silently run a different chain. "
+            f"Escape: an integer, e.g. --set ns_steps=3."
+        )
+    if (
+        isinstance(tcfg.muon_chunk_elems, bool)
+        or not isinstance(tcfg.muon_chunk_elems, int)
+        or tcfg.muon_chunk_elems < 1
+    ):
+        loud(
+            f"muon_chunk_elems={tcfg.muon_chunk_elems!r}: the lockstep cap is a "
+            f"positive element count (the schema default is 1<<25; m400/medium "
+            f"use 1<<26). Escape: an integer >= 1."
         )
     for name in ("muon_state_dtype", "ns_dtype"):
         rung = getattr(tcfg, name)

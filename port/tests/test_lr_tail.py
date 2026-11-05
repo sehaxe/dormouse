@@ -258,4 +258,11 @@ def test_progress_keys_are_a_closed_set() -> None:
         "ema_decay",
         "decay_frac",
         "min_lr_frac",
+        # `ns_steps` joined 2026-11-05: the polynomial approximation is a
+        # function of the momentum, not of the step's history, so a resume can
+        # change it (the 5-vs-3 parity driver is `scripts/ab_opt_region.py`).
+        "ns_steps",
+        # `muon_chunk_elems` is an IMPLEMENTATION key: the split is over whole
+        # matrices, so the per-slice NS chain is bit-identical across caps.
+        "muon_chunk_elems",
     }

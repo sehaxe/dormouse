@@ -719,6 +719,28 @@ testable and A/B-able (ADR-0017).
       r=64, d=1536, f=4096, cap=32): projection 3.221 -> 1.611 GMAC, write
       4.295 GMAC, total 7.516 -> 5.905 GMAC (21 % fewer, −2 `bmm` launches).
 
+- [x] P-OPT-REGION. port (Python): the 2026-11-05 profile's largest region
+      (optimizer 35.4 ms / 23.5 %). m400/medium now resolve
+      `muon_state_dtype=bf16` + `muon_chunk_elems=1<<26` through
+      `config.PRESET_TRAIN_DEFAULTS`; `ns_steps` and `muon_chunk_elems` are
+      `PROGRESS_KEYS`, with `MixOptimizer.set_ns_steps` re-applied after torch's
+      loader (otherwise the key is inert on resume). The chunk cap is
+      bit-identical (the split is over whole matrices) and takes the m400
+      optimizer stage 890 -> 731 launches (−17.9 %; cap alone −203, bf16 state
+      +60) on `bench_muon_launch.LaunchCounter`; the 600×[1024,64] fixture
+      127 -> 73. The bf16 state's 100-step CPU gate is a measured TOLERANCE, not
+      bit equality: max rel loss 0.036 % vs fp32 (fresh batch every step),
+      inside the fp32 seed spread 3.45 %, worst parameter delta 9.68 bf16 ulp
+      at scale (pins in `tests/test_opt_region.py`). The strict 1e-5 /
+      per-element-ulp claims are
+      impossible without stochastic rounding and are reported, not asserted.
+      `ns_steps` default is NOT flipped; `scripts/ab_opt_region.py ab` prices
+      5 vs 3 on 2 000 steps and prints both arms. Overlap is reported, not
+      implemented: one stream + one thread, and a per-group split is an autograd
+      seam, not a stream+event change. Reverts red: preset application, the
+      `ns_steps` progress key, the resume re-apply, the cap wiring, and the
+      bf16 store. Report `docs/reviews/2026-11-05-opt-region.md`.
+
 
 ## Critical Files
 

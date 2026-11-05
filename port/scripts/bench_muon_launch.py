@@ -176,13 +176,18 @@ class LaunchCounter(TorchDispatchMode):
 # --- the pre-change program, transcribed from b36ef27 -----------------------
 
 
-def _momentum_update_main(mom: torch.Tensor, params: list, mu: float) -> None:
+def _momentum_update_main(
+    mom: torch.Tensor,
+    params: list,
+    mu: float,
+    chunk_elems: int = MUON_CHUNK_ELEMS,
+) -> None:
     if mom.dtype != torch.bfloat16:
         mom.mul_(mu)
         torch._foreach_add_(torch.unbind(mom, 0), [p.grad for p in params], alpha=1.0 - mu)
         return
     n = len(params)
-    n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // mom[0].numel()))
+    n_chunk = max(1, min(n, chunk_elems // mom[0].numel()))
     for start in range(0, n, n_chunk):
         chunk = params[start : start + n_chunk]
         acc = mom[start : start + n_chunk].to(torch.float32)
@@ -191,10 +196,19 @@ def _momentum_update_main(mom: torch.Tensor, params: list, mu: float) -> None:
         mom[start : start + n_chunk].copy_(acc)
 
 
-def batched_step_main(muon, model, flag: torch.Tensor | None = None) -> int:
-    """`Muon.batched_step_from_model` at `b36ef27`, field for field."""
+def batched_step_main(
+    muon, model, flag: torch.Tensor | None = None, chunk_elems: int | None = None
+) -> int:
+    """`Muon.batched_step_from_model` at `b36ef27`, field for field.
+
+    `chunk_elems` defaults to the live optimizer's own cap, so the comparison
+    is main-vs-new at the SAME cap (`train.muon_chunk_elems` is a config field;
+    a fixed module constant would let the arm differ by the cap and call it a
+    step change).
+    """
     if not muon._groups:
         muon._build_groups()
+    cap = muon.chunk_elems if chunk_elems is None else chunk_elems
     n_batches = 0
     for grp in muon._groups:
         group = muon.param_groups[grp.gi]
@@ -207,13 +221,13 @@ def batched_step_main(muon, model, flag: torch.Tensor | None = None) -> int:
                     muon._step_one(p, lr, mu, ns, scale, flag)
             continue
         mom = grp.mom
-        _momentum_update_main(mom, params, mu)
+        _momentum_update_main(mom, params, mu, cap)
         n = len(params)
         if muon.sf:
             s_new, c = muon._sf_ckp(lr, float(muon.state[params[0]].get("sf_s", 0.0)))
             for p in params:
                 muon.state[p]["sf_s"] = s_new
-        n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // (grp.shape[0] * grp.shape[1])))
+        n_chunk = max(1, min(n, cap // (grp.shape[0] * grp.shape[1])))
         for start in range(0, n, n_chunk):
             params_c = params[start : start + n_chunk]
             update = muon._orthogonalize(mom[start : start + n_chunk], ns)
@@ -241,8 +255,10 @@ def shape_groups(muon) -> list[tuple[tuple[int, int], list]]:
     return [(grp.shape, grp.params) for grp in muon._groups]
 
 
-def chunk_bounds(shape: tuple[int, int], n: int) -> list[tuple[int, int]]:
-    n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // (shape[0] * shape[1])))
+def chunk_bounds(
+    shape: tuple[int, int], n: int, chunk_elems: int = MUON_CHUNK_ELEMS
+) -> list[tuple[int, int]]:
+    n_chunk = max(1, min(n, chunk_elems // (shape[0] * shape[1])))
     return [(s, min(s + n_chunk, n)) for s in range(0, n, n_chunk)]
 
 
@@ -268,7 +284,7 @@ def table(muon, arm: str) -> list[tuple]:
     for shape, params in shape_groups(muon):
         n = len(params)
         path, reason = group_path(muon, shape, n)
-        bounds = chunk_bounds(shape, n)
+        bounds = chunk_bounds(shape, n, muon.chunk_elems)
         ns = muon.param_groups[0]["ns_steps"]
         pieces = [
             muon._groups[[g.shape for g in muon._groups].index(shape)].mom[a:b] for a, b in bounds
@@ -300,6 +316,7 @@ def build(preset: str, *, state: str, ns: str, ns_kind: str, device: str):
         colrow_3d=run.train.muon_colrow_3d,
         muon_state_dtype=state,
         ns_dtype=ns,
+        muon_chunk_elems=run.train.muon_chunk_elems,
     )
     gen = torch.Generator().manual_seed(1234)
     with torch.no_grad():

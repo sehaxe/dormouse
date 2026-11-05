@@ -446,6 +446,7 @@ EXCUSED_FUNCTIONS = {
     "_shadow_params": "SF arm only (muon_sf)",
     "_eval_loss": "eval cadence, no backward",
     "MixOptimizer._fast_adamw_ok": "capability probe over <=8 param groups, no tensor work",
+    "MixOptimizer.set_ns_steps": "resume, once per run (a PROGRESS key repair)",
     "DormouseModel.set_recompute": "setup, once per run",
     "train": "the step DRIVER itself — the bracket, not a loop inside a step",
     "zeropower_via_ns": "per-matrix NS, the retraction's inherent sequential chain",

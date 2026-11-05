@@ -385,7 +385,10 @@ def _classic_ns_batch(tensors: list[torch.Tensor], steps: int, ns_dtype: str) ->
 
 
 def _classic_ns_many(
-    tensors: list[torch.Tensor], steps: int = 5, ns_dtype: str = "fp32"
+    tensors: list[torch.Tensor],
+    steps: int = 5,
+    ns_dtype: str = "fp32",
+    chunk_elems: int = MUON_CHUNK_ELEMS,
 ) -> list[torch.Tensor]:
     """`zeropower_via_ns(kind="classic")` for MANY matrices, one elementwise pass.
 
@@ -403,9 +406,11 @@ def _classic_ns_many(
     `zeropower_via_ns` on each tensor in turn, which `tests/test_muon_launch.py`
     pins against the pre-change step.
 
-    The list is split at `MUON_CHUNK_ELEMS` ELEMENTS, the same cap a single
-    chunk already obeys, and the biggest tensors are placed first so a chunk
-    that fills the cap gets its own batch while the many small groups share one.
+    The list is split at `chunk_elems` ELEMENTS (the schema
+    `MUON_CHUNK_ELEMS`, or the preset's `train.muon_chunk_elems`), the same cap
+    a single chunk already obeys, and the biggest tensors are placed first so a
+    chunk that fills the cap gets its own batch while the many small groups
+    share one.
     The lockstep pass keeps ~6 fp32 temporaries per element alive for the WHOLE
     batch (the per-chunk loop freed them between chunks), so an unbounded pass
     would turn b1's ~400M NS elements into ~10 GiB of transients. The cap keeps
@@ -430,7 +435,7 @@ def _classic_ns_many(
     for i in stepaudit.iterations("muon.ns_split", order):
         t = tensors[i]
         n = t.numel()
-        if batch and elems + n > MUON_CHUNK_ELEMS:
+        if batch and elems + n > chunk_elems:
             for j, u in stepaudit.iterations(
                 "muon.ns_take_inner",
                 zip(batch_idx, _classic_ns_batch(batch, steps, ns_dtype), strict=True),
@@ -786,7 +791,12 @@ def _foreach_add_mixed_(params: list, update: torch.Tensor, alpha: float = 1.0) 
     torch._foreach_copy_(params, torch.unbind(stacked))
 
 
-def _momentum_update_(mom: torch.Tensor, params: list, mu: float) -> None:
+def _momentum_update_(
+    mom: torch.Tensor,
+    params: list,
+    mu: float,
+    chunk_elems: int = MUON_CHUNK_ELEMS,
+) -> None:
     """`m ← mu·m + (1-mu)·g`, in place over a stacked buffer, a few launches.
 
     `fp32` (the default): `mom.mul_(mu)` + `_add_grads_` per CHUNK. The chunk is
@@ -795,14 +805,19 @@ def _momentum_update_(mom: torch.Tensor, params: list, mu: float) -> None:
 
     `bf16`: the ACCUMULATION is fp32 and only the STORE rounds to bf16
     (arXiv:2509.23106's rung, cited in the module docstring). One fp32 temporary
-    per CHUNK carries the arithmetic (`MUON_CHUNK_ELEMS` caps it at 134 MiB) and
-    the store is one cast-copy per chunk: an unchunked fp32 temporary of the b1
-    `[1024, 64, 5461]` group alone is 1.33 GiB, which is the size that OOM'd the
-    warm attempts (audit MAJOR 7, `~/logs/b1warm.log`), so the chunking is what
-    makes the bf16 rung a memory win instead of a memory-neutral one.
+    per CHUNK carries the arithmetic (`chunk_elems` caps it at 134 MiB by
+    default) and the store is one cast-copy per chunk: an unchunked fp32
+    temporary of the b1 `[1024, 64, 5461]` group alone is 1.33 GiB, which is
+    the size that OOM'd the warm attempts (audit MAJOR 7, `~/logs/b1warm.log`),
+    so the chunking is what makes the bf16 rung a memory win instead of a
+    memory-neutral one.
+
+    `chunk_elems` is the same cap `Muon.chunk_elems` carries (`train.muon_chunk_elems`):
+    the m400/medium presets raise it, which cuts launches, and the schema value
+    is the b1-safe one.
     """
     n = len(params)
-    n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // mom[0].numel()))
+    n_chunk = max(1, min(n, chunk_elems // mom[0].numel()))
     if mom.dtype != torch.bfloat16:
         mom.mul_(mu)
         for start in stepaudit.iterations("muon.momentum_chunks", range(0, n, n_chunk)):
@@ -849,12 +864,25 @@ class Muon(Optimizer):
         wd: float = 0.0,
         sf: bool = False,
         sf_beta: float = SF_BETA1,
+        chunk_elems: int = MUON_CHUNK_ELEMS,
     ) -> None:
         _check_ns_kind(ns_kind)
         _check_colrow_3d(colrow_3d)
         _check_dtype("state_dtype", state_dtype)
         _check_dtype("ns_dtype", ns_dtype)
         _check_muon_variant(variant)
+        if isinstance(ns_steps, bool) or not isinstance(ns_steps, int) or ns_steps < 1:
+            loud(
+                f"ns_steps={ns_steps!r} is not an iteration count: it must be a "
+                f"whole number >= 1 (5 = Muon's default, 3 = the measured-parity "
+                f"arm). Escape: an integer, e.g. ns_steps=3."
+            )
+        if isinstance(chunk_elems, bool) or not isinstance(chunk_elems, int) or chunk_elems < 1:
+            loud(
+                f"chunk_elems={chunk_elems!r}: the lockstep cap is a positive "
+                f"element count (optim.MUON_CHUNK_ELEMS = {MUON_CHUNK_ELEMS}). "
+                f"Escape: an integer >= 1."
+            )
         #: The arm and its restart positions live on the OPTIMIZER, not in the
         #: param group: the group is what `Optimizer.load_state_dict` REPLACES
         #: with the checkpoint's copy, so a key added today would KeyError on
@@ -873,6 +901,12 @@ class Muon(Optimizer):
         self.wd = wd
         self.sf = sf
         self.sf_beta = sf_beta
+        #: The lockstep cap in fp32 ELEMENTS per stacked buffer. The schema
+        #: default is the b1-safe `MUON_CHUNK_ELEMS`; `train.muon_chunk_elems`
+        #: can raise it for a preset whose peak fits (m400/medium). A chunk
+        #: split moves no value — the NS chain is per slice — so this is a
+        #: pure launch/memory trade.
+        self.chunk_elems = chunk_elems
         super().__init__(params, dict(lr=lr, momentum=momentum, ns_steps=ns_steps))
         #: One stacked momentum buffer per (param group, shape) — the canonical
         #: state, built lazily by `_build_groups` and rebuilt after a load.
@@ -1247,7 +1281,7 @@ class Muon(Optimizer):
             # The momentum update, in place, without a stack: `mom` is the
             # buffer and `torch.unbind` hands out its rows as views
             # (`_momentum_update_` carries the two dtype rungs' arithmetic).
-            _momentum_update_(mom, params, mu)
+            _momentum_update_(mom, params, mu, self.chunk_elems)
             n = len(params)
             if self.sf:
                 # `s`/`c` are ONE scalar per group (Alg 1 lines 14-15): read the
@@ -1259,7 +1293,7 @@ class Muon(Optimizer):
             # Chunk the shape stack: the cap is fp32 ELEMENTS per stacked
             # buffer (`MUON_CHUNK_ELEMS`), so NS never materializes the whole
             # shape group's chain at once.
-            n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // (grp.shape[0] * grp.shape[1])))
+            n_chunk = max(1, min(n, self.chunk_elems // (grp.shape[0] * grp.shape[1])))
             for start in stepaudit.iterations("muon.chunks", range(0, n, n_chunk)):
                 params_c = params[start : start + n_chunk]
                 pieces = mom[start : start + n_chunk]
@@ -1330,7 +1364,7 @@ class Muon(Optimizer):
         iteration per group.
         """
         if self.ns_kind != "triton":
-            return _classic_ns_many(tensors, steps, self.ns_dtype)
+            return _classic_ns_many(tensors, steps, self.ns_dtype, self.chunk_elems)
         from .ns_kernels import LAUNCH_REFUSALS, path_reason, zeropower_triton
 
         out: list[torch.Tensor | None] = [None] * len(tensors)
@@ -1349,7 +1383,12 @@ class Muon(Optimizer):
             self.counters.count("ns_triton_fallback")
             self.counters.why = f"triton: {why}"  # type: ignore[attr-defined]
         if classic:
-            outs = _classic_ns_many([tensors[i] for i in classic], steps, self.ns_dtype)
+            outs = _classic_ns_many(
+                [tensors[i] for i in classic],
+                steps,
+                self.ns_dtype,
+                self.chunk_elems,
+            )
             for i, update in stepaudit.iterations(
                 "muon.ns_classic_out", zip(classic, outs, strict=True)
             ):
@@ -1468,6 +1507,7 @@ class MixOptimizer:
         muon_variant: str = "muon",
         muon_sf: bool = False,
         muon_sf_wd: float | None = None,
+        muon_chunk_elems: int = MUON_CHUNK_ELEMS,
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
@@ -1529,6 +1569,7 @@ class MixOptimizer:
                 # arm against the control).
                 wd=sf_wd if muon_sf else 0.0,
                 sf=muon_sf,
+                chunk_elems=muon_chunk_elems,
             )
             if muon_params
             else None
@@ -1592,6 +1633,25 @@ class MixOptimizer:
         if self.muon is not None:
             self.muon.zero_grad(set_to_none=set_to_none)
         self.adamw.zero_grad(set_to_none=set_to_none)
+
+    def set_ns_steps(self, ns_steps: int) -> None:
+        """Re-apply `train.ns_steps` to the Muon group after a checkpoint load.
+
+        `Optimizer.load_state_dict` REPLACES `param_groups` with the
+        checkpoint's copies, so without this the progress key is inert on a
+        resume: the trainer would report the config's 3 while the chain ran the
+        checkpoint's 5. LOUD on a non-integer for the same reason the config
+        validation is (a float would run a different chain while the snapshot
+        looked right).
+        """
+        if isinstance(ns_steps, bool) or not isinstance(ns_steps, int) or ns_steps < 1:
+            loud(
+                f"ns_steps={ns_steps!r}: the Newton-Schulz iteration count is a "
+                f"whole number >= 1. Escape: an integer, e.g. 3."
+            )
+        if self.muon is not None:
+            for group in self.muon.param_groups:
+                group["ns_steps"] = ns_steps
 
     def sf_switch(self, mode: str) -> None:
         """`Muon.sf_switch` for the Muon group; LOUD when the arm is not on.
