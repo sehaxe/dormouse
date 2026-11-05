@@ -21,6 +21,9 @@ the table only varies `d`, so it needs one stated rule for `d_ffn`.
 from __future__ import annotations
 
 HEAD_DIM = 64  # the port's presets all ship head_dim = 64
+#: The `ffn_form` literals (`config.FFN_FORMS`), duplicated here so this module
+#: stays torch-free and importable by the pure-arithmetic gate.
+FFN_FORMS = ("bank", "dense", "tsct")
 
 
 def heads(d_model: int, head_dim: int = HEAD_DIM) -> int:
@@ -59,6 +62,89 @@ def out_proj_macs(d_model: int, out_proj_rank: int) -> int:
     return 2 * d_model * out_proj_rank if out_proj_rank else d_model * d_model
 
 
+def _ffn_ranks(rank: int, rank_gate: int, rank_down: int) -> tuple[int, int]:
+    """`(r_gate, r_down)`; 0 means `rank`."""
+    return (rank if not rank_gate else rank_gate, rank if not rank_down else rank_down)
+
+
+def ffn_params(
+    form: str,
+    d_model: int,
+    f: int,
+    *,
+    rank: int = 64,
+    rank_gate: int = 0,
+    rank_down: int = 0,
+    n_experts: int = 1,
+    shared_rank: int = 64,
+) -> int:
+    """The expert slot's parameter count for one `ffn_form`.
+
+    `dense` is `3·d·f + f + d` (gate bias `f`, down bias `d`; the up projection
+    is bias-free). `tsct` is `(2·r_g + r_d)·(d + f + 1)` per expert plus the
+    router `d·E` when `E > 1`. `bank` is today's tree: `E` dual-latent experts,
+    the always-on shared expert, the shared `down [f, d]` and the router.
+
+    `tests/test_ffn_form.py` checks every value against an instantiated
+    `DormouseModel` on CPU; `tests/test_cheapwidth.py` keeps the bank path's
+    old numbers pinned.
+    """
+    rg, rd = _ffn_ranks(rank, rank_gate, rank_down)
+    if form == "dense":
+        return 3 * d_model * f + f + d_model
+    if form == "tsct":
+        per = (2 * rg + rd) * (d_model + f + 1) + f + d_model
+        return n_experts * per + (d_model * n_experts if n_experts > 1 else 0)
+    if form == "bank":
+        per = 2 * d_model * rank + 2 * rank + rank * f
+        shared = 2 * d_model * shared_rank + 2 * shared_rank + shared_rank * f
+        return n_experts * per + shared + d_model * f + d_model * n_experts
+    raise ValueError(f"ffn_form={form!r} is not one of {FFN_FORMS}")
+
+
+def ffn_macs_per_token(
+    form: str,
+    d_model: int,
+    f: int,
+    *,
+    rank: int = 64,
+    rank_gate: int = 0,
+    rank_down: int = 0,
+    n_experts: int = 1,
+    topk: int = 0,
+    shared_rank: int = 64,
+) -> int:
+    """One FFN forward's MAC for one token, by form.
+
+    `dense` reads gate + up + down once: `3·d·f + f + d` (the biases are
+    counted, they are the same order). `tsct` reads `2·r_g·(d + f) +
+    r_d·(f + d)` per assignment plus the biases, and the router `d·E` when
+    `E > 1`. `bank` is the dual-latent bill `2·d·rank + rank·f` per routed
+    assignment, the always-on shared expert, the shared `down` and the router.
+
+    `topk = 0` is the dense blend: every expert runs. The BANK ledger's own
+    convention counts the routed/shared terms once per token (the same
+    convention `capacity_math` has always printed); `macs_per_token` keeps that
+    for `bank` and prices dense/tsct per loop iteration. The info table labels
+    the unit so the two are not subtracted from one another by accident.
+    """
+    if form == "dense":
+        return 3 * d_model * f + f + d_model
+    rg, rd = _ffn_ranks(rank, rank_gate, rank_down)
+    assignments = n_experts if topk == 0 else topk
+    router = d_model * n_experts if n_experts > 1 else 0
+    if form == "tsct":
+        per = 2 * rg * (d_model + f) + rd * (f + d_model) + (2 * rg + rd) + f + d_model
+        return assignments * per + router
+    if form == "bank":
+        routed = 2 * d_model * rank + rank * f
+        shared = 2 * d_model * shared_rank + shared_rank * f
+        # The bank always builds its router, even at E=1: this is the historical
+        # `capacity_math` ledger, not the non-bank forms' "no router" rule.
+        return assignments * routed + shared + d_model * f + d_model * n_experts
+    raise ValueError(f"ffn_form={form!r} is not one of {FFN_FORMS}")
+
+
 def macs_per_token(
     d_model: int,
     *,
@@ -68,14 +154,93 @@ def macs_per_token(
     n_kv_heads: int = 0,
     out_proj_rank: int = 0,
     f: int | None = None,
+    ffn_form: str = "bank",
+    ffn_rank: int = 64,
+    ffn_rank_gate: int = 0,
+    ffn_rank_down: int = 0,
+    n_experts: int = 1,
+    topk: int = 0,
+    shared_rank: int = 64,
 ) -> int:
-    """The dense bill per token: `iters · (attn + out_proj + d·f)`."""
+    """The dense bill per token: `iters · (attn + out_proj + FFN)`.
+
+    `bank` keeps the historical `iters · d·f` shared-write term (the routed
+    bank's terms are added by `capacity_math`, the ledger that owns them).
+    `dense`/`tsct` price the WHOLE expert slot here, since there is no separate
+    routed/shared term to add.
+    """
     f = d_ffn(d_model) if f is None else f
-    return iters * (
+    core = iters * (
         attn_macs(d_model, n_heads, attn_latent_rank, n_kv_heads)
         + out_proj_macs(d_model, out_proj_rank)
-        + d_model * f
     )
+    if ffn_form == "bank":
+        return core + iters * d_model * f
+    return core + iters * ffn_macs_per_token(
+        ffn_form,
+        d_model,
+        f,
+        rank=ffn_rank,
+        rank_gate=ffn_rank_gate,
+        rank_down=ffn_rank_down,
+        n_experts=n_experts,
+        topk=topk,
+        shared_rank=shared_rank,
+    )
+
+
+def active_macs_per_token(
+    d_model: int,
+    *,
+    iters: int,
+    n_heads: int,
+    attn_latent_rank: int = 0,
+    n_kv_heads: int = 0,
+    out_proj_rank: int = 0,
+    f: int | None = None,
+    ffn_form: str = "bank",
+    ffn_rank: int = 64,
+    ffn_rank_gate: int = 0,
+    ffn_rank_down: int = 0,
+    n_experts: int = 1,
+    topk: int = 0,
+    shared_rank: int = 64,
+) -> int:
+    """The full active bill: body + the expert slot, whatever its form.
+
+    The `bank` arm subtracts the `d·f` already inside `macs_per_token` from
+    `ffn_macs_per_token("bank")`, so the result is exactly the historical
+    `capacity_math` ledger. Dense/tsct are already complete inside
+    `macs_per_token`.
+    """
+    f = d_ffn(d_model) if f is None else f
+    body = macs_per_token(
+        d_model,
+        iters=iters,
+        n_heads=n_heads,
+        attn_latent_rank=attn_latent_rank,
+        n_kv_heads=n_kv_heads,
+        out_proj_rank=out_proj_rank,
+        f=f,
+        ffn_form=ffn_form,
+        ffn_rank=ffn_rank,
+        ffn_rank_gate=ffn_rank_gate,
+        ffn_rank_down=ffn_rank_down,
+        n_experts=n_experts,
+        topk=topk,
+        shared_rank=shared_rank,
+    )
+    if ffn_form == "bank":
+        return body + ffn_macs_per_token(
+            "bank",
+            d_model,
+            f,
+            rank=ffn_rank,
+            shared_rank=shared_rank,
+            n_experts=n_experts,
+            topk=topk,
+        ) - d_model * f
+    return body
 
 
 def attn_param_delta(
