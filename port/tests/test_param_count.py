@@ -176,6 +176,7 @@ def test_small_arithmetic_matches_the_model_and_the_preset():
     assert round(100 * rows / SMALL_PORT_TOTAL, 1) == 33.2  # burn measured 34.2%
 
 
+MEDIUM_MSA = 3_473_412  # medium's MSA projections (d=1024), not the d=1536 figure
 MEDIUM_PORT_TOTAL = 141_910_405  # the recipe-validation preset (2026-10-16)
 
 
@@ -184,7 +185,13 @@ def test_medium_arithmetic_matches_the_model_and_the_preset():
     model = DormouseModel(cfg, device="meta")
     want = arithmetic(cfg)
     assert built(model) == want
-    assert sum(want.values()) == MEDIUM_PORT_TOTAL == param_count(model)
+    # `medium` no longer carries MSA: the arm was a measured tie at 2k steps and
+    # 3.5x slower, and its 7 569 408 parameters were dead weight in every preset
+    # that still set `use_msa = true` (found 2026-11-05 while counting what a
+    # "dense 81M" model actually contains). The total is therefore the old one
+    # minus the MSA projections, asserted EXACTLY so a reappearance is loud.
+    assert param_count(model) == MEDIUM_PORT_TOTAL - MEDIUM_MSA
+    assert sum(want.values()) == param_count(model)
     assert want["engram_tables"] == 3 * 524288 * 32 == 50_331_648
     # The b1-bet shapes survive the halving: rank-64 experts, topk-2, depth 4.
     assert cfg.rank == 64 and cfg.moe_topk == 2 and cfg.max_iter == 4
