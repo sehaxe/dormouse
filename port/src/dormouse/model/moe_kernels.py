@@ -812,6 +812,64 @@ def _wgrad_kernel(
     )
 
 
+
+@triton.jit
+def _combine_fwd_kernel(
+    y_ptr,
+    w_ptr,
+    rowmap_ptr,
+    out_ptr,
+    N,
+    F_,
+    K: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_F: tl.constexpr,
+):
+    """The combine's FORWARD in one pass: `out[t] = Σ_k y[row(t,k)]·w[row(t,k)]`.
+
+    The inverse mapping of the backward below, and the same idea: one block per
+    `BLOCK_T` tokens reads those tokens' `rowmap` rows ONCE and writes the
+    token's output, instead of the three `[n, f]`/`[n·k, f]` passes torch runs
+    (`zeros`, the fp32 `y·w` widen+scale, `index_add_`). Traffic: `R·f` reads of
+    `y` (each row read once — every row belongs to exactly one token) plus
+    `n·f` writes of the output; the three-pass form reads/writes `y`'s fp32
+    copy twice and the output twice.
+
+    `w` is fp32 by the caller's contract (`combine`'s docstring); the product and
+    the accumulation are fp32 REGISTERS regardless of the output dtype. With
+    `out` fp32 and `k <= 2` this is bit-identical to `zeros + index_add_`: a
+    token's two contributions are added in the same fp32 precision and fp32
+    addition of two values is commutative, so the row order `index_add_` uses
+    cannot change the answer. `out` bf16 rounds the finished sum ONCE.
+
+    `rowmap [N, K]` int32 is the token→gathered-row map; `-1` is a capacity-dropped
+    assignment and contributes nothing (its lane is masked, `other=0.0`).
+    """
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    f0 = tl.program_id(1) * BLOCK_F
+    ff = f0 + tl.arange(0, BLOCK_F)
+    tmask = t < N
+    fmask = ff < F_
+    acc = tl.zeros((BLOCK_T, BLOCK_F), tl.float32)
+    for k in tl.static_range(TOP_K):
+        if k < K:  # static: a padded top-k slot costs no instruction
+            row = tl.load(rowmap_ptr + t * K + k, mask=tmask, other=-1)
+            valid = row >= 0
+            wv = tl.load(w_ptr + row, mask=valid, other=0.0)
+            yv = tl.load(
+                y_ptr + row[:, None] * F_ + ff[None, :],
+                mask=valid[:, None] & fmask[None, :],
+                other=0.0,
+            )
+            acc += yv.to(tl.float32) * wv[:, None]
+    tl.store(
+        out_ptr + t[:, None] * F_ + ff[None, :],
+        acc.to(out_ptr.dtype.element_ty),
+        mask=tmask[:, None] & fmask[None, :],
+    )
+
+
 @triton.jit
 def _combine_bwd_kernel(
     dout_ptr,
@@ -863,7 +921,7 @@ def _combine_bwd_kernel(
             dout_ptr + t[:, None] * F_ + ff[None, :],
             mask=tmask[:, None] & fmask[None, :],
             other=0.0,
-        )
+        ).to(tl.float32)  # a bf16 store makes grad_out bf16; the math stays fp32
         for k in tl.static_range(TOP_K):
             if k < K:  # static: a padded top-k slot costs no instruction
                 row = tl.load(rowmap_ptr + t * K + k, mask=tmask, other=-1)
@@ -1490,22 +1548,67 @@ def _glu_backward_fused(
 
 
 class _Combine(torch.autograd.Function):
-    """`out = index_add(owner, y·w)` with the FUSED backward — one kernel, one read.
+    """`out = index_add(owner, y·w)` with a fused forward AND backward.
 
-    The forward is the same three lines the caller used to run inline (`y` widened
-    to fp32, scaled by the gathered router weight, scattered by token), so the
-    forward's numbers are unchanged. What changes is the graph: the `[R, f]`
-    scaled tensor is no longer an autograd node, so it is not saved and no `mul`
-    backward or `index_add` backward exists — `_combine_bwd_kernel` produces both
-    gradients in one pass.
+    Two forward forms, one graph. `fused=False` (the default) is the same three
+    lines the caller used to run inline — `y` widened to fp32, scaled by the
+    gathered router weight, scattered by token — and `fused=True` is
+    `_combine_fwd_kernel`: one token-major pass that reads each token's k rows
+    once and writes its output, accumulating in fp32 registers. With `out` fp32
+    the two are bit-identical for `k <= 2` (`_combine_fwd_kernel`'s docstring);
+    `dtype="bf16"` stores the compute dtype and rounds the finish once.
+
+    Either way the graph is this Function's: the `[R, f]` scaled tensor is not an
+    autograd node, so it is not saved and no `mul` backward or `index_add`
+    backward exists — `_combine_bwd_kernel` produces both gradients in one pass,
+    and it reads a bf16 `grad_out` when the store was bf16 (`ctx.out_dtype`).
     """
 
     @staticmethod
-    def forward(ctx, y, w, owner, rowmap, n, ws, tiles, counters):
-        out = torch.zeros(n, y.shape[1], dtype=torch.float32, device=y.device)
-        out.index_add_(0, owner, y.to(torch.float32) * w.unsqueeze(-1))
+    def forward(ctx, y, w, owner, rowmap, n, ws, tiles, counters, fused=False, dtype="fp32"):
+        out_dtype = torch.float32 if dtype == "fp32" else y.dtype
+        if fused:
+            assert dtype == "fp32" or y.dtype != torch.float32, (
+                "a bf16 combine stores the compute dtype; y is fp32"
+            )
+            out = torch.empty(n, y.shape[1], dtype=out_dtype, device=y.device)
+            try:
+                _launch(
+                    _combine_fwd_kernel,
+                    (triton.cdiv(n, tiles["BLOCK_T"]), triton.cdiv(y.shape[1], tiles["BLOCK_F"])),
+                    y,
+                    w,
+                    rowmap,
+                    out,
+                    n,
+                    y.shape[1],
+                    K=rowmap.shape[1],
+                    TOP_K=_topk_tile(rowmap.shape[1]),
+                    BLOCK_T=tiles["BLOCK_T"],
+                    BLOCK_F=tiles["BLOCK_F"],
+                    num_warps=4,
+                )
+            except LaunchRefused as e:
+                # The torch three-pass form is the reference and writes fp32;
+                # a refused LAUNCH (not a numeric choice) runs it COUNTED.
+                _count_launch_refusal(counters, e)
+                fused, out = False, None
+        if not fused:
+            # `fused=False` is the torch arm, or the COUNTED fallback of a
+            # refused launch — which keeps the arm's declared store dtype so the
+            # degradation is visible in the output dtype, not silently fp32.
+            out = torch.zeros(n, y.shape[1], dtype=out_dtype, device=y.device)
+            if out_dtype == torch.float32:
+                out.index_add_(0, owner, y.to(torch.float32) * w.unsqueeze(-1))
+            else:
+                out.index_add_(0, owner, y * w.unsqueeze(-1).to(out_dtype))
+        if counters is not None and fused:
+            counters.count("moe_combine_fused")
+            if out_dtype != torch.float32:
+                counters.count("moe_combine_bf16")
         ctx.save_for_backward(y, w, rowmap)
         ctx.ws, ctx.tiles, ctx.counters = ws, tiles, counters
+        ctx.out_dtype = out.dtype
         return out
 
     @staticmethod
@@ -1514,7 +1617,9 @@ class _Combine(torch.autograd.Function):
         ws, tiles = ctx.ws, ctx.tiles
         R, f = y.shape
         n, k = rowmap.shape
-        assert dout.dtype == torch.float32, "the combine's grad_out is fp32 by contract"
+        assert dout.dtype == ctx.out_dtype, (
+            f"the combine's grad_out must be its output dtype ({ctx.out_dtype}), got {dout.dtype}"
+        )
         dout = dout.contiguous()  # a no-op when autograd hands over a dense tensor
         dy = ws.slot("dy", (R, f), y.dtype, y.device)
         # `dw` is NOT a workspace slot: it becomes `weight.grad` when the router
@@ -1552,10 +1657,52 @@ class _Combine(torch.autograd.Function):
                 rows = row[valid]
                 dy[rows] = (dout[valid] * w[rows].unsqueeze(-1)).to(y.dtype)
                 dw[rows] = (dout[valid] * y[rows].float()).sum(-1)
-        return dy, dw, None, None, None, None, None, None
+        return dy, dw, None, None, None, None, None, None, None, None
 
 
-def combine(y, w, owner, rowmap, n, *, ws=None, tiles=None, counters=None):
+def combine_reference(
+    y: torch.Tensor,
+    w: torch.Tensor,
+    rowmap: torch.Tensor,
+    n: int,
+    *,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """`_combine_fwd_kernel`'s math in torch — its CPU reference and the gate's proxy.
+
+    One term per top-k slot, accumulated in fp32 in SLOT order (the kernel's
+    order). `zeros + index_add_` accumulates in ROW order instead; for k=2 the
+    two are the same real number because fp32 addition is commutative, which is
+    what makes `moe_combine_dtype="fp32"` bit-identical (the gate asserts it).
+    A dropped slot (`rowmap == -1`) contributes nothing: the gather clamps the
+    sentinel (`-1` would otherwise mean the LAST row) and `torch.where` zeroes
+    the term.
+    """
+    assert y.ndim == 2 and rowmap.ndim == 2 and rowmap.shape[0] == n
+    assert w.shape == (y.shape[0],) and w.dtype == torch.float32
+    out = torch.zeros(n, y.shape[1], dtype=torch.float32, device=y.device)
+    for j in range(rowmap.shape[1]):
+        row = rowmap[:, j].to(torch.int64)
+        valid = row >= 0
+        r = row.clamp_min(0)
+        term = y.index_select(0, r).to(torch.float32) * w.index_select(0, r).unsqueeze(-1)
+        out = out + torch.where(valid[:, None], term, torch.zeros_like(term))
+    return out.to(out_dtype)
+
+
+def combine(
+    y,
+    w,
+    owner,
+    rowmap,
+    n,
+    *,
+    ws=None,
+    tiles=None,
+    counters=None,
+    fused: bool = False,
+    dtype: str = "fp32",
+):
     """`out [n, f] = Σ_rows y[row]·w[row]`, the rows gathered by `owner` — fused bwd.
 
     The scatter half of the MoE pass (`experts.SparseMoE._triton_dispatch`), with
@@ -1572,6 +1719,12 @@ def combine(y, w, owner, rowmap, n, *, ws=None, tiles=None, counters=None):
     bf16 (the softmax of `mm_mixed`'s bf16 logits), so the model widens it at
     this boundary (`experts.SparseMoE._triton_dispatch`); the assert is what
     keeps that a deliberate, single, visible cast instead of a silent one.
+
+    `fused` selects `_combine_fwd_kernel` (one pass, fp32 registers); `dtype`
+    is the dtype that pass STORES (`"fp32"` bit-identical today, `"bf16"` the
+    compute dtype). `dtype="bf16"` is refused without `fused` — the three-pass
+    torch form has no bf16 accumulation to speak of, and `config.validate`
+    refuses the pair before a run can ask for it.
     """
     assert y.ndim == 2 and y.is_cuda and y.is_contiguous(), "y must be a dense CUDA [R, f]"
     assert w.shape == (y.shape[0],) and w.dtype == torch.float32 and w.is_contiguous()
@@ -1592,6 +1745,8 @@ def combine(y, w, owner, rowmap, n, *, ws=None, tiles=None, counters=None):
         ws if ws is not None else BwdWorkspace(),
         _tiles(tiles, y.dtype, y.shape[1], y.shape[1]),
         counters,
+        fused,
+        dtype,
     )
 
 

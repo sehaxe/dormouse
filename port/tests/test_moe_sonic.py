@@ -873,8 +873,12 @@ def test_the_bf16_seam_arms_agree_on_the_card():
 # --------------------------------------------------------------------------
 
 
-def _torch_combine(y, w, owner, rowmap, n, *, ws=None, tiles=None):
+def _torch_combine(y, w, owner, rowmap, n, *, ws=None, tiles=None, **kw):
     """`moe_kernels.combine`'s forward in torch — the CPU proxy for its scatter.
+
+    `**kw` is the arm's own switches (`counters`/`fused`/`dtype`): the proxy runs
+    the torch form, which is exactly what `fused=False, dtype="fp32"` asks for,
+    so it ignores them rather than growing a second scatter.
 
     `combine` is a Triton kernel, so a card-less gate substitutes the FORWARD it
     performs (the same three lines `_Combine.forward` runs) and lets autograd
