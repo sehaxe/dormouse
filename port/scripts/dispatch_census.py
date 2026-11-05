@@ -69,6 +69,15 @@ ITEMSIZE = {"f32": 4, "bf16": 2, "f16": 2, "int64": 8, "int32": 4, "bool": 1}
 ROUTE_GROUPS = ("router", "route", "permute", "gather", "combine")
 CONTEXT_GROUPS = ("bank", "down", "expert", "lfb")
 
+#: The bank cache's key walk: `tuple(p._version for e in self.experts for p in
+#: e.parameters())` runs on EVERY `_banks` call. MEASURED on this box
+#: (2026-11-05, CPU, m400 geometry: E=512, 1 536 parameters, Python 3.12) at
+#: 2.09 ms/call = 4.08 us per expert. `moe_bank_epoch` replaces it with one int
+#: compare; the number is an input so a reader can re-measure, not a constant
+#: baked into a total.
+KEY_WALK_US_PER_EXPERT = 4.08
+EPOCH_KEY_US = 0.5
+
 
 def nbytes(shape: tuple[int, ...], dtype: str) -> int:
     if isinstance(shape, int):
@@ -112,6 +121,8 @@ class Row:
     launches: int = 1
     #: `once per training step` (the bank cache) vs `once per routed forward`.
     per_step: bool = False
+    #: HOST time this op spends, where the op is Python (the bank key walk).
+    host_us: float = 0.0
     note: str = ""
 
     def __post_init__(self):
@@ -145,6 +156,9 @@ class Ctx:
     gather: str
     permute: str
     route_fused: bool
+    combine: str
+    combine_dtype: str
+    bank_epoch: bool
     share_u: str
     lb_mode: str
 
@@ -184,6 +198,9 @@ def ctx_for(cfg: ModelConfig, b: int, s: int) -> Ctx:
         gather=cfg.moe_gather,
         permute=cfg.moe_permute,
         route_fused=cfg.moe_route_fused,
+        combine=cfg.moe_combine,
+        combine_dtype=cfg.moe_combine_dtype,
+        bank_epoch=cfg.moe_bank_epoch,
         share_u=cfg.share_u_mode if cfg.share_u else "off",
         lb_mode=cfg.moe_lb_mode,
     )
@@ -437,8 +454,40 @@ def _gather_rows(c: Ctx) -> list[Row]:
 
 
 def _combine_rows(c: Ctx) -> list[Row]:
-    """`moe_kernels.combine`: the fp32 scatter that closes the pass, and its adjoint."""
+    """`moe_kernels.combine`: the scatter that closes the pass, and its adjoint.
+
+    `torch` is the three-pass fp32 form (`zeros`, `y.to(f32)·w`, `index_add_`),
+    1 476 MB/pass. `fused` is ONE kernel reading each token's k rows in fp32
+    registers; `moe_combine_dtype="bf16"` stores the compute dtype (so the
+    caller's `weighted.to(dt)` also disappears — `_down_rows` drops that row)
+    and the backward reads a bf16 `grad_out`.
+    """
     R, n, f = c.R, c.n, c.f
+    out_dt = c.dt if c.combine_dtype == "bf16" else "f32"
+    grad_dt = c.dt if c.combine_dtype == "bf16" else "f32"
+    if c.combine == "fused":
+        return [
+            Row(
+                "combine",
+                "fused combine forward",
+                "moe_kernels._combine_fwd_kernel (one launch)",
+                (n, f),
+                ((R, f), c.dt) + ((R,), "f32") + ((n, c.k), "int32"),
+                ((n, f), out_dt),
+                1,
+                note="fp32 registers, one rounding on the store"
+                + (" (bf16)" if out_dt == c.dt else ""),
+            ),
+            Row(
+                "combine",
+                "combine backward",
+                "moe_kernels._combine_bwd_kernel (one launch)",
+                (n, f),
+                ((n, f), grad_dt) + ((R, f), c.dt) + ((R,), "f32"),
+                ((R, f), c.dt) + ((R,), "f32"),
+                1,
+            ),
+        ]
     return [
         Row("combine", "out = zeros(n, f) fp32", "experts._triton_dispatch: combine",
             (n, f), (), ((n, f), "f32"), 1),
@@ -447,7 +496,7 @@ def _combine_rows(c: Ctx) -> list[Row]:
             note="the fp32 widening at the MoE output boundary"),
         Row("combine", "out.index_add_(owner, ·)", "moe_kernels._Combine.forward", (n, f),
             ((R, f), "f32") + ((n, f), "f32"), ((n, f), "f32"), 1),
-        Row("combine", "combine backward", "moe_kernels._combine_bwd_kernel (one launch)",
+        Row("combine", "combine backward", "moe_kernels._Combine.backward (one launch)",
             (n, f), ((n, f), "f32") + ((R, f), c.dt) + ((R,), "f32"),
             ((R, f), c.dt) + ((R,), "f32"), 1),
     ]
@@ -474,7 +523,23 @@ def _bank_rows(c: Ctx) -> list[Row]:
     thousands of kernels.
     """
     E, d, f, r = c.E, c.d, c.f, c.r
-    rows: list[Row] = []
+    rows: list[Row] = [
+        Row(
+            "bank",
+            "key: _version walk" if not c.bank_epoch else "key: bank_epoch int",
+            "experts._banks: cache key",
+            (E,),
+            (),
+            (),
+            0,
+            host_us=(
+                E * KEY_WALK_US_PER_EXPERT
+                if not c.bank_epoch
+                else EPOCH_KEY_US
+            ),
+            note="HOST per `_banks` call, i.e. per forward (measured 2026-11-05)",
+        )
+    ]
     if c.share_u == "plane":
         for name in ("gate_u", "up_u"):
             rows.append(
@@ -503,9 +568,15 @@ def _bank_rows(c: Ctx) -> list[Row]:
 def _down_rows(c: Ctx) -> list[Row]:
     """`SparseMoE.forward`'s OUTPUT projection — in the region, not in routing."""
     n, d, f = c.n, c.d, c.f
-    return [
-        Row("down", "weighted.to(dt)", "experts.forward: mm_mixed(weighted.to(dt), ...)",
-            (n, f), ((n, f), "f32"), ((n, f), c.dt), 1),
+    rows = []
+    if not (c.combine == "fused" and c.combine_dtype == "bf16"):
+        # With a bf16 combine store `weighted` is ALREADY dt: `.to(dt)` is a
+        # no-op and its whole pass (134 MB read + 67 MB write) disappears.
+        rows.append(
+            Row("down", "weighted.to(dt)", "experts.forward: mm_mixed(weighted.to(dt), ...)",
+                (n, f), ((n, f), "f32"), ((n, f), c.dt), 1)
+        )
+    rows += [
         Row("down", "down weight cast", "tsct.mm_mixed: weight.to(dt)", (d, f),
             ((d, f), "f32"), ((d, f), c.dt), 1),
         Row("down", "down gemm", "tsct.mm_mixed: x @ w.t()", (n, d),
@@ -513,6 +584,7 @@ def _down_rows(c: Ctx) -> list[Row]:
         Row("down", "out.to(f32)", "experts.forward: ...to(torch.float32)", (n, d),
             ((n, d), c.dt), ((n, d), "f32"), 1),
     ]
+    return rows
 
 
 def _expert_rows(c: Ctx) -> list[Row]:
@@ -576,11 +648,14 @@ def report(
         f"moe_route_fused={c.route_fused}  share_u={c.share_u}  lb={c.lb_mode}  "
         f"max_iter={c.max_iter}"
     )
-    print(f"\n   {'group':<9}{'op':<46}{'shape':<16}{'dt':<9}{'MB':>9}{'launch':>7}  site")
+    print(
+        f"\n   {'group':<9}{'op':<46}{'shape':<16}{'dt':<9}{'MB':>9}{'launch':>7}"
+        f"{'host us':>9}  site"
+    )
     for r in rows:
         print(
             f"   {r.group:<9}{r.op[:45]:<46}{_shape(r):<16}{r.dtypes:<9}"
-            f"{r.nbytes / 1e6:9.2f}{r.launches:7d}  {r.site}"
+            f"{r.nbytes / 1e6:9.2f}{r.launches:7d}{r.host_us:9.1f}  {r.site}"
         )
     print("\n   -- groups --")
     order = ROUTE_GROUPS + CONTEXT_GROUPS
@@ -595,6 +670,7 @@ def report(
             f"   {g:<9}{nb / 1e6:9.2f} MB  {nb / total * 100:5.1f} %  "
             f"{nb / bw * 1e6:8.1f} us  {nl:4d} launches"
         )
+    host_us = sum(r.host_us for r in rows)
     route_b, route_l = totals([r for r in rows if r.group in ROUTE_GROUPS])
     print(
         f"   {'TOTAL':<9}{total / 1e6:9.2f} MB  100.0 %  "
@@ -618,6 +694,7 @@ def report(
         },
         "total_bytes": total,
         "total_launches": launches,
+        "host_us": host_us,
         "route_bytes": route_b,
         "route_launches": route_l,
         "step_bytes": step_b,
@@ -638,20 +715,30 @@ def report(
 
 
 def ab(cfg: ModelConfig, batch: int, seq: int) -> dict[str, dict]:
-    """The shipped arm vs the two new ones, SAME geometry — the A/B the flags need."""
-    out = {}
-    for name, over in (
-        ("shipped", dict(moe_route_fused=False, moe_permute="argsort")),
-        ("fused-route", dict(moe_route_fused=True, moe_permute="argsort")),
-        ("count-permute", dict(moe_route_fused=False, moe_permute="count")),
-        ("both", dict(moe_route_fused=True, moe_permute="count")),
-    ):
+    """The shipped arms vs each new one, SAME geometry — the A/B the flags need."""
+    arms = (
+        ("shipped", dict(moe_route_fused=False, moe_permute="argsort",
+                         moe_combine="torch", moe_combine_dtype="fp32", moe_bank_epoch=False)),
+        ("fused-route", dict(moe_route_fused=True, moe_permute="count")),
+        ("fused-combine", dict(moe_combine="fused")),
+        ("combine-bf16", dict(moe_combine="fused", moe_combine_dtype="bf16")),
+        ("bank-epoch", dict(moe_bank_epoch=True)),
+        # The combination the report PICKS: the fused route + counting permute +
+        # fp32 fused combine (bit-identical) + the epoch key. bf16 is priced
+        # separately because it does not meet the 1e-3 logits target.
+        ("picked", dict(moe_route_fused=True, moe_permute="count",
+                        moe_combine="fused", moe_bank_epoch=True)),
+        ("all", dict(moe_route_fused=True, moe_permute="count", moe_combine="fused",
+                     moe_combine_dtype="bf16", moe_bank_epoch=True)),
+    )
+    out: dict[str, dict] = {}
+    for name, over in arms:
         c, rows = census(dataclasses.replace(cfg, **over), batch, seq)
         rb, rl = totals([r for r in rows if r.group in ROUTE_GROUPS])
         out[name] = {
             "route_bytes": rb,
             "route_launches": rl,
-            "route_us": rb / DEFAULT_BW * 1e6,
+            "host_us": sum(r.host_us for r in rows),
             "ctx": c,
         }
     base = out["shipped"]
@@ -660,15 +747,15 @@ def ab(cfg: ModelConfig, batch: int, seq: int) -> dict[str, dict]:
         f"E={base['ctx'].E}, k={base['ctx'].k}"
     )
     print(
-        f"   {'arm':<15}{'route MB':>10}{'Δ MB':>8}{'launches':>10}"
-        f"{'Δ launch':>10}{'us @0.9TB/s':>13}"
+        f"   {'arm':<15}{'route MB':>10}{'Δ MB':>10}{'launches':>10}{'Δ launch':>10}"
+        f"{'host us':>10}{'Δ host':>10}"
     )
     for name, v in out.items():
         print(
             f"   {name:<15}{v['route_bytes'] / 1e6:10.2f}"
-            f"{(v['route_bytes'] - base['route_bytes']) / 1e6:+8.2f}"
+            f"{(v['route_bytes'] - base['route_bytes']) / 1e6:+10.2f}"
             f"{v['route_launches']:10d}{v['route_launches'] - base['route_launches']:+10d}"
-            f"{v['route_us']:13.1f}"
+            f"{v['host_us']:10.1f}{v['host_us'] - base['host_us']:+10.1f}"
         )
     return {k: {kk: vv for kk, vv in v.items() if kk != "ctx"} for k, v in out.items()}
 

@@ -191,6 +191,16 @@ MOE_GATHERS = ("off", "kernel")
 #: (`experts.SparseMoE._permute`): `argsort` is the stable sort every number on
 #: record runs, `count` the counting sort (`model/route_fused.py`). Same tensor.
 MOE_PERMUTES = ("argsort", "count")
+#: The `moe_combine` literals — HOW the routed pass's scatter closes. `torch` is
+#: `zeros + index_add_` (three fp32 passes over `[n·k, f]` + `[n, f]`), `fused`
+#: is one Triton pass (`moe_kernels._combine_fwd_kernel`) that reads the k rows
+#: of a token and writes its output, accumulating in fp32 registers.
+MOE_COMBINES = ("torch", "fused")
+#: The `moe_combine_dtype` literals — the dtype the fused combine STORES. `fp32`
+#: is bit-identical to today's `index_add_` (two fp32 adds are commutative);
+#: `bf16` writes the routed activation in the compute dtype, so the caller's
+#: `weighted.to(dt)` disappears. Only meaningful with `moe_combine="fused"`.
+MOE_COMBINE_DTYPES = ("fp32", "bf16")
 #: The `share_u_mode` literals — how the routed experts' INPUT basis is shaped
 #: (`experts.py`'s module docstring): `off` is one `U` per expert, `plane` is
 #: one `U` for the bank, `dict` is one dictionary plus a per-expert column
@@ -983,6 +993,26 @@ class ModelConfig:
     #: the bank rows and the drop set depend on — so this is a cost knob, not a
     #: semantics one. Counters: `moe_permute_count`, `moe_permute_fallback`.
     moe_permute: str = "argsort"
+    #: HOW the routed scatter closes (`MOE_COMBINES`). `torch` is today's
+    #: `zeros + y.to(f32)·w + index_add_` — 1 476 MB and 4 launches per pass at
+    #: m400, 81 % of the routing cluster's traffic. `fused` is ONE Triton pass
+    #: that reads each token's k rows and writes its output, accumulating in
+    #: fp32 registers: 671 MB / 2 launches at `moe_combine_dtype="fp32"` —
+    #: bit-identical, because with k=2 the two fp32 adds are commutative. OFF.
+    moe_combine: str = "torch"
+    #: The dtype the fused combine stores (`MOE_COMBINE_DTYPES`): `fp32` keeps
+    #: today's boundary; `bf16` removes the caller's `weighted.to(dt)` cast too
+    #: and rounds the routed activation ONCE (2^-9 relative — the measured
+    #: logits/gradient deltas are the gate's, not a claim). Refused unless
+    #: `moe_combine="fused"` and `bf16=true`.
+    moe_combine_dtype: str = "fp32"
+    #: The bank cache's KEY: `False` is today's `_version` tuple (a
+    #: 1 536-parameter walk per forward, measured 2.09 ms/call at m400);
+    #: `True` is one explicit `bank_epoch` int bumped by the trainer after
+    #: `opt.step` (`invalidate_banks_all`), by any `load_state_dict`, and by a
+    #: checkpoint resume. A stale epoch is never served (`_banks` rebuilds) and
+    #: an entry without an epoch, or from the future, is LOUD. OFF.
+    moe_bank_epoch: bool = False
     #: The expert GLU's activation, the 2026-10-16 activation tournament arm
     #: (`docs/research` scan; formula sources named in `experts.expert_glu`):
     #: `silu` = SwiGLU's gate, the control and every number on record;
@@ -2185,14 +2215,18 @@ class RunConfig:
                         continue
                 if section == "model" and f.name == "max_seq_len" and not positional:
                     continue  # handled above: grow-only, and a grow is a resume
-                if section == "model" and f.name in ("moe_kernel", "moe_permute"):
+                if section == "model" and f.name in (
+                    "moe_kernel", "moe_permute", "moe_bank_epoch"
+                ):
                     # implementation keys: `moe_kernel`'s arms are proven equal
                     # to 1e-6, and the balancing rule decides selection, not
                     # representation. `moe_permute` changes no VALUE at all —
                     # `tests/test_moe_route_fused.py` pins the counting
-                    # permutation element-wise against the stable argsort — so a
-                    # resume may switch it. `moe_route_fused` is NOT here: its
-                    # tie rule is a (measured, tiny) numeric difference.
+                    # permutation element-wise against the stable argsort — and
+                    # `moe_bank_epoch` changes only how the SAME bank is cached
+                    # (`tests/test_moe_bank_cache.py` pins build equality), so a
+                    # resume may switch either. `moe_route_fused` and
+                    # `moe_combine*` are NOT here: they change numerics.
                     continue
                 if getattr(a, f.name) != getattr(b, f.name):
                     out.append(f"{section}.{f.name}")
@@ -2766,6 +2800,57 @@ def validate(model: ModelConfig) -> None:
                 f"gather-parity gate covers that pair. Escape: factor_qat='none', or "
                 f"moe_gather='off'."
             )
+    if model.moe_combine not in MOE_COMBINES:
+        loud(
+            f"moe_combine={model.moe_combine!r} is not an arm. Known: "
+            f"{list(MOE_COMBINES)} — `torch` today's zeros+index_add, `fused` the "
+            f"one-pass Triton scatter (`moe_kernels._combine_fwd_kernel`). Escape: "
+            f"name one."
+        )
+    if model.moe_combine_dtype not in MOE_COMBINE_DTYPES:
+        loud(
+            f"moe_combine_dtype={model.moe_combine_dtype!r} is not a dtype. Known: "
+            f"{list(MOE_COMBINE_DTYPES)}. Escape: name one."
+        )
+    if model.moe_combine_dtype == "bf16" and model.moe_combine != "fused":
+        loud(
+            f"moe_combine_dtype='bf16' with moe_combine={model.moe_combine!r}: the "
+            f"torch arm's `y.to(f32) * w` and `index_add_` are fp32 by construction, "
+            f"and a bf16 `zeros` + `index_add_` is a DIFFERENT rounding chain (per-row "
+            f"bf16 adds) that no gate covers. Escape: moe_combine='fused', or "
+            f"moe_combine_dtype='fp32'."
+        )
+    if model.moe_combine == "fused":
+        # Which routed passes reach `moe_kernels.combine` (the only caller of
+        # `_combine_fwd_kernel`): the gather arm always, the grouped GEMM (the
+        # `triton` arm and the dropless route's default), and nothing else — the
+        # padded/batched/bucketed banks have their own `index_add_`, and the
+        # reference loop has its own scatter. An arm asked for and not reachable
+        # is the ADR-0019 defect this refusal exists for.
+        reachable = (
+            model.moe_gather == "kernel"
+            or model.moe_kernel == "triton"
+            or (
+                model.moe_capacity == 0
+                and model.moe_kernel not in ("batched", "bucketed", "naive")
+            )
+        )
+        if not reachable:
+            loud(
+                f"moe_combine='fused' with moe_kernel={model.moe_kernel!r} and "
+                f"moe_capacity={model.moe_capacity}: that routed pass scatters with its "
+                f"own bank/index_add_ and never reaches `moe_kernels.combine`, so the "
+                f"arm would be inert while `moe_combine_fused` never appears on the log. "
+                f"Escape: moe_capacity=0 (the dropless grouped GEMM), moe_kernel='triton', "
+                f"moe_gather='kernel', or moe_combine='torch'."
+            )
+    if model.moe_combine_dtype == "bf16" and not model.bf16:
+        loud(
+            "moe_combine_dtype='bf16' with bf16=false: the routed activation is fp32, "
+            "so a bf16 store would round a value the model deliberately kept at 4 "
+            "bytes and the `weighted.to(dt)` cast it removes is a no-op. Escape: "
+            "bf16=true, or moe_combine_dtype='fp32'."
+        )
     if model.moe_permute not in MOE_PERMUTES:
         loud(
             f"moe_permute={model.moe_permute!r} is not an algorithm. Known: "

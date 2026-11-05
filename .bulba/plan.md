@@ -767,6 +767,41 @@ testable and A/B-able (ADR-0017).
       +554 MB (unchanged conclusion); one defect fixed on the dropless route (it
       passed `keep`, not `keep_rows`, so it built an all-True bool-mask index).
 
+- [x] P-DISPATCH-COSTS. port (Python): the two costs the census named, both OFF.
+      **J1 bank cache (`moe_bank_epoch`).** The premise "it rebuilds every
+      iteration" is FALSE and the measurement says so: `invalidate_banks_all`
+      already runs once per optimizer step and `_banks` reuses the entry within
+      the step (1.00 builds/step; the profile's 577 copy kernels/step ARE one
+      build of 512 parameter tensors). The 519 launches / 1 007 MB per step do
+      NOT move — a `[E,·]` stack of 512 separate parameters is 512 casts + a
+      stack, and only a parameter-layout change can cut it (follow-up). What
+      DOES move: the `_version` key walks all 1 536 parameters on EVERY
+      `_banks` call — 2 092 us/call at m400, **6.28 ms/step of HOST time** at
+      max_iter 3 on a step that is 87 % host-gap — replaced by one `bank_epoch`
+      int (entry epoch, dropped before the rebuild so the peak is not two banks)
+      bumped by `invalidate_banks` (the trainer's per-step call) and by any
+      `load_state_dict`. A frozen epoch serves a stale bank and the parity gate
+      goes red; an entry with no epoch or from the future is LOUD.
+      `moe_bank_builds` is the counter (host int, no device read).
+      **J2 combine (`moe_combine`/`moe_combine_dtype`).** `torch` = 1 476 526 080
+      B / 4 launches per pass (81 % of the routing cluster). `fused` = ONE
+      token-major kernel, fp32 registers: **671 350 784 B / 2** (-805 MB, -2)
+      and **bit-identical** on logits and every parameter gradient (bf16 `y` ×
+      fp32 `w`, k=2 fp32 adds commute, so `index_add_`'s row order cannot
+      matter). `fused/bf16` stores the compute dtype: **537 133 056 B / 2**
+      (-939 MB) plus the caller's `weighted.to(dt)` row disappears (-201 MB)
+      = -1.14 GB/pass (-24 % of the whole MoE pass), but it rounds the routed
+      activation one step earlier and MEASURES 4.1..6.2e-3 relative on logits
+      and 3.2..4.9e-3 on gradients over three seeds — **the 1e-3 logits target
+      is NOT met**, so the default stays fp32 and bf16 is the documented
+      second arm, not the pick. Gates `tests/test_moe_bank_cache.py` (11) and
+      `tests/test_moe_combine_fused.py` (14 + 1 card-only skip); 4 scratch
+      mutations turn 6 gates red (no epoch bump -> 2, serve-stale -> 2,
+      dropped-row mask -> 1, forgotten combine switches -> 1). GPU parity
+      written, unrun. Picked together: 53 -> 32 launches and 1 815 -> 891 MB per
+      forwarded pass (-50.9 % of the routing cluster), host 2 089 -> 0.5 us/pass
+      (-6.27 ms/step at max_iter 3); the bf16 store is priced and NOT picked.
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)

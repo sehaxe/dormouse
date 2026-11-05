@@ -764,6 +764,22 @@ class SparseMoE(nn.Module):
         #: counting sort in `model/route_fused.py`). The permutation is the SAME
         #: tensor by construction; the knob is cost, not semantics.
         self.moe_permute = cfg.moe_permute
+        #: HOW the routed scatter closes (`moe_combine`) and the dtype it stores
+        #: (`moe_combine_dtype`): `torch` is today's three-pass fp32 form, `fused`
+        #: the one-pass kernel. OFF (torch/fp32) is every pin on record.
+        self.moe_combine = cfg.moe_combine
+        self.moe_combine_dtype = cfg.moe_combine_dtype
+        #: The bank cache's KEY (`moe_bank_epoch`). `False` keeps the `_version`
+        #: tuple — a 1 536-parameter walk PER FORWARD (measured 2.09 ms/call at
+        #: m400, x3 iterations = 6.3 ms/step of host time). `True` replaces it
+        #: with ONE integer bumped by `invalidate_banks` (the trainer's
+        #: per-optimizer-step call), by any `load_state_dict`, and by a resume.
+        #: A stale entry is never served; one without an epoch or from the
+        #: future is LOUD (`_banks`). `_bank_builds` is the host count the
+        #: `moe_bank_builds` counter drains.
+        self.moe_bank_epoch = cfg.moe_bank_epoch
+        self._bank_epoch = 0
+        self._bank_builds = 0
         #: The compressed-forward sprint's factor quantization (`factor_qat`):
         #: `_banks` applies it to the fp32 stacks before the dt-conversion, and
         #: `DualLatentGLU` applies the SAME projection (dim=None on a 2-D
@@ -1066,7 +1082,7 @@ class SparseMoE(nn.Module):
             e = self.n_experts
             budget = e * n * self.d * 2 <= (1 << 28)
             if budget:
-                gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+                gate_u, up_u, v, gate_s, up_s = self._banks(dt, counters)
                 xg = x.to(dt).unsqueeze(0).expand(e, -1, -1)  # view, not copy
                 g = torch.bmm(xg, gate_u) * gate_s[:, None, :]
                 u = torch.bmm(xg, up_u) * up_s[:, None, :]
@@ -1556,23 +1572,63 @@ class SparseMoE(nn.Module):
     def invalidate_banks(self) -> None:
         """Drop the bank cache so the NEXT forward rebuilds it — the opt_graph fix.
 
-        The cache key carries the parameters' `_version` tuple, and that assumed
-        "an optimizer step bumps `_version`". **A CUDA-graph replay does not**
-        (measured 2026-10-19: an eager step moves 0->1; the same step replayed
-        from a captured graph leaves `_version` FROZEN while the value moves).
-        With `opt_graph = true` the key therefore stopped moving at capture, the
-        bank served the step-5 build for the whole run — the experts' FORWARD was
-        frozen while the optimizer kept stepping them with stale gradients (they
-        drifted ~44x; the saved checkpoint then exploded in any fresh process,
-        and the live evals could not show it because they reused the same stale
-        bank). The trainer now calls this once per TRAINING step, right after the
-        parameters move: the cache keeps its real job (one build per step, reused
-        by the loop's iterations) and can no longer outlive a step.
+        Two keys implement the "one build per step" contract, and the flag picks:
+
+        * `moe_bank_epoch = false` (the default) keys the cache on the parameters'
+          `_version` tuple and CLEARS it here. That invented the step boundary
+          because a `_version` key could not describe a weight move that leaves
+          `_version` frozen — **a CUDA-graph replay does exactly that** (measured
+          2026-10-19: an eager step moves 0->1; the same step replayed from a
+          captured graph leaves `_version` FROZEN while the value moves). With
+          `opt_graph = true` the key stopped moving at capture and the bank
+          served the step-5 build for the whole run: the experts' FORWARD was
+          frozen while the optimizer kept stepping them with stale gradients
+          (they drifted ~44x; the saved checkpoint then exploded in any fresh
+          process, and the live evals could not show it). The cost of that key is
+          a 1 536-parameter walk on EVERY `_banks` call — measured 2 092 us/call
+          at m400, 6.3 ms/step of HOST time at max_iter 3.
+        * `moe_bank_epoch = true` BUMPS one integer and leaves the entry in
+          place; `_banks` compares the entry's epoch and NEVER serves an older
+          one (it drops it before rebuilding, so the peak is not two banks).
+          The trainer's per-step call is unchanged; `_load_from_state_dict`
+          bumps the same counter on a resume, so a pre-load bank cannot survive
+          a load. No parameter is read on a hit.
+
+        Either way this runs once per TRAINING step, right after the parameters
+        move: the cache keeps its real job (one build per step, reused by the
+        loop's iterations) and can no longer outlive a step.
         """
+        self._bank_epoch += 1
+        # Under the epoch key the entry is left in place ON PURPOSE: the next
+        # `_banks` sees `entry_epoch < _bank_epoch`, drops it before allocating
+        # the new one (so the peak is not two banks) and rebuilds. Clearing here
+        # as well would hide the stale branch from every step — the branch the
+        # frozen-epoch gate exists to exercise.
+        if not self.moe_bank_epoch:
+            self._bank_cache = None
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ) -> None:
+        """A load is a weight move: bump the epoch so no pre-load bank is served.
+
+        `torch.nn.Module.load_state_dict` writes the parameters IN PLACE without
+        bumping `_version` in every path (a `copy_` does, a graph replay does
+        not), and `moe_bank_epoch`'s contract is that the epoch — not the
+        version — is what makes a bank fresh. Bumping here covers resume,
+        eval-time loads and tests with ONE hook; `invalidate_banks_all` stays the
+        trainer's per-optimizer-step call.
+        """
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
         self._bank_cache = None
+        self._bank_epoch += 1
 
     @torch.compiler.disable
-    def _banks(self, dt: torch.dtype) -> tuple[torch.Tensor, ...]:
+    def _banks(
+        self, dt: torch.dtype, counters: Counters | None = None
+    ) -> tuple[torch.Tensor, ...]:
         """The expert bank as `[E, ·]` tensors for the batched matmuls — CACHED IN `dt`.
 
         Two caches' lessons paid here. (1) The naive form stacked per forward
@@ -1580,10 +1636,19 @@ class SparseMoE(nn.Module):
         `.to(dt)` EVERY forward — measured ~15 ms host + ~4 ms copies per
         call at b1 (1.79 GB re-converted twice per step at max_iter 2; the
         TSCT-super-kernel bench flagged it as larger than the Triton kernel
-        win). So this cache stores the CONVERTED tensors, keyed by the
-        parameters' in-place `_version`: an optimizer step bumps it, nothing
-        stale survives; one conversion per step is the honest floor, zero
-        conversions inside the step.
+        win). So this cache stores the CONVERTED tensors: one conversion per
+        step is the honest floor, zero conversions inside the step.
+
+        **The key is the epoch** (`moe_bank_epoch`, the entry's `cached[3]`)
+        **or, with the flag off, the `_version` tuple** (`cached[0]`, the old
+        path every pin on record runs). The epoch path reads no parameter on a
+        hit — the `_version` walk is 2 092 us/call at m400 (E=512, 1 536
+        params, measured 2026-11-05) and 6.3 ms/step at max_iter 3. An entry
+        whose epoch is OLDER is dropped before the rebuild; one with no epoch
+        (built before the scheme) or one from the FUTURE is LOUD, because
+        neither can be vouched for. The build count is unchanged either way:
+        the trainer's `invalidate_banks_all` already made it one per step, and
+        a `[E, ·]` stack of 512 separate parameters is 512 casts + a stack.
 
         **`_version` alone was a one-step zero-gradient bug** (battery
         2026-10-17, measured 20/20 dead on both adjoints). The eval forward runs
@@ -1632,27 +1697,56 @@ class SparseMoE(nn.Module):
                 self._shared_params[0] if self._shared_params else self.experts[0].gate_u
             ).requires_grad
         )
-        key = (
-            dt,
-            self.factor_qat,
-            self.factor_qat_alpha,  # the anneal ramp moves this every step
-            tuple(p._version for e in self.experts for p in e.parameters()),
-            # The shared basis is not inside `self.experts`, so its `_version`
-            # is not in the tuple above: without this an optimizer step that
-            # moved ONLY `u_dict` (or `gate_u`/`up_u`) would serve a stale bank.
-            # (The trainer's `invalidate_banks` also covers that, but the cache
-            # must not depend on a caller for its own correctness.)
-            tuple(p._version for p in self._shared_params),
-            want,
-        )
+        if self.moe_bank_epoch:
+            # NO PARAMETER WALK. The freshness contract is the entry's own
+            # `epoch` (checked below) — the trainer's `invalidate_banks_all`,
+            # called after the only thing that moves the weights, plus this
+            # module's load hook. Never `_version`, which a CUDA-graph replay
+            # freezes while the values move (`test_bank_invalidation.py`).
+            key = (dt, self.factor_qat, self.factor_qat_alpha, want)
+        else:
+            key = (
+                dt,
+                self.factor_qat,
+                self.factor_qat_alpha,  # the anneal ramp moves this every step
+                tuple(p._version for e in self.experts for p in e.parameters()),
+                # The shared basis is not inside `self.experts`, so its
+                # `_version` is not in the tuple above: an optimizer step that
+                # moved ONLY `u_dict` (or `gate_u`/`up_u`) must still rebuild.
+                tuple(p._version for p in self._shared_params),
+                want,
+            )
         cached = getattr(self, "_bank_cache", None)
         if cached is not None:
+            entry_epoch = cached[3] if len(cached) > 3 else None
+            if self.moe_bank_epoch:
+                # Refuse to SERVE a bank the epoch does not vouch for. An entry
+                # from an older epoch is simply rebuilt (the normal path); one
+                # with no epoch, or from the future, is a wiring error and says
+                # so instead of returning weights nobody can account for.
+                if entry_epoch is None:
+                    raise loud(
+                        "the bank cache carries no epoch while moe_bank_epoch=true: an "
+                        "entry built before the epoch scheme cannot be trusted. Escape: "
+                        "invalidate_banks_all(model) after the load, or moe_bank_epoch=false."
+                    )
+                if entry_epoch > self._bank_epoch:
+                    raise loud(
+                        f"the bank cache is from epoch {entry_epoch}, the model is at "
+                        f"{self._bank_epoch}: a cache cannot be newer than its model. "
+                        f"Escape: invalidate_banks_all(model) and rebuild."
+                    )
+                if entry_epoch < self._bank_epoch:
+                    # Stale: never served, and dropped BEFORE the rebuild so the
+                    # old [E,·] stacks are freed instead of held beside the new.
+                    self._bank_cache = None
+                    cached = None
             # A TRACKED entry serves a no-grad forward as it stands — same
             # tensors, no gradient wanted — so the eval keeps the cache hit. The
             # reverse (an untracked entry serving a tracked forward) is the
             # defect above, and it is what the key and the second clause forbid.
-            reusable = cached[0] == key or (
-                not grad and cached[0][:-1] == key[:-1] and cached[0][-1]
+            reusable = cached is not None and (
+                cached[0] == key or (not grad and cached[0][:-1] == key[:-1] and cached[0][-1])
             )
             if not reusable or (want and not cached[1][0].requires_grad):
                 cached = None
@@ -1736,7 +1830,16 @@ class SparseMoE(nn.Module):
                     torch.stack([getattr(e, name) for e in self.experts]).to(dt)
                     for name in ("gate_s", "up_s")
                 ),
+                self._bank_epoch if self.moe_bank_epoch else None,
             )
+            self._bank_builds += 1
+            if counters is not None:
+                # Counted HERE, inside the `torch.compiler.disable` frame: a
+                # `counters` mutation in `forward` is a dynamo guard on the
+                # dict's length, and the first build of a fresh Counters moves it
+                # (measured: `recompile_limit (8), last reason: len(counters) != 9`
+                # in `tests/test_compile_moe.py`).
+                counters.count("moe_bank_builds")
             if want:
                 self._bank_cache = cached
         mats, scales = cached[1], cached[2]
@@ -1956,7 +2059,7 @@ class SparseMoE(nn.Module):
         xg = torch.zeros(dump + 1, self.d, dtype=dt, device=x.device)
         xg = xg.index_put((slots,), self._gather_rows(x, owner, dt))
         flat = xg.narrow(0, 0, dump)
-        gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+        gate_u, up_u, v, gate_s, up_s = self._banks(dt, counters)
         ys = []
         offset = 0
         for idx, cap in local:
@@ -2101,7 +2204,7 @@ class SparseMoE(nn.Module):
         # row is sliced off, so the expert pass keeps its shape, its kernel and
         # its bits. Only the lookup needs the extra row, and it gets a constant
         # zero row (the dumped assignments' output is 0 anyway).
-        gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+        gate_u, up_u, v, gate_s, up_s = self._banks(dt, counters)
         if self.moe_shared_compute:
             self._assert_shared_compute()
             rank = self.experts[0].rank
@@ -2638,7 +2741,7 @@ class SparseMoE(nn.Module):
         counts = _bincount(kept, self.n_experts).to(torch.int32)
         offs = torch.zeros(self.n_experts + 1, dtype=torch.int32, device=x.device)
         offs[1:] = torch.cumsum(counts, 0)
-        gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+        gate_u, up_u, v, gate_s, up_s = self._banks(dt, counters)
         cap = None if dropless else self._capacity(n, k)
         if self.moe_shared_compute:
             self._assert_shared_compute()
@@ -2693,7 +2796,15 @@ class SparseMoE(nn.Module):
         # assert LOUD: a future caller that hands it a non-fp32 weight still
         # fails instead of being silently coerced.
         return moe_kernels.combine(
-            y, weight.reshape(-1)[rows].float(), owner, rowmap.view(n, k), n, ws=ws
+            y,
+            weight.reshape(-1)[rows].float(),
+            owner,
+            rowmap.view(n, k),
+            n,
+            ws=ws,
+            counters=counters,
+            fused=self.moe_combine == "fused",
+            dtype=self.moe_combine_dtype,
         )
 
     def _gather_dispatch(
@@ -2737,7 +2848,7 @@ class SparseMoE(nn.Module):
         rows = order if keep is None else order[keep]
         owner = rows // k
         toks, offs = moe_sonic.gather_abi(index, order, keep, self.n_experts)
-        gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+        gate_u, up_u, v, gate_s, up_s = self._banks(dt, counters)
         cap = None if self.capacity == 0 else self._capacity(n, k)
         seg = index.reshape(-1)[rows].to(torch.int32)
         rowmap = torch.full((n * k,), -1, dtype=torch.int32, device=x.device)
@@ -2757,7 +2868,15 @@ class SparseMoE(nn.Module):
             ws=ws,
         )
         return moe_kernels.combine(
-            y, weight.reshape(-1)[rows].float(), owner, rowmap.view(n, k), n, ws=ws
+            y,
+            weight.reshape(-1)[rows].float(),
+            owner,
+            rowmap.view(n, k),
+            n,
+            ws=ws,
+            counters=counters,
+            fused=self.moe_combine == "fused",
+            dtype=self.moe_combine_dtype,
         )
 
 
