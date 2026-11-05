@@ -692,6 +692,16 @@ class ModelConfig:
     #: Lanes. Only K=2 ships: it is the configuration the paper measured and
     #: the one the review wires; `validate` refuses anything else.
     mhc_streams: int = 2
+    #: Eq. 9's Sinkhorn normaliser (`model/mhc.sinkhorn_knopp`). `"logsumexp"`
+    #: is the shipped arithmetic, bit for bit (`m -= logsumexp(m)`).
+    #: `"log_softmax"` is the SAME expression as one ATen op, so only fp32
+    #: roundoff moves (≤2.4e-7 absolute on the probability, measured) while the
+    #: 20-iteration Python loop's per-normalisation subtract leaves the graph:
+    #: 881 -> 81 dispatches per call. The `mhc_write` region's kernel profile
+    #: (2026-11-05) priced that subtract family at 1 395 launches / 10 steps.
+    #: It does NOT touch the fused kernel (`fused_residual._write_kernel`),
+    #: whose 20 iterations are already in registers.
+    mhc_sinkhorn: str = "logsumexp"
     #: The residual chain as fused Triton kernels (`model/fused_residual.py`):
     #: `H_pre`'s mix, the AttnRes write, `H_res`/`H_post` and the lane readout
     #: become two forward launches and two backward launches per iteration
@@ -3048,6 +3058,20 @@ def validate(model: ModelConfig) -> None:
             f"act_group={model.act_group} with act_quant='none' is inert — the "
             f"quantizer is off, so there is no block to group. Escape: set "
             f"act_quant, or leave act_group at 0."
+        )
+    if model.mhc_sinkhorn not in ("logsumexp", "log_softmax"):
+        loud(
+            f"mhc_sinkhorn={model.mhc_sinkhorn!r} is not a Sinkhorn normaliser. "
+            f"Known: 'logsumexp' (the shipped bits) and 'log_softmax' (the same "
+            f"expression as one ATen op). Escape: name one of those, or leave it "
+            f"at its default 'logsumexp'."
+        )
+    if model.mhc_sinkhorn != "logsumexp" and not model.use_mhc:
+        loud(
+            f"mhc_sinkhorn='{model.mhc_sinkhorn}' with use_mhc=false is inert — "
+            f"there is no lane chain and no Sinkhorn to normalise, so the field "
+            f"would name an arm that never ran. Escape: use_mhc=true, or leave "
+            f"mhc_sinkhorn at its default 'logsumexp'."
         )
     if model.use_mhc:
         for name, why in (

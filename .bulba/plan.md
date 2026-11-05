@@ -850,6 +850,29 @@ testable and A/B-able (ADR-0017).
       forwarded pass (-50.9 % of the routing cluster), host 2 089 -> 0.5 us/pass
       (-6.27 ms/step at max_iter 3); the bf16 store is priced and NOT picked.
 
+- [x] P-MHC-WRITE. port (Python): the `mhc_write` region's 1 395 `add`
+      launches were **not** the fused kernel. The profile ran
+      `fused_residual=false` (`port/configs/m400b.toml:58`), so `MHCMix` ran
+      eagerly and `mhc.sinkhorn_knopp`'s 20-iteration Python loop issued
+      `torch.logsumexp(m)` + `m = m - lse` per normalisation: the reduction's
+      `add` and the caller's `sub` (CUDA lowers `sub` to `CUDAFunctor_add`,
+      alpha=-1) are ~120 add-family launches per call, x3 iterations/step.
+      **The fused write's Sinkhorn is already in registers**
+      (`fused_residual._write_kernel`, `for it in tl.static_range(ITERS)`, one
+      launch/iteration), so an iteration-count arm would buy nothing there.
+      New arm `mhc_sinkhorn="log_softmax"` (default `"logsumexp"` = the shipped
+      bits, pinned sha): `log_softmax(dim)` IS `m - logsumexp(m)` as one ATen
+      op, so the relaunch family leaves the graph. b8 x s1024 d1536, one
+      iteration: add family 126 -> 6 (21x), region ATen ops 827 -> 147 (5.6x),
+      Sinkhorn alone 761 -> 81 (9.4x; the add family 120 -> 0); values and
+      grads within 2.4e-7 / 1.8e-7 (NOT bit-identical, hence the flag).
+      Gates `tests/test_mhc_write_launches.py` (13: pins, 21x family gate,
+      scratch revert red, parity, refusals with Escape, no host sync, the
+      kernel's `static_range` pinned). `scripts/bench_mhc_write.py` prints both
+      arms (CPU us are not a GPU estimate). The profile's 23.2 ms is fixed by
+      the fusion flag, not this arm: `--set fused_residual=true
+      --set fused_epilogue=true`; GPU numbers unrun (card owned).
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)
