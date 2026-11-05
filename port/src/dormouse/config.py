@@ -1092,6 +1092,42 @@ class ModelConfig:
     #: checkpoint resume. A stale epoch is never served (`_banks` rebuilds) and
     #: an entry without an epoch, or from the future, is LOUD. OFF.
     moe_bank_epoch: bool = False
+    #: PACKED EXPERT BANK (`experts.SparseMoE`): ONE `[E, rank, d_ffn]` master
+    #: for the experts' write `v` (and, when `share_u_mode="off"`, one
+    #: `[E, d_model, rank]` per input site) instead of E separate
+    #: `nn.Parameter`s. The bank rebuild (`_banks`, once per optimizer step)
+    #: stops running one `.to(dt)` per expert plus a stack: it casts the packed
+    #: buffer ONCE and returns slices, measured `2·E + 3 -> 3` launches at
+    #: E=512 — the 519-launch/step rebuild the 2026-11-05 census named.
+    #:
+    #: The scales (`gate_s`/`up_s`) stay one `[E, 2, rank]` buffer; the bank
+    #: returns the two `[E, rank]` views (no copies, no stacks).
+    #:
+    #: The optimizer sees ordinary parameters: `packed_v`/`packed_gate_u`/
+    #: `packed_up_u` are 3-D BATCHES of 2-D matrices, and `train.optim`'s
+    #: `is_muon_param`/`Muon._build_groups` treat the leading dim as the batch
+    #: (the Newton-Schulz chain and ColRow already have a per-slice 3-D form).
+    #: `packed_s` is a scale tensor and goes to AdamW like every other `s`.
+    #:
+    #: A checkpoint stays readable both ways: `_load_from_state_dict` expands a
+    #: packed state dict into per-expert keys for an unpacked model, and gathers
+    #: the per-expert keys into the packed buffers for a packed model; the
+    #: round-trip gate pins both directions (`tests/test_tsct_packed.py`).
+    #:
+    #: REFUSED with a storage rung (`quant != "none"`): `is_factor_key` names
+    #: the per-expert `.v` leaf, and a packed `packed_v` would be written
+    #: UNCOMPRESSED beside factors the rung compresses — a checkpoint that is
+    #: half-packed and does not say so. REFUSED with `use_byteflow`, which
+    #: builds no expert bank (the switch would be inert while the snapshot
+    #: reported it on). OFF by default and bit-identical when off: no parameter
+    #: is replaced, no RNG is drawn and no state-dict key appears.
+    #: COMPOSES WITH TSCT-2: with `tsct_expert_basis` on, the shared plane is
+    #: still folded per expert (`gate_u @ w_j.T`) — the selector is not a packed
+    #: site — while the packed `v`/`packed_s` supply the write and the scales.
+    #: The combined bank is `torch.equal` to the unpacked arm's
+    #: (`tests/test_tsct_merge.py`); packed + `tsct_expert_lr` scales each
+    #: expert row of `packed_v` exactly as it scales an unpacked `v`.
+    tsct_packed: bool = False
     #: The expert GLU's activation, the 2026-10-16 activation tournament arm
     #: (`docs/research` scan; formula sources named in `experts.expert_glu`):
     #: `silu` = SwiGLU's gate, the control and every number on record;
@@ -1459,6 +1495,21 @@ class ModelConfig:
                     f"`share_u_mode`, or set `share_u_mode='plane'`."
                 )
             self.share_u_mode = "plane"
+        if self.tsct_packed and self.quant != "none":
+            loud(
+                f"tsct_packed=true with quant={self.quant!r}: the storage rung packs "
+                f"the per-expert `.v` factor (`is_factor_key`), and the packed "
+                f"`packed_v` buffer is not a factor key — the checkpoint would carry "
+                f"an uncompressed bank beside compressed factors and say so nowhere. "
+                f"Escape: quant='none', or tsct_packed=false."
+            )
+        if self.tsct_packed and self.use_byteflow:
+            loud(
+                "tsct_packed=true with use_byteflow=true: the byteflow shapes build "
+                "no expert bank (their loop runs over patch latents), so the packed "
+                "buffers would not exist while the snapshot reported the flag on. "
+                "Escape: use_byteflow=false, or tsct_packed=false."
+            )
         for name in ("prelude_layers", "coda_layers"):
             n = getattr(self, name)
             if not 0 <= n <= 4:

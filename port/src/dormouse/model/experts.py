@@ -609,6 +609,7 @@ class DualLatentGLU(nn.Module):
         share_u: bool = False,
         tsct_basis: int = 0,
         basis_shared: int = 0,
+        packed: bool = False,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
@@ -685,13 +686,55 @@ class DualLatentGLU(nn.Module):
         #: activation identically (per-row/group scale, expert-independent).
         self.act_quant = act_quant
         self.act_group = act_group
+        #: PACKED BANK (`SparseMoE.tsct_packed`, OFF by default): this expert
+        #: owns no `v`/`s` (and no `u` when the parent shares one). The parent
+        #: owns ONE buffer per site and binds per-expert VIEWS through
+        #: [`bind_packed`], so the once-per-step bank rebuild casts a whole
+        #: `[E, ...]` tensor instead of E parameter `.to`s. The views are plain
+        #: tensors on purpose — they must NOT appear in `named_parameters()`,
+        #: because the optimizer's objects are the packed buffers (a second
+        #: registration would double-step the same storage).
+        self.packed = packed
         for name in ("gate", "up"):
-            if not share_u:
+            if not share_u and not packed:
                 # `U [d, r]` and `s [r]`: the latent half of TSCT's factorization.
                 setattr(self, f"{name}_u", nn.Parameter(init_u(d, rank, device)))
-            setattr(self, f"{name}_s", nn.Parameter(torch.ones(rank, device=device)))
-        # The write `V [r, f]` — one, at the latent, after the GLU.
-        self.v = nn.Parameter(torch.randn(rank, f, device=device) / math.sqrt(rank))
+            if not packed:
+                setattr(self, f"{name}_s", nn.Parameter(torch.ones(rank, device=device)))
+        if not packed:
+            # The write `V [r, f]` — one, at the latent, after the GLU.
+            self.v = nn.Parameter(torch.randn(rank, f, device=device) / math.sqrt(rank))
+        else:
+            self.v = None
+            self.gate_s = None
+            self.up_s = None
+            if not share_u:
+                self.gate_u = None
+                self.up_u = None
+
+    def bind_packed(
+        self,
+        v: torch.Tensor,
+        gate_s: torch.Tensor,
+        up_s: torch.Tensor,
+        gate_u: torch.Tensor | None = None,
+        up_u: torch.Tensor | None = None,
+    ) -> None:
+        """Take the parent's packed buffers as per-expert VIEWS — never a copy.
+
+        Called once at build and again after a `load_state_dict` (a loader may
+        replace the storage a view pointed at, which would silently freeze the
+        expert on the old tensor). The buffers are `nn.Parameter`s of the
+        PARENT; these attributes are plain tensors, so `named_parameters()` has
+        exactly one entry per site and the optimizer steps it once.
+        """
+        assert self.packed, "bind_packed on an expert that owns its own factors"
+        self.v = v
+        self.gate_s = gate_s
+        self.up_s = up_s
+        if gate_u is not None:
+            self.gate_u = gate_u
+            self.up_u = up_u
 
     def bind_shared_u(
         self,
@@ -900,6 +943,14 @@ class SparseMoE(nn.Module):
         self.moe_bank_epoch = cfg.moe_bank_epoch
         self._bank_epoch = 0
         self._bank_builds = 0
+        #: The PACKED bank (`tsct_packed`, OFF): ONE `[E, rank, d_ffn]` master
+        #: for `v` and one `[E, d, rank]` per input site instead of E separate
+        #: parameters, so `_banks` casts a whole buffer once. The parent owns
+        #: the parameters and the experts hold views (`bind_packed`); the tuple
+        #: is the `_version` key's contribution from these buffers (they are not
+        #: inside `self.experts`, so their versions must be part of the key).
+        self.tsct_packed = cfg.tsct_packed
+        self._packed_params: tuple[nn.Parameter, ...] = ()
         #: The compressed-forward sprint's factor quantization (`factor_qat`):
         #: `_banks` applies it to the fp32 stacks before the dt-conversion, and
         #: `DualLatentGLU` applies the SAME projection (dim=None on a 2-D
@@ -1041,18 +1092,11 @@ class SparseMoE(nn.Module):
                 share_u=self.share_u,
                 tsct_basis=self.tsct_expert_basis if self.share_u_mode == "plane" else 0,
                 basis_shared=cfg.shared_rank,
+                packed=cfg.tsct_packed,
                 device=device,
             )
             for _ in range(cfg.n_experts)
         )
-        if self.tsct_expert_lr:
-            # The optimizer's row-scale seam: a 2-D parameter is one row of its
-            # shape group, and these attributes are how `MixOptimizer` knows
-            # WHICH row belongs to which expert. Not state, not a buffer, never
-            # saved — the mapping is rebuilt from the module tree.
-            for j, e in enumerate(self.experts):
-                e.v._tsct_moe = self
-                e.v._tsct_index = j
         self.shared = DualLatentGLU(
             d,
             f,
@@ -1157,6 +1201,59 @@ class SparseMoE(nn.Module):
                 for e in self.experts:
                     e.bind_shared_u(self.gate_u, self.up_u, cache=self._qat_cache)
                 self._shared_params = (self.gate_u, self.up_u)
+        #: PACKED BANK (`tsct_packed`): the parameters above were skipped by the
+        #: experts; the parent owns one buffer per SITE and binds views. Under
+        #: `share_u` the input side is already one tensor, so only `v` (the
+        #: `[E, rank, d_ffn]` write — the 512-copy rebuild) and the `[E, 2,
+        #: rank]` scales are packed here. Without `share_u` the two input bases
+        #: are packed too: `packed_gate_u`/`packed_up_u`, one `[E, d, rank]`
+        #: each rather than one concatenated `[E, 2d, rank]`. The split is
+        #: deliberate: Muon orthogonalizes each expert's `[d, rank]` matrix, and
+        #: a concatenated buffer would make the optimizer see a `[2d, rank]`
+        #: matrix whose Gram mixes the gate and up rows and whose
+        #: `max(1, m/n)^0.5` scale is not the per-site one. Two buffers = two
+        #: casts, still 3 launches for the whole build at E=512.
+        if self.tsct_packed:
+            e, r = cfg.n_experts, cfg.rank
+            self.packed_v = nn.Parameter(
+                torch.randn(e, r, f, device=device) / math.sqrt(r)
+            )
+            self.packed_s = nn.Parameter(torch.ones(e, 2, r, device=device))
+            params: list[nn.Parameter] = [self.packed_v, self.packed_s]
+            if not self.share_u:
+                self.packed_gate_u = nn.Parameter(
+                    torch.randn(e, d, r, device=device) / math.sqrt(d)
+                )
+                self.packed_up_u = nn.Parameter(
+                    torch.randn(e, d, r, device=device) / math.sqrt(d)
+                )
+                params += [self.packed_gate_u, self.packed_up_u]
+            # The optimizer marker: `[E, rows, cols]` is a BATCH of 2-D matrices,
+            # and `train.optim.is_muon_param` reads this attribute (not the rank
+            # alone) so the packed write keeps the per-expert Muon update. The
+            # scales are NOT marked: `[E, 2, rank]` is a scale tensor and goes to
+            # AdamW like every other `s`.
+            for p in (
+                self.packed_v,
+                getattr(self, "packed_gate_u", None),
+                getattr(self, "packed_up_u", None),
+            ):
+                if p is not None:
+                    p._muon_batched = True
+            self._packed_params = tuple(params)
+            self._bind_packed()
+        if self.tsct_expert_lr:
+            # The optimizer's row-scale seam: an unpacked expert's `v` is one
+            # parameter = one row of its shape group; the packed bank is ONE
+            # parameter whose leading dim is E rows, so the same seam marks the
+            # buffer and `_build_groups` expands the id per row. Not state, not
+            # a buffer, never saved — the mapping is rebuilt from the module tree.
+            if self.tsct_packed:
+                self.packed_v._tsct_moe = self
+            else:
+                for j, e in enumerate(self.experts):
+                    e.v._tsct_moe = self
+                    e.v._tsct_index = j
         # The router: ONE 2-D linear on the raw hidden state (not on the
         # latent), softmax over the bank, then top-k + a capacity-bound permute.
         self.router = nn.Linear(d, cfg.n_experts, bias=False, device=device)
@@ -1891,21 +1988,172 @@ class SparseMoE(nn.Module):
         if not self.moe_bank_epoch:
             self._bank_cache = None
 
+    # -- packed bank: one buffer per site, and a checkpoint readable both ways --
+    def _bind_packed(self) -> None:
+        """Point every expert at its row of the parent's buffers (views)."""
+        gate_u = getattr(self, "packed_gate_u", None)
+        for e, ex in enumerate(self.experts):
+            ex.bind_packed(
+                self.packed_v[e],
+                self.packed_s[e, 0],
+                self.packed_s[e, 1],
+                None if gate_u is None else gate_u[e],
+                None if gate_u is None else self.packed_up_u[e],
+            )
+
+    def _packed_family(self, prefix: str) -> dict[str, tuple[str, ...]]:
+        """`packed key -> the per-expert keys it replaces` — the FULL mapping.
+
+        Both directions read it: a pack filters to the buffers the target model
+        owns, an unpack reads whichever packed keys the checkpoint carries.
+        """
+        return {
+            "packed_v": tuple(f"{prefix}experts.{e}.v" for e in range(self.n_experts)),
+            # ALL gate_s then ALL up_s: the pack is `[E, 2, rank]`, so the
+            # gather's two halves are `vals[:E]` and `vals[E:]`.
+            "packed_s": tuple(
+                f"{prefix}experts.{e}.gate_s" for e in range(self.n_experts)
+            )
+            + tuple(f"{prefix}experts.{e}.up_s" for e in range(self.n_experts)),
+            "packed_gate_u": tuple(
+                f"{prefix}experts.{e}.gate_u" for e in range(self.n_experts)
+            ),
+            "packed_up_u": tuple(
+                f"{prefix}experts.{e}.up_u" for e in range(self.n_experts)
+            ),
+        }
+
+    def _translate(
+        self, state_dict, prefix: str, *, to_packed: bool, own_only: bool = False
+    ) -> None:
+        """Rewrite the model half between the packed and per-expert forms.
+
+        `to_packed`: gather `[E, ...]` from the per-expert keys (an old
+        checkpoint into a packed model). Otherwise expand the packed buffer into
+        per-expert keys (a packed checkpoint into an unpacked model). A family
+        is translated only when the TARGET carries it: a `share_u` model has no
+        per-expert `u`, so those keys are left for the loader's own
+        missing/unexpected report (a config mismatch, not a format).
+        `own_only` is the LOAD path's rule (the target model must own the packed
+        buffer); `state_dict(packed_form=True)` writes the form even when the
+        model itself is unpacked, so the export path passes `False`.
+        """
+        family = self._packed_family(prefix)
+        # The per-expert form of the scales is TWO leaves per expert; the pack
+        # is `[E, 2, rank]`, so the gather has to interleave (`dim=1`).
+        for packed_key, old_keys in family.items():
+            packed_full = f"{prefix}{packed_key}"
+            present = [k in state_dict for k in old_keys]
+            if to_packed:
+                if own_only and not hasattr(self, packed_key):
+                    # The target does not own this site (a share_u model has no
+                    # per-expert `u`): leave the keys for the loader's own
+                    # missing/unexpected report — a config mismatch, not a format.
+                    continue
+                if packed_full in state_dict:
+                    if any(present):
+                        loud(
+                            f"{packed_full} and its per-expert keys are BOTH in the "
+                            f"checkpoint: one bank, two formats. Escape: keep one "
+                            f"(drop the packed key, or the experts.* keys)."
+                        )
+                    continue
+                if not any(present):
+                    continue
+                if not all(present):
+                    missing = [k for k, ok in zip(old_keys, present, strict=True) if not ok]
+                    loud(
+                        f"{packed_full}: a packed load needs EVERY per-expert key, "
+                        f"missing {missing[:4]}. Escape: a complete checkpoint, or "
+                        f"tsct_packed=false."
+                    )
+                vals = [state_dict.pop(k) for k in old_keys]
+                if packed_key == "packed_s":
+                    n = self.n_experts
+                    gate = torch.stack(vals[:n])
+                    up = torch.stack(vals[n:])
+                    state_dict[packed_full] = torch.stack([gate, up], dim=1)
+                else:
+                    state_dict[packed_full] = torch.stack(vals)
+                continue
+            # packed -> per-expert
+            if packed_full not in state_dict:
+                continue
+            if any(present):
+                loud(
+                    f"{packed_full} and its per-expert keys are BOTH in the "
+                    f"checkpoint: one bank, two formats. Escape: keep one."
+                )
+            val = state_dict.pop(packed_full)
+            if packed_key == "packed_s":
+                n = self.n_experts
+                for e in range(n):
+                    state_dict[old_keys[e]] = val[e, 0]
+                    state_dict[old_keys[n + e]] = val[e, 1]
+            else:
+                for e, key in enumerate(old_keys):
+                    state_dict[key] = val[e]
+
+    def state_dict(self, destination=None, prefix="", keep_vars=False, packed_form=None):
+        """The bank's half in either form (`packed_form`, default: the model's).
+
+        `None` writes what this model IS (`packed_v`/`packed_s` when packed,
+        `experts.*` otherwise) — so a checkpoint is honest about the layout it
+        came from. `packed_form=True|False` rewrites that half into the other
+        form, which is what makes a packed run's checkpoint readable by an
+        unpacked model (and the reverse) without a converter script. The values
+        are the same tensors: the translation only regroups the keys.
+        """
+        dest = super().state_dict(
+            destination=destination, prefix=prefix, keep_vars=keep_vars
+        )
+        form = self.tsct_packed if packed_form is None else bool(packed_form)
+        if form != self.tsct_packed:
+            self._translate(dest, prefix, to_packed=form)
+        return dest
+
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ) -> None:
-        """A load is a weight move: bump the epoch so no pre-load bank is served.
+        """A load is a weight move AND a format conversion.
 
-        `torch.nn.Module.load_state_dict` writes the parameters IN PLACE without
-        bumping `_version` in every path (a `copy_` does, a graph replay does
-        not), and `moe_bank_epoch`'s contract is that the epoch — not the
-        version — is what makes a bank fresh. Bumping here covers resume,
-        eval-time loads and tests with ONE hook; `invalidate_banks_all` stays the
-        trainer's per-optimizer-step call.
+        The bank cache is dropped and the epoch bumped (no pre-load bank may be
+        served). The model half is translated across the packed and per-expert
+        layouts before the base loader runs: an old per-expert checkpoint
+        gathers into `packed_v`/`packed_s` (and the u pair when the model owns
+        it), and a packed checkpoint expands into `experts.{e}.{v,gate_s,
+        up_s,...}` for an unpacked model. After the copy the per-expert views
+        are rebound — a loader that replaced the storage would otherwise leave
+        every expert reading the old tensor.
         """
+        family = self._packed_family(prefix)
+        has_packed = any(f"{prefix}{k}" in state_dict for k in family)
+        has_old = any(k in state_dict for keys in family.values() for k in keys)
+        if has_packed and has_old:
+            loud(
+                f"{prefix}: the checkpoint carries BOTH the packed bank and the "
+                f"per-expert keys. One bank, two formats. Escape: keep one."
+            )
+        if self.tsct_packed and has_old:
+            self._translate(state_dict, prefix, to_packed=True, own_only=True)
+        elif not self.tsct_packed and has_packed:
+            self._translate(state_dict, prefix, to_packed=False)
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
+        if self.tsct_packed:
+            # `assign=True` can REPLACE the parameter objects; the tuple and the
+            # expert views must follow the live ones.
+            self._packed_params = (
+                self.packed_v,
+                self.packed_s,
+                *(
+                    (self.packed_gate_u, self.packed_up_u)
+                    if hasattr(self, "packed_gate_u")
+                    else ()
+                ),
+            )
+            self._bind_packed()
         self._bank_cache = None
         self._bank_epoch += 1
 
@@ -1968,6 +2216,12 @@ class SparseMoE(nn.Module):
         into the columns it read, and leaves the rest of the dictionary with no
         gradient from that expert. The shared tensors are not inside
         `self.experts`, so their `_version`s are part of the key explicitly.
+
+        **Under `tsct_packed`** the per-expert branch of `_one` is gone: `v`
+        (and the u pair when `share_u` is off) is ONE `[E, ·, ·]` buffer, so the
+        build is `buffer.to(dt)` — one cast instead of E casts + a stack — and
+        the scales are two views of `packed_s`. Measured at m400b/E=512:
+        521 -> 5 launches and 1 681 -> 1 010 MB of operand traffic per build.
         """
         grad = torch.is_grad_enabled()
         # `want` is what the cached bank must carry a graph FOR: a frozen expert
@@ -1978,7 +2232,13 @@ class SparseMoE(nn.Module):
         want = (
             grad
             and (
-                self._shared_params[0] if self._shared_params else self.experts[0].gate_u
+                self._packed_params[0]
+                if self._packed_params
+                else (
+                    self._shared_params[0]
+                    if self._shared_params
+                    else self.experts[0].gate_u
+                )
             ).requires_grad
         )
         if self.moe_bank_epoch:
@@ -1988,6 +2248,19 @@ class SparseMoE(nn.Module):
             # module's load hook. Never `_version`, which a CUDA-graph replay
             # freezes while the values move (`test_bank_invalidation.py`).
             key = (dt, self.factor_qat, self.factor_qat_alpha, want)
+        elif self.tsct_packed:
+            # Same shape as the unpacked key plus the packed buffers' versions:
+            # the experts own none, and a step that moved only `packed_v` must
+            # rebuild the bank.
+            key = (
+                dt,
+                self.factor_qat,
+                self.factor_qat_alpha,
+                tuple(p._version for e in self.experts for p in e.parameters()),
+                tuple(p._version for p in self._packed_params),
+                tuple(p._version for p in self._shared_params),
+                want,
+            )
         else:
             key = (
                 dt,
@@ -2109,7 +2382,23 @@ class SparseMoE(nn.Module):
                             counters.count("tsct_basis_fold")
                         w = torch.stack([e.w.to(dt) for e in self.experts])
                         return torch.einsum("dr,ekr->edk", u, w).contiguous()
+                    if self.tsct_packed:
+                        # A VIEW, not a copy: the E slices share one `[d, r]`
+                        # storage and `bmm`'s backward through `expand` sums the
+                        # E contributions into the same parameter. This is what
+                        # keeps the packed build at 1 cast per site (the whole
+                        # `_banks` rebuild: v + 2 scales = 3 launches).
+                        return u.unsqueeze(0).expand(len(self.experts), -1, -1)
                     return u.unsqueeze(0).expand(len(self.experts), -1, -1).contiguous()
+                # PACKED SITE (`tsct_packed`): one `[E, ·, ·]` buffer, ONE cast.
+                # This is the whole arm: no per-expert `.to`, no `stack`.
+                packed = getattr(self, f"packed_{name}", None)
+                if packed is not None:
+                    if self.factor_qat == "none":
+                        return packed.to(dt)
+                    return qat_project_stacked(
+                        packed, self.factor_qat, self.factor_qat_alpha, dim=(1, 2)
+                    ).to(dt)
                 params = [getattr(e, name) for e in self.experts]
                 if self.factor_qat == "none":
                     return torch.stack([t.to(dt) for t in params])
@@ -2118,13 +2407,19 @@ class SparseMoE(nn.Module):
                 ).to(dt)
 
             mats = [_one(name) for name in ("gate_u", "up_u", "v")]
+            if self.tsct_packed:
+                # Views, then ONE cast each: the scales are fp32 masters and the
+                # bank is `dt`, exactly as the unpacked `stack(...).to(dt)` path.
+                scales = tuple(self.packed_s[:, i].to(dt) for i in (0, 1))
+            else:
+                scales = tuple(
+                    torch.stack([getattr(e, name) for e in self.experts]).to(dt)
+                    for name in ("gate_s", "up_s")
+                )
             cached = (
                 key,
                 tuple(mats),
-                tuple(
-                    torch.stack([getattr(e, name) for e in self.experts]).to(dt)
-                    for name in ("gate_s", "up_s")
-                ),
+                scales,
                 self._bank_epoch if self.moe_bank_epoch else None,
             )
             self._bank_builds += 1

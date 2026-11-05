@@ -673,7 +673,19 @@ class _MomGroup:
       PARAMS are `Y = (1-β1)Z + β1 X` (`sf_switch`).
     """
 
-    __slots__ = ("gi", "shape", "params", "mom", "v", "x", "z", "tsct_ids", "tsct_row")
+    __slots__ = (
+        "gi",
+        "shape",
+        "params",
+        "mom",
+        "v",
+        "x",
+        "z",
+        "tsct_ids",
+        "tsct_row",
+        "packed",
+        "rows",
+    )
 
     def __init__(
         self,
@@ -684,6 +696,8 @@ class _MomGroup:
         v: torch.Tensor | None = None,
         x: torch.Tensor | None = None,
         z: torch.Tensor | None = None,
+        packed: bool = False,
+        rows: int | None = None,
     ) -> None:
         self.gi = gi
         self.shape = shape
@@ -694,9 +708,14 @@ class _MomGroup:
         self.z = z
         #: TSCT-2's per-expert LR row ids (`0` = no scale) and the current
         #: step's `[N]` scale vector. `None` without the arm, so the OFF path
-        #: allocates and multiplies nothing.
+        #: allocates and multiplies nothing. A packed group's ids are one row
+        #: per expert slice of its 3-D buffer.
         self.tsct_ids: torch.Tensor | None = None
         self.tsct_row: torch.Tensor | None = None
+        #: One 3-D parameter carrying `rows` 2-D matrices (`tsct_packed`).
+        #: `params` is `[that_parameter]` then; `mom` is `[rows, *shape]`.
+        self.packed = packed
+        self.rows = len(params) if rows is None else rows
 
 
 def _stack_grads(params: list) -> torch.Tensor:
@@ -913,6 +932,20 @@ class Muon(Optimizer):
         #: pure launch/memory trade.
         self.chunk_elems = chunk_elems
         super().__init__(params, dict(lr=lr, momentum=momentum, ns_steps=ns_steps))
+        if (sf or variant != "muon") and any(
+            _is_packed_matrix_batch(p)
+            for group in self.param_groups
+            for p in group["params"]
+        ):
+            loud(
+                "a packed 3-D bank (`tsct_packed`) with "
+                f"muon_sf={sf} / muon_variant={variant!r}: the SF and NorMuon "
+                "tails are per-PARAMETER loops (`_sf_batched`/`_nor_batched` "
+                "write one row per parameter), while a packed buffer is one "
+                "parameter with E rows. The default `muon` batched path is the "
+                "supported arm. Escape: tsct_packed=false, muon_sf=false and "
+                "muon_variant='muon', or land the packed tail with its gate."
+            )
         #: One stacked momentum buffer per (param group, shape) — the canonical
         #: state, built lazily by `_build_groups` and rebuilt after a load.
         self._groups: list[_MomGroup] = []
@@ -947,12 +980,22 @@ class Muon(Optimizer):
         """
         self._groups = []
         for gi, group in enumerate(self.param_groups):
-            by_shape: dict[tuple[int, int], list] = {}
+            by_shape: dict[tuple, list] = {}
             for p in group["params"]:
-                if p.ndim == 2:
-                    by_shape.setdefault((p.shape[0], p.shape[1]), []).append(p)
-            for shape, params in by_shape.items():
-                n = len(params)
+                if _is_packed_matrix_batch(p):
+                    # `[E, d0, d1]` = E matrices of ONE shape. Each packed
+                    # buffer is its OWN group (`id(p)`): two buffers can share a
+                    # shape (`gate_u`/`up_u`) but their rows are different
+                    # parameters, and merging them would make one `p.grad`
+                    # write-back target a list. The lockstep NS still batches
+                    # their jobs together.
+                    by_shape.setdefault(("packed", id(p), p.shape[1], p.shape[2]), []).append(p)
+                elif p.ndim == 2:
+                    by_shape.setdefault(("2d", p.shape[0], p.shape[1]), []).append(p)
+            for key, params in by_shape.items():
+                packed = key[0] == "packed"
+                shape = (key[2], key[3]) if packed else (key[1], key[2])
+                n = params[0].shape[0] if packed else len(params)
                 dtype = _torch_dtype(self.state_dtype)
                 mom = torch.zeros(n, *shape, dtype=dtype, device=params[0].device)
                 v = (
@@ -964,34 +1007,60 @@ class Muon(Optimizer):
                 if self.sf:
                     x = torch.zeros(n, *shape, dtype=dtype, device=params[0].device)
                     z = torch.zeros(n, *shape, dtype=dtype, device=params[0].device)
-                for i, p in enumerate(params):
+                if packed:
+                    # ONE parameter, E rows: the state lives on that parameter as
+                    # a whole tensor (the 2-D branch stores row views).
+                    assert len(params) == 1, "a packed buffer is one parameter"
+                    p = params[0]
                     prev = self.state[p].get("momentum")
                     if prev is not None:
-                        mom[i].copy_(prev)
-                    self.state[p]["momentum"] = mom[i]
+                        mom.copy_(prev)
+                    self.state[p]["momentum"] = mom
                     if v is not None:
                         pv = self.state[p].get("v")
                         if pv is not None:
-                            v[i].copy_(pv)
-                        self.state[p]["v"] = v[i]
-                    for key, buf in (("x", x), ("z", z)):
+                            v.copy_(pv)
+                        self.state[p]["v"] = v
+                    for name, buf in (("x", x), ("z", z)):
                         if buf is None:
                             continue
-                        pv = self.state[p].get(key)
-                        buf[i].copy_(pv if pv is not None else p.detach())
-                        self.state[p][key] = buf[i]
-                grp = _MomGroup(gi, shape, params, mom, v, x, z)
+                        pv = self.state[p].get(name)
+                        buf.copy_(pv if pv is not None else p.detach())
+                        self.state[p][name] = buf
+                else:
+                    for i, p in enumerate(params):
+                        prev = self.state[p].get("momentum")
+                        if prev is not None:
+                            mom[i].copy_(prev)
+                        self.state[p]["momentum"] = mom[i]
+                        if v is not None:
+                            pv = self.state[p].get("v")
+                            if pv is not None:
+                                v[i].copy_(pv)
+                            self.state[p]["v"] = v[i]
+                        for name, buf in (("x", x), ("z", z)):
+                            if buf is None:
+                                continue
+                            pv = self.state[p].get(name)
+                            buf[i].copy_(pv if pv is not None else p.detach())
+                            self.state[p][name] = buf[i]
+                grp = _MomGroup(gi, shape, params, mom, v, x, z, packed=packed, rows=n)
                 if self._tsct_moes:
-                    ids = []
+                    # ONE device row id per parameter — or per EXPERT SLICE of a
+                    # packed 3-D buffer — built once at setup, never per step:
+                    # the step only gathers `[N]` scales.
+                    ids: list[int] = []
                     for p in params:
                         moe = getattr(p, "_tsct_moe", None)
-                        if moe is None or id(moe) not in self._tsct_offset:
-                            ids.append(0)
+                        base = None if moe is None else self._tsct_offset.get(id(moe))
+                        rows = p.shape[0] if packed else 1
+                        if base is None:
+                            ids.extend([0] * rows)
+                        elif packed:
+                            ids.extend([1 + base + j for j in range(rows)])
                         else:
-                            ids.append(1 + self._tsct_offset[id(moe)] + int(p._tsct_index))
+                            ids.append(1 + base + int(p._tsct_index))
                     if any(ids):
-                        # ONE device row id per parameter, built once (setup),
-                        # never per step: the step only gathers `[N]` scales.
                         grp.tsct_ids = torch.tensor(
                             ids, dtype=torch.int64, device=params[0].device
                         )
@@ -1020,7 +1089,15 @@ class Muon(Optimizer):
                     continue
                 g = p.grad
                 if g.ndim != 2:
-                    loud(f"Muon got a rank-{g.ndim} gradient: the router must not send it here")
+                    loud(
+                        f"Muon got a rank-{g.ndim} gradient: the per-parameter "
+                        f"contract is 2-D. A packed `tsct_packed` bank is a 3-D "
+                        f"BATCH of matrices and is stepped by "
+                        f"`batched_step_from_model` (per-slice NS/ColRow); this "
+                        f"method refuses it rather than flattening E experts into "
+                        f"one matrix. Escape: run the batched step (MixOptimizer "
+                        f"does), or tsct_packed=false."
+                    )
                 scale = max(1.0, p.shape[0] / p.shape[1]) ** 0.5
                 self._step_one(p, lr, mu, ns, scale)
         return loss
@@ -1276,10 +1353,11 @@ class Muon(Optimizer):
             self._build_groups()
         n_batches = 0
         # `(write_targets, tensor_to_orthogonalize, lr, scale, ns_steps,
-        #   singleton, row_scale)`. `row_scale` is TSCT-2's per-expert LR
-        # (`[k]`, or a 0-dim tensor for a singleton), gathered from the counts
-        # ONCE per step.
-        jobs: list[tuple[list, torch.Tensor, float, float, int, bool, object]] = []
+        #   singleton, row_scale, packed)`. `row_scale` is TSCT-2's per-expert
+        # LR (`[k]`, or a 0-dim tensor for a singleton), gathered from the
+        # counts ONCE per step; `packed` says the write target is ONE 3-D slice
+        # of the parameter (`[k, r, f]`), never a list of E 2-D parameters.
+        jobs: list[tuple[list, torch.Tensor, float, float, int, bool, object, bool]] = []
         for grp in stepaudit.iterations("muon.groups", self._groups):
             group = self.param_groups[grp.gi]
             lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
@@ -1290,7 +1368,10 @@ class Muon(Optimizer):
                 if expert_scales is not None and grp.tsct_ids is not None
                 else None
             )
-            if len(params) < 2 or any(p.grad is None for p in params):
+            if grp.packed:
+                if params[0].grad is None:
+                    continue
+            elif len(params) < 2 or any(p.grad is None for p in params):
                 # A 2-D parameter with no gradient falls back to the definition
                 # (inventing a "zero gradient" row would move the momentum).
                 if any(p.grad is None for p in params):
@@ -1321,14 +1402,24 @@ class Muon(Optimizer):
                 else:
                     buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
                 row = grp.tsct_row[0] if grp.tsct_row is not None else None
-                jobs.append(([p], buf, lr, scale, ns, True, row))
+                jobs.append(([p], buf, lr, scale, ns, True, row, False))
                 continue
             mom = grp.mom
-            # The momentum update, in place, without a stack: `mom` is the
-            # buffer and `torch.unbind` hands out its rows as views
-            # (`_momentum_update_` carries the two dtype rungs' arithmetic).
-            _momentum_update_(mom, params, mu, self.chunk_elems)
-            n = len(params)
+            if grp.packed:
+                # `mom` and `p.grad` are the SAME `[E, r, f]` shape: the update
+                # is one elementwise op, not E row views. The arithmetic is
+                # `_momentum_update_`'s (fp32 accumulate, optional bf16 store).
+                p = params[0]
+                if mom.dtype == torch.bfloat16:
+                    mom.copy_(mom.float().mul_(mu).add_(p.grad, alpha=1.0 - mu))
+                else:
+                    mom.mul_(mu).add_(p.grad, alpha=1.0 - mu)
+            else:
+                # The momentum update, in place, without a stack: `mom` is the
+                # buffer and `torch.unbind` hands out its rows as views
+                # (`_momentum_update_` carries the two dtype rungs' arithmetic).
+                _momentum_update_(mom, params, mu, self.chunk_elems)
+            n = grp.rows
             if self.sf:
                 # `s`/`c` are ONE scalar per group (Alg 1 lines 14-15): read the
                 # group's accumulator once and write it back once, rather than
@@ -1341,7 +1432,10 @@ class Muon(Optimizer):
             # shape group's chain at once.
             n_chunk = max(1, min(n, self.chunk_elems // (grp.shape[0] * grp.shape[1])))
             for start in stepaudit.iterations("muon.chunks", range(0, n, n_chunk)):
-                params_c = params[start : start + n_chunk]
+                if grp.packed:
+                    params_c = [params[0][start : start + n_chunk]]
+                else:
+                    params_c = params[start : start + n_chunk]
                 pieces = mom[start : start + n_chunk]
                 if self.sf:
                     update = self._orthogonalize(pieces, ns)
@@ -1351,12 +1445,13 @@ class Muon(Optimizer):
                     update = self._orthogonalize(pieces, ns)
                     self._nor_batched(grp, start, len(params_c), params_c, update, lr, flag)
                     continue
+                k = pieces.shape[0]
                 row = (
-                    grp.tsct_row[start : start + len(params_c)]
+                    grp.tsct_row[start : start + k]
                     if grp.tsct_row is not None
                     else None
                 )
-                jobs.append((params_c, pieces, lr, scale, ns, False, row))
+                jobs.append((params_c, pieces, lr, scale, ns, False, row, grp.packed))
             n_batches += 1
 
         if jobs:
@@ -1373,8 +1468,26 @@ class Muon(Optimizer):
             for job, update in stepaudit.iterations(
                 "muon.writeback", zip(jobs, updates, strict=True)
             ):
-                params_c, _, lr, scale, _, singleton, row = job
+                params_c, _, lr, scale, _, singleton, row, packed = job
                 assert update is not None
+                if packed:
+                    # The 3-D tail: per-slice ColRow (`colrow_3d="colrow"` IS
+                    # the 2-D definition on each matrix, `colrow_normalize`'s
+                    # docstring), then the SAME `update.mul_(-lr*scale)` +
+                    # plain add the per-expert batched path runs — folding the
+                    # scale into the add's alpha would round differently in the
+                    # last bits and break the `torch.equal` bank-update gate.
+                    colrow_normalize_(update, colrow_3d=self.colrow_3d).mul_(-lr * scale)
+                    if row is not None:
+                        # TSCT-2's per-expert LR on the packed bank: one scalar
+                        # per expert SLICE (`row` is `[k]`, update `[k, r, f]`),
+                        # the same multiply the 2-D chunk runs.
+                        update.mul_(row[:, None, None])
+                    if flag is not None:
+                        update.mul_(flag.to(update.dtype))
+                    with torch.no_grad():
+                        params_c[0].add_(update)
+                    continue
                 if singleton:
                     # `_step_one`'s tail, verbatim: out-of-place 2-D ColRow,
                     # the device gate, then the cast-then-add the per-parameter
@@ -1520,6 +1633,23 @@ class Muon(Optimizer):
             torch._foreach_add_(params_c, torch.unbind(x), alpha=self.sf_beta)
 
 
+def _is_packed_matrix_batch(p: torch.Tensor) -> bool:
+    """A 3-D `[E, rows, cols]` parameter the model EXPLICITLY marks as a batch
+    of 2-D matrices (`SparseMoE`'s packed bank sets `_muon_batched`).
+
+    The marker, not the rank, is the contract: a future 3-D parameter that is
+    not a matrix batch must not silently change optimizer semantics the way a
+    rank-only rule would. It is read at construction / `_build_groups` time, so
+    it never sits on the step path.
+    """
+    return (
+        p.ndim == 3
+        and bool(getattr(p, "_muon_batched", False))
+        and p.shape[1] > 1
+        and p.shape[2] > 1
+    )
+
+
 def is_muon_param(name: str, p: torch.Tensor) -> bool:
     """The membership rule, in one place, checked by a test.
 
@@ -1528,11 +1658,20 @@ def is_muon_param(name: str, p: torch.Tensor) -> bool:
     and the Engram tables go to AdamW** — orthogonalization hurts or ignores
     them. The literal "everything-2-D" rule is the defect the router agent
     flagged; this is the honest mirror.
+
+    A 3-D PARAMETER is Muon only when it is a marked batch of 2-D matrices
+    (`tsct_packed`'s `[E, rows, cols]` buffer): the batched NS chain and ColRow
+    already have a per-slice 3-D form, so the update is the per-expert one.
+    Anything else 3-D stays on AdamW — the old behaviour — and the
+    per-parameter `Muon.step` refuses a rank-3 gradient loudly rather than
+    flattening it.
     """
     if name.endswith("tables"):
         return False  # the hashed-memory table: Adam, orthogonalization is meaningless
     if any(t in name for t in ("embed", "lm_head", "controller", "router")):
         return False  # orthogonalization hurts them (burn's measured policy)
+    if _is_packed_matrix_batch(p):
+        return True
     return p.ndim == 2 and p.shape[0] > 1 and p.shape[1] > 1
 
 
