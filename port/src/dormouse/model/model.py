@@ -894,8 +894,10 @@ class DormouseModel(nn.Module):
             out = layer(out)
             counters.count("coda")
         # fp32 logits — the burn rule that fixes `bf16 logits NaN`: the final
-        # norm and the head run in fp32 whatever the body computed in.
-        hn = self.norm(out)
+        # norm and the head run in fp32 whatever the body computed in. The
+        # cast is the identity on the fp32 path (`residual_dtype="fp32"`), and
+        # it is what keeps the readout's storage dtype from reaching the head.
+        hn = self.norm(out.to(torch.float32))
         logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
         if self.cfg.logit_softcap > 0.0:
             # Gemma-2's final-logit cap (`losses.logit_softcap`): applied to

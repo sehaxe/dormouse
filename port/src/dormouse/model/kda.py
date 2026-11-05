@@ -282,6 +282,12 @@ class KDAAttention(nn.Module):
         The OFF branch returns `x` unmodified — no matmul, no cast, no copy — so
         the dense path is the call it was.
         """
+        # The module's own weight dtype decides the seam: fp32 masters widen a
+        # bf16 residual; a bf16 module keeps bf16 (identity when they match).
+        # The SDPA fallback enters HERE, not through `projections_raw`, so the
+        # cast must live in this common call.
+        pdt = self.q_proj.weight.dtype
+        x = x if x.dtype is pdt else x.to(pdt)
         if self.latent_down is None:
             return x
         return qat_linear(self.latent_down, x, *dq)
@@ -372,6 +378,12 @@ class KDAAttention(nn.Module):
         shipped arithmetic, unchanged), and `fused_kda.tail` does the same tail
         in ONE launch (`fused_kda_tail=true`).
         """
+        # The four projections are fp32 masters and the fused tail is
+        # fp32-input only, so a bf16 residual (`residual_dtype="bf16"`) widens
+        # ONCE at this seam. The module's OWN weight dtype is the target: the
+        # model builds fp32, a bf16 test module keeps bf16.
+        pdt = self.q_proj.weight.dtype
+        x = x if x.dtype is pdt else x.to(pdt)
         dq = (self.dense_qat, self.dense_qat_alpha)
         c = self._latent_base(x, dq)
         q, k, v, g = self._qkvg(c, dq)
@@ -558,6 +570,11 @@ class KDAAttention(nn.Module):
 
         b, t, d = x.shape
         dt = self.compute_dtype
+        # The tail reads the PROJECTIONS, not the residual: widen the body's
+        # input once so a bf16 `normed` (residual_dtype="bf16") still reaches
+        # the fp32-input fused tail instead of counting a pointless fallback.
+        pdt = self.q_proj.weight.dtype
+        x = x if x.dtype is pdt else x.to(pdt)
         # The tail is fp32-input only: the projections are fp32 under bf16=true,
         # so the training arm qualifies; a whole-model bf16 cast or a CPU host
         # takes the eager lines and says so (`fused_kda_tail_fallback`).

@@ -802,6 +802,39 @@ testable and A/B-able (ADR-0017).
       forwarded pass (-50.9 % of the routing cluster), host 2 089 -> 0.5 us/pass
       (-6.27 ms/step at max_iter 3); the bf16 store is priced and NOT picked.
 
+- [x] P-RESIDUAL-BF16. port (Python): `residual_dtype="fp32"|"bf16"` — the
+      loop's residual stream stored at half the bytes. `scripts/precision_census.py`
+      (static, torch-free) is the change list: it prices every iteration tensor
+      (shape, dtype, one-pass bytes, `required` + why, the projected dtype) and
+      its m400b b8×s1024 table goes **1.354 → 0.976 GB (−27.9 %, 15 bf16
+      passes)**, with the `residual` group itself **0.705 → 0.352 GB (−50.0 %)**
+      — the reductions/state groups it leaves alone are the rest; the tracked
+      `configs/m400.toml` goes **0.921 → 0.644 GB (−30.1 %)**. Moved: `h`/the mHC lanes, `ctx`, the normed reads, the three
+      branch writes, `y`, `step_out`, the Engram `mem`/`dense` outputs. Kept
+      fp32, each named by the census: the lane RMSNorm (`xn`), the mHC
+      hyper-network/Sinkhorn/lane mix, AttnRes' key norm + softmax, the KDA
+      projection input and `g` (the fused tail is fp32-input), the gated-delta
+      state `S`, the CSA scores/ring `sum`, the Engram read + order reduction,
+      the readout accumulator `out_acc`, the final norm/head/CE, the optimizer
+      masters. The fused residual/epilogue kernels and `fused_kda_tail`'s
+      combine are fp32-only and REFUSED with `Escape:` naming each (config
+      `validate` AND the `LoopBlock` runtime seam a hand-built model reaches).
+      `tests/test_residual_bf16.py` (13): OFF pins from clean `main f09eea5`
+      (logits+loss+every param grad sha256, before the edit), ON stores bf16 at
+      the seams while `xn` stays fp32, the 200-step CPU drift is a MEASURED pin
+      (max per-step rel **7.32e-4**, final Δ **+1.04e-4**, last-20 mean
+      **6.33e-4**; fp32 seed spread is 7.7e-2, so the arm is inside its own
+      control's noise), the lane-norm-without-`.float()` mutation reddens the
+      dtype-seam gate, a required census row moved to bf16 reddens the pinned
+      total, the census bytes are recomputed `prod(shape)·itemsize` and pinned,
+      refusals carry `Escape:` + the kernel name, and the ON forward adds no
+      `item`/`__bool__`/`__float__` sync. Full CPU suite: the 18 pre-existing
+      failures on clean `main` plus the 4 worktree-local untracked-artifact ones
+      (`checkpoints/` ×3, `sft_pairs/`), nothing new; ruff clean. **No GPU
+      timing exists** — the card is on the multi-day run; the A/B is
+      `scripts/kernel_profile.py` ×2 + `--diff`, with the arm at
+      `--set residual_dtype=bf16` (below).
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)

@@ -166,14 +166,22 @@ def host_reason(device_type: str = "cuda") -> str | None:
 
 
 def unsupported_reason(
-    dtype: torch.dtype, streams: int, kd: int, device_type: str = "cuda"
+    dtype: torch.dtype,
+    streams: int,
+    kd: int,
+    device_type: str = "cuda",
+    kernel: str = "fused_residual",
 ) -> str | None:
-    """Why this shape cannot be fused, or None. The caller falls back on it."""
+    """Why this shape cannot be fused, or None. The caller falls back on it.
+
+    `kernel` names the Triton chain being asked for (`fused_residual` or
+    `fused_epilogue`), so a refusal tells the reader WHICH one is fp32-only.
+    """
     host = host_reason(device_type)
     if host is not None:
         return (
-            f"fused_residual needs a CUDA device and Triton: {host}. "
-            "Escape: fused_residual=false, or run on the card."
+            f"{kernel} needs a CUDA device and Triton: {host}. "
+            f"Escape: {kernel}=false, or run on the card."
         )
     if streams != K:
         return (
@@ -182,10 +190,10 @@ def unsupported_reason(
         )
     if dtype != torch.float32:
         return (
-            f"fused_residual reproduces the fp32 chain only, got {dtype}. The mHC "
-            "hyper-network and the lanes are fp32 in the reference; a lower-precision "
-            "store changes the arithmetic, not just its speed. Escape: the fp32 arm, "
-            "or fused_residual=false."
+            f"the {kernel} Triton kernels reproduce the fp32 chain only, got {dtype}. "
+            "The mHC hyper-network and the lanes are fp32 in the reference; a "
+            "lower-precision store changes the arithmetic, not just its speed. "
+            f"Escape: residual_dtype='fp32' (the fp32 arm), or {kernel}=false."
         )
     if kd > MAX_KD:
         return (

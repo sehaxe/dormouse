@@ -354,6 +354,12 @@ class Engram(nn.Module):
         transcriptions that happen to agree.
         """
         counters = Counters() if counters is None else counters
+        # The arm is fp32 end to end (the tables, the gate's order reduction,
+        # the f32-only burn kernels): widen a bf16 residual ONCE at this seam.
+        # The module's own weight dtype is the target (a bf16 test module keeps
+        # bf16); it is the identity when they already match.
+        pdt = self.query_proj.weight.dtype
+        hidden = hidden if hidden.dtype is pdt else hidden.to(pdt)
         if self.host is not None:
             return self._forward_host(hidden, input_ids, counters, slots=slots)
         if slots is None:

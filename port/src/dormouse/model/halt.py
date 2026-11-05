@@ -73,6 +73,11 @@ class HaltHead(nn.Module):
         The mean over positions matches the per-iteration CE target, which is a
         mean too, so the head scores the same aggregate the target names.
         """
+        # The head's own weight dtype decides the seam: fp32 masters widen a
+        # bf16 readout (`residual_dtype`), a bf16 head keeps bf16. Identity when
+        # they already match.
+        pdt = self.down.weight.dtype
+        h = h if h.dtype is pdt else h.to(pdt)
         return self.up(F.silu(self.down(h))).mean()
 
 
