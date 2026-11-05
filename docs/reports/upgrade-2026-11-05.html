@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Апгрейд 2026-11: платформа, процы, память — что брать</title>
+<style>
+:root{
+  --bg:#fdfcfc; --ink:#201d1d; --muted:#6b6360; --line:#e6e1de;
+  --ok:#1f7a4d; --bad:#a02b2b; --warn:#a86a12; --accent:#201d1d; --card:#fff;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:1080px;margin:0 auto;padding:56px 24px 96px}
+header{border-bottom:1px solid var(--line);padding-bottom:28px;margin-bottom:40px}
+h1{font-size:34px;line-height:1.2;margin:0 0 10px;letter-spacing:-.02em}
+.sub{color:var(--muted);font-size:15px}
+.verdict{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:32px 0 44px}
+.v{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px}
+.v .k{font:11px/1.4 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.v .n{font-size:26px;font-weight:650;letter-spacing:-.02em;margin-top:6px}
+.v .d{color:var(--muted);font-size:13px;margin-top:6px}
+h2{font-size:21px;margin:52px 0 6px;letter-spacing:-.01em}
+h2 .num{font:12px var(--mono);color:var(--muted);margin-right:10px}
+p{max-width:76ch}
+table{width:100%;border-collapse:collapse;margin:18px 0 8px;font-size:14.5px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:11px/1.4 var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+tr.best td{background:#f3f8f4}
+tr.bad td{background:#fdf4f4}
+tr.total td{font-weight:650;border-top:2px solid var(--ink)}
+.ok{color:var(--ok)} .no{color:var(--bad)} .w{color:var(--warn)}
+.mono{font-family:var(--mono);font-size:13px}
+.note{border-left:3px solid var(--ink);padding:2px 0 2px 16px;margin:26px 0;color:var(--muted)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin:22px 0}
+.card h3{margin:0 0 10px;font-size:16px}
+ul{margin:10px 0;padding-left:20px} li{margin:6px 0}
+a{color:var(--ink);text-decoration:none;border-bottom:1px solid var(--line)}
+a:hover{border-bottom-color:var(--ink)}
+footer{margin-top:64px;padding-top:22px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+.badge{display:inline-block;font:11px var(--mono);padding:2px 7px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Апгрейд 2026-11: платформа, процессор, память</h1>
+  <div class="sub">Цены сняты в браузере на Superbuy 5 ноября 2026. Без пошлин и доставки — только цена товара.
+  Xianyu (闲鱼) исключён.</div>
+</header>
+
+<div class="verdict">
+  <div class="v"><div class="k">плата</div><div class="n">ASUS KRPA-U16</div>
+    <div class="d"><b>$457.94</b> · дешевле клона Huananzhi на <b>$202</b></div></div>
+  <div class="v"><div class="k">процессор</div><div class="n">1 × EPYC</div>
+    <div class="d">переход на 2 проца — только с 160 ГБ памяти</div></div>
+  <div class="v"><div class="k">сборка 8 каналов</div><div class="n">$813.50</div>
+    <div class="d">плата + 7452 + 4×16 ГБ = 128 ГБ, PCIe 4.0 x16</div></div>
+  <div class="v"><div class="k">даёт обучению</div><div class="n">0</div>
+    <div class="d">замерено: батч не масштабируется (26.4 → 27.0 kB/s)</div></div>
+</div>
+
+<h2><span class="num">01</span>Платы: у клона больше нет ценового преимущества</h2>
+
+<p>Все SP3-платы ниже — <b>PCIe 4.0</b>, поэтому «нужен 4.0» не является аргументом за конкретную модель.
+Разница — в цене, QVL и в том, проверялся ли на них 5070 Ti.</p>
+
+<table>
+<thead><tr><th>Плата</th><th class="n">Сокетов</th><th class="n">DIMM / каналов</th><th class="n">PCIe</th>
+<th class="n">Цена</th><th>Риск</th></tr></thead>
+<tbody>
+<tr class="best"><td><b>ASUS KRPA-U16</b></td><td class="n">1</td><td class="n">8 / 8</td><td class="n">4.0 ×16</td>
+  <td class="n"><b>$457.94</b></td><td>вариант без 10G; уточнить наличие BMC-модуля</td></tr>
+<tr><td>Tyan S8030</td><td class="n">1</td><td class="n">8 / 8</td><td class="n">4.0 ×16</td>
+  <td class="n">$507.34</td><td>E-ATX</td></tr>
+<tr><td>Gigabyte MZ32-AR0</td><td class="n">1</td><td class="n">8 / 8</td><td class="n">4.0 ×16</td>
+  <td class="n">$515.68</td><td>E-ATX</td></tr>
+<tr class="bad"><td>Huananzhi H12D-8D (клон)</td><td class="n">1</td><td class="n">8 / 8</td><td class="n">4.0 ×16</td>
+  <td class="n">$605–660</td><td>нет QVL, BMC зависает, 50-я серия не проверена</td></tr>
+<tr class="bad"><td>ASRock ROMED8-2T</td><td class="n">1</td><td class="n">8 / 8</td><td class="n">4.0 ×16</td>
+  <td class="n">$1 026.51</td><td><b>$504.84 — другой вариант, приманка</b></td></tr>
+<tr><td>Supermicro H12SSL-i</td><td class="n">1</td><td class="n">8 / 8</td><td class="n">4.0 ×16</td>
+  <td class="n">≈$760</td><td>дороже клона на ~$100 — как ты и сказал</td></tr>
+</tbody>
+</table>
+<div class="note">Ссылки: <span class="mono">superbuy.com/en/page/buy/?url=…id%3D</span> —
+KRPA-U16 <span class="mono">692957896170</span>, S8030 <span class="mono">928664948767</span>,
+MZ32-AR0 <span class="mono">1040643068738</span>, H12D-8D <span class="mono">832257628838</span>,
+ROMED8-2T <span class="mono">562741966118</span>.</div>
+
+<h2><span class="num">02</span>Процессоры: цена за ядро</h2>
+
+<table>
+<thead><tr><th>CPU</th><th class="n">Ядра/потоки</th><th class="n">Частота</th><th class="n">Каналов</th><th class="n">Цена</th><th class="n">$ / ядро</th></tr></thead>
+<tbody>
+<tr class="best"><td><b>EPYC 7452</b></td><td class="n">32 / 64</td><td class="n">2.35 ГГц</td><td class="n">8</td><td class="n"><b>$107.72</b></td><td class="n"><b>$3.37</b></td></tr>
+<tr><td>EPYC 7502P</td><td class="n">32 / 64</td><td class="n">2.5 ГГц</td><td class="n">8</td><td class="n">$197.77</td><td class="n">$6.18</td></tr>
+<tr><td><b>EPYC 7K62</b></td><td class="n">48 / 96</td><td class="n">2.6 ГГц</td><td class="n">8</td><td class="n">$235.64</td><td class="n">$4.91</td></tr>
+<tr><td>EPYC 7R32</td><td class="n">48 / 96</td><td class="n">2.8 ГГц</td><td class="n">8</td><td class="n">$269.30</td><td class="n">$5.61</td></tr>
+</tbody>
+</table>
+<p>Лот <span class="mono">1075894213217</span> — один продавец, все варианты «official version unlocked».
+7452 — самый дешёвый вход в 8 каналов; 7K62 — если нужны ядра под даталоадер и оффлоад.</p>
+
+<h2><span class="num">03</span>Память: 8 каналов требуют 8 планок</h2>
+
+<table>
+<thead><tr><th>Что</th><th class="n">Цена</th><th>Комментарий</th></tr></thead>
+<tbody>
+<tr><td>16 ГБ DDR4-2133 ECC RDIMM (SK Hynix 2RX4)</td><td class="n">$61.96</td>
+  <td>твои 4 планки + 4 таких = 128 ГБ и <b>8 каналов</b></td></tr>
+<tr class="best"><td><b>+4 планки = $247.84</b></td><td class="n"><b>$247.84</b></td><td>единственная покупка, дающая полосу</td></tr>
+<tr><td>32 ГБ DDR4-3200 RDIMM</td><td class="n">$197–233</td><td>8 планок = $1 580–1 864, 256 ГБ</td></tr>
+</tbody>
+</table>
+
+<h2><span class="num">04</span>Один процессор или два</h2>
+
+<div class="card">
+<h3>Ответ: один. Переход — на 160 ГБ памяти, не на полосе.</h3>
+<ul>
+<li><b>Полоса не удваивается.</b> Процесс живёт на одном NUMA-узле: 2 проца не дают 2× ГБ/с для одной модели.</li>
+<li><b>PCIe не нужен второй сокет.</b> Две карты занимают 32 линии из 128.</li>
+<li><b>Что реально даёт второй сокет — слоты DIMM.</b> И они начинают окупаться только на ёмкости.</li>
+</ul>
+<table>
+<thead><tr><th>Память</th><th class="n">1 проц</th><th class="n">2 проца</th><th>Выгоднее</th></tr></thead>
+<tbody>
+<tr class="best"><td><b>128 ГБ (твоя задача)</b></td><td class="n"><b>$813.50</b></td><td class="n">$1 236</td><td><b>один</b></td></tr>
+<tr><td>192 ГБ</td><td class="n">$1 354</td><td class="n">$1 236</td><td>два, на $118</td></tr>
+<tr><td>256 ГБ</td><td class="n">$2 142</td><td class="n">$1 484</td><td>два, на $658</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="num">05</span>Три сборки</h2>
+
+<table>
+<thead><tr><th>Сборка</th><th>Состав</th><th class="n">Итого</th><th class="n">30 ГБ MoE</th><th class="n">60 ГБ MoE</th></tr></thead>
+<tbody>
+<tr class="best"><td><b>Минимальная 8-канальная</b></td>
+  <td>KRPA-U16 $458 + 7452 $108 + 4×16 ГБ $248</td><td class="n"><b>$813.50</b></td>
+  <td class="n">~52 ток/с</td><td class="n">~26 ток/с</td></tr>
+<tr><td>Та же под 60 ГБ</td><td>128 ГБ хватает — та же сборка</td><td class="n">$813.50</td>
+  <td class="n">~52</td><td class="n">~26</td></tr>
+<tr><td>Двухсокетная 256 ГБ</td><td>+ 2-й CPU + 8 планок + корпус E-ATX + БП</td><td class="n">$1 483.86</td>
+  <td class="n">~52</td><td class="n">~52</td></tr>
+</tbody>
+</table>
+
+<h2><span class="num">06</span>Что это даёт — и чего не даёт</h2>
+
+<div class="card">
+<h3>Замерено на нашей машине, не по спецификации</h3>
+<table>
+<thead><tr><th>Параметр</th><th class="n">сейчас</th><th class="n">после 8 каналов</th></tr></thead>
+<tbody>
+<tr><td>Полоса памяти</td><td class="n">68.3 ГБ/с (4 канала 2133)</td><td class="n"><b>136.5 ГБ/с</b></td></tr>
+<tr><td>Локальная MoE 30 ГБ</td><td class="n">26 ток/с</td><td class="n">~52 ток/с</td></tr>
+<tr><td>All-reduce для 2-й карты</td><td class="n">3.0 x8 → 0.19 с</td><td class="n"><b>4.0 x16 → 0.047 с</b></td></tr>
+<tr><td>Вторая карта в DDP</td><td class="n">×1.03</td><td class="n"><b>×1.62</b></td></tr>
+<tr><td><b>Обучение одной картой</b></td><td class="n">26.4 kB/s</td><td class="n"><b>26.4 kB/s</b> — ноль</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+Свежий замер (сегодня): батч <b>не</b> является рычагом — b8 без чекпоинтинга 26 400 Б/с,
+b16 с рекомпутом 25 312, b24 с рекомпутом 26 955. То есть +2% за 3× батча.
+Платформа не ускоряет обучение: узкое место — внутри ядер, а не в шине.
+</div>
+
+<h2><span class="num">07</span>Ранжирование всех апгрейдов</h2>
+
+<table>
+<thead><tr><th>Вариант</th><th class="n">Цена</th><th class="n">Δ шага</th><th class="n">$ за +1 kB/s</th><th>Вердикт</th></tr></thead>
+<tbody>
+<tr class="best"><td><b>Ничего не покупать — оптимизировать код</b></td><td class="n">$0</td>
+  <td class="n">+6.5 за неделю</td><td class="n"><b>$0</b></td><td><b>лучший</b></td></tr>
+<tr class="best"><td><b>RTX 5090 32 ГБ</b></td><td class="n">$2 400–4 600</td><td class="n">×1.9</td>
+  <td class="n">$103–197</td><td>1B влезает, 32 ГБ, шины не касается</td></tr>
+<tr><td>Платформа EPYC (1 проц)</td><td class="n">$814</td><td class="n">0</td><td class="n">∞ одна</td>
+  <td>только с 2-й картой (+×1.62) или ради инференса (×2)</td></tr>
+<tr class="bad"><td>2-я 5070 Ti</td><td class="n">$1 560</td><td class="n">×1.03</td><td class="n">$2 000</td>
+  <td>бесполезна как ранг; как второй лейн — дорого</td></tr>
+<tr class="bad"><td>Только память (+4 планки)</td><td class="n">$248</td><td class="n">0</td><td class="n">∞</td>
+  <td>ёмкость без полосы</td></tr>
+<tr class="bad"><td>Двухсокетная платформа</td><td class="n">$1 484+</td><td class="n">0</td><td class="n">∞</td>
+  <td>нужна только под 256 ГБ</td></tr>
+<tr><td>Аренда 8×H100</td><td class="n">$36–897 за прогон</td><td class="n">×225–1 124</td>
+  <td class="n">—</td><td>1B прогон: 17–28 ч вместо 415 суток локально</td></tr>
+</tbody>
+</table>
+
+<h2><span class="num">08</span>Вердикт</h2>
+
+<div class="card">
+<h3>Если покупать платформу — то так</h3>
+<p class="mono" style="font-size:14px">
+ASUS KRPA-U16 &nbsp;$457.94<br>
+EPYC 7452 &nbsp;$107.72<br>
++4× 16 ГБ DDR4-2133 ECC RDIMM &nbsp;$247.84<br>
+─────────────────────────<br>
+<b>$813.50</b> · 128 ГБ · 8 каналов · PCIe 4.0 ×16
+</p>
+<ul>
+<li><b>Huananzhi не брать:</b> $202 дороже, без QVL, BMC зависает, 5070 Ti на нём не проверялась.</li>
+<li><b>Второй процессор не брать:</b> окупается только с 160+ ГБ памяти.</li>
+<li><b>Знать заранее:</b> обучение это не ускорит ни на процент. Ускорит инференс ×2 и сделает вторую карту осмысленной (×1.62 вместо ×1.03).</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>Чего я не советую</h3>
+<p>Порядок вложений по отдаче: <b>код → аренда под большой прогон → карта с 32 ГБ → платформа</b>.
+Платформа стоит третьей с конца, потому что наш шаг упирается в эффективность ядер, а не в шину:
+151 мс работы ядер на 7.8 мс арифметики.</p>
+</div>
+
+<footer>
+Источники цен: живые чтения Superbuy (5 ноября 2026, через браузер), мемо
+<span class="mono">docs/research/2026-11-05-epyc-platform-report.md</span>.
+Замеры шага — <span class="mono">/tmp/opencode/bsweep*.jsonl</span>.
+Исключено по указанию: Xianyu (闲鱼), пошлины, доставка.
+</footer>
+
+</div>
+</body>
+</html>
