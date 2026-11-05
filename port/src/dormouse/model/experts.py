@@ -228,6 +228,28 @@ and CUDA) and pinned by `tests/test_offload_experts.py`:
    equal in value, size, dtype *and device*). The copy back happens at the
    backward edge — a device temporary for exactly the node that needs it, which
    is what makes the peak fall.
+
+**TSCT-2** (`docs/architecture/2026-11-05-tsct-2.md`) adds three OFF-by-default
+mechanisms, all on this module because the routed counts are here:
+
+* `tsct_expert_basis` — one `w [rank, shared_rank]` per routed expert, applied
+  inside a `[d, shared_rank]` shared plane. The bank FOLDS it into the effective
+  per-expert basis at the rebuild (`gate_u @ w.T -> [d, rank]`), so the operand
+  shapes and the per-token MAC do not move; only the build pays
+  `E·d·rank·shared_rank`, once per optimizer step. Init `[I | 0]` makes step 0
+  the planeless forward. Counter: `tsct_basis_fold`.
+* `tsct_expert_lr` — `expert_lr_scales()` returns `[E]` from the device-side
+  `lfb_counts`; `train.optim.MixOptimizer` gathers it into the Muon stack's row
+  scale (one grouped multiply, no per-parameter loop, no host read).
+  Counter: `tsct_expert_lr`.
+* `tsct_expert_revive` — `revive_experts()` copies the hottest expert onto the
+  coldest plus seeded noise and resets both LFB entries. The two indices are
+  the ONE declared host read, once per N optimizer steps; the LR path reads
+  none. Counter: `tsct_revive`.
+
+The three arms compose. All refusals are LOUD with an `Escape:` naming the
+flag to change; `config.validate` and this constructor both enforce them
+(a hand-built config skips the former).
 3. **The parameter banks are packed too, and that buys nothing.** The pass's
    `bmm` operands are `_banks`' cached `[E, ·, ·]` stacks; they are saved by
    autograd like any other operand, so they ride the copy out and back — but
@@ -462,6 +484,59 @@ def _check_dict_index(idx: torch.Tensor, dict_rank: int, cols: int, where: str) 
         )
 
 
+#: The local seed for the EXTRA shared-plane columns of `tsct_expert_basis`.
+#: A local generator on purpose: the extra columns are new parameters, and
+#: drawing them from the global stream would shift every later parameter and
+#: confound the ON-vs-OFF A/B with a second initialisation.
+TSCT_BASIS_EXTRA_SEED = 0x7A5C2
+
+#: The pre-registered revive noise is `sigma = noise · std(v_hot)`; this is the
+#: clip on the LR multiplier (`experts.expert_lr_multipliers`), as specified in
+#: `docs/architecture/2026-11-05-tsct-2.md`.
+EXPERT_LR_CLIP = (0.2, 5.0)
+
+
+def tsct_basis_extra(d: int, cols: int, device: torch.device | str = "cpu") -> torch.Tensor:
+    """`N(0, 1/sqrt(d))` for the widened plane's new columns, from a LOCAL stream.
+
+    Drawn on CPU and moved, for two reasons: a `meta` build (`capacity_math`'s
+    price table) has no generator, and a CPU stream makes the new columns
+    identical across devices. The draw is once per site at construction.
+    """
+    g = torch.Generator().manual_seed(TSCT_BASIS_EXTRA_SEED)
+    return (torch.randn(d, cols, generator=g) / math.sqrt(d)).to(device)
+
+
+def tsct_basis_param_delta(n_experts: int, d: int, rank: int, shared_rank: int) -> int:
+    """The arm's exact parameter delta: `E·rank·r_shared` selectors + the wider plane.
+
+    The doc's `+6.3M` counts only the selectors and assumes a `[d, 192]` plane
+    already existed. It does not: the routed plane is `[d, rank]` (64), so the
+    arm also pays `2·d·(r_shared − rank)` once per site. At m400b
+    (E=512, d=1536, rank=64, r_shared=192): 6 291 456 + 393 216 = 6 684 672.
+    """
+    return n_experts * rank * shared_rank + 2 * d * (shared_rank - rank)
+
+
+def expert_lr_multipliers(
+    counts: torch.Tensor,
+    coeff: float,
+    clip: tuple[float, float] = EXPERT_LR_CLIP,
+) -> torch.Tensor:
+    """`1 + coeff·(mean(L)/max(L_j,1) − 1)`, clipped — a PURE function of `counts`.
+
+    Device-in, device-out: no `.item()`, no branch on a device value, and no
+    history (the caller recomputes it from the LFB integrator's `lfb_counts`
+    every step, so a resume needs no extra state). All counts equal → exactly
+    `1.0`; a dead expert reads `mean(L)` before the clip, so a small `coeff`
+    gives it a bounded boost rather than an unbounded one.
+    """
+    assert counts.ndim == 1, f"expert_lr_multipliers wants [E] counts, got {tuple(counts.shape)}"
+    assert coeff >= 0.0, f"expert_lr_multipliers: coeff={coeff} must be >= 0"
+    ratio = counts.mean() / counts.clamp_min(1.0)
+    return (1.0 + coeff * (ratio - 1.0)).clamp(clip[0], clip[1])
+
+
 def share_u_dict_index(
     n_experts: int, dict_rank: int, cols: int, *, seed: int = SHARE_U_DICT_SEED
 ) -> torch.Tensor:
@@ -532,6 +607,8 @@ class DualLatentGLU(nn.Module):
         act_quant: str = "none",
         act_group: int = 0,
         share_u: bool = False,
+        tsct_basis: int = 0,
+        basis_shared: int = 0,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
@@ -567,6 +644,40 @@ class DualLatentGLU(nn.Module):
         self._shared_index: torch.Tensor | None = None
         if share_u:
             _refuse_shared_qat(factor_qat, "DualLatentGLU")
+        #: TSCT-2's per-expert INPUT selector (`SparseMoE.tsct_expert_basis`):
+        #: `w [rank, basis_shared]`, applied INSIDE the widened shared plane.
+        #: It has NO effect alone — `share_u` is what binds the plane — and the
+        #: parent refuses the pairless case; the check here is for a hand-built
+        #: expert. Init is `[I | 0]`, so at step 0 `x @ (plane @ w.T)` is exactly
+        #: `x @ plane[:, :rank]`, i.e. today's path (gate b,
+        #: `tests/test_tsct2.py`).
+        self.tsct_basis = int(tsct_basis)
+        self.basis_shared = int(basis_shared)
+        self.w: nn.Parameter | None = None
+        if self.tsct_basis:
+            if not share_u:
+                loud(
+                    f"tsct_basis={self.tsct_basis} on an expert that owns its U: "
+                    f"the selector lives INSIDE the shared plane (`share_u`). "
+                    f"Escape: build it under SparseMoE with share_u_mode='plane', "
+                    f"or tsct_basis=0."
+                )
+            if self.basis_shared <= rank:
+                loud(
+                    f"tsct_basis={self.tsct_basis} with basis_shared="
+                    f"{self.basis_shared} <= rank={rank}: the wider plane must be "
+                    f"wider than the latent or there is no subspace to select. "
+                    f"Escape: shared_rank > rank, or tsct_basis=0."
+                )
+            self.w = nn.Parameter(
+                torch.cat(
+                    (
+                        torch.eye(rank, device=device),
+                        torch.zeros(rank, self.basis_shared - rank, device=device),
+                    ),
+                    dim=1,
+                )
+            )
         #: The a4.8 ACTIVATION switch (`act_quant.fake_quant_act`): the `x` fed
         #: to this expert's factor matmuls is fake-quantized with an STE. Same
         #: switch the banked path in `SparseMoE` applies to its `x`, so one
@@ -645,6 +756,15 @@ class DualLatentGLU(nn.Module):
         if self._shared_index is not None:
             gate_u = gate_u.index_select(1, self._shared_index[0])
             up_u = up_u.index_select(1, self._shared_index[1])
+        if self.w is not None:
+            # TSCT-2: the expert's own `rank`-dim subspace of the wider shared
+            # plane. The LITERAL form of `docs/architecture/2026-11-05-tsct-2.md`
+            # (`x @ plane @ w.T`); the banked path folds the same product into
+            # the effective basis at the rebuild so the per-token MAC does not
+            # move. `factor_qat` is refused with this arm by config.validate.
+            w = self.w.to(gate_u.dtype)
+            gate_u = gate_u @ w.T
+            up_u = up_u @ w.T
         return gate_u, up_u
 
     def forward(self, x: torch.Tensor, glu=None) -> torch.Tensor:
@@ -840,6 +960,74 @@ class SparseMoE(nn.Module):
                 f"without the loader). Escape: name one of those."
             )
         self.share_u = self.share_u_mode != "off"
+        #: ---- TSCT-2 (`docs/architecture/2026-11-05-tsct-2.md`) -------------
+        #: The three arms and their per-forward hooks. The checks run HERE too:
+        #: a hand-built `ModelConfig` reaches this constructor without passing
+        #: `config.validate`, and an arm that is silently INERT is the defect
+        #: ADR-0019 bans.
+        self.tsct_expert_basis = int(cfg.tsct_expert_basis)
+        self.tsct_expert_lr = float(cfg.tsct_expert_lr)
+        self.tsct_expert_revive = int(cfg.tsct_expert_revive)
+        self.tsct_revive_noise = float(cfg.tsct_revive_noise)
+        if self.tsct_expert_basis:
+            if self.share_u_mode != "plane":
+                loud(
+                    f"tsct_expert_basis={self.tsct_expert_basis} with "
+                    f"share_u_mode={self.share_u_mode!r}: the selector lives inside "
+                    f"ONE shared plane. Escape: share_u_mode='plane', or "
+                    f"tsct_expert_basis=0."
+                )
+            if self.tsct_expert_basis != cfg.rank:
+                loud(
+                    f"tsct_expert_basis={self.tsct_expert_basis} != rank={cfg.rank}: "
+                    f"the selector's output is the GLU latent, and `v` is "
+                    f"[rank, f]. Escape: tsct_expert_basis={cfg.rank}."
+                )
+            if cfg.shared_rank <= cfg.rank:
+                loud(
+                    f"tsct_expert_basis with shared_rank={cfg.shared_rank} <= "
+                    f"rank={cfg.rank}: no wider plane to select from. Escape: "
+                    f"shared_rank > rank."
+                )
+            if self.factor_qat != "none":
+                loud(
+                    f"tsct_expert_basis with factor_qat={self.factor_qat!r}: the "
+                    f"shared plane is quantized before the selector. Escape: "
+                    f"factor_qat='none'."
+                )
+            if cfg.moe_shared_compute:
+                loud(
+                    "tsct_expert_basis with moe_shared_compute=true: that arm uses a "
+                    "constant selector and cannot carry a per-expert `w`. Escape: "
+                    "moe_shared_compute=false."
+                )
+        if self.tsct_expert_lr or self.tsct_expert_revive:
+            if cfg.n_experts < 2:
+                loud(
+                    f"tsct_expert_lr={self.tsct_expert_lr} / "
+                    f"tsct_expert_revive={self.tsct_expert_revive} with "
+                    f"n_experts={cfg.n_experts}: no second expert to reweight or "
+                    f"revive. Escape: n_experts >= 2."
+                )
+            if cfg.moe_lb_mode == "aux":
+                loud(
+                    "tsct_expert_lr / tsct_expert_revive with moe_lb_mode='aux': "
+                    "the aux arm never accumulates `lfb_counts`. Escape: "
+                    "moe_lb_mode='sign' or 'prop'."
+                )
+            lb_step = cfg.moe_lb_gamma if cfg.moe_lb_mode == "prop" else cfg.moe_lb_coef
+            if lb_step == 0.0:
+                loud(
+                    f"tsct_expert_lr / tsct_expert_revive with a zero "
+                    f"{'moe_lb_gamma' if cfg.moe_lb_mode == 'prop' else 'moe_lb_coef'}: "
+                    f"`_lfb_step` returns before accumulating `lfb_counts`. Escape: "
+                    f"set the controller step positive."
+                )
+            if self.tsct_revive_noise < 0.0:
+                loud(
+                    f"tsct_revive_noise={self.tsct_revive_noise} is negative. "
+                    f"Escape: >= 0."
+                )
         self.experts = nn.ModuleList(
             DualLatentGLU(
                 d,
@@ -851,10 +1039,20 @@ class SparseMoE(nn.Module):
                 act_quant=cfg.act_quant,
                 act_group=cfg.act_group,
                 share_u=self.share_u,
+                tsct_basis=self.tsct_expert_basis if self.share_u_mode == "plane" else 0,
+                basis_shared=cfg.shared_rank,
                 device=device,
             )
             for _ in range(cfg.n_experts)
         )
+        if self.tsct_expert_lr:
+            # The optimizer's row-scale seam: a 2-D parameter is one row of its
+            # shape group, and these attributes are how `MixOptimizer` knows
+            # WHICH row belongs to which expert. Not state, not a buffer, never
+            # saved — the mapping is rebuilt from the module tree.
+            for j, e in enumerate(self.experts):
+                e.v._tsct_moe = self
+                e.v._tsct_index = j
         self.shared = DualLatentGLU(
             d,
             f,
@@ -931,8 +1129,31 @@ class SparseMoE(nn.Module):
                     e.bind_shared_u(self.u_dict, self.u_dict, row, cache=self._qat_cache)
                 self._shared_params = (self.u_dict,)
             else:
-                self.gate_u = nn.Parameter(init_u(d, cfg.rank, device))
-                self.up_u = nn.Parameter(init_u(d, cfg.rank, device))
+                if self.tsct_expert_basis:
+                    # TSCT-2: a WIDER shared plane, `[d, shared_rank]`, of which
+                    # each expert selects its own `rank` columns. The first
+                    # `rank` columns are today's exact draw (the global stream
+                    # is consumed in the same order, so every non-new parameter
+                    # stays bit-identical to OFF); the extra columns come from a
+                    # LOCAL generator, so adding the arm does not shift the
+                    # initialisation of anything else. At init `w = [I | 0]`
+                    # drops the extra columns, so the forward is the OFF forward.
+                    extra = cfg.shared_rank - cfg.rank
+                    self.gate_u = nn.Parameter(
+                        torch.cat(
+                            (init_u(d, cfg.rank, device), tsct_basis_extra(d, extra, device)),
+                            dim=1,
+                        )
+                    )
+                    self.up_u = nn.Parameter(
+                        torch.cat(
+                            (init_u(d, cfg.rank, device), tsct_basis_extra(d, extra, device)),
+                            dim=1,
+                        )
+                    )
+                else:
+                    self.gate_u = nn.Parameter(init_u(d, cfg.rank, device))
+                    self.up_u = nn.Parameter(init_u(d, cfg.rank, device))
                 for e in self.experts:
                     e.bind_shared_u(self.gate_u, self.up_u, cache=self._qat_cache)
                 self._shared_params = (self.gate_u, self.up_u)
@@ -1301,6 +1522,69 @@ class SparseMoE(nn.Module):
                     self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean())
                 )
         counters.count("moe_lfb_updates")
+
+    def expert_lr_scales(self) -> torch.Tensor:
+        """TSCT-2's per-expert LR multiplier, `[E]`, PURE from the device counts.
+
+        No host read and no state: the optimizer recomputes it every step from
+        `lfb_counts` (the LFB integrator's device-side counter), so a resume
+        needs nothing extra and a stale scale cannot outlive a step.
+        """
+        return expert_lr_multipliers(self.lfb_counts, self.tsct_expert_lr)
+
+    def revive_experts(self, step: int, seed: int) -> int:
+        """TSCT-2's revive, once per `tsct_expert_revive` optimizer steps.
+
+        The coldest expert takes the hottest expert's `v`, `gate_s`, `up_s` (and
+        its selector `w` when the basis arm is on) plus
+        `σ = tsct_revive_noise · std(v_hot)` of Gaussian noise, and BOTH experts'
+        `lfb_counts`/`lfb_bias` entries are reset so the controller starts them
+        from zero traffic. Returns 1 when it ran, 0 when the cadence has not
+        fired or the bank has no traffic yet.
+
+        The two indices are the ONE declared host read at this cadence: a
+        device `argmin`/`argmax` still needs a Python int to index the expert
+        list, and there is no `[E, ·]` stack of `v` to gather from (it would be
+        512 copies of the whole bank). It runs once per N steps, never on the
+        LR path, and the values themselves are device-side. The noise generator
+        is seeded `(seed + step)`, so a replayed step revives identically.
+
+        Under `share_u_mode='off'` the expert also owns a private `gate_u`/
+        `up_u`; this method copies only the three tensors the mechanism names
+        (`v`, `gate_s`, `up_s`) and does NOT claim to revive the private basis
+        — the arm is specified for the shared-basis bank the A/B runs.
+        """
+        if not self.training or self.tsct_expert_revive <= 0:
+            return 0
+        if step % self.tsct_expert_revive != 0:
+            return 0
+        counts = self.lfb_counts
+        hot = int(counts.argmax())
+        cold = int(counts.argmin())
+        if cold == hot or float(counts[hot]) <= 0.0:
+            # No traffic yet (step 0) or every expert tied: there is no
+            # starvation to answer and copying an expert onto itself would only
+            # inject noise.
+            return 0
+        donor = self.experts[hot]
+        receiver = self.experts[cold]
+        g = torch.Generator(device=counts.device).manual_seed(seed + step)
+        with torch.no_grad():
+            sigma = self.tsct_revive_noise * donor.v.detach().std()
+            pairs = [(receiver.v, donor.v), (receiver.gate_s, donor.gate_s),
+                     (receiver.up_s, donor.up_s)]
+            if donor.w is not None and receiver.w is not None:
+                pairs.append((receiver.w, donor.w))
+            for dst, src in pairs:
+                noise = torch.randn(
+                    src.shape, generator=g, device=src.device, dtype=src.dtype
+                )
+                dst.copy_(src.detach() + noise * sigma)
+            counts[cold] = 0.0
+            counts[hot] = 0.0
+            self.lfb_bias[cold] = 0.0
+            self.lfb_bias[hot] = 0.0
+        return 1
 
     def _k_counters(self, k: torch.Tensor, counters: Counters) -> None:
         """Per-token width histogram + mean, DEVICE accumulators (no host read).
@@ -1814,6 +2098,17 @@ class SparseMoE(nn.Module):
                             cache=self._qat_cache,
                         )
                     u = u.to(dt)
+                    if self.tsct_expert_basis:
+                        # TSCT-2: fold each expert's selector into its EFFECTIVE
+                        # basis, `gate_u @ w_j.T` -> `[d, rank]`, so every bank
+                        # arm below (padded/batched/bucketed/triton/gather) keeps
+                        # the exact operand shape it had and the per-token MAC is
+                        # UNCHANGED. The fold itself is one batched matmul per
+                        # rebuild (once per optimizer step), not per token.
+                        if counters is not None:
+                            counters.count("tsct_basis_fold")
+                        w = torch.stack([e.w.to(dt) for e in self.experts])
+                        return torch.einsum("dr,ekr->edk", u, w).contiguous()
                     return u.unsqueeze(0).expand(len(self.experts), -1, -1).contiguous()
                 params = [getattr(e, name) for e in self.experts]
                 if self.factor_qat == "none":
@@ -2878,6 +3173,20 @@ class SparseMoE(nn.Module):
             fused=self.moe_combine == "fused",
             dtype=self.moe_combine_dtype,
         )
+
+
+def revive_experts_all(model: nn.Module, step: int, seed: int) -> int:
+    """Call every live TSCT-2 revive; returns how many experts were revived.
+
+    The trainer's seam (`train/loop.py`), once per OPTIMIZER step, after the
+    optimizer and the bank invalidation. A model with the arm off makes no call
+    and draws nothing, so the OFF path is untouched.
+    """
+    n = 0
+    for m in model.modules():
+        if isinstance(m, SparseMoE):
+            n += m.revive_experts(step, seed)
+    return n
 
 
 def invalidate_banks_all(model: nn.Module) -> int:

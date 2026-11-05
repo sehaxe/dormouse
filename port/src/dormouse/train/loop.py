@@ -42,7 +42,7 @@ from ..model.engram import (
     host_step_all,
     load_host_state,
 )
-from ..model.experts import invalidate_banks_all
+from ..model.experts import invalidate_banks_all, revive_experts_all
 from ..model.qat_cache import invalidate_qat_cache_all
 from ..model.tsct import set_mm_dtype
 from .data import ByteStream, distinct_scored_bytes, eval_window_bytes, open_streams, warmup_steps
@@ -1194,7 +1194,22 @@ def train(
         # softmax-collapse cliff (16.6). 1e-8 is torch's own default, so the
         # off path is bit-identical.
         eps=cfg.adam_eps,
+        # TSCT-2's per-expert LR. It is a MODEL field because the counts it
+        # reads (`lfb_counts`) live on the expert bank, and the config snapshot
+        # pins it there; the optimizer only applies the grouped scale vector.
+        tsct_expert_lr=run.model.tsct_expert_lr,
     )
+    if run.model.tsct_expert_lr > 0 and (cfg.opt_graph or cfg.full_graph):
+        # A captured region replays the FIRST step's scale vector: the counts
+        # move every forward, so the recorded `[1+ΣE]` tensor would be stale.
+        # Refuse before a step runs rather than train a frozen schedule.
+        loud(
+            f"tsct_expert_lr={run.model.tsct_expert_lr} with "
+            f"opt_graph={cfg.opt_graph}/full_graph={cfg.full_graph}: the "
+            f"per-expert scale is recomputed from `lfb_counts` every step, and a "
+            f"capture replays the first step's vector. Escape: opt_graph=false and "
+            f"full_graph=false, or tsct_expert_lr=0."
+        )
     if cfg.optim_8bit:
         # The device firewall multiplies the FIRST MOMENT and the weight-decay
         # factor before the step; bitsandbytes' AdamW8bit keeps its state in
@@ -1793,6 +1808,15 @@ def train(
         # banks: one quantize per trained step, reused by every forward.
         invalidate_banks_all(model)
         invalidate_qat_cache_all(model)
+        # TSCT-2's revive, once per OPTIMIZER step and AFTER the update landed
+        # (a revive before the step would be overwritten by it). The method is a
+        # no-op unless the cadence fires; a model with the arm off makes no call
+        # at all, so the OFF path draws nothing.
+        if run.model.tsct_expert_revive > 0:
+            revived = revive_experts_all(model, opt.steps, cfg.seed)
+            if revived:
+                total.count("tsct_revive", revived)
+                window.count("tsct_revive", revived)
         if opt.counters:
             # The Muon arms' own counters (ADR-0019): `ns_triton` when the
             # fused Newton–Schulz chain ran, `ns_triton_fallback` + the reason

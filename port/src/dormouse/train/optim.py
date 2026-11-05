@@ -673,7 +673,7 @@ class _MomGroup:
       PARAMS are `Y = (1-β1)Z + β1 X` (`sf_switch`).
     """
 
-    __slots__ = ("gi", "shape", "params", "mom", "v", "x", "z")
+    __slots__ = ("gi", "shape", "params", "mom", "v", "x", "z", "tsct_ids", "tsct_row")
 
     def __init__(
         self,
@@ -692,6 +692,11 @@ class _MomGroup:
         self.v = v
         self.x = x
         self.z = z
+        #: TSCT-2's per-expert LR row ids (`0` = no scale) and the current
+        #: step's `[N]` scale vector. `None` without the arm, so the OFF path
+        #: allocates and multiplies nothing.
+        self.tsct_ids: torch.Tensor | None = None
+        self.tsct_row: torch.Tensor | None = None
 
 
 def _stack_grads(params: list) -> torch.Tensor:
@@ -918,6 +923,11 @@ class Muon(Optimizer):
         #: is where a reader learns which chain ran. Empty for every other arm,
         #: so the default path's log line does not move.
         self.counters = Counters()
+        #: TSCT-2's per-expert LR map, set by `MixOptimizer` after it discovers
+        #: the bank. Empty for a directly-built Muon, so `_build_groups` never
+        #: references an attribute that is not there.
+        self._tsct_moes: list = []
+        self._tsct_offset: dict[int, int] = {}
 
     def _build_groups(self) -> None:
         """One stacked momentum buffer per unique shape; per-param state views it.
@@ -970,7 +980,22 @@ class Muon(Optimizer):
                         pv = self.state[p].get(key)
                         buf[i].copy_(pv if pv is not None else p.detach())
                         self.state[p][key] = buf[i]
-                self._groups.append(_MomGroup(gi, shape, params, mom, v, x, z))
+                grp = _MomGroup(gi, shape, params, mom, v, x, z)
+                if self._tsct_moes:
+                    ids = []
+                    for p in params:
+                        moe = getattr(p, "_tsct_moe", None)
+                        if moe is None or id(moe) not in self._tsct_offset:
+                            ids.append(0)
+                        else:
+                            ids.append(1 + self._tsct_offset[id(moe)] + int(p._tsct_index))
+                    if any(ids):
+                        # ONE device row id per parameter, built once (setup),
+                        # never per step: the step only gathers `[N]` scales.
+                        grp.tsct_ids = torch.tensor(
+                            ids, dtype=torch.int64, device=params[0].device
+                        )
+                self._groups.append(grp)
 
     def load_state_dict(self, state_dict) -> None:  # noqa: D102 - torch's contract
         super().load_state_dict(state_dict)
@@ -1023,6 +1048,7 @@ class Muon(Optimizer):
         ns: int,
         scale: float,
         flag: torch.Tensor | None = None,
+        row_scale: torch.Tensor | None = None,
     ) -> None:
         """The per-param update — the reference the batched path must match.
 
@@ -1047,6 +1073,11 @@ class Muon(Optimizer):
         else:
             buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
         update = self._orthogonalize(buf, ns)
+        if row_scale is not None:
+            assert not self.sf and self.variant == "muon", (
+                "TSCT-2's per-expert LR has no seam in the SF/NorMuon tails; "
+                "MixOptimizer refuses the combination before a step runs."
+            )
         if self.sf:
             self._sf_one(p, update, lr)
             return
@@ -1058,6 +1089,10 @@ class Muon(Optimizer):
             # The device firewall's gate (0/1, on the device): `*1.0` is exact
             # on a healthy step, so this cannot move a health-run number.
             update = update.mul(flag.to(update.dtype))
+        if row_scale is not None:
+            # TSCT-2: the expert's own LR, on the update only (the momentum is
+            # unscaled). A 0-dim device tensor; no host read.
+            update = update.mul(row_scale)
         with torch.no_grad():
             if torch.is_tensor(lr):
                 # The CUDA-graph arm (`train/graph.py`): `lr` is a 0-dim DEVICE
@@ -1196,7 +1231,12 @@ class Muon(Optimizer):
                 else:
                     p.copy_(st["z"]).lerp_(st["x"].to(p.dtype), self.sf_beta)
 
-    def batched_step_from_model(self, model, flag: torch.Tensor | None = None) -> int:
+    def batched_step_from_model(
+        self,
+        model,
+        flag: torch.Tensor | None = None,
+        expert_scales: torch.Tensor | None = None,
+    ) -> int:
         """The shape-batched Muon pass (a no-op when the batches are trivially small).
 
         The per-param loop above re-derives identical-shape Newton-Schulz
@@ -1235,24 +1275,29 @@ class Muon(Optimizer):
         if not self._groups:
             self._build_groups()
         n_batches = 0
-        # The default `muon` arm queues its Newton–Schulz calls and runs the
-        # classic chain in ONE lockstep pass (`_classic_ns_many`), so the five
-        # elementwise ops per iteration are issued once for every shape group
-        # instead of once per group. A job is
-        # `(params, tensor_to_orthogonalize, lr, scale, ns_steps, singleton)`.
-        jobs: list[tuple[list, torch.Tensor, float, float, int, bool]] = []
+        # `(write_targets, tensor_to_orthogonalize, lr, scale, ns_steps,
+        #   singleton, row_scale)`. `row_scale` is TSCT-2's per-expert LR
+        # (`[k]`, or a 0-dim tensor for a singleton), gathered from the counts
+        # ONCE per step.
+        jobs: list[tuple[list, torch.Tensor, float, float, int, bool, object]] = []
         for grp in stepaudit.iterations("muon.groups", self._groups):
             group = self.param_groups[grp.gi]
             lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
             scale = max(1.0, grp.shape[0] / grp.shape[1]) ** 0.5
             params = grp.params
+            grp.tsct_row = (
+                expert_scales.index_select(0, grp.tsct_ids)
+                if expert_scales is not None and grp.tsct_ids is not None
+                else None
+            )
             if len(params) < 2 or any(p.grad is None for p in params):
                 # A 2-D parameter with no gradient falls back to the definition
                 # (inventing a "zero gradient" row would move the momentum).
                 if any(p.grad is None for p in params):
-                    for p in stepaudit.iterations("muon.singletons", params):
+                    for i, p in enumerate(stepaudit.iterations("muon.singletons", params)):
                         if p.grad is not None:
-                            self._step_one(p, lr, mu, ns, scale, flag)
+                            row = grp.tsct_row[i] if grp.tsct_row is not None else None
+                            self._step_one(p, lr, mu, ns, scale, flag, row_scale=row)
                     continue
                 if self.sf or self.variant == "normuon":
                     # The SF/NorMuon tails are per-parameter (`_sf_one` /
@@ -1275,7 +1320,8 @@ class Muon(Optimizer):
                     buf.copy_(buf.float().mul_(mu).add_(p.grad, alpha=1.0 - mu))
                 else:
                     buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
-                jobs.append(([p], buf, lr, scale, ns, True))
+                row = grp.tsct_row[0] if grp.tsct_row is not None else None
+                jobs.append(([p], buf, lr, scale, ns, True, row))
                 continue
             mom = grp.mom
             # The momentum update, in place, without a stack: `mom` is the
@@ -1305,7 +1351,12 @@ class Muon(Optimizer):
                     update = self._orthogonalize(pieces, ns)
                     self._nor_batched(grp, start, len(params_c), params_c, update, lr, flag)
                     continue
-                jobs.append((params_c, pieces, lr, scale, ns, False))
+                row = (
+                    grp.tsct_row[start : start + len(params_c)]
+                    if grp.tsct_row is not None
+                    else None
+                )
+                jobs.append((params_c, pieces, lr, scale, ns, False, row))
             n_batches += 1
 
         if jobs:
@@ -1322,7 +1373,7 @@ class Muon(Optimizer):
             for job, update in stepaudit.iterations(
                 "muon.writeback", zip(jobs, updates, strict=True)
             ):
-                params_c, _, lr, scale, _, singleton = job
+                params_c, _, lr, scale, _, singleton, row = job
                 assert update is not None
                 if singleton:
                     # `_step_one`'s tail, verbatim: out-of-place 2-D ColRow,
@@ -1332,6 +1383,11 @@ class Muon(Optimizer):
                     update = colrow_normalize(update, colrow_3d=self.colrow_3d)
                     if flag is not None:
                         update = update.mul(flag.to(update.dtype))
+                    if row is not None:
+                        # TSCT-2: the expert's own LR, on the update only. The
+                        # momentum above is unscaled, so a cold expert's
+                        # history is not permanently shrunk.
+                        update = update.mul(row)
                     with torch.no_grad():
                         p = params_c[0]
                         if torch.is_tensor(lr):
@@ -1344,6 +1400,11 @@ class Muon(Optimizer):
                 # write-back is the same-dtype fast `_foreach_add_` (or the
                 # 3-launch stacked form on the mixed dtype rung).
                 colrow_normalize_(update, colrow_3d=self.colrow_3d).mul_(-lr * scale)
+                if row is not None:
+                    # TSCT-2's grouped scale vector: ONE `[k]` multiply over the
+                    # chunk, never a per-parameter loop. `row` was gathered from
+                    # the device counts in `MixOptimizer.step`.
+                    update.mul_(row[:, None, None])
                 if flag is not None:
                     # The device firewall's gate: `*1.0` on a healthy step is
                     # bit-exact, `*0` on a skipped one makes the write below a
@@ -1508,9 +1569,37 @@ class MixOptimizer:
         muon_sf: bool = False,
         muon_sf_wd: float | None = None,
         muon_chunk_elems: int = MUON_CHUNK_ELEMS,
+        tsct_expert_lr: float = 0.0,
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
+        if tsct_expert_lr < 0.0:
+            loud(
+                f"tsct_expert_lr={tsct_expert_lr} is negative: it is a multiplier "
+                f"on the routed counts (0 = off). Escape: >= 0."
+            )
+        if tsct_expert_lr > 0.0:
+            # The row-scale seam exists in the Muon half: the update is one
+            # `[N, d0, d1]` stack, so an expert's scale is one row of one
+            # multiply. The fused AdamW writer, the SF and NorMuon tails have no
+            # such seam, and the live recipe routes `v` (2-D) to Muon; refusing
+            # is the ADR-0019 rule, not a missing arm.
+            if opt != "mix":
+                loud(
+                    f"tsct_expert_lr={tsct_expert_lr} with opt={opt!r}: the "
+                    f"per-expert scale rides the Muon shape-group stack, and "
+                    f"opt='adamw' routes every parameter to the fused AdamW "
+                    f"writer, which has no per-row seam. Escape: opt='mix' (the "
+                    f"live recipe routes `v` to Muon), or tsct_expert_lr=0."
+                )
+            if muon_variant != "muon" or muon_sf:
+                loud(
+                    f"tsct_expert_lr={tsct_expert_lr} with "
+                    f"muon_variant={muon_variant!r}/muon_sf={muon_sf}: those "
+                    f"tails build their own per-parameter update and have no "
+                    f"row-scale seam. Escape: muon_variant='muon', muon_sf=false, "
+                    f"or tsct_expert_lr=0."
+                )
         _check_ns_kind(ns_kind)
         _check_colrow_3d(colrow_3d)
         _check_dtype("muon_state_dtype", muon_state_dtype)
@@ -1603,6 +1692,29 @@ class MixOptimizer:
         #: reads a state scalar during a step. `load_state_dict` restores it
         #: from the checkpoint's per-parameter `step` tensors once.
         self._adamw_t = 0
+        #: TSCT-2's per-expert LR (`SparseMoE.expert_lr_scales`). The MoEs are
+        #: discovered ONCE here, in module order; `_build_groups` maps each
+        #: expert's `v` to a row id, and the step turns the current counts into
+        #: one `[1 + ΣE]` device vector. `0.0` off: no map, no vector, no row
+        #: multiply, so the default path is byte-identical.
+        self.tsct_expert_lr = float(tsct_expert_lr)
+        self._tsct_moes: list[nn.Module] = []
+        self._tsct_offset: dict[int, int] = {}
+        if self.tsct_expert_lr > 0.0:
+            for m in model.modules():
+                if getattr(m, "tsct_expert_lr", 0.0) > 0.0 and hasattr(m, "experts"):
+                    self._tsct_offset[id(m)] = sum(x.n_experts for x in self._tsct_moes)
+                    self._tsct_moes.append(m)
+            if not self._tsct_moes:
+                loud(
+                    f"tsct_expert_lr={self.tsct_expert_lr} but the model has no "
+                    f"SparseMoE carrying the flag: the scale would be computed and "
+                    f"never applied. Escape: build the expert bank with "
+                    f"tsct_expert_lr>0, or set tsct_expert_lr=0."
+                )
+        if self.muon is not None:
+            self.muon._tsct_moes = self._tsct_moes
+            self.muon._tsct_offset = self._tsct_offset
 
     def enable_bnb8bit(self) -> None:
         """Swap the plain AdamW for bitsandbytes' 8-bit state, LOUD on absence.
@@ -1695,6 +1807,16 @@ class MixOptimizer:
         pins that against a HEAD golden, and the conversion was checked on CPU.
         """
         if self.muon is not None:
+            # TSCT-2: ONE device vector per step — slot 0 is the identity for
+            # non-expert rows, then each MoE's `[E]` multipliers. No `.item()`,
+            # no host branch on a count.
+            expert_scales = None
+            if self.tsct_expert_lr > 0.0 and self._tsct_moes:
+                expert_scales = torch.cat(
+                    [torch.ones(1, device=self._tsct_moes[0].lfb_counts.device)]
+                    + [moe.expert_lr_scales() for moe in self._tsct_moes]
+                )
+                self.counters.count("tsct_expert_lr")
             if self.muon.sf and flag is not None:
                 # The SF arm's `s`/`c` are HOST state (`_sf_ckp`), so its skip
                 # has to be decided on the host: ONE declared read per step,
@@ -1704,8 +1826,14 @@ class MixOptimizer:
                 # device-resident.
                 if float(flag) > 0.0:
                     self.steps_batched = self.muon.batched_step_from_model(self.model)
+            elif expert_scales is None:
+                # The OFF path's call is byte-for-byte the old one: tests and
+                # the CUDA-graph warm-up spy on this method's exact signature.
+                self.steps_batched = self.muon.batched_step_from_model(self.model, flag)
             else:
-                n_batched = self.muon.batched_step_from_model(self.model, flag)
+                n_batched = self.muon.batched_step_from_model(
+                    self.model, flag, expert_scales=expert_scales
+                )
                 self.steps_batched = n_batched
         if self._fast_adamw_ok():
             # The fused AdamW: ~10 dispatches for the whole group instead of

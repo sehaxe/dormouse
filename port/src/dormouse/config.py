@@ -705,6 +705,40 @@ class ModelConfig:
     #: by every routed expert; each expert spends `rank` of its columns. 64 at
     #: medium (d=1024) is 65 536 parameters against the control's 78.3M bank.
     share_u_rank: int = 64
+    #: ---- TSCT-2 (`docs/architecture/2026-11-05-tsct-2.md`) ----
+    #: Per-expert INPUT selector inside the shared plane (see
+    #: `experts.SparseMoE._banks`). `0` off. When on, the routed shared plane
+    #: (`gate_u`/`up_u`) is widened from `rank` to `shared_rank` columns and each
+    #: expert owns `w [rank, shared_rank]`: it selects its own `rank`-dimensional
+    #: subspace of that wider shared plane, instead of only re-weighting the one
+    #: shared `rank`-dim coordinate system. It must equal `rank`: the selector's
+    #: output IS the GLU latent width, and the expert's write is `v [rank, f]`.
+    #: The selector is FOLDED into the effective per-expert basis at the bank
+    #: rebuild (`gate_u @ w.T [d, rank]`), so the per-token forward MAC is
+    #: unchanged and the A/B is at equal active MAC; the once-per-step fold costs
+    #: `E·d·rank·shared_rank` MAC per site. Init is `[I | 0]`, so at step 0 the
+    #: arm is output-equivalent to the planeless path (gate b of
+    #: `tests/test_tsct2.py`). Refused unless `share_u_mode='plane'`, with
+    #: `factor_qat`, or `moe_shared_compute`.
+    tsct_expert_basis: int = 0
+    #: Per-expert LR multiplier from the routed counts (see
+    #: `experts.expert_lr_multipliers` and `train.optim.MixOptimizer`):
+    #: `lr_j = lr · (1 + c · (mean(L)/max(L_j,1) − 1))`, clipped to `[0.2, 5]`,
+    #: applied to that expert's `v` only. `0.0` off. Counts are the LFB
+    #: integrator's device-side `lfb_counts`, so the arm reads no host scalar on
+    #: the step path. Requires a live LFB controller (`moe_lb_mode` sign/prop
+    #: with a non-zero step) and the Muon half (`opt='mix'`, `muon_variant='muon'`,
+    #: `muon_sf=false`): the fused AdamW group and the SF/NorMuon tails have no
+    #: row-scale seam, and the flag is refused rather than silently inert.
+    tsct_expert_lr: float = 0.0
+    #: Revive cadence in OPTIMIZER STEPS: every N steps the coldest expert copies
+    #: the hottest expert's `v`/`gate_s`/`up_s` (and `w` when the basis arm is on)
+    #: plus noise, and both experts' `lfb_counts`/`lfb_bias` entries are reset.
+    #: `0` off. Requires the same live LFB counts as `tsct_expert_lr`.
+    tsct_expert_revive: int = 0
+    #: The revive noise scale: `σ = tsct_revive_noise · std(v_hot)`, drawn from a
+    #: generator seeded `(run seed + step)`.
+    tsct_revive_noise: float = 0.01
     use_engram: bool = True
     #: AttnRes (`2603.15031`): the loop-boundary write becomes a softmax
     #: mixture over the depth sources with one learned pseudo-query per
@@ -2999,6 +3033,99 @@ def validate(model: ModelConfig) -> None:
                 f"out of range — every expert would see the whole plane this mode "
                 f"exists to split. Escape: share_u_rank > rank (64 at medium), or "
                 f"share_u_mode='plane'."
+            )
+    # ---- TSCT-2 (docs/architecture/2026-11-05-tsct-2.md) ------------------
+    if model.tsct_expert_basis < 0:
+        loud(
+            f"tsct_expert_basis={model.tsct_expert_basis} is negative: it is the "
+            f"per-expert selector's output width (0 = off). Escape: 0, or rank "
+            f"({model.rank})."
+        )
+    if model.tsct_expert_basis:
+        if model.share_u_mode != "plane":
+            loud(
+                f"tsct_expert_basis={model.tsct_expert_basis} with "
+                f"share_u_mode={model.share_u_mode!r}: the selector is applied "
+                f"INSIDE one shared plane, and only 'plane' has that plane. "
+                f"('off' already gives every expert its own [d, rank] basis, so "
+                f"the selector would be a different mechanism; 'dict' already "
+                f"gives each expert a fixed column subset.) Escape: "
+                f"share_u_mode='plane', or tsct_expert_basis=0."
+            )
+        if model.tsct_expert_basis != model.rank:
+            loud(
+                f"tsct_expert_basis={model.tsct_expert_basis} != rank="
+                f"{model.rank}: the selector's output IS the GLU latent width, "
+                f"and the expert's write is `v [rank, f]`. A narrower selector "
+                f"would change `v` and therefore the model, not add a subspace "
+                f"selector. Escape: tsct_expert_basis={model.rank} (the arm's "
+                f"value), or change rank and re-price the whole bank."
+            )
+        if model.shared_rank <= model.rank:
+            loud(
+                f"tsct_expert_basis with shared_rank={model.shared_rank} <= "
+                f"rank={model.rank}: the wider plane the selector selects FROM is "
+                f"`shared_rank` (192 in every real preset), and a plane no wider "
+                f"than the latent leaves nothing to select. Escape: shared_rank > "
+                f"rank, or tsct_expert_basis=0."
+            )
+        if model.factor_qat != "none":
+            loud(
+                f"tsct_expert_basis with factor_qat={model.factor_qat!r}: the "
+                f"shared plane is quantized ONCE per site before the experts read "
+                f"it, and a per-expert selector after that quantization is a new "
+                f"α/STE interaction with no gate. Escape: factor_qat='none', or "
+                f"tsct_expert_basis=0."
+            )
+        if model.moe_shared_compute:
+            loud(
+                "tsct_expert_basis with moe_shared_compute=true: that arm projects "
+                "the tokens through ONE `[d, 2·rank]` pair and selects the halves "
+                "with a constant `[E, 2·rank, rank]`; a per-expert `w` has no "
+                "constant selector. Escape: moe_shared_compute=false, or "
+                "tsct_expert_basis=0."
+            )
+    if model.tsct_expert_lr < 0.0:
+        loud(
+            f"tsct_expert_lr={model.tsct_expert_lr} is negative: it is a "
+            f"multiplier on the routed counts (0 = off). Escape: >= 0."
+        )
+    if model.tsct_expert_revive < 0:
+        loud(
+            f"tsct_expert_revive={model.tsct_expert_revive} is negative: it is a "
+            f"cadence in optimizer steps (0 = off). Escape: >= 0."
+        )
+    if model.tsct_revive_noise < 0.0:
+        loud(
+            f"tsct_revive_noise={model.tsct_revive_noise} is negative: sigma is "
+            f"a fraction of the donor's std. Escape: >= 0."
+        )
+    if model.tsct_expert_lr or model.tsct_expert_revive:
+        if model.n_experts < 2:
+            loud(
+                f"tsct_expert_lr={model.tsct_expert_lr} / "
+                f"tsct_expert_revive={model.tsct_expert_revive} with "
+                f"n_experts={model.n_experts}: both arms are per-expert and a "
+                f"bank of one has no other expert to starve, revive, or reweight. "
+                f"Escape: n_experts >= 2, or both flags 0."
+            )
+        if model.moe_lb_mode == "aux":
+            loud(
+                "tsct_expert_lr / tsct_expert_revive with moe_lb_mode='aux': the "
+                "aux arm adds the Switch/GShard loss and `_lfb_step` returns "
+                "before it accumulates `lfb_counts`, so there are no counts to "
+                "read. Escape: moe_lb_mode='sign' or 'prop', or both flags 0."
+            )
+        lb_step = model.moe_lb_gamma if model.moe_lb_mode == "prop" else model.moe_lb_coef
+        if lb_step == 0.0:
+            loud(
+                f"tsct_expert_lr / tsct_expert_revive with "
+                f"moe_lb_mode={model.moe_lb_mode!r} and a zero controller step "
+                f"({'moe_lb_gamma' if model.moe_lb_mode == 'prop' else 'moe_lb_coef'}"
+                f"=0): `_lfb_step` returns before it accumulates `lfb_counts`, so "
+                f"the counts the arms read would stay zero. Escape: set the "
+                f"controller step positive (prop: moe_lb_gamma=0.002), or both "
+                f"flags 0."
             )
     if model.factor_qat not in FACTOR_QATS:
         loud(

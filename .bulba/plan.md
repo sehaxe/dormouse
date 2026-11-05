@@ -905,6 +905,40 @@ testable and A/B-able (ADR-0017).
       `scripts/kernel_profile.py` ×2 + `--diff`, with the arm at
       `--set residual_dtype=bf16` (below).
 
+- [x] P-TSCT-2. port (Python): the three OFF-by-default mechanisms from
+      `docs/architecture/2026-11-05-tsct-2.md`. **The doc's `[d, 192]` was
+      wrong**: at `ecc979e` the routed plane is `[d, rank]` (64 in every real
+      preset); 192 is `shared_rank`, the always-on shared expert's width. So
+      `tsct_expert_basis=rank` WIDENS the routed plane to `shared_rank` and
+      each expert owns `w [rank, shared_rank]`; the bank folds `gate_u @ w.T`
+      into the effective `[d, rank]` basis at the rebuild, so the per-token
+      operands/MAC are the control's and the A/B is at equal active MAC.
+      Param delta exactly `E·rank·r_shared + 2·d·(r_shared−rank)` =
+      **+6 684 672** at m400b (6 291 456 selectors + 393 216 wider plane), bank
+      134 479 872 → 141 164 544; fold 19 327 352 832 MAC once per optimizer
+      step. `tsct_expert_lr` is a pure device-side function of `lfb_counts`
+      (`1 + c·(mean/max(L_j,1) − 1)`, clip [0.2,5]) applied as ONE `[N]` row
+      scale on the Muon stack's `v` rows, no per-parameter loop, no host read;
+      refused with `opt='adamw'`, SF/NorMuon, or no live LFB counts.
+      `tsct_expert_revive`/`tsct_revive_noise` copy the hottest expert onto the
+      coldest (`v`/`gate_s`/`up_s`/`w`, `σ=noise·std(v_hot)`, generator seeded
+      `seed+step`) and reset both LFB entries; the two indices are the ONE
+      declared host read at that cadence. Init `w=[I|0]` gives
+      `max|Δlogits| = 0.0` vs the planeless path (gate b); a non-trivial `w`'s
+      banked pass matches the literal formula at 3.79e-7 logits and 8.45e-7 on
+      the worst TSCT-2 grad (all ≤1e-6; the engram 2.03e-6 is the pre-existing
+      bank-vs-loop reduction, printed). Gates `tests/test_tsct2.py` (17), six
+      scratch reverts each red, every file restored byte-for-byte (sha256).
+      Driver `scripts/ab_tsct2.py`: control/+basis/+lr/+revive/all, 3 seeds ×
+      2 000 steps, m400b, b8×s1024, 65 536-B window, equal active MAC
+      (28 442 624/B in all five), rule printed: WIN needs mean <
+      control_mean − max(2·spread, 0.01) AND live/E ≥ 70 % in every seed; a tie
+      goes to fewer parameters. `plan` exercised (no card); `run` **NOT RUN** —
+      the card is on the multi-day m400b job, so no BPB/verdict exists.
+      Suite diff vs `907b3b5`: only the four pre-existing medium-parameter-table
+      failures (`test_export`, `test_fullattn::gate_7`, `test_loop_blocks`,
+      `test_prelude`), reproduced on clean `907b3b5`; ruff clean.
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)
