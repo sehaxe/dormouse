@@ -278,7 +278,7 @@ class OptimizerGraph:
             return (
                 "optim_8bit=true: bitsandbytes' AdamW8bit has no capturable / "
                 "device-tensor-LR path, so a captured step would freeze its LR at "
-                "the capture value. Escape: optim_8bit=false, or opt_graph=false."
+                f"the capture value. Escape: optim_8bit=false, or {self.arm}=false."
             )
         if muon is not None and muon.sf:
             return (
@@ -286,7 +286,7 @@ class OptimizerGraph:
                 "(`s += lr*lr`, `c = lr*lr/s`) is HOST arithmetic and reads `lr` as a "
                 "Python float (`optim.Muon._sf_ckp`), so a captured step would freeze "
                 "BOTH the iterate averaging and the LR at capture time. Escape: "
-                "muon_sf=false, or opt_graph=false (putting `_sf_ckp` on device is the "
+                f"muon_sf=false, or {self.arm}=false (putting `_sf_ckp` on device is the "
                 "named follow-up, not this arm)."
             )
         if muon is not None and muon.variant != "muon":
@@ -295,7 +295,7 @@ class OptimizerGraph:
                 f"`torch._foreach_add_(..., alpha=-lr)` (`optim.Muon._nor_batched`), and "
                 f"an `alpha` that is a 0-dim device tensor is read back to the HOST by "
                 f"the dispatcher — a sync inside the capture window, which CUDA graphs "
-                f"refuse. Escape: muon_variant='muon', or opt_graph=false."
+                f"refuse. Escape: muon_variant='muon', or {self.arm}=false."
             )
         names = {id(p): n for n, p in self.opt.model.named_parameters()}
         missing = [
@@ -316,7 +316,7 @@ class OptimizerGraph:
                 f"capture, so every replay would leave them frozen: {shown}. Escape: "
                 f"capture after every parameter has taken part in a backward pass (raise "
                 f"the warmup past whatever starves them), or set requires_grad=False on "
-                f"the ones meant to be frozen, or opt_graph=false."
+                f"the ones meant to be frozen, or {self.arm}=false."
             )
         if missing:
             # `allow_frozen` (the TRAINER's setting, and `FullGraph`'s): a
@@ -342,7 +342,7 @@ class OptimizerGraph:
                 "the optimizer's parameters are not on CUDA: a CUDA graph is a "
                 "CUDA-only mechanism, and capturing on any other device is not a "
                 "degradation this port can make honest. Escape: run with "
-                "--device cuda, or opt_graph=false."
+                f"--device cuda, or {self.arm}=false."
             )
         if self._lr:
             # FREE, after the `empty_cache` in `capture()` has returned the
@@ -413,6 +413,26 @@ class OptimizerGraph:
             if p.requires_grad
         }
         graph.replay()
+        self._count_captured()
+
+    def _count_captured(self) -> None:
+        """COUNTED: one capture happened, and the arm is no longer eager.
+
+        The failure this guards is the one this project paid for twice: an arm
+        that REFUSES and falls back silently looks identical from the outside
+        (`opt_graph` measured "+0" for a month because `loop.residual_scale`
+        had no gradient and every step stayed eager). A run that asks for a
+        capture must therefore carry a positive `<arm>_captured` counter, and
+        `tests/test_full_graph_m400b.py` asserts exactly that on the m400b
+        recipe. The mirror (`<arm>_fallback`) is counted in `_fall_back`.
+        """
+        if self.counters is not None:
+            self.counters.count(f"{self.arm}_captured")
+        if self.log is not None:
+            self.log(
+                f"{self.arm}: captured at step {self._steps} — every later step is "
+                f"ONE replay; {self.arm}_captured=1"
+            )
 
     def _check_participants(self) -> str | None:
         """Why the recorded participating set no longer matches, or `None`.
@@ -509,10 +529,13 @@ class OptimizerGraph:
         self._capturable_restore.clear()
         if self.counters is not None:
             # ONE counter for both arms (`opt_graph_fallback` is the documented
-            # name the log/JSONL schema carries), but the REASON names the arm
-            # that fell back: a `full_graph` run whose log says `opt_graph` is a
-            # reader who cannot tell which of the two captures failed (ADR-0019).
+            # name the log/JSONL schema carries), and an arm-specific mirror so
+            # a `full_graph` run can be read without translating `opt_graph`
+            # (ADR-0019: the reason and the counter name must both name the arm
+            # that failed). `opt_graph` keeps the single name it always had.
             self.counters.count("opt_graph_fallback")
+            if self.arm != "opt_graph":
+                self.counters.count(f"{self.arm}_fallback")
             self.counters.why = f"{self.arm}: {reason}"  # type: ignore[attr-defined]
         if self.log is not None:
             self.log(
@@ -681,35 +704,104 @@ def full_graph_refusal(train, model) -> str | None:
             "the same quantized weights. Escape: dense_qat=none and factor_qat=none, or "
             "full_graph=false."
         )
-    # --- the routed MoE: only the capacity-PADDED arm has static rows --------
+    # --- the routed MoE: only the STATIC-ROW arms are capturable -------------
     #
     # Measured 2026-10-24: `order[keep]` (a BOOLEAN-mask index) is `nonzero` on
     # the device — a D2H read AND a kept-row count that changes with the
     # routing. Both are illegal in a graph: the capture aborts at the op
-    # (`tests/test_full_graph.py` captures it) and a replay would keep the
-    # first call's shape while the data changed. `_padded_dispatch` now keeps
-    # `n·k` rows and masks the cap, which is why IT can be captured; the other
-    # arms are built around the ragged kept count itself (`offs`, the
-    # per-expert loop's `unique`, the gather ABI's permuted rows), and
-    # `moe_kernel="batched"` sizes its bank from the batch's largest group (a
-    # D2H scalar) when dropless, so they are refused HERE, loudly, instead of
-    # falling back mid-capture.
+    # (`tests/test_full_graph.py`) and a replay would keep the first call's
+    # shape while the data changed. Two arms have static rows:
+    #
+    # * `moe_capacity>0` + `moe_kernel='padded'`: keeps `n·k` rows and masks the
+    #   cap (or `batched` with a capacity: the same static `_capacity` rule);
+    # * `moe_capacity=0` (dropless) + `moe_kernel='triton'`: the grouped GEMM's
+    #   row-block grid takes the STATIC `_dropless_cap` bound and each program
+    #   exits on-device on an empty block, so `offs` never comes back to the
+    #   host. This is the arm the m400b recipe (`moe_kernel=triton`) runs.
+    #
+    # Everything else is built around the ragged kept count itself (`order[keep]`
+    # for triton-at-a-capacity, the per-expert loop's `unique`, the bucket plan's
+    # `counts.tolist()`), or reads a D2H scalar (`_batched_cap`'s
+    # `counts.max().item()` when dropless), so they are refused HERE, loudly,
+    # instead of falling back mid-capture.
     if getattr(model, "moe_topk", 0) > 0:
         kernel = getattr(model, "moe_kernel", "padded")
         cap = getattr(model, "moe_capacity", 0.0)
         gather = getattr(model, "moe_gather", "off")
+        permute = getattr(model, "moe_permute", "argsort")
+        # The two off-by-default routing kernels are refused by NAME, not by
+        # accident: both have a host-shaped fallback (`counts.tolist()` in the
+        # counting permute's reference, the reference route's Python sort), so a
+        # capture whose kernel path is refused at runtime would abort mid-window
+        # instead of falling back. The recipe runs both off, so this costs
+        # nothing today and keeps the arm from being flipped on silently.
+        if getattr(model, "moe_route_fused", False):
+            return (
+                "moe_route_fused=true: the fused route head is not part of the "
+                "measured capture recipe — its reference fallback sorts on the "
+                "HOST (`route_reference`'s `torch.sort`) and its custom backward "
+                "recomputes the softmax in a second kernel. A capture cannot be "
+                "allowed to depend on which of the two ran. Escape: "
+                "moe_route_fused=false, or full_graph=false."
+            )
+        if permute == "count":
+            return (
+                "moe_permute='count': the counting permute's reference fallback "
+                "reads `(cumsum(counts) - counts).tolist()` (a D2H inside the "
+                "captured dispatch), and the arm is not part of the measured "
+                "recipe. Escape: moe_permute='argsort', or full_graph=false."
+            )
+        if gather == "kernel":
+            return (
+                "moe_gather=kernel: the gather-fused ABI is the PERMUTED "
+                "(ragged) rows — its `(toks, offs)` pair is built from the "
+                "permute, and the arm is not part of the measured capture recipe "
+                "(`moe_gather` is off in the current run). Escape: "
+                "moe_gather='off' with moe_kernel='padded' or 'batched' (and "
+                "moe_capacity>0), or full_graph=false."
+            )
         why = None
         if cap == 0:
-            why = (
-                "moe_capacity=0 (dropless) routes the routed pass to a "
-                "batch-sized bank (`moe_kernel=batched` reads `counts.max()` "
-                "back to size `[E, cap, ·]`) or a RAGGED arm, whose row count "
-                "is the routing's own (there is no static cap to pad to)"
-            )
+            # Dropless: the only capture-safe routed pass is the grouped GEMM.
+            # It takes the STATIC row-block bound (`moe_kernels._dropless_cap`,
+            # R rows in one group) and every program exits ON-DEVICE when its
+            # block is empty, so no `offs`/`counts` crosses to the host — that
+            # is the arm the current m400b recipe runs (`moe_kernel=triton`).
+            if kernel == "triton":
+                why = None
+            elif kernel == "padded":
+                why = (
+                    "moe_capacity=0 (dropless) with moe_kernel='padded': the "
+                    "padded bank has no cap to size itself with, so the pass "
+                    "would silently fall through to the grouped GEMM — and to "
+                    "the per-expert `unique().tolist()` loop on a box without "
+                    "Triton. A capture must not depend on that runtime choice"
+                )
+            elif kernel == "batched":
+                why = (
+                    "moe_capacity=0 (dropless) with `moe_kernel=batched`: the "
+                    "bank's cap is THIS batch's largest group, read back with "
+                    "`int(counts.max().item())` (`_batched_cap`) — a D2H read "
+                    "inside the captured region"
+                )
+            elif kernel == "bucketed":
+                why = (
+                    "moe_capacity=0 (dropless) with moe_kernel='bucketed': the "
+                    "bucket plan reads `counts.tolist()` and allocates one bank "
+                    "per row-count class, so both the read and the shapes move "
+                    "with the routing"
+                )
+            else:  # naive
+                why = (
+                    "moe_capacity=0 (dropless) with moe_kernel='naive': the "
+                    "reference loop is `torch.unique(...).tolist()`, a host read "
+                    "per pass"
+                )
         elif kernel == "triton":
             why = (
-                "moe_kernel=triton's grouped GEMM is RAGGED: `offs` and the gathered "
-                "row count come from `order[keep]`, a data-dependent `nonzero`"
+                "moe_kernel=triton with moe_capacity>0 is RAGGED: `offs` and the "
+                "gathered row count come from `order[keep]`, a data-dependent "
+                "`nonzero`"
             )
         elif kernel == "naive":
             why = (
@@ -719,19 +811,17 @@ def full_graph_refusal(train, model) -> str | None:
         elif kernel == "bucketed":
             why = (
                 "moe_kernel=bucketed reads THIS batch's per-expert counts back to "
-                "build one `[n_b, cap_b, ·]` bank per row-count class, so both the "
-                "allocation shapes and the number of bucket GEMMs change with routing"
-            )
-        elif gather == "kernel":
-            why = (
-                "moe_gather=kernel's ABI is the PERMUTED (ragged) rows, so its row "
-                "count is `order[keep]`'s"
+                "the HOST (`counts.tolist()`) to build one `[n_b, cap_b, ·]` bank "
+                "per row-count class, so both the allocation shapes and the number "
+                "of bucket GEMMs change with routing"
             )
         if why is not None:
             return (
-                f"the routed MoE arm cannot be captured: {why}. Escape: moe_kernel="
-                f"'padded' or 'batched' with moe_capacity>0 and moe_gather='off' "
-                f"(the arms whose rows are static), or full_graph=false."
+                f"the routed MoE arm cannot be captured: {why}. Escape: "
+                f"moe_capacity=0 with moe_kernel='triton' (the dropless grouped "
+                f"GEMM's static row-block bound), or moe_capacity>0 with "
+                f"moe_kernel='padded'/'batched' (the arms whose rows are static), "
+                f"or full_graph=false."
             )
     return None
 
@@ -780,6 +870,7 @@ class FullGraph(OptimizerGraph):
         allow_frozen: bool = True,
         on_replay: Callable[[], None] | None = None,
         on_counters: Callable[[], None] | None = None,
+        pre_capture: Callable[[], None] | None = None,
     ) -> None:
         assert batch > 0 and seq_len > 0, f"bad static input shape {batch}x{seq_len}"
         super().__init__(
@@ -800,6 +891,16 @@ class FullGraph(OptimizerGraph):
         #: replay never advances them. Without this a COUNTED arm goes silent
         #: the moment the arm is on (ADR-0019's defect).
         self.on_counters = on_counters
+        #: Run ONCE, immediately before the capture: the trainer drops the
+        #: expert-bank and QAT caches here so the captured forward REBUILDS them
+        #: inside the recording. A cache HIT at capture records no `stack`/copy
+        #: op at all, so every replay would train the experts through the
+        #: capture step's snapshot while the optimizer moved the parameters
+        #: under it — the medbig2/b1night freeze (`SparseMoE._banks`). The
+        #: per-step `invalidate_banks_all` normally leaves no entry to hit; an
+        #: eval between the last warmup step and the capture is the case that
+        #: would, and this closes it structurally.
+        self.pre_capture = pre_capture
         #: The STATIC inputs. `dtype=torch.long` is the model's id dtype and the
         #: buffers are `[batch, seq_len]` exactly — the recording holds these
         #: addresses, so they are allocated once and never rebound.
@@ -833,6 +934,8 @@ class FullGraph(OptimizerGraph):
         why = self._refusals()
         if why is not None:
             loud(f"full_graph: capture refused — {why}")
+        if self.pre_capture is not None:
+            self.pre_capture()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         # The WARMUP's last backward left an `AccumulateGrad` node referring to
@@ -855,9 +958,18 @@ class FullGraph(OptimizerGraph):
             torch.autograd.graph.set_override_stale_capture_stream(False)
         self._graph = graph
         # The recorded step's own DEVICE counters are recorded too; the HOST ones
-        # (`forward`, the arm counters) are Python and stop at capture, so they
-        # are re-merged per replay from this snapshot.
-        self._captured_counters = {}
+        # (`forward`, the arm counters AND the optimizer's `ns_triton`) are
+        # Python and stop at capture, so they are re-merged per replay from this
+        # snapshot. An empty dict here is how a COUNTED optimizer arm went
+        # silent after the capture step.
+        counters = getattr(self.opt, "counters", None)
+        self._captured_counters = dict(counters) if counters else {}
+        if counters:
+            # The capture already ran the body once, so `opt.counters` holds
+            # this step's counts. Clear them and let `_host_bookkeeping` re-add
+            # the snapshot exactly once — otherwise the capture step counts
+            # twice, and every replay would read a doubled total.
+            counters.clear()
         self._participants = {
             name: p.grad is not None
             for name, p in self.opt.model.named_parameters()
@@ -865,6 +977,7 @@ class FullGraph(OptimizerGraph):
         }
         graph.replay()
         self._host_bookkeeping()
+        self._count_captured()
 
     def step(self) -> None:
         """One step: eager during warmup and after a fallback, one replay after.

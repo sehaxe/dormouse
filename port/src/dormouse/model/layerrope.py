@@ -154,9 +154,11 @@ never half-quantised.
 
 REFUSED: `use_byteflow` (its channel path returns before this tree is built
 and its loop runs over patch latents), an odd `d_model` (the rotation needs
-pairs), and — in `config.validate_model_train` — `full_graph`/`opt_graph`: the
-per-depth gather is a device op, but the capture would freeze the depth index
-and the identity is not worth proving inside a graph before it is measured.
+pairs), and — in `config.validate_model_train` — `opt_graph` (the capture
+contract over the rotated gains is not measured). `full_graph` is ALLOWED: the
+capture records one device-side `select` per FIXED depth index, and the arms
+that would move that index (`rand_depth`, `segment_len`) are refused by
+`train.graph.full_graph_refusal` first.
 """
 
 from __future__ import annotations

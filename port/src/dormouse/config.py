@@ -4052,9 +4052,10 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
     ONE definition with two callers (`load_run` and `train/loop.py::train`), the
     same shape as `validate_train` — a hand-built run that skips `load_run`
     must hear the same refusal. LayerRoPE's per-depth gain is a device-side
-    gather + rotation (no host read), but a capture would freeze the Python
-    depth index it is built from, and the identity has not been measured inside
-    a graph. Refused rather than silently captured; the reason names the arm.
+    gather + rotation (no host read). `full_graph` is allowed because the
+    captured loop's depth indices are fixed (the arms that would move them are
+    refused by `train.graph.full_graph_refusal`); `opt_graph` is still refused,
+    and the reason names the arm.
     """
     if tcfg.activation_offload > 0.0 and model.use_byteflow:
         loud(
@@ -4082,14 +4083,15 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
         )
     if not model.layerrope:
         return
-    if tcfg.full_graph:
-        loud(
-            "layerrope=true with full_graph=true: the per-depth gain is selected by "
-            "a PYTHON depth index (`model/layerrope.py::LayerRoPEGains._index`) and "
-            "the rotation is a device op — a capture would freeze the depth index "
-            "and replay one depth's gain at every site. The arm is not measured "
-            "inside a graph. Escape: full_graph=false, or layerrope=false."
-        )
+    # `full_graph` is ALLOWED. The per-depth gain is selected by a Python depth
+    # index, but every index the captured loop reaches is a pure function of the
+    # FIXED structure (`prelude_layers`, the iteration number, `max_iter`,
+    # `coda_layers`); the two arms that would make it move — `rand_depth` and
+    # `segment_len` — are refused by `train.graph.full_graph_refusal`, and the
+    # capture records one `select` per fixed iteration. The m400b recipe
+    # (paper LayerRoPE, max_iter=3) is the gate:
+    # `tests/test_full_graph_m400b.py` asserts its capture counter. `opt_graph`
+    # stays refused: its contract over the rotated gains has not been measured.
     if tcfg.opt_graph:
         loud(
             "layerrope=true with opt_graph=true: the optimizer stage is captured "

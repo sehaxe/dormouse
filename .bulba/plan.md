@@ -509,6 +509,54 @@ testable and A/B-able (ADR-0017).
       `port/scripts/bench_full_graph.py` (`--modes eager,full_graph`,
       launch count for ONE step).
 
+- [x] P-GRAPH-M400B. port (Python): `full_graph` on the LIVE m400b recipe
+      (199M, b8 x s1024) after the 2026-11-05 kernel profile measured 60% HOST
+      GAPS (320 ms wall, 200 ms GPU busy, 151 ms kernels, 4 692 launches/step).
+      The old verdict ("GPU-bound, graph buys 2.3%") was `final_byte` b8 s512;
+      this recipe is the one the card trains now. `configs/m400b.toml` is the
+      checkpoint's model half, tracked so the gate is reproducible.
+      **What changed for capture:** (1) `full_graph_refusal` now allows the
+      dropless grouped GEMM (`moe_capacity=0` + `moe_kernel=triton`): its
+      row-block grid takes the STATIC `_dropless_cap` and every program exits
+      on-device, so `offs` never crosses to the host. `moe_capacity>0` +
+      triton is still refused (`order[keep]` = `nonzero`); `batched` dropless
+      (`counts.max().item()`), `bucketed` (`counts.tolist()`), `naive`
+      (`unique().tolist()`), `padded` dropless and `gather=kernel` are refused
+      with their Escape. The off-by-default `moe_route_fused` and
+      `moe_permute="count"` are refused by name too.
+      (2) LayerRoPE + `full_graph` is ALLOWED: every depth index the capture
+      reaches is fixed (`rand_depth`/`segment_len` are refused first), and the
+      recording holds one device-side slice per iteration; `opt_graph` stays
+      refused. `tests/test_layerrope.py` was updated to the new contract.
+      (3) **The bank-cache trap:** a `_banks` HIT at capture records no
+      `torch.stack`, so every replay would read the capture step's stack while
+      the optimizer moves the real parameters — the medbig2/b1night freeze,
+      now structurally closed by `FullGraph(pre_capture=drop_caches)`
+      (`invalidate_banks_all` + `invalidate_qat_cache_all` immediately before
+      the recording).
+      **The counter this task exists for:** a successful capture counts
+      `full_graph_captured=1` and logs it; a fallback counts
+      `full_graph_fallback=1` + the documented `opt_graph_fallback`. The gate
+      asserts the positive counter, so an arm that refuses and stays eager can
+      no longer look like a graph run (the class paid for twice).
+      Gates `port/tests/test_full_graph_m400b.py` (18 CPU + 3 GPU-skipped):
+      recipe legal; one refusal per ragged arm with `Escape:`; recompute LOUD;
+      the `prop` controller is device-only under `item/tolist/__float__/
+      __bool__` traps; capture/fallback counter deterministic on a faked CUDA
+      surface; pre-capture ordering; the off path's pinned 5-step sha; the
+      probe names `nonzero`; GPU: recipe capture + 20 replays + no fallback,
+      first replay vs the arm's own eager twin at 1e-6, and the 20-step drift
+      REPORTED (mHC/Muon chaos ~1e-1; not a 1e-6 bound).
+      Probe `port/scripts/probe_capture.py --target step` (TorchDispatchMode
+      over the real trainer, prints the last 12 ops + culprit) and
+      `--ops` (the per-op table). Bench `port/scripts/bench_graph.py`:
+      eager vs graph, min-of-5, ms/step + launches + B/s, `_lane.preflight`,
+      `--parity N` (first replay 1e-6 gated, N-replay drift printed).
+      **NOT RUN:** the card is owned by the multi-day m400b run; the probe,
+      bench and GPU gates were written and their CPU halves are green. The
+      checkpoint-gap command is in the bench docstring. No ms or parity number
+      is claimed until that command runs.
+
 - [x] P-LAYERROPE2. port (Python): upgrade LayerRoPE to the paper's reference
       form beside v1. `layerrope_form: "v1" | "paper"` (default `"v1"`, so no
       number on record moves). `"paper"` = the project page's snippet,
