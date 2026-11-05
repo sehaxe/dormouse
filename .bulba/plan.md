@@ -905,6 +905,59 @@ testable and A/B-able (ADR-0017).
       `scripts/kernel_profile.py` ×2 + `--diff`, with the arm at
       `--set residual_dtype=bf16` (below).
 
+- [x] P-TSCT-PACKED. port (Python): the 519-launch bank rebuild as ONE buffer.
+      `ModelConfig.tsct_packed` (OFF): `SparseMoE` owns `packed_v [E, r, f]`
+      (+ `packed_gate_u`/`packed_up_u [E, d, r]` when `share_u_mode="off"`) and
+      `packed_s [E, 2, r]`; each expert holds plain-tensor VIEWS
+      (`DualLatentGLU.bind_packed`, rebound after every load) and `_banks`
+      returns `buffer.to(dt)` instead of E casts + `stack`. MEASURED at m400b
+      (E=512, r=64, f=4096, bf16): **521 -> 5 launches** (plane; 1 543 -> 5
+      with `share_u` off) and **1 681 -> 1 010 MB** of operand traffic per
+      build; the transient drops by the second E-fold copy (~268 MB), steady
+      state is unchanged. The scales are views (`[E, 2, r]`), so the `[E, 2f,
+      r]` shape in the brief is read as the two input bases `[E, d, r]` + a
+      `[E, 2, r]` scale buffer: one concatenated `[E, 2d, r]` would make Muon
+      orthogonalize `[2d, r]` (the Gram mixes gate/up rows and the
+      `max(1,m/n)^0.5` scale is wrong), so the pair stays two buffers — two
+      casts, still 3 launches for v+scales at E=512.
+      OPTIMIZER: `is_muon_param` sends a 3-D parameter to Muon only when the
+      model marks it `_muon_batched`; `Muon._build_groups` gives it its own
+      `[E, d0, d1]` momentum buffer, the momentum update is one `add_`,
+      `batched_step_from_model` chunks the leading dim and writes
+      `colrow_normalize_ + update.mul_(-lr*scale) + add_` per slice (bit-equal
+      to E 2-D params on the gate fixture and in the whole-model step); the
+      per-parameter `Muon.step` and the `sf`/`normuon` tails REFUSE LOUDLY with
+      `Escape:`. CHECKPOINT: both ways, `strict=True` — old `experts.i.{v,
+      gate_s,up_s,gate_u,up_u}` gather into the packed buffers and a packed
+      `state_dict` expands back (`SparseMoE.state_dict(packed_form=)` writes
+      either form); the optimizer's per-parameter state is NOT convertible
+      across the flag (different parameter count), stated in the plan.
+      Gates `port/tests/test_tsct_packed.py` (14): OFF pins captured on clean
+      `907b3b5` before the edit (55 025 params, grad/state sha256, loss
+      5.939486); packed vs unpacked `torch.equal` on the bank (fp32+bf16, both
+      share modes), logits/loss and EVERY parameter gradient; the two-way
+      checkpoint round-trip incl. a real `torch.save` file; **521 -> 5
+      launches (104x)** at E=512 via the repo's `DispatchCounter`; Muon
+      routing/step/refusals; the starvation rule rejecting a tie + the
+      `--dry-run` table. Five scratch reverts each redden their named gate.
+      Driver `port/scripts/ab_tsct_starvation.py` (A E=512 b24, B E=128 b24,
+      C E=512 b8, D dense b24, E dense b8; 1500 steps, 2 seeds, eval every 500;
+      pre-registered rule printed in the file and the output; `--dry-run`
+      prints resolved configs, tokens/expert and the compute table; the b24 x
+      s1024 peak is 14.8 of 15.6 GiB, so the high tier RESOLVES TO b24 x s512
+      = 48 tokens/expert and says so) written, **NOT run** (this task trains
+      nothing; the card is busy). **No BPB, no verdict exists.**
+      Concurrency note: the shared tree was being edited by the TSCT-2 agent
+      while this task ran; the work is isolated on `wt/tsct-packed`
+      (`907b3b5`) and touches only config.py / experts.py / optim.py + the new
+      test and driver.
+      MERGED onto `main 1ab5020` (TSCT-2, `9b5e6dd`): the shared-plane conflict
+      is a precedence chain (TSCT-2's basis fold first, the packed view only
+      without a selector), `_MomGroup`/`__slots__` carry TSCT-2's
+      `tsct_ids`/`tsct_row` AND `packed`/`rows`, and `packed_v` rows take the
+      per-expert LR. `tests/test_tsct_merge.py` (3) gates the combined flags:
+      packed + `tsct_expert_basis=64` bank is `torch.equal` on 5/5 (max|Δ|=0)
+      and a packed + `tsct_expert_lr` step equals the unpacked rows exactly.
 - [x] P-TSCT-2. port (Python): the three OFF-by-default mechanisms from
       `docs/architecture/2026-11-05-tsct-2.md`. **The doc's `[d, 192]` was
       wrong**: at `ecc979e` the routed plane is `[d, rank]` (64 in every real
