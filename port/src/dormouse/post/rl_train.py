@@ -434,6 +434,7 @@ def rl_train(
         muon_variant=cfg.muon_variant,
         muon_sf=cfg.muon_sf,
         muon_sf_wd=cfg.muon_sf_wd,
+        muon_chunk_elems=cfg.muon_chunk_elems,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
@@ -462,6 +463,7 @@ def rl_train(
         ck, _stored = load_ckpt(run)
         load_model_state(model, cfg, ck["model"])
         opt.load_state_dict(ck["opt"])
+        opt.set_ns_steps(cfg.ns_steps)  # a PROGRESS key the loader would revert
         start = int(ck["step"]) + 1
         log(f"rl resume: step={start} opt_steps={opt.steps}")
 

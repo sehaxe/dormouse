@@ -1183,6 +1183,11 @@ def train(
         muon_variant=cfg.muon_variant,
         muon_sf=cfg.muon_sf,
         muon_sf_wd=cfg.muon_sf_wd,
+        # The lockstep NS cap (`train.muon_chunk_elems`): the schema default is
+        # the b1-safe 1<<25; the measured m400/medium recipe uses 1<<26. Without
+        # this kwarg the config field would be INERT (the same wiring rule the
+        # dtype rungs follow).
+        muon_chunk_elems=cfg.muon_chunk_elems,
         # The AdamW denominator floor (`train.adam_eps`): a one-line experiment
         # with a sourced mechanism — the equilibrium logit scale is bounded by
         # about log(1/eps), and 1e-8's ~18.4 nats sits above the fp32
@@ -1275,6 +1280,11 @@ def train(
         ck, _stored = load_ckpt(run)
         load_model_state(model, cfg, ck["model"])
         opt.load_state_dict(ck["opt"])
+        # `ns_steps` is a PROGRESS key, but torch's loader has just replaced
+        # the param groups with the CHECKPOINT's copies. Re-apply the config's
+        # count or the A/B would silently keep the old chain while the snapshot
+        # reported the new one.
+        opt.set_ns_steps(cfg.ns_steps)
         start = int(ck["step"]) + 1
         resumed_ema = ck.get("model_ema") if cfg.ema_decay > 0.0 else None
         if start:

@@ -235,7 +235,7 @@ def test_the_memory_cap_splits_the_batch_without_moving_a_value(monkeypatch):
     biggest-first sort REORDERING the work: the outputs still land at their
     input indices and are bit-identical to the per-matrix chain.
     """
-    monkeypatch.setattr(optim, "MUON_CHUNK_ELEMS", 3 * 64 * 64)
+    cap = 3 * 64 * 64
     torch.manual_seed(0)
     xs = [
         torch.randn(2, 64, 64) * 1e-3,
@@ -244,7 +244,10 @@ def test_the_memory_cap_splits_the_batch_without_moving_a_value(monkeypatch):
         torch.randn(1, 64, 64) * 1e-3,
     ]
     refs = [zeropower_via_ns(x, 2, "classic") for x in xs]
-    gots = _classic_ns_many(xs, 2)
+    # The cap is a keyword now (a config value, not a module constant read at
+    # step time); pass it explicitly or the test would silently run the
+    # ordinary single-batch path.
+    gots = _classic_ns_many(xs, 2, chunk_elems=cap)
     assert all(torch.equal(a, b) for a, b in zip(refs, gots, strict=True))
 
 
