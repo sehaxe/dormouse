@@ -1022,6 +1022,16 @@ class SparseMoE(nn.Module):
             # a default chosen to silence the error.
             self.tsct_packed = False
             self._packed_params = ()
+            # Every attribute the shared seams read must exist for the non-bank
+            # forms too: `_banks` is never called there, but `invalidate_banks`
+            # (the trainer's per-step call), the checkpoint translation and the
+            # cache-key branch read the epoch flag unconditionally. Two separate
+            # 200k-step launches died on the first step for this reason.
+            self.moe_bank_epoch = bool(cfg.moe_bank_epoch)
+            self.moe_combine = cfg.moe_combine
+            self.moe_combine_dtype = cfg.moe_combine_dtype
+            self.moe_permute = cfg.moe_permute
+            self.moe_kernel = cfg.moe_kernel
             return
         self.router_jitter = getattr(cfg, "moe_router_jitter", 0.0)
         self.moe_kernel = cfg.moe_kernel
