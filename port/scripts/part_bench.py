@@ -111,7 +111,7 @@ def main() -> int:
         "dense attention projections (4×latent + out)": dense,
         f"one expert on its rows ({max(1, t * a.topk // e)} rows)": expert_one,
         f"ALL {e} experts, python loop": expert_all_loop,
-        f"ALL experts' rows, ONE grouped pass": expert_all_stacked,
+        "ALL experts' rows, ONE grouped pass": expert_all_stacked,
         f"per-expert weights, ONE bmm ({rows} rows/expert)": expert_bmm,
         "norm/mHC-style elementwise chain (6 ops)": norm_epilogue,
     }

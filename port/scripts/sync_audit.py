@@ -85,7 +85,6 @@ def main() -> int:
     sys.argv = ["dormouse"] + argv
     Path("/tmp/opencode/syncaudit").mkdir(parents=True, exist_ok=True)
     # the resume needs a copy of the pair under the audit name
-    import shutil
 
     src = Path("/home/sehaxe/dormouse/checkpoints/m400")
     dst = Path("/tmp/opencode/syncaudit")
