@@ -458,7 +458,9 @@ class LoopBlock(nn.Module):
         # per block (each body owns the residual operator that deposits its
         # write); the lane STATE is not — it lives in `_window` across the loop.
         self.mhc = (
-            MHCMix(d, cfg.mhc_streams, device=device) if getattr(cfg, "use_mhc", False) else None
+            MHCMix(d, cfg.mhc_streams, device=device, sinkhorn=cfg.mhc_sinkhorn)
+            if getattr(cfg, "use_mhc", False)
+            else None
         )
         #: The residual chain as fused Triton kernels (`model/fused_residual.py`):
         #: `H_pre`'s lane mix, the AttnRes write, `H_res`/`H_post` and the readout

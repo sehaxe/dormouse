@@ -58,10 +58,28 @@ from torch import nn
 
 from .. import stepaudit
 
-__all__ = ["ALPHA_INIT", "EPS", "MHCMix", "SINKHORN_ITERS", "STATIC_INIT", "sinkhorn_knopp"]
+__all__ = [
+    "ALPHA_INIT",
+    "EPS",
+    "MHCMix",
+    "SINKHORN_IMPLS",
+    "SINKHORN_ITERS",
+    "STATIC_INIT",
+    "sinkhorn_knopp",
+]
 
 #: Sinkhorn-Knopp iterations (App. A.1: `t_max = 20`) — `sinkhorn.rs:5-6`.
 SINKHORN_ITERS = 20
+#: Eq. 9's normaliser. `"logsumexp"` is the shipped arithmetic, bit for bit:
+#: `m -= logsumexp(m)`. `"log_softmax"` is the SAME expression as one ATen op
+#: (`log_softmax` returns `m - logsumexp(m)`), so the value moves only by fp32
+#: roundoff (≤2.4e-7 absolute on probabilities, ≤1.8e-7 on the gradient,
+#: measured in `tests/test_mhc_write_launches.py`) while the launch family that
+#: the kernel profile priced — the per-normalisation `sub` that CUDA lowers to
+#: `CUDAFunctor_add` — disappears: 120 per Sinkhorn call, 881 ATen dispatches
+#: down to 81. The fused kernel (`fused_residual._write_kernel`) does not read
+#: this field: its 20 iterations are already in registers.
+SINKHORN_IMPLS = ("logsumexp", "log_softmax")
 #: Gating-factor init (App. A.1: `alpha = 0.01`) — `block.rs:5-6`.
 ALPHA_INIT = 0.01
 #: Static-bias magnitude: `sigmoid(10) ~ 1`, the full read-in gate —
@@ -72,7 +90,11 @@ EPS = 1e-20
 # burn: block.rs:5-9, :86-90; sinkhorn.rs:6 — the four crate constants above.
 
 
-def sinkhorn_knopp(logits: torch.Tensor, iters: int = SINKHORN_ITERS) -> torch.Tensor:
+def sinkhorn_knopp(
+    logits: torch.Tensor,
+    iters: int = SINKHORN_ITERS,
+    impl: str = "logsumexp",
+) -> torch.Tensor:
     """Eq. 9: the log-domain Sinkhorn-Knopp projection onto the Birkhoff polytope.
 
     `logits [..., n, n]` → `M⁽⁰⁾ = exp(logits)`, then `iters` alternating
@@ -80,8 +102,23 @@ def sinkhorn_knopp(logits: torch.Tensor, iters: int = SINKHORN_ITERS) -> torch.T
     `m -= logsumexp(m)`, which is shift-invariant and never overflows — the
     naive exp-then-divide form breaks on the hyper-network's unbounded output
     (`sinkhorn.rs:8-21`). Burn: `sinkhorn.rs:22-71`.
+
+    `impl="log_softmax"` replaces each `m - logsumexp(m)` with the single
+    `torch.log_softmax` op that is the same expression: one dispatch (≈3 CUDA
+    kernels) instead of a reduction's ~6 kernels plus the separate subtract.
+    The value is the same to fp32 roundoff and NOT bit-identical, which is why
+    it is a named arm with `logsumexp` as the default.
     """
+    assert impl in SINKHORN_IMPLS, (
+        f"sinkhorn_knopp(impl={impl!r}) is not a normaliser. Escape: impl in {SINKHORN_IMPLS}."
+    )
     m = logits
+    if impl == "log_softmax":
+        for _ in stepaudit.iterations("mhc.sinkhorn", range(iters)):
+            # `log_softmax(dim)` IS `m - logsumexp(m, dim, keepdim=True)`.
+            m = torch.log_softmax(m, dim=-1)
+            m = torch.log_softmax(m, dim=-2)
+        return m.exp()
     for _ in stepaudit.iterations("mhc.sinkhorn", range(iters)):
         # burn: sinkhorn.rs:48-68 — row then column, both `m -= logsumexp(m)`.
         m = m - torch.logsumexp(m, dim=-1, keepdim=True)
@@ -99,13 +136,21 @@ class MHCMix(nn.Module):
     """
 
     def __init__(
-        self, d_model: int, n_streams: int = 2, device: torch.device | str = "cpu"
+        self,
+        d_model: int,
+        n_streams: int = 2,
+        device: torch.device | str = "cpu",
+        sinkhorn: str = "logsumexp",
     ) -> None:
         super().__init__()
         assert n_streams >= 1, "n_streams (the expansion rate n) must be >= 1"
+        assert sinkhorn in SINKHORN_IMPLS, (
+            f"sinkhorn={sinkhorn!r} is not a normaliser. Escape: {SINKHORN_IMPLS}."
+        )
         d, n = int(d_model), int(n_streams)
         self.d_model = d
         self.n_streams = n
+        self.sinkhorn = sinkhorn
         total = n * d
         # burn: block.rs:81-97 — φ ~ N(0, 0.01), α = 0.01.
         # Eq. 7's projections: φ_pre/φ_post [nC, n], φ_res [nC, n²], drawn
@@ -163,7 +208,7 @@ class MHCMix(nn.Module):
         return (
             torch.sigmoid(pre).unsqueeze(-2),
             2.0 * torch.sigmoid(post).unsqueeze(-2),
-            sinkhorn_knopp(res),
+            sinkhorn_knopp(res, impl=self.sinkhorn),
         )
 
     def pre_mix(self, x_streams: torch.Tensor) -> torch.Tensor:
@@ -186,7 +231,7 @@ class MHCMix(nn.Module):
         """
         post, res = self._post_res_tilde(x_streams)
         h_post = (2.0 * torch.sigmoid(post)).unsqueeze(-2)  # [b, t, 1, n]
-        h_res = sinkhorn_knopp(res)
+        h_res = sinkhorn_knopp(res, impl=self.sinkhorn)
         # burn: block.rs:213-226 — H_res x_l, then H_postᵀ F added per lane.
         mixed = torch.einsum("btij,btjd->btid", h_res, x_streams)
         return mixed + h_post.transpose(-1, -2) * x_in.unsqueeze(-2)
