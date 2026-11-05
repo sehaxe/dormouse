@@ -56,17 +56,17 @@ TINY_BASE = 64_881
 TINY_BLOCK = 45_737
 
 #: The `medium` preset: base and one extra block, from `dormouse info`.
-MEDIUM_BASE = 141_910_405
-MEDIUM_BLOCK = 141_561_153
+MEDIUM_BASE = 138_436_993
+MEDIUM_BLOCK = 138_087_745
 MEDIUM_TOTALS = {
-    1: 141_910_405,
-    2: 283_471_558,
-    3: 425_032_711,
-    4: 566_593_864,
+    1: 138_436_993,
+    2: 276_524_738,
+    3: 414_612_483,
+    4: 552_700_228,
 }
 #: The driver block's own count — constant across `loop_blocks` (the
 #: per-iteration slots live once, not once per body).
-MEDIUM_LOOP = 141_565_253
+MEDIUM_LOOP = 138_091_841
 
 
 def _batch() -> tuple[torch.Tensor, torch.Tensor]:

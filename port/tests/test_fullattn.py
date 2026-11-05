@@ -60,8 +60,8 @@ KDA_ENGRAM_OFF_SHA = "ef1c14cc7058d4a9fe10cae1e3efad6822f3fa4aab21cdf564ed23604f
 #: Moved 2026-10-26: `use_engram=false` no longer builds the dead `mem_dense`.
 #: The Engram-ON `KDA_SHA` above is unchanged.
 
-MEDIUM_KDA_PARAMS = 141_910_405
-MEDIUM_FULL_PARAMS = 141_894_021
+MEDIUM_KDA_PARAMS = 138_436_993
+MEDIUM_FULL_PARAMS = 138_420_609
 
 
 def _batch() -> tuple[torch.Tensor, torch.Tensor]:

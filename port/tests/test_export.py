@@ -163,7 +163,10 @@ def test_export_plan_matches_the_medium_preset_arithmetic() -> None:
     rep = export_plan(DormouseModel(load_preset("medium"), device="meta"))
     assert rep.counts["factors"] == 79_413_120
     assert rep.groups["factors"] == 19_854_830  # n/4 + 2 B x 775 factors
-    assert rep.total_bytes == 144_849_912
+    # 144_849_912 was measured when `medium` still built MSA (7 569 408 params at
+    # d=1024 ... 3 473 412 in the preset). `use_msa=false` in the preset removed
+    # them (`907b3b5`), so the plan's byte total drops by the same tensors.
+    assert rep.total_bytes == 137_903_088
 
 
 def test_exported_file_size_is_what_the_report_says(tmp_path: Path) -> None:
