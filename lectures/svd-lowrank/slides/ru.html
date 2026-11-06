@@ -102,7 +102,7 @@
     <div class="k">линейная алгебра · первая лекция цикла · 25 минут</div>
     <h1>Зачем матрицу можно<br>заменить <em>двумя тонкими</em></h1>
     <p class="sub">Теорема Эккарта–Янга, один опыт и один результат, который противоречит ожиданию.</p>
-    <div class="footer"><span>числа измерены на модели с 102 678 943 параметрами</span><span>01 / 14</span></div>
+    <div class="footer"><span>числа измерены на модели с 102 678 943 параметрами</span><span>01 / 15</span></div>
   </section>
 
   <!-- 02 hook -->
@@ -124,7 +124,7 @@
         <p class="mono-sm" style="margin-top:12px">всё остальное выведем по дороге</p>
       </div>
     </div>
-    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>02 / 14</span></div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>02 / 15</span></div>
   </section>
 
   <!-- 03 geometry -->
@@ -161,7 +161,7 @@
         </svg>
       </div>
     </div>
-    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>03 / 14</span></div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>03 / 15</span></div>
   </section>
 
   <!-- 04 formal -->
@@ -186,7 +186,7 @@
         <p class="body">Проверьте на следующей паре: [3 0; 0 4] → σ = 4 и 3.</p>
       </div>
     </div>
-    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>04 / 14</span></div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>04 / 15</span></div>
   </section>
 
   <!-- 05 svd -->
@@ -205,7 +205,7 @@
     </table>
     <p class="body" style="margin-top:12px">Полезная арифметика: <b>сумма квадратов всех элементов матрицы
       равна сумме квадратов её σ</b>. Поэтому σ² — это «сколько энергии» сидит в направлении i.</p>
-    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>05 / 14</span></div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>05 / 15</span></div>
   </section>
 
   <!-- 06 hand example -->
@@ -228,7 +228,7 @@
           у которых ранг мал по сравнению с размером.</p>
       </div>
     </div>
-    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>06 / 14</span></div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>06 / 15</span></div>
   </section>
 
   <!-- 07 theorem -->
@@ -246,7 +246,7 @@
       <li><span class="m">02</span><span>ошибку видно <span class="accent">заранее</span>: это хвост спектра, считать после обучения не нужно</span></li>
       <li><span class="m">03</span><span>здесь ‖·‖ — «корень из суммы квадратов всех элементов» (евклидова длина матрицы)</span></li>
     </ul>
-    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>07 / 14</span></div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>07 / 15</span></div>
   </section>
 
   <!-- 08 why -->
@@ -271,7 +271,7 @@
           Это факт про линейные отображения.</p>
       </div>
     </div>
-    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>08 / 14</span></div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>08 / 15</span></div>
   </section>
 
   <!-- 09 demo -->
@@ -282,7 +282,16 @@
     <p class="body" style="margin-top:8px">Цветная картинка — это <b>три матрицы</b> (R, G, B), каждая сжимается
       отдельно: 691 200 чисел в оригинале. При ранге 20 их 57 600 — <b>в 12 раз меньше</b>, и ошибка 14.0%,
       ровно та, что даёт формула. При ранге 50 в 4.8 раза меньше, ошибка 9.8%.</p>
-    <div class="footer"><span>числа печатает src/demo_svd_image.py — запускается за две секунды</span><span>09 / 14</span></div>
+    <div class="footer"><span>числа печатает src/demo_svd_image.py — запускается за две секунды</span><span>09 / 15</span></div>
+  </section>
+
+  <!-- 10 compare -->
+  <section class="slide">
+    <div class="k">[+] опыт · две картинки, одни и те же ранги</div>
+    <h2 class="sm">Ошибка зависит не от красоты, а от хвоста</h2>
+    <img class="fig" src="../figures/compare_demo.png" alt="рисунок и фото при рангах 5 и 20" style="width:60%;margin:0 auto">
+    <p class="body" style="margin-top:4px">Одни и те же 57 600 чисел: рисунок 14.0% ошибки, фото 8.8% —
+      у фото энергия в плавных градиентах, у рисунка в контурах. <b>Стоимость сжатия решает спектр, не сюжет.</b></p>
   </section>
 
   <!-- 10 sigma vs lambda -->
@@ -310,7 +319,7 @@
           она переводит в вектор длины 1. Это видно только через σ.</p>
       </div>
     </div>
-    <div class="footer"><span>на экзамене за это снимают баллы — запомните раз и навсегда</span><span>10 / 14</span></div>
+    <div class="footer"><span>на экзамене за это снимают баллы — запомните раз и навсегда</span><span>11 / 15</span></div>
   </section>
 
   <!-- 11 network -->
@@ -320,7 +329,7 @@
     <img class="fig" src="../figures/spectrum.png" alt="спектры сингулярных чисел четырёх обученных матриц" style="margin-top:2px">
     <p class="body" style="margin-top:6px">Четыре матрицы из настоящей модели: 1024×2730, 1024×256,
       1024×1024 и 64×2730. Спектр падает, но <b>ни одна не обрывается в ноль</b>.</p>
-    <div class="footer"><span>сеть на 102 млн параметров, обученная на 4.2 ГБ текста</span><span>11 / 14</span></div>
+    <div class="footer"><span>сеть на 102 млн параметров, обученная на 4.2 ГБ текста</span><span>12 / 15</span></div>
   </section>
 
   <!-- 12 surprise dark -->
@@ -343,7 +352,7 @@
           плохая идея. А последняя строка — исключение, и у него структурная причина.</p>
       </div>
     </div>
-    <div class="footer"><span>это тот самый момент, когда теория и практика расходятся</span><span>12 / 14</span></div>
+    <div class="footer"><span>это тот самый момент, когда теория и практика расходятся</span><span>13 / 15</span></div>
   </section>
 
   <!-- 13 resolution -->
@@ -367,7 +376,7 @@
     </div>
     <p class="body" style="margin-top:10px">Теорема Эккарта–Янга ограничивает первое. Про второе она не говорит
       <span class="accent">ничего</span> — а именно второе работает в реальных моделях.</p>
-    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>13 / 14</span></div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>14 / 15</span></div>
   </section>
 
   <!-- 14 takeaway -->
@@ -391,7 +400,7 @@
           факторизация весов в нейросетях</p>
       </div>
     </div>
-    <div class="footer"><span>все числа воспроизводятся скриптами src/*.py</span><span>14 / 14</span></div>
+    <div class="footer"><span>все числа воспроизводятся скриптами src/*.py</span><span>15 / 15</span></div>
   </section>
 
 </div>
