@@ -196,6 +196,11 @@ class DormouseModel(nn.Module):
         #: (`train/loop.py`'s `mtp_field`) — never per step (ADR-0018 rule 2).
         self.mtp: MTPHead | None = None
         self.last_mtp: torch.Tensor | None = None
+        #: The MoD router's BCE aux value (`model/transformer.py`), DETACHED by
+        #: the forward and read only on the log cadence (`train/loop.py`'s
+        #: `mod_field`) — never per step (ADR-0018 rule 2). `None` when the arm
+        #: is off or the forward ran no routed block.
+        self.last_mod_aux: torch.Tensor | None = None
         #: The ENERGY head (`energy.py`, EBT arXiv:2507.02092): inference
         #: reranker and an OPTIONAL contrastive training term, built IFF
         #: `energy_weight > 0`. Declared before the byteflow early return so a
@@ -1201,9 +1206,20 @@ class DormouseModel(nn.Module):
         are loop-only and `validate_block_form` refuses their weights.
         """
         h = self.embed(input_ids)
+        mod_aux = None
         for block in stepaudit.iterations("forward.transformer_blocks", self.transformer_blocks):
             h = block(h, counters)
             counters.count("transformer_block")
+            aux = getattr(block, "last_aux", None)
+            if aux is not None:
+                mod_aux = aux if mod_aux is None else mod_aux + aux
+        self.last_mod_aux = None
+        if mod_aux is not None:
+            # The arm's BCE value is ONE number per forward: the mean over the
+            # routed blocks (the paper's per-block term, not per-token). The
+            # trainer weights it by `mod_aux_weight` and logs it as `mod_aux=`.
+            mod_aux = mod_aux / len(self.transformer_blocks)
+            self.last_mod_aux = mod_aux.detach()
         hn = self.norm(h.to(torch.float32))
         logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
         if self.cfg.logit_softcap > 0.0:
@@ -1225,6 +1241,10 @@ class DormouseModel(nn.Module):
                 # Eval-only host read (the same contract `_forward_byte_lm`'s
                 # breakdown block documents): never in a training step.
                 self.last_breakdown = {"fin": float(loss.detach()), "per_iter": []}
+            if mod_aux is not None and self.cfg.mod_aux_weight:
+                # The paper's §3.5 aux, weighted: `CE + α·BCE(router, top-k)`.
+                # `mod_aux` stays attached so the router learns from it.
+                loss = loss + self.cfg.mod_aux_weight * mod_aux
         return logits, loss
 
 

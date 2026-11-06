@@ -139,6 +139,18 @@ def halt_field(model: torch.nn.Module) -> str:
     return "" if value is None else f"halt={float(value):.4f}"
 
 
+def mod_field(model: torch.nn.Module) -> str:
+    """`mod_aux=<BCE>` — the MoD router's aux value, on the log cadence.
+
+    The routed block leaves the term DETACHED on the model (`last_mod_aux`) and
+    never reads it; this is the one declared read, once per log window (the
+    same contract as `mtp_field`/`halt_field`). Empty when no routed block ran
+    (`mod_capacity=1.0` builds no router).
+    """
+    value = getattr(model, "last_mod_aux", None)
+    return "" if value is None else f"mod_aux={float(value):.4f}"
+
+
 def ce_field(cfg: TrainConfig, drained: dict) -> str:
     """`ce_cliff=N` when the fixed CE is on: 0 is a statement, not an absence.
 
@@ -1925,6 +1937,7 @@ def train(
                 kda_field(window),
                 halt_field(model),
                 mtp_field(model),
+                mod_field(model),
                 ce_field(cfg, drained),
                 window.line(),
             ]
