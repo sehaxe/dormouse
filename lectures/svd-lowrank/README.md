@@ -15,7 +15,9 @@
 | `notes-ru.md` | конспект выступающего: тайминг, что писать на доске, где задать вопрос залу, 5 вопросов с ответами, что прочитать за час |
 | `handout-ru.html`, `handout-ru.pdf` | раздатка на 2 страницы: определения, разобранный пример, теорема, 4 задачи с ответами |
 | `src/lecture_svd.py` | спектры реальных матриц модели → `numbers.json` + рисунки |
-| `src/demo_svd_image.py` | опыт с картинкой: rank 1/5/20/50, ошибка, число чисел |
+| `src/demo_svd_image.py` | опыт с картинкой (цвет, три канала): rank 1/5/20/50, ошибка, число чисел |
+| `figures/photo_demo.png` | кадр для слайда 09 — цветная картинка, сжатая по рангу |
+| `figures/text_demo.png` | альтернативный кадр: страница текста (если фото неуместно) |
 | `numbers.json` | все числа, которые цитируются на слайдах |
 
 ## Как показывать
@@ -35,7 +37,8 @@ xdg-open slides/ru.html
 ```bash
 cd /home/sehaxe/dormouse/port
 CUDA_VISIBLE_DEVICES= .venv/bin/python ../lectures/svd-lowrank/src/lecture_svd.py
-CUDA_VISIBLE_DEVICES= .venv/bin/python ../lectures/svd-lowrank/src/demo_svd_image.py --image ~/Pictures/твоё-фото.jpg
+CUDA_VISIBLE_DEVICES= .venv/bin/python ../lectures/svd-lowrank/src/demo_svd_image.py \
+    --image ~/Downloads/telegram/photo.jpg --out photo_demo.png
 # затем открой HTML и нажми p → «Сохранить как PDF» (размер страницы 1280×720)
 ```
 
