@@ -280,7 +280,13 @@ def _run(preset: str, sets: list[str]):
 
 
 def _snapshot_run(
-    out_dir: Path, ckpt_name: str, *, eval_file: str | None = None, eval_batches: int | None = None
+    out_dir: Path,
+    ckpt_name: str,
+    *,
+    eval_file: str | None = None,
+    eval_batches: int | None = None,
+    eval_bytes: int | None = None,
+    eval_offset: int | None = None,
 ):
     """Eval/decode resolve FROM THE SNAPSHOT, never from a preset: the snapshot
     IS the resolved run (`RunConfig.from_snapshot`). Only progress keys may be
@@ -299,10 +305,20 @@ def _snapshot_run(
         over["eval_data"] = eval_file
     if eval_batches is not None:
         over["eval_batches"] = eval_batches
-    # `eval_data` is measurement, not a model-computing config — the snapshot's
-    # strictness covers what the model computes; scoring against a different
-    # held-out file is how a checkpoint is used, not a different experiment.
-    allowed = set(PROGRESS_KEYS) | {"eval_data"}
+    if eval_bytes is not None:
+        over["eval_bytes"] = eval_bytes
+        over["eval_batches"] = None
+    if eval_offset is not None:
+        over["eval_offset"] = eval_offset
+    # The eval WINDOW and OFFSET are the measurement, not the model: scoring a
+    # checkpoint on another window is how it is read, not a different
+    # experiment (the same class as `eval_data`). The forward is untouched.
+    allowed = set(PROGRESS_KEYS) | {
+        "eval_data",
+        "eval_batches",
+        "eval_bytes",
+        "eval_offset",
+    }
     bad = [k for k in over if k not in allowed]
     if bad:
         raise LoudError(
@@ -759,10 +775,17 @@ def eval_cmd(
         Path | None, typer.Option("--eval", help="score against THIS file")
     ] = None,
     eval_batches: Annotated[int | None, typer.Option("--eval-batches")] = None,
+    eval_bytes: Annotated[
+        int | None,
+        typer.Option("--eval-bytes", help=f"window in scored bytes (default {196_608})"),
+    ] = None,
+    eval_offset: Annotated[
+        int | None, typer.Option("--eval-offset", help="pinned byte offset (default 0)")
+    ] = None,
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
 ) -> None:
     """Held-out BPB of a checkpoint. It resolves from the checkpoint's own snapshot."""
-    from .train.data import open_streams
+    from .train.data import eval_batches_for, open_streams
     from .train.loop import evaluate as _evaluate
     from .train.loop import load_model_half, load_model_state
 
@@ -773,6 +796,8 @@ def eval_cmd(
         ckpt_name,
         eval_file=None if eval_file is None else str(eval_file),
         eval_batches=eval_batches,
+        eval_bytes=eval_bytes,
+        eval_offset=eval_offset,
     )
     run.train = dataclasses.replace(run.train, eval=True)
     dev = _device(device)
@@ -787,13 +812,15 @@ def eval_cmd(
     if eval_stream is None:
         raise LoudError("no eval stream (the snapshot carries eval_data or eval=true)")
     loss, scored, fin, _per_iter = _evaluate(
-        model, eval_stream, run.train.eval_batches, device=None if dev.type == "cpu" else dev
+        model, eval_stream, eval_batches_for(run.train),
+        device=None if dev.type == "cpu" else dev,
     )
     console.print(
         Panel(
             f"[bold]{ckpt_name}[/] · [bold]{fin / _LN2:.3f}[/] BPB (fin) · "
-            f"{loss / _LN2:.3f} headline",
-            subtitle=f"loss {loss:.4f} fin {fin:.4f} over {scored:,} B = {run.train.eval_batches}"
+            f"{loss / _LN2:.3f} depth-mean",
+            subtitle=f"loss {loss:.4f} fin {fin:.4f} over {scored:,} B = "
+            f"{eval_batches_for(run.train)}"
             f" x {run.train.batch} x {run.train.seq_len}",
         )
     )

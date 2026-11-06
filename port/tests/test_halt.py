@@ -288,7 +288,7 @@ def test_max_iter_eight_builds_trains_and_curves(tmp_path):
     assert model.loop.iter_embed.shape[0] == 8
     assert param_count(model) > param_count(tiny_model(max_iter=4))
 
-    run = tiny_run(tmp_path, steps=4, log_every=2, eval=True)
+    run = tiny_run(tmp_path, steps=4, log_every=2, eval=True, eval_batches=3)
     run = dataclasses.replace(run, model=tiny_cfg(max_iter=8))
     report = train(DormouseModel(run.model), run, log=lambda *_: None)
     assert report["nan_skipped"] == 0

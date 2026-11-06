@@ -327,7 +327,9 @@ def test_cli_eval_and_decode_load_a_rung_checkpoint(tmp_path: Path, quant: str):
     """
     corpus = _save_rung_checkpoint(tmp_path, quant)
     ck = ["--out-dir", str(tmp_path / "ck"), "--ckpt-name", "rung", "--device", "cpu"]
-    ev = runner.invoke(app, ["eval", *ck, "--eval", str(corpus)])
+    ev = runner.invoke(
+        app, ["eval", *ck, "--eval", str(corpus), "--eval-batches", "2"]
+    )
     assert ev.exit_code == 0, ev.output
     assert "BPB" in ev.output
     dec = runner.invoke(app, ["decode", *ck, "--prompt", "abcdefgh", "--n", "4"])

@@ -1786,7 +1786,25 @@ class TrainConfig:
     ckpt_name: str = "port"
     eval: bool = False
     eval_every: int = 50
-    eval_batches: int = 20
+    #: THE EVAL WINDOW, in SCORED BYTES. 196 608 = 24 x 8 x 1024: the burn
+    #: flagship's b24 window, and the width that moved the SAME checkpoint
+    #: +0.045..+0.050 BPB against the old 65 536
+    #: (docs/reviews/2026-11-06-bpb-accounting.md §3). A BPB is only comparable
+    #: within one window, so this field is the only source of that width.
+    #: REFUSED below 65 536: one 64 KB window has a 95% interval of about
+    #: +-0.19 BPB on this corpus — a narrower number is not a measurement.
+    eval_bytes: int = 196_608
+    #: Legacy explicit window in BATCHES (`eval_batches x batch x seq_len`).
+    #: `None` = derive the batch count from `eval_bytes` (the default). A
+    #: checkpoint snapshot that carries a number keeps its recorded window:
+    #: its curve was measured there and must stay readable — that is also the
+    #: deliberate below-the-floor override the tiny CPU fixtures use.
+    eval_batches: int | None = None
+    #: WHERE the eval window starts, in bytes into the eval file (or into the
+    #: eval tail when no separate `eval_data` is set). 0 = the head. It is
+    #: printed as `off=` on the eval line: `rewind()` alone makes two evals at
+    #: the SAME offset comparable, not two runs at different ones.
+    eval_offset: int = 0
     #: `mix` = Muon on 2-D params + AdamW elsewhere (the default); `adamw` =
     #: the fallback arm, which is the same code with the routing disabled.
     opt: str = "mix"
@@ -4363,6 +4381,14 @@ def rl_config(tcfg: TrainConfig) -> RLConfig:
     )
 
 
+#: The floor of a defensible held-out eval window (`TrainConfig.eval_bytes`).
+#: One 64 KB window has a 95 % interval of about ±0.19 BPB on this corpus
+#: (docs/reviews/2026-11-06-bpb-accounting.md §3), so a narrower window is a
+#: reading of one document, not a BPB. ONE definition: `train/data.py` imports
+#: this for the loader and `validate_train` refuses below it.
+MIN_EVAL_BYTES = 65_536
+
+
 def validate_train(tcfg: TrainConfig) -> None:
     """The train-half refusals the CLI and a hand-built `train()` share.
 
@@ -4376,6 +4402,27 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"per optimizer step, so 1 is one forward/backward and 0 or a negative "
             f"value would mean a step with no gradient at all. Escape: "
             f"grad_accum >= 1 (the default 1)."
+        )
+    if (tcfg.eval or tcfg.eval_data) and tcfg.eval_batches is None:
+        if tcfg.eval_bytes < MIN_EVAL_BYTES:
+            loud(
+                f"eval_bytes={tcfg.eval_bytes} is below the {MIN_EVAL_BYTES} B "
+                f"floor. One 64 KB window has a 95 % interval of about ±0.19 BPB "
+                f"on this corpus, so a narrower window is not a measurement. "
+                f"Escape: eval_bytes >= {MIN_EVAL_BYTES} (196608 is the default "
+                f"and the flagship's window)."
+            )
+    if tcfg.eval_batches is not None and tcfg.eval_batches < 1:
+        loud(
+            f"eval_batches={tcfg.eval_batches}: the legacy window override is a "
+            f"positive number of batches. Escape: eval_batches >= 1, or leave it "
+            f"unset and set eval_bytes."
+        )
+    if tcfg.eval_offset < 0:
+        loud(
+            f"eval_offset={tcfg.eval_offset}: the eval window starts at a BYTE "
+            f"offset into the held-out file, so a negative value is a rewind "
+            f"outside the file. Escape: eval_offset >= 0 (0 = the head)."
         )
     if not tcfg.agc_clip >= 0.0:
         loud(

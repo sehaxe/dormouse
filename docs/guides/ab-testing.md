@@ -69,18 +69,51 @@ A/B" below.
 
 ## The window: a BPB is only comparable within one window
 
-The eval window is **`eval_batches × batch × seq_len` bytes**
-(`crates/dormouse-train/src/lib.rs:1417`), `rewind()` before every eval, and
-**the byte count printed on the eval line is the authority** — quote it in any
-table. The concrete damage: the best number on record, **4.997**, is a
-**20 480 B** window at depth 2; the **6.351** is a **102 400 B** window at
-depth 4 — not two points on one curve, two different measurements, and no run
-in the archive has been scored on both (`docs/protocols/AB-PROTOCOL.md`). The
-current control family and every arm in the 2026-10-01 wave share **81 920 B**
-(20 batches × batch 8 × seq 512), and every one of them is batch 8
+The eval window is **`eval_bytes` scored bytes** — 196 608 by default
+(24 × batch 8 × seq 1024), refused below 65 536; a legacy snapshot's
+`eval_batches × batch × seq_len` is the same quantity and still wins when it
+is set. The window starts at a pinned **`eval_offset`**, printed as `off=` on
+the eval line, and `rewind()` before every eval. **The byte count printed on
+the eval line is the authority** — quote it in any table. The concrete damage:
+the best number on record, **4.997**, is a **20 480 B** window at depth 2; the
+**6.351** is a **102 400 B** window at depth 4 — not two points on one curve,
+two different measurements, and no run in the archive has been scored on both
+(`docs/protocols/AB-PROTOCOL.md`). The current control family and every arm in
+the 2026-10-01 wave share **81 920 B** (20 batches × batch 8 × seq 512), and
+every one of them is batch 8
 (`docs/reviews/ab-wave-2026-10-01.md:8-11`). If an A/B table has one arm at a
 different batch size from its control, **the table is void regardless of what
 the numbers say**.
+
+## Which BPB number to quote
+
+Four fields make a BPB a number; a sentence that omits one of them is not one.
+
+1. **`bpb_fin`, never the depth mean.** `bpb_fin` is the CE of the final mean
+   readout — the readout generation uses. `bpb` in the JSONL IS `bpb_fin`;
+   `bpb_mean` (and `loss`) is the depth-averaged training objective
+   `(Σ CE_i + CE_final)/(T+1)` and is **not** the model's BPB. On one
+   checkpoint the two differed by **0.116 BPB** (1.729 headline vs 1.617 fin);
+   the gap is a function of depth, not noise
+   (`docs/reviews/2026-11-06-bpb-accounting.md` §6).
+2. **The window in bytes.** Quote `eval_bytes` (or `over N B` off the eval
+   line), not "N batches": a batch size is a throughput knob and it changes
+   the window. 196 608 B is the current default; the 65 536 B floor exists
+   because one 64 KB window has a 95 % interval of about ±0.19 BPB on this
+   corpus (§3).
+3. **The offset.** `off=` is the absolute byte the window starts at. Two
+   evals are comparable only at the same offset and the same width; a
+   different offset is a different sample and must be labelled as one.
+4. **The noise floor.** A same-seed rerun moved **0.043 BPB** on CUDA under a
+   shared GPU (`docs/reviews/2026-11-06-control-transformer.md` §"Caveats").
+   Measure the floor on the setup you are using, with
+   `port/scripts/noise_floor.py` (two same-seed trials, prints the spread at
+   the configured window/offset — measured **0.0000 BPB on the CPU tiny run**),
+   and compare an A/B's delta against that floor, never against 0.01.
+
+The old "paired-eval resolution 0.002–0.005 BPB" was an estimate from
+independent bytes. It is superseded: the *instrument* floor is measured, and
+the *training-seed* floor is still the reason the protocol wants 3 seeds.
 
 ## The yardstick: a 3-seed control and its own spread
 
@@ -246,13 +279,11 @@ final rating.
 
 ## The noise floor under everything
 
-The paired-eval resolution on a fixed window is **estimated at 0.002–0.005
-BPB and NOT VERIFIED** — measure it before believing a win that small:
-evaluate the *same* checkpoint twice at the same depth and confirm the numbers
-are bit-identical, then run two control seeds before believing any win smaller
-than their spread; and fix the window first, because "the same checkpoint
-twice" is only a resolution measurement if the byte count on both eval lines
-is identical (`docs/protocols/AB-PROTOCOL.md`, "Measure the noise floor
-first"). The real floor is the training seed — which is exactly why the
-protocol is 3 seeds, a control family, and a bar made of the control's own
-spread.
+A same-seed rerun moved **0.043 BPB** on CUDA under a shared GPU
+(`docs/reviews/2026-11-06-control-transformer.md` §"Caveats"), which is why the
+protocol also wants 3 seeds. Measure the floor on your own setup with
+`port/scripts/noise_floor.py` (two trials, same seed, same window/offset) and
+compare any delta against the larger of the instrument floor and the control's
+seed spread — see "Which BPB number to quote" above. The real floor is the
+training seed, which is exactly why the protocol is 3 seeds, a control family,
+and a bar made of the control's own spread.

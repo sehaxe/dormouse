@@ -213,7 +213,7 @@ def test_open_streams_wraps_the_train_side_only(tmp_path):
     (tmp_path / "corpus.bin.docs.json").write_text(
         json.dumps({"version": 1, "size": 4096, "starts": starts})
     )
-    run = _run(tmp_path, corpus, doc_masking=True, eval=True)
+    run = _run(tmp_path, corpus, doc_masking=True, eval=True, eval_batches=3)
     tr, ev = open_streams(run)
     assert isinstance(tr, DocPackedStream)
     assert isinstance(ev, ByteStream)
