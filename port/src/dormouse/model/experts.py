@@ -3094,6 +3094,7 @@ class SparseMoE(nn.Module):
         out.index_add_(0, owner, y)
         return out
 
+    @torch.compiler.disable
     def _naive_dispatch(
         self,
         x: torch.Tensor,
@@ -3103,7 +3104,18 @@ class SparseMoE(nn.Module):
         keep: torch.Tensor,
         counters: Counters,
     ) -> torch.Tensor:
-        """Gather → per-expert matmul → scatter. The reference and the CPU path."""
+        """Gather → per-expert matmul → scatter. The reference and the CPU path.
+
+        COUNTED COMPILE BREAK (`scripts/bench_compile.py`'s explain pass). The
+        body is a per-expert Python loop over `torch.unique(ids_in).tolist()` —
+        a device read whose output shape is data, so no graph can hold it. Left
+        to dynamo it splits the graph FOUR times per dispatch (`Dynamic shape
+        operator` at the `unique` below); the decorator makes that ONE break
+        named `skip inlining torch.compiler.disable()d function`, which is the
+        same program with a smaller, stable guard set (the loop's Python values
+        are no longer re-specialised as the routed expert set changes). Eager is
+        a no-op: `torch.compiler.disable` only affects tracing.
+        """
         n, k = index.shape
         flat_w = weight.reshape(-1)
         sorted_ids = index.reshape(-1)[order]
