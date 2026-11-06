@@ -13,7 +13,25 @@
     --ink:#201d1d; --body:#424245; --mute:#646262; --faint:#9a9898;
     --line:rgba(15,0,0,.14); --bg:#fdfcfc; --dark:#201d1d; --on:#fdfcfc;
     --accent:#007aff; --danger:#ff3b30; --success:#30d158; --card:#f1eeee;
+    --dkbg:#201d1d; --on:#fdfcfc; --softon:rgba(253,252,252,.84); --dline:rgba(253,252,252,.22);
   }
+  /* projection: pure ink on pure paper, thicker rules, no pastel */
+  body[data-theme="light"]{
+    --bg:#ffffff; --ink:#000000; --body:#111111; --mute:#3a3a3a; --faint:#5a5a5a;
+    --line:rgba(0,0,0,.42); --accent:#0055cc; --danger:#c4140a; --success:#0a7a2f; --card:#ffffff;
+    --dkbg:#ffffff; --on:#000000; --softon:#111111; --dline:rgba(0,0,0,.42);
+  }
+  body[data-theme="dark"]{
+    --bg:#000000; --ink:#ffffff; --body:#e8e8e8; --mute:#b4b4b4; --faint:#8f8f8f;
+    --line:rgba(255,255,255,.42); --accent:#4da3ff; --danger:#ff6b62; --success:#4ade80; --card:#0d0d0d;
+    --dkbg:#000000; --on:#ffffff; --softon:#e8e8e8; --dline:rgba(255,255,255,.42);
+  }
+  body[data-theme="light"] .slide.dark, body[data-theme="dark"] .slide.dark{background:var(--dkbg);color:var(--on)}
+  body[data-theme="light"] .cell p, body[data-theme="light"] .dark .cell p,
+  body[data-theme="light"] .dark .body, body[data-theme="light"] .dark .sub{color:var(--softon);opacity:1}
+  body[data-theme="light"] .dark .row, body[data-theme="light"] .dark .cell,
+  body[data-theme="light"] .dark table.m td, body[data-theme="light"] .dark .fbox{border-color:var(--dline)}
+  body[data-theme="light"] .dark .footer, body[data-theme="light"] .dark .num, body[data-theme="light"] .dark .k{color:var(--faint);opacity:1}
   *{box-sizing:border-box}
   @page{size:1280px 720px;margin:0}
   html,body{margin:0;background:#111;color:var(--ink);font-family:var(--mono)}
@@ -27,9 +45,9 @@
   h1 em{font-style:italic}
   h2{font-family:var(--serif);font-weight:400;font-size:44px;line-height:1.06;letter-spacing:-.015em;margin:4px 0 12px}
   h2.sm{font-size:38px}
-  .sub{font-size:16px;line-height:1.55;color:var(--body);max-width:1000px}
+  .sub{font-size:17.5px;line-height:1.6;color:var(--body);max-width:1000px}
   .dark .sub{color:var(--on);opacity:.84}
-  .body{font-size:15px;line-height:1.56;color:var(--body)}
+  .body{font-size:16.5px;line-height:1.6;color:var(--body)}
   .dark .body{color:var(--on);opacity:.84}
   .body b{color:var(--ink)}
   .dark .body b{color:var(--on)}
@@ -43,26 +61,27 @@
   .cell p{font-size:13px;line-height:1.5;color:var(--body);margin:0}
   .dark .cell p{color:var(--on);opacity:.72}
   ul.big{list-style:none;margin:8px 0 0;padding:0}
-  ul.big li{display:grid;grid-template-columns:26px 1fr;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:15px;line-height:1.45}
+  ul.big li{display:grid;grid-template-columns:26px 1fr;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);font-size:16.5px;line-height:1.5}
   ul.big .m{color:var(--faint);font-size:12.5px}
   .split{display:grid;grid-template-columns:1fr 1fr;gap:32px;align-items:start}
   .mono-sm{font-size:12.5px;color:var(--mute);line-height:1.6}
   .footer{position:absolute;left:64px;right:64px;bottom:18px;display:flex;justify-content:space-between;font-size:10.5px;color:var(--faint)}
   .dark .footer{color:var(--on);opacity:.42}
   .accent{color:var(--accent)}
+  .nb{white-space:nowrap}
   .danger{color:var(--danger)}
   .success{color:var(--success)}
   .dark .danger{color:#ff6b62}
-  .f{font-family:var(--serif);font-size:25px;line-height:1.28}
-  .fs{font-family:var(--serif);font-size:19px;line-height:1.3}
+  .f{font-family:var(--mono);font-size:22px;line-height:1.35;letter-spacing:.02em}
+  .fs{font-family:var(--mono);font-size:18px;line-height:1.4;letter-spacing:.02em}
   .fbox{border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:9px 0;margin:8px 0}
   .dark .fbox{border-color:rgba(253,252,252,.18)}
-  table.m{width:100%;border-collapse:collapse;font-size:13.5px}
+  table.m{width:100%;border-collapse:collapse;font-size:15px}
   table.m th{text-align:left;font-weight:400;color:var(--faint);font-size:11px;letter-spacing:.05em;text-transform:uppercase;padding:0 0 6px}
   table.m td{padding:5px 0;border-top:1px solid var(--line)}
   .dark table.m td{border-color:rgba(253,252,252,.16)}
   table.m td.r,table.m th.r{text-align:right}
-  img.fig{width:100%;height:auto;display:block}
+  img.fig{width:100%;height:auto;display:block;background:#ffffff;padding:5px;border-radius:3px}
   .card{background:var(--card);padding:10px;border-radius:2px}
   .ask{border-left:2px solid var(--accent);padding:6px 0 6px 12px;font-size:15px;line-height:1.5;color:var(--body)}
   .dark .ask{color:var(--on);opacity:.9}
@@ -82,8 +101,7 @@
   <section class="slide dark on">
     <div class="k">линейная алгебра · первая лекция цикла · 25 минут</div>
     <h1>Зачем матрицу можно<br>заменить <em>двумя тонкими</em></h1>
-    <p class="sub">Одна теорема, один опыт на ваших глазах и один результат,
-      который противоречит ожиданию. Всё, что нужно знать заранее, — как умножаются матрицы.</p>
+    <p class="sub">Теорема Эккарта–Янга, один опыт и один результат, который противоречит ожиданию.</p>
     <div class="footer"><span>числа измерены на модели с 102 678 943 параметрами</span><span>01 / 14</span></div>
   </section>
 
@@ -95,13 +113,6 @@
       <div>
         <p class="body">Чёрно-белая фотография 480 × 480 — это таблица из <b>230 400 чисел</b>.
           Именно столько места она занимает.</p>
-        <div class="ask" style="margin-top:14px">
-          Поднимите руку: кто думает, что её можно хранить в <b>10 раз меньшим</b> числом чисел?
-        </div>
-        <p class="body" style="margin-top:14px">Через десять минут мы это проверим — не на словах,
-          а на картинке, которую я покажу вам на экране.</p>
-        <p class="mono-sm" style="margin-top:12px">обещание лекции: вы уйдёте с одним рабочим инструментом
-          и одной формулой, которой можно доверять</p>
       </div>
       <div>
         <p class="mono-sm">что понадобится</p>
@@ -194,8 +205,6 @@
     </table>
     <p class="body" style="margin-top:12px">Полезная арифметика: <b>сумма квадратов всех элементов матрицы
       равна сумме квадратов её σ</b>. Поэтому σ² — это «сколько энергии» сидит в направлении i.</p>
-    <div class="ask" style="margin-top:10px">Вопрос: если три первых σ большие, а остальные 0.01 — сколько
-      направлений тут «настоящих»?</div>
     <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>05 / 14</span></div>
   </section>
 
@@ -255,9 +264,9 @@
           это и есть σ<sub>r+1</sub>.</p>
       </div>
       <div>
-        <div class="ask">Вопрос в зал: можно ли сохранить все направления, оставив только r слагаемых?</div>
-        <p class="body" style="margin-top:10px">Ответ: нет — и предыдущая строчка это доказывает.
-          Именно поэтому точную матрицу ранга 100 нельзя заменить матрицей ранга 10.</p>
+        <p class="body">Сохранить все направления, оставив только r слагаемых, нельзя — и предыдущая
+          строчка это доказывает. Именно поэтому точную матрицу ранга 100 нельзя заменить
+          матрицей ранга 10.</p>
         <p class="mono-sm" style="margin-top:12px">заметьте: мы не использовали ни данных, ни обучения.
           Это факт про линейные отображения.</p>
       </div>
@@ -386,8 +395,15 @@
   </section>
 
 </div>
-<div class="hint">← → листать · p — печать · клик — дальше</div>
+<div class="hint">← → листать · p — печать · t — тема (светлая / тёмная / экран) · клик — дальше</div>
 <script>
+  const THEMES = ['light', 'dark', 'screen'];
+  function setTheme(t) {
+    document.body.dataset.theme = t;
+    try { localStorage.setItem('slide-theme', t); } catch (e) {}
+  }
+  const urlTheme = new URLSearchParams(location.search).get('theme');
+  setTheme(urlTheme || (() => { try { return localStorage.getItem('slide-theme'); } catch (e) { return null; } })() || 'light');
   const slides = [...document.querySelectorAll('.slide')];
   let i = 0;
   function show(n) {
@@ -399,6 +415,10 @@
     if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); show(i + 1); }
     if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); show(i - 1); }
     if (e.key === 'p') { e.preventDefault(); print(); }
+    if (e.key === 't') {
+      e.preventDefault();
+      setTheme(THEMES[(THEMES.indexOf(document.body.dataset.theme) + 1) % THEMES.length]);
+    }
   });
   document.addEventListener('click', (e) => { if (!e.target.closest('a')) show(i + 1); });
   addEventListener('hashchange', () => {
