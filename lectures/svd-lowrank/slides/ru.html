@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Зачем матрицу можно заменить двумя тонкими — лекция по линалу</title>
+<style>
+  @font-face{font-family:"JetBrains Mono";src:url("../assets/fonts/JetBrainsMono-var.woff2") format("woff2");font-weight:400 700;font-display:swap}
+  @font-face{font-family:"Instrument Serif";src:url("../assets/fonts/InstrumentSerif-normal.woff2") format("woff2");font-weight:400;font-display:swap}
+  @font-face{font-family:"Instrument Serif";src:url("../assets/fonts/InstrumentSerif-italic.woff2") format("woff2");font-weight:400;font-style:italic;font-display:swap}
+  :root{
+    --mono:"JetBrains Mono",monospace; --serif:"Instrument Serif",Georgia,serif;
+    --ink:#201d1d; --body:#424245; --mute:#646262; --faint:#9a9898;
+    --line:rgba(15,0,0,.14); --bg:#fdfcfc; --dark:#201d1d; --on:#fdfcfc;
+    --accent:#007aff; --danger:#ff3b30; --success:#30d158; --card:#f1eeee;
+    --dkbg:#201d1d; --on:#fdfcfc; --softon:rgba(253,252,252,.84); --dline:rgba(253,252,252,.22);
+  }
+  /* projection: pure ink on pure paper, thicker rules, no pastel */
+  body[data-theme="light"]{
+    --bg:#ffffff; --ink:#000000; --body:#111111; --mute:#3a3a3a; --faint:#5a5a5a;
+    --line:rgba(0,0,0,.42); --accent:#0055cc; --danger:#c4140a; --success:#0a7a2f; --card:#ffffff;
+    --dkbg:#ffffff; --on:#000000; --softon:#111111; --dline:rgba(0,0,0,.42);
+  }
+  body[data-theme="dark"]{
+    --bg:#000000; --ink:#ffffff; --body:#e8e8e8; --mute:#b4b4b4; --faint:#8f8f8f;
+    --line:rgba(255,255,255,.42); --accent:#4da3ff; --danger:#ff6b62; --success:#4ade80; --card:#0d0d0d;
+    --dkbg:#000000; --on:#ffffff; --softon:#e8e8e8; --dline:rgba(255,255,255,.42);
+  }
+  body[data-theme="light"] .slide.dark, body[data-theme="dark"] .slide.dark{background:var(--dkbg);color:var(--on)}
+  body[data-theme="light"] .cell p, body[data-theme="light"] .dark .cell p,
+  body[data-theme="light"] .dark .body, body[data-theme="light"] .dark .sub{color:var(--softon);opacity:1}
+  body[data-theme="light"] .dark .row, body[data-theme="light"] .dark .cell,
+  body[data-theme="light"] .dark table.m td, body[data-theme="light"] .dark .fbox{border-color:var(--dline)}
+  body[data-theme="light"] .dark .footer, body[data-theme="light"] .dark .num, body[data-theme="light"] .dark .k{color:var(--faint);opacity:1}
+  *{box-sizing:border-box}
+  @page{size:1280px 720px;margin:0}
+  html,body{margin:0;background:#111;color:var(--ink);font-family:var(--mono)}
+  .deck{width:1280px;height:720px;margin:0 auto;position:relative;overflow:hidden;background:var(--bg)}
+  .slide{position:absolute;inset:0;padding:44px 64px;display:none;flex-direction:column;background:var(--bg)}
+  .slide.on{display:flex}
+  .slide.dark{background:var(--dark);color:var(--on)}
+  .k{font-size:11.5px;color:var(--faint);letter-spacing:.06em;text-transform:uppercase}
+  .dark .k{color:var(--on);opacity:.5}
+  h1{font-family:var(--serif);font-weight:400;font-size:66px;line-height:1.02;letter-spacing:-.02em;margin:12px 0 10px}
+  h1 em{font-style:italic}
+  h2{font-family:var(--serif);font-weight:400;font-size:44px;line-height:1.06;letter-spacing:-.015em;margin:4px 0 12px}
+  h2.sm{font-size:38px}
+  .sub{font-size:17.5px;line-height:1.6;color:var(--body);max-width:1000px}
+  .dark .sub{color:var(--on);opacity:.84}
+  .body{font-size:16.5px;line-height:1.6;color:var(--body)}
+  .dark .body{color:var(--on);opacity:.84}
+  .body b{color:var(--ink)}
+  .dark .body b{color:var(--on)}
+  .row{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line);margin-top:16px}
+  .dark .row{border-color:rgba(253,252,252,.18)}
+  .cell{padding:14px 18px 0 0;border-right:1px solid var(--line)}
+  .cell:last-child{border-right:0}
+  .dark .cell{border-color:rgba(253,252,252,.18)}
+  .cell .n{font-size:11px;color:var(--faint);margin-bottom:6px}
+  .cell h3{font-size:15px;margin:0 0 6px}
+  .cell p{font-size:13px;line-height:1.5;color:var(--body);margin:0}
+  .dark .cell p{color:var(--on);opacity:.72}
+  ul.big{list-style:none;margin:8px 0 0;padding:0}
+  ul.big li{display:grid;grid-template-columns:26px 1fr;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);font-size:16.5px;line-height:1.5}
+  ul.big .m{color:var(--faint);font-size:12.5px}
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:32px;align-items:start}
+  .mono-sm{font-size:12.5px;color:var(--mute);line-height:1.6}
+  .footer{position:absolute;left:64px;right:64px;bottom:18px;display:flex;justify-content:space-between;font-size:10.5px;color:var(--faint)}
+  .dark .footer{color:var(--on);opacity:.42}
+  .accent{color:var(--accent)}
+  .nb{white-space:nowrap}
+  .danger{color:var(--danger)}
+  .success{color:var(--success)}
+  .dark .danger{color:#ff6b62}
+  .f{font-family:var(--mono);font-size:22px;line-height:1.35;letter-spacing:.02em}
+  .fs{font-family:var(--mono);font-size:18px;line-height:1.4;letter-spacing:.02em}
+  .fbox{border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:9px 0;margin:8px 0}
+  .dark .fbox{border-color:rgba(253,252,252,.18)}
+  table.m{width:100%;border-collapse:collapse;font-size:15px}
+  table.m th{text-align:left;font-weight:400;color:var(--faint);font-size:11px;letter-spacing:.05em;text-transform:uppercase;padding:0 0 6px}
+  table.m td{padding:5px 0;border-top:1px solid var(--line)}
+  .dark table.m td{border-color:rgba(253,252,252,.16)}
+  table.m td.r,table.m th.r{text-align:right}
+  img.fig{width:100%;height:auto;display:block;background:#ffffff;padding:5px;border-radius:3px}
+  .card{background:var(--card);padding:10px;border-radius:2px}
+  .ask{border-left:2px solid var(--accent);padding:6px 0 6px 12px;font-size:15px;line-height:1.5;color:var(--body)}
+  .dark .ask{color:var(--on);opacity:.9}
+  .hint{position:fixed;bottom:8px;left:50%;transform:translateX(-50%);font-size:11px;color:#666;z-index:5}
+  @media print{
+    html,body{background:#fff}
+    .deck{margin:0;width:1280px;height:auto;overflow:visible}
+    .slide{display:flex!important;position:relative;width:1280px;height:720px;page-break-after:always;break-after:page}
+    .hint{display:none}
+  }
+</style>
+</head>
+<body>
+<div class="deck" id="deck">
+
+  <!-- 01 -->
+  <section class="slide dark on">
+    <div class="k">линейная алгебра · первая лекция цикла · 25 минут</div>
+    <h1>Зачем матрицу можно<br>заменить <em>двумя тонкими</em></h1>
+    <p class="sub">Теорема Эккарта–Янга, один опыт и один результат, который противоречит ожиданию.</p>
+    <div class="footer"><span>числа измерены на модели с 102 678 943 параметрами</span><span>01 / 14</span></div>
+  </section>
+
+  <!-- 02 hook -->
+  <section class="slide">
+    <div class="k">[+] вопрос в зал</div>
+    <h2>Сколько чисел — это одна картинка?</h2>
+    <div class="split">
+      <div>
+        <p class="body">Чёрно-белая фотография 480 × 480 — это таблица из <b>230 400 чисел</b>.
+          Именно столько места она занимает.</p>
+      </div>
+      <div>
+        <p class="mono-sm">что понадобится</p>
+        <ul class="big" style="margin-top:4px">
+          <li><span class="m">01</span><span>умножение матрицы на вектор</span></li>
+          <li><span class="m">02</span><span>что такое ранг (на уровне «зависимые строки»)</span></li>
+          <li><span class="m">03</span><span>длина вектора и корень из суммы квадратов</span></li>
+        </ul>
+        <p class="mono-sm" style="margin-top:12px">всё остальное выведем по дороге</p>
+      </div>
+    </div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>02 / 14</span></div>
+  </section>
+
+  <!-- 03 geometry -->
+  <section class="slide">
+    <div class="k">[+] шаг первый</div>
+    <h2>Матрица — это форма, а не таблица</h2>
+    <div class="split">
+      <div>
+        <p class="body">Возьмём все векторы длины 1 — это окружность (в пространстве — сфера).
+          Умножим каждый на матрицу A и посмотрим, что получится.</p>
+        <p class="body" style="margin-top:10px">Получится <span class="accent">эллипсоид</span>.
+          Его полуоси — это и есть <b>сингулярные числа</b> σ₁ ≥ σ₂ ≥ ⋯ ≥ 0.</p>
+        <p class="body" style="margin-top:10px">Если какая-то полуось равна нулю — матрица
+          <b>не видит</b> этого направления. Число ненулевых полуосей и есть ранг.</p>
+        <p class="mono-sm" style="margin-top:10px">никакой магии: это тот же факт, что «образ плоскости —
+          плоскость или прямая»</p>
+      </div>
+      <div>
+        <svg viewBox="0 0 520 240" width="100%" role="img" aria-label="окружность переходит в эллипс">
+          <circle cx="105" cy="112" r="62" fill="none" stroke="#201d1d" stroke-width="1.4"/>
+          <line x1="26" y1="112" x2="184" y2="112" stroke="#e7e3e3" stroke-width="1" stroke-dasharray="4 4"/>
+          <text x="105" y="198" text-anchor="middle" font-family="JetBrains Mono" font-size="10" fill="#646262">все направления равны</text>
+          <line x1="206" y1="112" x2="272" y2="112" stroke="#007aff" stroke-width="1.6"/>
+          <polygon points="272,112 261,107 261,117" fill="#007aff"/>
+          <text x="239" y="102" text-anchor="middle" font-family="JetBrains Mono" font-size="12" fill="#424245">A</text>
+          <g transform="translate(392,112) rotate(18)">
+            <ellipse cx="0" cy="0" rx="76" ry="24" fill="none" stroke="#201d1d" stroke-width="1.4"/>
+            <line x1="0" y1="0" x2="72" y2="0" stroke="#007aff" stroke-width="2"/>
+            <line x1="0" y1="0" x2="-22" y2="0" stroke="#007aff" stroke-width="2"/>
+            <text x="54" y="-8" font-family="JetBrains Mono" font-size="10" fill="#007aff">σ₁</text>
+            <text x="-36" y="-8" font-family="JetBrains Mono" font-size="10" fill="#007aff">σ₂</text>
+          </g>
+          <text x="392" y="198" text-anchor="middle" font-family="JetBrains Mono" font-size="10" fill="#646262">эллипсоид</text>
+        </svg>
+      </div>
+    </div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>03 / 14</span></div>
+  </section>
+
+  <!-- 04 formal -->
+  <section class="slide">
+    <div class="k">[+] минимум формальностей</div>
+    <h2 class="sm">Ранг и откуда берутся σ</h2>
+    <div class="split">
+      <div>
+        <p class="body"><b>Ранг</b> — размерность образа: сколько независимых направлений
+          матрица реально «видит». Через σ это просто:</p>
+        <div class="fbox"><span class="fs">rang A = число ненулевых σ<sub>i</sub></span></div>
+        <p class="body">Сингулярные числа — это корни из собственных чисел матрицы AᵀA:</p>
+        <div class="fbox"><span class="fs">σ<sub>i</sub> = √λ<sub>i</sub>(AᵀA)</span></div>
+        <p class="mono-sm">отсюда сразу: σ всегда вещественные и неотрицательные</p>
+      </div>
+      <div>
+        <p class="mono-sm">проверка на пальцах — это и есть домашний пример</p>
+        <p class="body" style="margin-top:6px">A = [1 2; 2 4]. Вторая строка = 2 × первая, значит ранг 1,
+          одно σ равно нулю.</p>
+        <p class="body">Сумма квадратов всех элементов = σ₁² + σ₂²:</p>
+        <div class="fbox"><span class="fs">1 + 4 + 4 + 16 = 25 = σ₁², &nbsp; σ₁ = 5</span></div>
+        <p class="body">Проверьте на следующей паре: [3 0; 0 4] → σ = 4 и 3.</p>
+      </div>
+    </div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>04 / 14</span></div>
+  </section>
+
+  <!-- 05 svd -->
+  <section class="slide">
+    <div class="k">[+] инструмент</div>
+    <h2>Повернуть, растянуть, повернуть</h2>
+    <div class="fbox" style="text-align:center">
+      <span class="f">A = U Σ V<sup>ᵀ</sup></span>
+      <span class="mono-sm" style="margin-left:12px">U и V — повороты (ортогональные), Σ — растяжение по осям</span>
+    </div>
+    <table class="m" style="margin-top:6px">
+      <tr><th>множитель</th><th>что делает</th><th class="r">размер</th></tr>
+      <tr><td>Vᵀ</td><td>поворачивает вход на главные оси</td><td class="r">n × n</td></tr>
+      <tr><td>Σ</td><td>растягивает ось i в σ<sub>i</sub> раз</td><td class="r">m × n</td></tr>
+      <tr><td>U</td><td>поворачивает результат в пространство выхода</td><td class="r">m × m</td></tr>
+    </table>
+    <p class="body" style="margin-top:12px">Полезная арифметика: <b>сумма квадратов всех элементов матрицы
+      равна сумме квадратов её σ</b>. Поэтому σ² — это «сколько энергии» сидит в направлении i.</p>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>05 / 14</span></div>
+  </section>
+
+  <!-- 06 hand example -->
+  <section class="slide">
+    <div class="k">[+] разбор у доски</div>
+    <h2 class="sm">Маленький пример: выгоды пока нет</h2>
+    <div class="split">
+      <div>
+        <div class="fbox"><span class="f">A = [ 1 2 ; 2 4 ], &nbsp; σ₁ = 5, &nbsp; σ₂ = 0</span></div>
+        <p class="body">Разложение: A = σ₁ u vᵀ, где u и v — единичные векторы вдоль (1, 2).
+          Одно слагаемое — и матрица восстановлена точно.</p>
+        <p class="body" style="margin-top:8px">Считаем стоимость: было 4 числа, стало 2 + 2 = 4.
+          <span class="danger">Экономии нет.</span></p>
+      </div>
+      <div>
+        <p class="mono-sm">когда экономия появляется</p>
+        <div class="fbox"><span class="fs">r · (m + n) &lt; m · n</span></div>
+        <p class="body">Для 2×2 это никогда. Для 1000×1000 — уже при r &lt; 500.</p>
+        <p class="body" style="margin-top:8px">То есть сжатие — это про <b>большие</b> матрицы,
+          у которых ранг мал по сравнению с размером.</p>
+      </div>
+    </div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>06 / 14</span></div>
+  </section>
+
+  <!-- 07 theorem -->
+  <section class="slide">
+    <div class="k">[+] главная теорема</div>
+    <h2 class="sm">Эккарт–Янг: обрезка оптимальна</h2>
+    <p class="body">Оставим только r первых слагаемых: A<sub>r</sub> = σ₁u₁v₁ᵀ + ⋯ + σ<sub>r</sub>u<sub>r</sub>v<sub>r</sub>ᵀ.
+      Тогда для <em>любой</em> матрицы B ранга не больше r:</p>
+    <div class="fbox" style="text-align:center">
+      <span class="f">‖A − A<sub>r</sub>‖ ≤ ‖A − B‖</span>
+      <span class="mono-sm" style="margin-left:12px">и ошибка равна √(σ<sub>r+1</sub>² + σ<sub>r+2</sub>² + ⋯)</span>
+    </div>
+    <ul class="big">
+      <li><span class="m">01</span><span>обрезанное разложение — <span class="accent">лучшее</span> среди всех матриц ранга r, а не «одно из»</span></li>
+      <li><span class="m">02</span><span>ошибку видно <span class="accent">заранее</span>: это хвост спектра, считать после обучения не нужно</span></li>
+      <li><span class="m">03</span><span>здесь ‖·‖ — «корень из суммы квадратов всех элементов» (евклидова длина матрицы)</span></li>
+    </ul>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>07 / 14</span></div>
+  </section>
+
+  <!-- 08 why -->
+  <section class="slide">
+    <div class="k">[+] почему это верно</div>
+    <h2 class="sm">Потерять направление — значит промахнуться</h2>
+    <div class="split">
+      <div>
+        <p class="body">Любая матрица B ранга r обнуляет целое подпространство размерности
+          не меньше n − r — своё <b>ядро</b>.</p>
+        <p class="body" style="margin-top:8px">Возьмём единичный вектор z из этого ядра: Bz = 0.
+          Тогда A и B расходятся ровно на Az:</p>
+        <div class="fbox"><span class="fs">‖A − B‖ ≥ ‖(A − B)z‖ = ‖Az‖</span></div>
+        <p class="body">Остаётся выбрать направление, которое B не видит, а A видит сильнее всего —
+          это и есть σ<sub>r+1</sub>.</p>
+      </div>
+      <div>
+        <p class="body">Сохранить все направления, оставив только r слагаемых, нельзя — и предыдущая
+          строчка это доказывает. Именно поэтому точную матрицу ранга 100 нельзя заменить
+          матрицей ранга 10.</p>
+        <p class="mono-sm" style="margin-top:12px">заметьте: мы не использовали ни данных, ни обучения.
+          Это факт про линейные отображения.</p>
+      </div>
+    </div>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>08 / 14</span></div>
+  </section>
+
+  <!-- 09 demo -->
+  <section class="slide">
+    <div class="k">[+] опыт · смотрим на экран</div>
+    <h2 class="sm">Одна страница текста, четыре обрезки</h2>
+    <img class="fig" src="../figures/text_demo.png" alt="страница текста и её приближения ранга 1, 5, 20, 50">
+    <p class="body" style="margin-top:8px">Оригинал — 483 600 чисел. При ранге 1 нельзя прочитать ни слова,
+      при 20 читается почти всё, при 50 отличить от оригинала нельзя. <b>Ошибки внизу — ровно те,
+      что предсказывает формула теоремы</b>, посчитанные заранее.</p>
+    <div class="footer"><span>числа печатает src/demo_svd_text.py — запускается за две секунды</span><span>09 / 14</span></div>
+  </section>
+
+  <!-- 10 sigma vs lambda -->
+  <section class="slide">
+    <div class="k">[+] частая путаница</div>
+    <h2 class="sm">σ — это не собственные числа</h2>
+    <div class="split">
+      <div>
+        <p class="body"><b>λ</b> есть только у квадратных матриц и бывают отрицательными
+          или комплексными.</p>
+        <p class="body" style="margin-top:8px"><b>σ</b> есть у любой матрицы, всегда вещественные
+          и неотрицательные.</p>
+        <p class="body" style="margin-top:8px">Для симметричной матрицы они совпадают по модулю:
+          σ = |λ|. Во всех остальных случаях это разные вещи.</p>
+      </div>
+      <div>
+        <p class="mono-sm">пример, где разница видна сразу</p>
+        <div class="fbox"><span class="f">B = [ 0 1 ; 0 0 ]</span></div>
+        <table class="m">
+          <tr><th></th><th class="r">значения</th></tr>
+          <tr><td>собственные λ</td><td class="r">0 и 0</td></tr>
+          <tr><td>сингулярные σ</td><td class="r">1 и 0</td></tr>
+        </table>
+        <p class="body" style="margin-top:8px">По λ матрица «ничего не делает», но вектор (0,1)
+          она переводит в вектор длины 1. Это видно только через σ.</p>
+      </div>
+    </div>
+    <div class="footer"><span>на экзамене за это снимают баллы — запомните раз и навсегда</span><span>10 / 14</span></div>
+  </section>
+
+  <!-- 11 network -->
+  <section class="slide">
+    <div class="k">[+] а теперь то, ради чего всё</div>
+    <h2 class="sm">Так выглядят матрицы обученной сети</h2>
+    <img class="fig" src="../figures/spectrum.png" alt="спектры сингулярных чисел четырёх обученных матриц" style="margin-top:2px">
+    <p class="body" style="margin-top:6px">Четыре матрицы из настоящей модели: 1024×2730, 1024×256,
+      1024×1024 и 64×2730. Спектр падает, но <b>ни одна не обрывается в ноль</b>.</p>
+    <div class="footer"><span>сеть на 102 млн параметров, обученная на 4.2 ГБ текста</span><span>11 / 14</span></div>
+  </section>
+
+  <!-- 12 surprise dark -->
+  <section class="slide dark">
+    <div class="k">[+] неожиданный результат</div>
+    <h2 class="sm">Ожидание не подтверждается</h2>
+    <div class="split" style="align-items:start">
+      <div class="card" style="background:#fdfcfc"><img class="fig" src="../figures/mass.png" alt="доля массы при ранге r"></div>
+      <div>
+        <table class="m">
+          <tr><th>матрица</th><th class="r">масса при r = 64</th></tr>
+          <tr><td>moe.down</td><td class="r">41%</td></tr>
+          <tr><td>q_proj</td><td class="r">45%</td></tr>
+          <tr><td>mem_dense</td><td class="r"><span class="danger">28%</span></td></tr>
+          <tr><td>эксперт v</td><td class="r">100%</td></tr>
+        </table>
+        <p class="body" style="margin-top:10px">Обученные матрицы <span class="danger">не</span> почти низкоранговые:
+          ранг 64 сохраняет лишь 28–45% «энергии».</p>
+        <p class="body" style="margin-top:8px;opacity:.75">То есть просто взять и обрезать обученный слой —
+          плохая идея. А последняя строка — исключение, и у него структурная причина.</p>
+      </div>
+    </div>
+    <div class="footer"><span>это тот самый момент, когда теория и практика расходятся</span><span>12 / 14</span></div>
+  </section>
+
+  <!-- 13 resolution -->
+  <section class="slide">
+    <div class="k">[+] разрешение противоречия</div>
+    <h2 class="sm">Сжать готовое ≠ ограничить при обучении</h2>
+    <p class="body">Экспертная матрица имеет ранг 64 <span class="accent">по построению</span>: в модели
+      вообще не хранится матрица 64 × 2730 — хранятся две тонкие, и их произведение всегда ранга ≤ 64.</p>
+    <div class="fbox" style="text-align:center"><span class="f">W = U V<sup>ᵀ</sup>, &nbsp; U: 64×64, &nbsp; V: 64×2730</span></div>
+    <div class="row" style="grid-template-columns:1fr 1fr">
+      <div class="cell">
+        <div class="n">сжатие готового</div>
+        <h3>Дана фиксированная W. Насколько точно её повторит ранг r?</h3>
+        <p style="margin-top:6px"><span class="danger">ответ: плохо</span></p>
+      </div>
+      <div class="cell" style="border-right:0">
+        <div class="n">ограничение при обучении</div>
+        <h3>Слой сразу ограничен рангом r, и обучение ищет только внутри.</h3>
+        <p style="margin-top:6px"><span class="success">ответ: почти бесплатно</span></p>
+      </div>
+    </div>
+    <p class="body" style="margin-top:10px">Теорема Эккарта–Янга ограничивает первое. Про второе она не говорит
+      <span class="accent">ничего</span> — а именно второе работает в реальных моделях.</p>
+    <div class="footer"><span>зачем матрицу можно заменить двумя тонкими</span><span>13 / 14</span></div>
+  </section>
+
+  <!-- 14 takeaway -->
+  <section class="slide dark">
+    <div class="k">[+] итог · и что делать дальше</div>
+    <h2 class="sm" style="font-size:34px">Три вывода и одна формула</h2>
+    <ul class="big" style="margin-top:4px">
+      <li style="border-color:rgba(253,252,252,.16)"><span class="m">01</span><span><b>матрица — это форма;</b> σ — её полуоси, обрезка оптимальна, ошибка = √(Σ<sub>i&gt;r</sub> σᵢ²)</span></li>
+      <li style="border-color:rgba(253,252,252,.16)"><span class="m">02</span><span><b>обученные матрицы не низкоранговые:</b> ранг 64 держит 28–45% энергии — измерено на настоящей сети</span></li>
+      <li style="border-color:rgba(253,252,252,.16)"><span class="m">03</span><span><b>сжать ≠ ограничить:</b> обрезка дорога, обучение внутри семейства почти бесплатно</span></li>
+    </ul>
+    <div class="two" style="display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:10px">
+      <div>
+        <p class="mono-sm" style="opacity:.65">задача на дом (20 минут)</p>
+        <p class="body" style="margin-top:4px">Возьмите A = [2 0; 0 1]. Найдите σ, постройте A<sub>1</sub>,
+          посчитайте ошибку по формуле и проверьте её прямым вычислением.</p>
+      </div>
+      <div>
+        <p class="mono-sm" style="opacity:.65">куда смотреть дальше</p>
+        <p class="body" style="margin-top:4px">SVD и низкоранговые приближения · сжатие изображений ·
+          факторизация весов в нейросетях</p>
+      </div>
+    </div>
+    <div class="footer"><span>все числа воспроизводятся скриптами src/*.py</span><span>14 / 14</span></div>
+  </section>
+
+</div>
+<div class="hint">← → листать · p — печать · t — тема (светлая / тёмная / экран) · клик — дальше</div>
+<script>
+  const THEMES = ['light', 'dark', 'screen'];
+  function setTheme(t) {
+    document.body.dataset.theme = t;
+    try { localStorage.setItem('slide-theme', t); } catch (e) {}
+  }
+  const urlTheme = new URLSearchParams(location.search).get('theme');
+  setTheme(urlTheme || (() => { try { return localStorage.getItem('slide-theme'); } catch (e) { return null; } })() || 'light');
+  const slides = [...document.querySelectorAll('.slide')];
+  let i = 0;
+  function show(n) {
+    i = Math.max(0, Math.min(slides.length - 1, n));
+    slides.forEach((s, k) => s.classList.toggle('on', k === i));
+    location.hash = 's' + (i + 1);
+  }
+  addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); show(i + 1); }
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); show(i - 1); }
+    if (e.key === 'p') { e.preventDefault(); print(); }
+    if (e.key === 't') {
+      e.preventDefault();
+      setTheme(THEMES[(THEMES.indexOf(document.body.dataset.theme) + 1) % THEMES.length]);
+    }
+  });
+  document.addEventListener('click', (e) => { if (!e.target.closest('a')) show(i + 1); });
+  addEventListener('hashchange', () => {
+    const m = location.hash.match(/^#s(\d+)/);
+    if (m) { const n = Number(m[1]) - 1; if (n !== i) show(n); }
+  });
+  const h = location.hash.match(/^#s(\d+)/);
+  show(h ? Number(h[1]) - 1 : 0);
+</script>
+</body>
+</html>

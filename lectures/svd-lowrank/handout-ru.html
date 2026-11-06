@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Раздатка: SVD и теорема Эккарта–Янга</title>
+<style>
+  @font-face{font-family:"JetBrains Mono";src:url("../assets/fonts/JetBrainsMono-var.woff2") format("woff2");font-weight:400 700}
+  @font-face{font-family:"Instrument Serif";src:url("../assets/fonts/InstrumentSerif-normal.woff2") format("woff2");font-weight:400}
+  @font-face{font-family:"Instrument Serif";src:url("../assets/fonts/InstrumentSerif-italic.woff2") format("woff2");font-weight:400;font-style:italic}
+  :root{
+    --mono:"JetBrains Mono",monospace; --serif:"Instrument Serif",Georgia,serif;
+    --ink:#201d1d; --body:#424245; --mute:#646262; --faint:#9a9898;
+    --line:rgba(15,0,0,.16); --bg:#fdfcfc; --accent:#007aff;
+  }
+  *{box-sizing:border-box}
+  @page{size:A4;margin:16mm 15mm}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--mono);font-size:9.8pt;line-height:1.42}
+  h1{font-family:var(--serif);font-weight:400;font-size:26pt;line-height:1.05;margin:0 0 2mm}
+  h2{font-family:var(--serif);font-weight:400;font-size:13.5pt;margin:4mm 0 1.4mm;letter-spacing:-.01em}
+  .k{font-size:8pt;color:var(--faint);letter-spacing:.08em;text-transform:uppercase;margin-bottom:1mm}
+  p{margin:0 0 1.5mm}
+  .rule{height:1px;background:var(--line);margin:2mm 0 4mm}
+  .box{border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:1.4mm 0;margin:1.6mm 0}
+  .f{font-family:var(--serif);font-size:15pt}
+  table{width:100%;border-collapse:collapse;font-size:9.5pt;margin:2mm 0}
+  th{text-align:left;font-weight:400;color:var(--faint);font-size:8pt;letter-spacing:.05em;text-transform:uppercase;padding:0 0 1.5mm}
+  td{padding:1.4mm 0;border-top:1px solid var(--line);vertical-align:top}
+  td.r,th.r{text-align:right}
+  .accent{color:var(--accent)}
+  .mute{color:var(--mute)}
+  .small{font-size:9pt;color:var(--mute)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:8mm}
+  ol,ul{margin:0 0 2mm;padding-left:5mm}
+  li{margin-bottom:1mm}
+  .page-break{page-break-after:always;break-after:page}
+  .foot{font-size:8pt;color:var(--faint);margin-top:4mm;display:flex;justify-content:space-between}
+</style>
+</head>
+<body>
+
+<section class="page-break">
+  <div class="k">линейная алгебра · раздатка к лекции · 1/2</div>
+  <h1>Сингулярные числа и теорема Эккарта–Янга</h1>
+  <div class="rule"></div>
+
+  <h2>1. Что такое сингулярные числа</h2>
+  <p>Матрица A размера m × n — это линейное отображение. Единичная сфера под её действием
+     превращается в эллипсоид; <b>полуоси этого эллипсоида</b> — сингулярные числа
+     σ₁ ≥ σ₂ ≥ ⋯ ≥ 0.</p>
+  <div class="box"><span class="f">σ<sub>i</sub> = √λ<sub>i</sub>(AᵀA)</span>
+    <span class="small" style="margin-left:6mm">отсюда: σ всегда вещественные и ≥ 0; определены для любой матрицы</span></div>
+  <p class="small">Ранг = число ненулевых σ. Сумма квадратов всех элементов A равна σ₁² + σ₂² + ⋯
+     (потому что это след AᵀA).</p>
+
+  <h2>2. Разложение</h2>
+  <div class="box"><span class="f">A = U Σ Vᵀ</span>
+    <span class="small" style="margin-left:6mm">Vᵀ поворачивает вход на главные оси, Σ растягивает, U поворачивает в выход</span></div>
+
+  <h2>3. Теорема (Эккарт–Янг, 1936)</h2>
+  <p>Пусть A<sub>r</sub> = σ₁u₁v₁ᵀ + ⋯ + σ<sub>r</sub>u<sub>r</sub>v<sub>r</sub>ᵀ — обрезка до r слагаемых.
+     Тогда для любой матрицы B ранга не больше r:</p>
+  <div class="box"><span class="f">‖A − A<sub>r</sub>‖ ≤ ‖A − B‖, &nbsp;&nbsp; ‖A − A<sub>r</sub>‖ = √(σ<sub>r+1</sub>² + σ<sub>r+2</sub>² + ⋯)</span></div>
+  <p class="small">‖·‖ — евклидова длина матрицы: корень из суммы квадратов всех элементов («норма Фробениуса»).
+     Смысл: обрезка SVD — <b>лучшая</b> матрица ранга r, и ошибка известна заранее.</p>
+
+  <h2>4. Почему это верно (идея)</h2>
+  <p>Любая матрица B ранга r обнуляет подпространство размерности не меньше n − r (своё ядро).
+     Возьмём единичный вектор z из ядра: Bz = 0. Тогда</p>
+  <div class="box"><span class="f">‖A − B‖ ≥ ‖(A − B)z‖ = ‖Az‖</span></div>
+  <p class="small">и остаётся выбрать направление, которое B не видит, а A видит сильнее всего — это σ<sub>r+1</sub>.</p>
+
+  <h2>5. Разобранный пример</h2>
+  <div class="two">
+    <div>
+      <p><b>A = [1 2; 2 4]</b>. Вторая строка = 2 × первая, значит ранг 1, одно σ равно нулю.</p>
+      <p>Сумма квадратов элементов: 1 + 4 + 4 + 16 = 25 = σ₁² → <b>σ₁ = 5</b>, σ₂ = 0.</p>
+      <p>Разложение: A = σ₁ u vᵀ, где u и v — единичные векторы вдоль (1, 2).</p>
+    </div>
+    <div>
+      <table>
+        <tr><th>способ хранения</th><th class="r">чисел</th></tr>
+        <tr><td>матрица целиком</td><td class="r">4</td></tr>
+        <tr><td>u и v (rank 1)</td><td class="r">2 + 2 = 4</td></tr>
+        <tr><td>выигрыш</td><td class="r">никакого</td></tr>
+      </table>
+      <p class="small">Сжатие возможно, только когда r·(m + n) &lt; m·n. Для 2×2 — никогда;
+         для 1000×1000 — уже при r &lt; 500.</p>
+    </div>
+  </div>
+
+  <div class="foot"><span>все числа на лекции воспроизводятся скриптами из папки lectures/svd-lowrank/src</span><span>1 / 2</span></div>
+</section>
+
+<section>
+  <div class="k">линейная алгебра · раздатка к лекции · 2/2</div>
+  <h1 style="font-size:22pt">Задачи (с ответами)</h1>
+  <div class="rule"></div>
+
+  <h2>Задача 1 · посчитать руками</h2>
+  <p>A = [2 0; 0 1]. Найдите σ, постройте A₁ (обрезку до ранга 1), посчитайте ошибку
+     по формуле и проверьте прямым вычислением.</p>
+  <p class="small"><b>Ответ.</b> AᵀA = [4 0; 0 1], λ = 4 и 1 → σ = 2 и 1.
+     A₁ = [2 0; 0 0]. Ошибка по формуле √(σ₂²) = 1; прямым вычислением ‖A − A₁‖ = ‖[0 0; 0 1]‖ = 1. Совпало.</p>
+
+  <h2>Задача 2 · проверить тождество</h2>
+  <p>Для A = [1 2; 2 4] проверьте, что сумма квадратов элементов равна σ₁² + σ₂².</p>
+  <p class="small"><b>Ответ.</b> 1 + 4 + 4 + 16 = 25; σ₁² + σ₂² = 25 + 0 = 25.</p>
+
+  <h2>Задача 3 · когда сжатие вообще есть</h2>
+  <p>Матрица 1000 × 1000 имеет ранг 10. Сколько чисел нужно, чтобы хранить её точно
+     в низкоранговом виде, и во сколько раз это меньше?</p>
+  <p class="small"><b>Ответ.</b> 10 · (1000 + 1000) = 20 000 против 1 000 000 → в 50 раз меньше, без потерь.</p>
+
+  <h2>Задача 4 · σ ≠ λ</h2>
+  <p>Для B = [0 1; 0 0] найдите собственные и сингулярные числа. Объясните разницу одной фразой.</p>
+  <p class="small"><b>Ответ.</b> λ = 0 и 0; σ = 1 и 0. Собственные числа описывают повторное применение
+     (B² = 0), сингулярные — растяжение за один шаг: вектор (0, 1) переходит в вектор длины 1.</p>
+
+  <h2>Что унести с лекции</h2>
+  <ul>
+    <li>Матрица — это форма; σ — её полуоси; ранг — число ненулевых полуосей.</li>
+    <li>Обрезка SVD оптимальна, а ошибка равна √(сумма квадратов отброшенных σ).</li>
+    <li>У обученных нейросетей спектр <b>не</b> обрывается: ранг 64 из 1024 держит всего 28–45% энергии.</li>
+    <li>Сжать готовую матрицу и обучать сразу в низкоранговом семействе — разные задачи;
+        теорема говорит только про первую.</li>
+  </ul>
+
+  <div class="foot"><span>курс: линейная алгебра · лекция «Зачем матрицу можно заменить двумя тонкими»</span><span>2 / 2</span></div>
+</section>
+
+</body>
+</html>
