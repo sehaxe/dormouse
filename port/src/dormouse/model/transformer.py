@@ -20,6 +20,19 @@ burn "mixed-dtype ops NaN" rule): every projection goes through
 [`tsct.mm_mixed`] (fp32 masters, bf16 compute when `bf16=true`), the output is
 widened back to the residual dtype, and SDPA runs in the compute dtype like
 `FullAttention`. `bf16=false` (the CPU gates) is plain fp32 bit for bit.
+
+MIXTURE-OF-DEPTHS (`mod_capacity < 1.0`, arXiv:2404.02258v1 §3.4). A per-block
+router `r_i = w^T x_i` (one bias-free linear projection, `w ∈ R^d`) picks the
+top-`C = round(capacity·T)` tokens of each sequence; those `C` tokens are
+gathered, run through the block, scaled by their own `r_i` (Eq. 1's
+`r_i·f(X̃) + x_i`, which puts the router on the gradient path) and scattered
+back; the rest bypass through the residual. The gather is in POSITION order (a
+scatter through the slots the selection occupies), so `is_causal=True` over the
+compacted sequence is the same causal mask the full sequence had, and RoPE still
+uses each token's ORIGINAL position. One `torch.topk` + gather/scatter per
+block, static shapes, no `.item()`/`nonzero`/boolean-mask indexing — CUDA-graph
+capturable by construction. `mod_capacity=1.0` builds no router at all: the
+forward is the plain block, bit for bit.
 """
 
 from __future__ import annotations
@@ -30,10 +43,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..instrument import Counters
+from ..instrument import Counters, loud
 from .tsct import mm_mixed
 
-__all__ = ["TransformerBlock", "apply_rope", "rope_tables"]
+__all__ = [
+    "TransformerBlock",
+    "apply_rope",
+    "mod_capacity_tokens",
+    "mod_route",
+    "rope_tables",
+]
 
 
 def rope_tables(
@@ -60,8 +79,62 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
 
 
+def mod_capacity_tokens(capacity: float, top_k: int, t: int) -> int:
+    """`C` — the tokens one block processes: `top_k`, else `round(capacity·T)`.
+
+    Pure Python integers (`t` is a shape), so it costs no host read. `top_k`
+    wins when nonzero; otherwise the capacity is rounded to the nearest integer
+    and clamped into `1..t` (a static shape either way).
+    """
+    assert t >= 1, t
+    if top_k:
+        if top_k > t:
+            loud(
+                f"mod_top_k={top_k} > the sequence's {t} positions: the router "
+                f"cannot select more tokens than the forward holds. Escape: "
+                f"mod_top_k <= {t}, or 0 to derive it from mod_capacity."
+            )
+        return int(top_k)
+    return min(max(int(round(capacity * t)), 1), t)
+
+
+def mod_route(
+    scores: torch.Tensor, capacity: float, top_k: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Top-`C` selection as ONE `topk` + scatter/cumsum — no host read.
+
+    `scores [b, t]` are the router logits. Returns
+
+    * `idx [b, C]` — the selected token positions (score order, as `topk`
+      returns them);
+    * `sel [b, t]` int64 — the selection mask (1 where selected), built by a
+      scatter (never a boolean mask or `nonzero`);
+    * `slots [b, C]` — each selected token's rank in POSITION order, built from
+      `cumsum` of the mask. A `scatter` through `slots` compacts the selection
+      into original-position order without a second sort, so `is_causal=True`
+      on the compacted sequence is the same causal mask the full sequence has.
+
+    Every op is device-side and static-shape; the only host values are `C`
+    (from Python ints) and the buffer sizes. This is the capture-safe form the
+    CUDA-graph probe in `scripts/probe_capture.py` looks for.
+    """
+    assert scores.dim() == 2, scores.shape
+    b, t = scores.shape
+    c = mod_capacity_tokens(capacity, top_k, t)
+    idx = torch.topk(scores, c, dim=1).indices
+    sel = torch.zeros((b, t), dtype=torch.long, device=scores.device)
+    sel.scatter_(1, idx, 1)
+    slots = (sel.cumsum(1) - 1).gather(1, idx)
+    return idx, sel, slots
+
+
 class TransformerBlock(nn.Module):
-    """One vanilla decoder block: `x + proj(SDPA(RoPE(qkv(norm(x)))))`, then FFN."""
+    """One vanilla decoder block: `x + proj(SDPA(RoPE(qkv(norm(x)))))`, then FFN.
+
+    With `mod_capacity < 1.0` (or `mod_top_k > 0`) the same block also owns a
+    Mixture-of-Depths router; its `forward` then routes `C` tokens through
+    `_block` and passes the rest through unchanged (see the module docstring).
+    """
 
     def __init__(self, cfg, *, n_layers: int, device: torch.device | str = "cpu") -> None:
         super().__init__()
@@ -91,9 +164,36 @@ class TransformerBlock(nn.Module):
         nn.init.normal_(self.fc.weight, std=std)
         nn.init.normal_(self.proj.weight, std=std / math.sqrt(2 * n_layers))
         nn.init.normal_(self.fc2.weight, std=std / math.sqrt(2 * n_layers))
+        # The MoD router (`r_i = w^T x_i`), built IFF routing is on. A
+        # CONSTANT init, not `nn.Linear`'s: `nn.Linear` would draw from the
+        # global RNG, shifting every later block's init and turning the arm
+        # into a different seed. `0.02` gives `r ≈ 0.02·Σx ≈ O(1)` on the
+        # embedding stream, so the scaled block output starts at full strength
+        # and every token is selectable. At `mod_capacity=1.0` there is no
+        # router and `forward` is the plain block, bit for bit.
+        self.mod_capacity = float(cfg.mod_capacity)
+        self.mod_top_k = int(cfg.mod_top_k)
+        self.router: nn.Parameter | None = None
+        if self.mod_capacity < 1.0 or self.mod_top_k:
+            self.router = nn.Parameter(torch.full((1, d), 0.02, device=device))
+        #: The last forward's BCE aux value, DETACHED (log-cadence read only).
+        self.last_aux: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [b, t, d]` in the residual dtype → `[b, t, d]` in the same dtype."""
+        if self.router is None:
+            return self._block(x, counters)
+        return self._forward_mod(x, counters)
+
+    def _block(
+        self,
+        x: torch.Tensor,
+        counters: Counters | None = None,
+        rope: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """The plain block. `rope` is the pre-built `(cos, sin)` table of a
+        compacted MoD call (per-token ORIGINAL positions); `None` is today's
+        table over positions `0..t-1`."""
         pdt = self.qkv.weight.dtype
         if x.dtype is not pdt:
             x = x.to(pdt)
@@ -104,7 +204,10 @@ class TransformerBlock(nn.Module):
         q = q.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        cos, sin = rope_tables(t, self.head_dim, x.device, q.dtype)
+        if rope is None:
+            cos, sin = rope_tables(t, self.head_dim, x.device, q.dtype)
+        else:
+            cos, sin = rope
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
         y = y.transpose(1, 2).reshape(b, t, d)
@@ -114,3 +217,40 @@ class TransformerBlock(nn.Module):
         h = mm_mixed(self.ln2(x), self.fc.weight, self.compute_dtype, counters)
         h = mm_mixed(F.gelu(h), self.fc2.weight, self.compute_dtype, counters)
         return x + h.to(x.dtype)
+
+    def _forward_mod(self, x: torch.Tensor, counters: Counters | None) -> torch.Tensor:
+        """Route `C = mod_capacity_tokens(...)` tokens through the block.
+
+        One `topk` on the router score, gather into fixed buffers in POSITION
+        order, the plain block on those `C` tokens, then `r_i·f_i + x_i` (Eq. 1)
+        scattered back. No `.item()`, `nonzero`, boolean-mask indexing or host
+        sync anywhere in the path — the buffers are sized from the static
+        shape, so a CUDA graph can hold it.
+        """
+        b, t, d = x.shape
+        scores = F.linear(x, self.router).squeeze(-1)  # [b, t], fp32 residual
+        idx, sel, slots = mod_route(scores, self.mod_capacity, self.mod_top_k)
+        c = idx.shape[1]
+        g = idx.unsqueeze(-1).expand(-1, -1, d)
+        sg = slots.unsqueeze(-1).expand(-1, -1, d)
+        # Compact into position order through `slots` (a scatter, not a sort).
+        buf = x.new_zeros((b, c, d)).scatter_(1, sg, x.gather(1, g))
+        rbuf = scores.new_zeros((b, c)).scatter_(1, slots, scores.gather(1, idx))
+        pos = torch.arange(t, device=x.device).expand(b, t).gather(1, idx)
+        pbuf = torch.zeros((b, c), dtype=torch.long, device=x.device).scatter_(1, slots, pos)
+        cos_tab, sin_tab = rope_tables(t, self.head_dim, x.device, self.compute_dtype)
+        cos = cos_tab[0, 0][pbuf].unsqueeze(1)
+        sin = sin_tab[0, 0][pbuf].unsqueeze(1)
+        y = self._block(buf, counters, rope=(cos, sin))
+        # Eq. 1: `r_i · f_i(X̃) + x_i`. The router weight is ON the gradient
+        # path, which is the only gradient the router gets from the LM term
+        # (the top-k identity itself is not differentiable).
+        delta = (y - buf) * rbuf.unsqueeze(-1)
+        out = x + x.new_zeros((b, t, d)).scatter(1, g, delta.gather(1, sg))
+        # The paper's §3.5 aux: BCE(logits=r_i, target=top-k indicator). One
+        # value per block, detached for the log line; the caller weights it.
+        self.last_aux = F.binary_cross_entropy_with_logits(scores, sel.to(scores.dtype))
+        if counters is not None:
+            counters.count("mod_block")
+            counters.count("mod_tokens", b * c)
+        return out

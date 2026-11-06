@@ -1019,6 +1019,31 @@ testable and A/B-able (ADR-0017).
       clean. **NOT wired:** recurrent decode/serve (KDA state), and the
       graph/QAT arms are unmeasured on this form.
 
+- [x] P-MOD. port (Python): Mixture-of-Depths over `block_form="transformer"`
+      (arXiv:2404.02258v1 §3.4). `ModelConfig.mod_capacity` (1.0 = off, no
+      router built, bit-identical), `mod_top_k` (0 = `round(capacity·T)`),
+      `mod_aux_weight` (0 = off; the paper's §3.5 BCE of the router logits
+      against the top-k indicator, printed as `mod_aux=` on the log line).
+      Per block: one `torch.topk` on `r_i = w^T x_i`, a scatter/`cumsum` that
+      compacts the selection into POSITION order (so `is_causal` and the
+      original RoPE positions are exactly the full sequence's), the plain block
+      on the `C` gathered tokens, `r_i·f_i + x_i` scattered back. No
+      `.item()`/`nonzero`/boolean-mask indexing: one `topk` and fixed-shape
+      gathers, CUDA-graph capturable (`tests/test_mod_capture.py`).
+      `scripts/mod_ledger.py` prints the formula and reproduces the measured
+      flagship bill (137.42 MFLOP/byte at c=1.0; 0.63x at c=0.5 under the
+      conservative "attention core is not credited" split, 0.50x if it is);
+      `scripts/ab_mod.py` is the 3-seed equal-bytes/equal-steps A/B (control
+      vs c=0.5, aux 0.01) with the pre-registered KEEP rule (+0.02 BPB AND
+      <=0.85x step time), and it names the equal-steps/equal-FLOPs confound in
+      its header. Gates `tests/test_mod.py` (16) + `tests/test_mod_capture.py`
+      (2): capacity 1.0 has state/logits/loss/gradient pins from clean `main`
+      `7e921b3`; the ledger algebra; the host-read spy on forward AND
+      backward; the exact count for 20 random batches; router gradient on
+      every step and no router at all when off; a 20-step CPU run at c=0.5.
+      **NOT run:** no GPU and no driver run; the paper's 0.60x is a 60M-3B
+      result, not a prediction for 13.5M.
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)

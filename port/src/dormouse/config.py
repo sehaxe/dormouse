@@ -400,6 +400,24 @@ class ModelConfig:
     #: Refused on `block_form="kda"`: the loop's depth is `loop_blocks`, and a
     #: second, inert depth field is the config-lies defect.
     n_layers: int = 0
+    #: ---- MIXTURE-OF-DEPTHS over the transformer form (`model/transformer.py`) ----
+    #: Per-block token routing, arXiv:2404.02258v1 §3.4. `1.0` (the default)
+    #: builds NO router and runs the plain block, bit for bit; `< 1.0` routes
+    #: `round(capacity · T)` tokens per sequence through each block and passes
+    #: the rest through the residual. The capacity is the paper's knob: 1.0 is
+    #: the vanilla control, 0.5 halves the block's token budget per layer.
+    mod_capacity: float = 1.0
+    #: `0` = derive `C` from `mod_capacity`. `>0` names the token count
+    #: directly (it wins over the capacity when both are set, so a preset can
+    #: pin an integer capacity and still record the fraction it corresponds
+    #: to). A top-k above the sequence is refused loudly at the forward.
+    mod_top_k: int = 0
+    #: The paper's §3.5 binary-cross-entropy aux weight: the router's logits
+    #: are trained toward the top-k indicator (1 selected, 0 skipped). `0.0`
+    #: (the default) adds no term; the router still learns from `r_i·f_i`
+    #: (Eq. 1 puts its weight on the LM gradient path). Refused when routing is
+    #: off, because the term would reach no code.
+    mod_aux_weight: float = 0.0
     #: ---- UNIQUE BLOCKS INSIDE THE LOOP (`model/loopblock.py`) ----
     #: The number of DISTINCT loop blocks the loop cycles over:
     #:
@@ -2769,7 +2787,50 @@ def validate_block_form(model: ModelConfig) -> None:
                 f"counts UNIQUE transformer blocks only. Escape: n_layers=0, or "
                 f"block_form='transformer'."
             )
+        mod = [
+            name
+            for name in ("mod_capacity", "mod_top_k", "mod_aux_weight")
+            if getattr(model, name) != getattr(ModelConfig, name)
+        ]
+        if mod:
+            loud(
+                f"block_form='kda' refuses {mod}: Mixture-of-Depths is implemented "
+                f"over the UNIQUE transformer blocks only (`model/transformer.py`); "
+                f"the KDA loop has no per-block token router. Escape: "
+                f"{', '.join(f'{n}={getattr(ModelConfig, n)!r}' for n in mod)}, or "
+                f"block_form='transformer'."
+            )
         return
+    if not 0.0 < model.mod_capacity <= 1.0:
+        loud(
+            f"mod_capacity={model.mod_capacity}: the paper's capacity is the "
+            f"fraction of a sequence's tokens a block processes, so it lives in "
+            f"(0, 1]. 1.0 is off. Escape: 0.0 < mod_capacity <= 1.0."
+        )
+    if model.mod_top_k < 0:
+        loud(
+            f"mod_top_k={model.mod_top_k}: a token count is >= 0 (0 = derive it "
+            f"from mod_capacity). Escape: mod_top_k >= 0."
+        )
+    if model.mod_top_k > model.max_seq_len:
+        loud(
+            f"mod_top_k={model.mod_top_k} > max_seq_len={model.max_seq_len}: the "
+            f"router cannot select more tokens than a sequence holds. Escape: "
+            f"mod_top_k <= max_seq_len, or 0 to derive it from mod_capacity."
+        )
+    if model.mod_aux_weight < 0.0:
+        loud(
+            f"mod_aux_weight={model.mod_aux_weight}: the BCE aux is a positive "
+            f"term. Escape: mod_aux_weight >= 0.0."
+        )
+    if model.mod_aux_weight and model.mod_capacity >= 1.0 and not model.mod_top_k:
+        loud(
+            f"mod_aux_weight={model.mod_aux_weight} with mod_capacity="
+            f"{model.mod_capacity} and mod_top_k={model.mod_top_k}: routing is "
+            f"off, so no router exists and the aux term would reach no code. "
+            f"Escape: mod_capacity < 1.0 (or mod_top_k > 0), or "
+            f"mod_aux_weight=0.0."
+        )
     if model.max_iter != 1:
         loud(
             f"block_form='transformer' with max_iter={model.max_iter}: the vanilla "
