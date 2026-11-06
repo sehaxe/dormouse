@@ -280,6 +280,27 @@ class Cache:  # not a dataclass: the module is also loaded via importlib in test
 CACHE = Cache()
 
 
+def _ev_value(row: dict):
+    """The held-out BPB of an eval row: `bpb_fin`, NEVER a silent fallback.
+
+    New rows carry `bpb_fin` (the final readout, the number generation reads)
+    and `bpb_mean` (the depth-averaged objective). Old rows carry only `bpb`,
+    which WAS the depth mean; using it as if it were `fin` is the defect this
+    dashboard must not repeat, so the caller gets the raw value and the row's
+    kind (`_ev_kind`) decides how the label reads.
+    """
+    return row.get("bpb_fin") if row.get("bpb_fin") is not None else row.get("bpb")
+
+
+def _ev_kind(evals: list[dict]) -> str:
+    """`fin` | `legacy_mean` | `mixed` — and a mixed log is a visible defect."""
+    fin = sum(1 for e in evals if e.get("bpb_fin") is not None)
+    old = sum(1 for e in evals if e.get("bpb_fin") is None and e.get("bpb") is not None)
+    if fin and old:
+        return "mixed"
+    return "fin" if fin else ("legacy_mean" if old else "fin")
+
+
 def snapshot() -> dict:
     now = time.time()
     if CACHE.value is not None and now - CACHE.at < CACHE_S:
@@ -295,13 +316,21 @@ def snapshot() -> dict:
     run_cfg = _run_config()
     step = int(last.get("step") or (evals[-1]["step"] if evals else 0))
     total_steps = int(run_cfg.get("steps", 320_000))
-    bpb = evals[-1].get("bpb") if evals else None
-    prev_bpb = evals[-2].get("bpb") if len(evals) > 1 else None
+    kind = _ev_kind(evals)
+    # A mixed log (some rows fin, some legacy mean) is a defect, not a series:
+    # plot ONLY the fin rows and let the hero label say `MIXED`.
+    fin_rows = [e for e in evals if e.get("bpb_fin") is not None]
+    series = fin_rows or [e for e in evals if e.get("bpb") is not None]
+    bpb = _ev_value(series[-1]) if series else None
+    prev_bpb = _ev_value(series[-2]) if len(series) > 1 else None
     tps = float(last.get("tokens_per_s") or 0.0)
-    bytes_per_step = (
-        int(run_cfg.get("batch", 8)) * int(run_cfg.get("seq_len", 1024))
-        * int(run_cfg.get("grad_accum", 1))
-    )
+    batch = int(run_cfg.get("batch", 8))
+    seq_len = int(run_cfg.get("seq_len", 1024))
+    bytes_per_step = batch * seq_len * int(run_cfg.get("grad_accum", 1))
+    eval_bytes = run_cfg.get("eval_bytes")
+    if eval_bytes is None:
+        # A legacy snapshot records the window in BATCHES.
+        eval_bytes = int(run_cfg.get("eval_batches", 20)) * batch * seq_len
     seen = step * bytes_per_step
     budget = total_steps * bytes_per_step
     eta = (budget - seen) / tps if tps > 0 else float("nan")
@@ -364,6 +393,7 @@ def snapshot() -> dict:
             "total_steps": total_steps,
             "decay_at": int(total_steps * (1.0 - float(run_cfg.get("decay_frac", 0.15)))),
             "bpb": bpb,
+            "bpb_metric": kind,
             "bpb_prev": prev_bpb,
             "loss": last.get("loss"),
             "lr": last.get("lr"),
@@ -371,16 +401,21 @@ def snapshot() -> dict:
             "seen": seen,
             "budget": budget,
             "eta": eta,
+            "eval_bytes": eval_bytes,
             "nan": last.get("nan_skipped", 0),
         },
-        "stair": _stair(evals, run_cfg),
+        "stair": _stair(series, run_cfg),
         "agent": _agent_eval(),
         "history": [
-            {"step": e["step"], "bpb": e.get("bpb"), "loss": e.get("loss")}
-            for e in evals[-120:]
-            if e.get("bpb") is not None
+            {
+                "step": e["step"],
+                "bpb": _ev_value(e),
+                "bpb_mean": e.get("bpb_mean"),
+                "loss": e.get("loss"),
+            }
+            for e in series[-120:]
         ],
-        "projection": _projection(evals, total_steps),
+        "projection": _projection(series, total_steps),
         "counters": counters,
         "gpu": _gpu(),
         "ckpts": ckpts,
@@ -399,7 +434,7 @@ def _projection(evals: list[dict], total_steps: int) -> dict:
     Cheap and honest: it is the current slope, not a promise. The decay phase is
     not modelled, so the number is a floor-ish estimate and is labelled as such.
     """
-    pts = [(e["step"], e["bpb"]) for e in evals[-6:] if e.get("bpb") is not None]
+    pts = [(e["step"], _ev_value(e)) for e in evals[-6:] if _ev_value(e) is not None]
     if len(pts) < 3:
         return {}
     import math
@@ -434,8 +469,14 @@ def frag_metrics(s: dict) -> str:
         if pr
         else "projection: needs 3 eval points"
     )
+    metric = r.get("bpb_metric", "fin")
+    label = {
+        "fin": "held-out bpb (fin)",
+        "legacy_mean": "held-out bpb (LEGACY depth-avg)",
+        "mixed": "held-out bpb (MIXED LOG)",
+    }.get(metric, "held-out bpb (fin)")
     return f"""<div class="nums">
-  <div class="cell hero"><span class="k">held-out bpb</span>
+  <div class="cell hero"><span class="k">{label}</span>
     <div class="v">{_fmt(r['bpb'])}</div>
     <span class="sub">{arrow} vs previous eval · ×{8 / (r['bpb'] or 8):.1f} compression</span>
     <span class="sub">{proj}</span></div>
@@ -457,7 +498,7 @@ def frag_hero(s: dict) -> str:
         if len(ln) > 150:
             ln = ln[:147] + "…"
         safe = html.escape(ln)
-        for token, cls2 in ((" bpb=", "ok"), (" loss=", ""), ("nan_skipped=0", "ok")):
+        for token, cls2 in ((" bpb_fin=", "ok"), (" loss=", ""), ("nan_skipped=0", "ok")):
             if token in safe and cls2:
                 safe = safe.replace(token, f'<span class="{cls2}">{token}</span>', 1)
         if i == len(lines) - 1:
@@ -759,8 +800,8 @@ def page(s: dict, query: str = "") -> str:
 
   <div class="block" style="--i:1" id="hero" sse-swap="hero">{frag_hero(s)}</div>
   <div class="block" style="--i:2" id="metrics" sse-swap="metrics">{frag_metrics(s)}</div>
-<div class="block" style="--i:3"><h2>held-out bpb <span class="hint">eval every 2k steps ·
-      64 KiB window</span></h2>
+<div class="block" style="--i:3"><h2>held-out bpb (fin) <span class="hint">eval every 2k steps ·
+      {s['run']['eval_bytes']:,} B window</span></h2>
     <div id="chart" sse-swap="chart">{frag_chart(s)}</div></div>
   <div class="block" style="--i:4" id="routing" sse-swap="routing">
     <h2>routing health <span class="hint">live experts / E · below 50% is a dead bank</span></h2>
@@ -806,13 +847,22 @@ def _stair(evals: list[dict], run_cfg: dict) -> dict:
             * int(run_cfg.get("grad_accum", 1))
         )
         ref_rows = _jsonl(LOGS / "flagship_resume.jsonl") + _jsonl(LOGS / "flagship.jsonl")
-        ref = sorted({(r["step"], r["bpb"]) for r in ref_rows if r.get("event") == "eval"})
+        ref_eval = [r for r in ref_rows if r.get("event") == "eval"]
+        # Never mix metrics on one axis: the reference is plotted on `bpb_fin`
+        # when it has it, and dropped (not silently swapped to the mean) when
+        # the active run is fin and the reference is not.
+        cur_kind = _ev_kind(evals)
+        ref_kind = _ev_kind(ref_eval)
+        ref = []
+        if ref_kind == cur_kind and ref_kind != "mixed":
+            ref = sorted({(r["step"], _ev_value(r)) for r in ref_eval if _ev_value(r) is not None})
+        cur = sorted({(e["step"], _ev_value(e)) for e in evals if _ev_value(e) is not None})
         ref_bps = 8 * 1024 * 3
         return {
             "name": RUN,
-            "ref_name": "flagship 105M",
-            "cur": [[round(st * bps / 1e9, 3), round(b, 4)] for st, b in
-                    ((e["step"], e["bpb"]) for e in evals)],
+            "ref_name": "flagship 105M" if ref_kind == "fin" else "flagship 105M (legacy mean)",
+            "metric": "bpb_fin" if cur_kind == "fin" else "bpb (legacy depth-avg)",
+            "cur": [[round(st * bps / 1e9, 3), round(b, 4)] for st, b in cur],
             "ref": [[round(st * ref_bps / 1e9, 3), round(b, 4)] for st, b in ref],
         }
     except Exception:

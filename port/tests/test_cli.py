@@ -143,6 +143,12 @@ def test_eval_runs_the_trained_checkpoint(ckpt_dir: Path, tmp_path: Path):
             "smoke",
             "--eval",
             str(tmp_path / "corpus.bin"),
+            # The current snapshot's default window (196 608 B) is larger than
+            # this 4 KB fixture; the legacy batch form is the explicit small
+            # override the tiny CPU gates use (the 65 536 B floor is for real
+            # runs, not a 4 KB smoke corpus).
+            "--eval-batches",
+            "2",
             "--device",
             "cpu",
         ],
@@ -215,6 +221,8 @@ def test_eval_loads_an_engram_ram_checkpoint(tmp_path: Path):
             run.train.ckpt_name,
             "--eval",
             run.train.data,
+            "--eval-batches",
+            "2",
             "--device",
             "cpu",
         ],

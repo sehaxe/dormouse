@@ -2,8 +2,9 @@
 
 The instrument layer is day-one code here, not an addition (readiness plan §7):
 every log line carries the arm counters and the step timing, every eval line
-carries the BYTE COUNT it scored (`eval_batches × batch × seq_len`, AGENTS
-§2.6), and the two failure modes that cost the burn side real runs are LOUD:
+carries the BYTE COUNT it scored (`eval_bytes`, or a legacy snapshot's
+`eval_batches × batch × seq_len`, AGENTS §2.6), and the two failure modes that
+cost the burn side real runs are LOUD:
 
 * **a NaN step is skipped, COUNTED** (`nan_skipped`), and two consecutive
   windows in which EVERY step was non-finite stop the run — the plan's
@@ -45,7 +46,14 @@ from ..model.engram import (
 from ..model.experts import invalidate_banks_all, revive_experts_all
 from ..model.qat_cache import invalidate_qat_cache_all
 from ..model.tsct import set_mm_dtype
-from .data import ByteStream, distinct_scored_bytes, eval_window_bytes, open_streams, warmup_steps
+from .data import (
+    ByteStream,
+    distinct_scored_bytes,
+    eval_batches_for,
+    eval_window_bytes,
+    open_streams,
+    warmup_steps,
+)
 from .graph import FullGraph, OptimizerGraph, full_graph_refusal
 from .lr import anneal_alpha, wsd_lr
 from .mixture import MixtureStream, open_mixture
@@ -964,21 +972,24 @@ def _eval_line(
     max_iter: int,
     device: torch.device | str | None,
     step: int,
-) -> tuple[str, float, int]:
-    """The eval line, carrying the depth curve when the config asks for it.
+) -> tuple[str, float, int, float]:
+    """The eval line: `bpb_fin` headline, `bpb_mean` beside it, pinned `off=`.
 
-    `cfg.rand_depth` turns the curve on (the arm must show its own curve);
-    `cfg.eval_depths` requests it on a fixed-depth run. The line reports the
-    held-out loss at `max_iter` as its headline number, so the arm's curve and
-    the fixed-depth control are read off the same line.
+    `fin` is the CE of the final mean readout — the number generation reads and
+    the only one comparable with a single-output model. `loss`/`bpb_mean` is the
+    depth-averaged training objective (Σ CE_i + CE_final)/(T+1): it is kept for
+    continuity, never as "the model's BPB" (found 2026-11-06). `off=` is the
+    ABSOLUTE byte the window starts at, so two runs can be shown to have scored
+    the same bytes. Returns `(line, mean_ce, scored_bytes, final_ce)`.
     """
     curve = None
     eng = Counters()
+    batches = eval_batches_for(cfg)
     if cfg.rand_depth or cfg.eval_depths:
         curve = evaluate(
             model,
             stream,
-            cfg.eval_batches,
+            batches,
             device=device,
             depths=True,
             counters=eng,
@@ -987,19 +998,17 @@ def _eval_line(
         ev, scored, fin, per_iter = curve[max_iter]
     else:
         ev, scored, fin, per_iter = evaluate(
-            model, stream, cfg.eval_batches, device=device, counters=eng, ce_fixed=cfg.ce_fixed
+            model, stream, batches, device=device, counters=eng, ce_fixed=cfg.ce_fixed
         )
-    # `fin` = the CE of the final mean readout — the DEPTH-COMPARABLE number
-    # (the headline `loss` averages T+1 terms and is not, see `_eval_loss`).
     # `engram=<rows>/<arms>` is burn's field (`lib.rs:1751`, the `ENGRAM_KEYS` /
     # `ENGRAM` probe deltas) over THIS eval's own forwards: `engram=0/<n>` is how
     # a reader learns the eval ran a memory-disabled forward, which is the defect
     # that retracted the Engram arm's numbers (AGENTS §3.2). It is printed on
     # both substrates — the host path counts the same rows in `Engram._read`.
     line = (
-        f"eval step={step} loss={ev:.4f} bpb={bpb(ev):.3f} fin={fin:.4f} "
-        f"bpb_fin={bpb(fin):.3f} over {scored} B "
-        f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) "
+        f"eval step={step} off={stream.lo} bpb_fin={bpb(fin):.3f} "
+        f"bpb_mean={bpb(ev):.3f} fin={fin:.4f} loss={ev:.4f} over {scored} B "
+        f"({batches} x {cfg.batch} x {cfg.seq_len}) "
         f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)}"
     )
     capped = getattr(stream, "eval_tail_capped", None)
@@ -1010,7 +1019,41 @@ def _eval_line(
         line += " periter=" + ",".join(f"{v:.4f}" for v in per_iter)
     if curve is not None:
         line += " depths=" + ",".join(f"{d}:{curve[d][2]:.4f}(fin)" for d in sorted(curve))
-    return line, ev, scored
+    return line, ev, scored, fin
+
+
+def eval_row(
+    *,
+    step: int,
+    ev: float,
+    fin: float,
+    scored: int,
+    cfg: TrainConfig,
+    offset: int,
+) -> dict:
+    """One JSONL eval row: `bpb` IS `bpb_fin`; the depth mean keeps its own key.
+
+    This is a function, not an inline dict, so the headline mapping has ONE
+    definition and a gate can pin it. `bpb` is the model's held-out BPB (the
+    readout decode uses); `bpb_mean` is the depth-averaged objective. A reader
+    that wants "the model's BPB" reads `bpb`/`bpb_fin`; a reader that wants the
+    training objective reads `loss`/`bpb_mean`. They are never the same number.
+    """
+    return {
+        "event": "eval",
+        "step": step,
+        # `bytes_seen` is OPTIMIZER-STEP arithmetic: every step drew
+        # `grad_accum` micro-batches of `batch × seq_len` bytes.
+        "bytes_seen": step * cfg.batch * cfg.seq_len * cfg.grad_accum,
+        "bpb": bpb(fin),
+        "bpb_fin": bpb(fin),
+        "bpb_mean": bpb(ev),
+        "loss": ev,
+        "fin": fin,
+        "scored": scored,
+        "eval_offset": offset,
+        "eval_bytes": eval_window_bytes(cfg),
+    }
 
 
 def train(
@@ -1416,6 +1459,10 @@ def train(
             lr=cfg.lr,
             opt=cfg.opt,
             grad_accum=cfg.grad_accum,
+            # The ONE byte-accounting constant: an optimizer step draws
+            # `grad_accum` micro-batches of `batch x seq_len` bytes. The old
+            # "0.53 GB at step 64k" figure was this without the factor 3.
+            bytes_per_step=tokens_per_step,
             ema_decay=cfg.ema_decay,
             resumed=start,
         )
@@ -1906,6 +1953,10 @@ def train(
                     loss=last_loss,
                     lr=lr,
                     tokens_per_s=rate,
+                    # Optimizer-step arithmetic, `grad_accum` included: the
+                    # micro-batch bytes are `batch x seq_len`; one logged step
+                    # consumed `grad_accum` of them per micro-window.
+                    bytes_seen=(step + 1) * tokens_per_step,
                     counters=dict(window),
                     nan_skipped=nan_skipped,
                 )
@@ -1927,13 +1978,22 @@ def train(
             # reference's `eval()`); the params go back to Y for the next step.
             sf("eval")
             with _shadow_params(model, ema):
-                line, ev, scored = _eval_line(
+                line, ev, scored, fin = _eval_line(
                     model, eval_stream, cfg, run.model.max_iter, device, step + 1
                 )
             sf("train")
             log(line)
             if sink is not None:
-                _row(event="eval", step=step + 1, loss=ev, bpb=bpb(ev), scored=scored)
+                _row(
+                    **eval_row(
+                        step=step + 1,
+                        ev=ev,
+                        fin=fin,
+                        scored=scored,
+                        cfg=cfg,
+                        offset=eval_stream.lo,
+                    )
+                )
 
         if (step + 1) % cfg.ckpt_every == 0:
             # A checkpoint is the model a reader would serve, so it is written
@@ -1958,7 +2018,7 @@ def train(
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
         sf("eval")
         with _shadow_params(model, ema):
-            line, _ev, _scored = _eval_line(
+            line, _ev, _scored, _fin = _eval_line(
                 model, eval_stream, cfg, run.model.max_iter, device, cfg.steps
             )
         sf("train")

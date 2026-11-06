@@ -102,7 +102,7 @@ from ..model.engram import enable_host_tables, host_engrams, host_step_all
 from ..model.experts import invalidate_banks_all
 from ..model.qat_cache import invalidate_qat_cache_all
 from ..post.tasks import build_tasks
-from .data import ByteStream, warmup_steps
+from .data import ByteStream, eval_batches_for, warmup_steps
 from .loop import (
     ce_field,
     init_cfg,
@@ -1365,7 +1365,8 @@ def sft_train(
             first_ok = 0
             first_n = 0
             with torch.no_grad():
-                for _ in range(cfg.eval_batches):
+                batches = eval_batches_for(cfg)
+            for _ in range(batches):
                     ex, ey = eval_stream.next_batch()
                     if device is not None:
                         ex, ey = ex.to(device), ey.to(device)

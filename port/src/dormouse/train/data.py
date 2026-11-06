@@ -27,9 +27,10 @@ is periodic in its byte range and the shard stream is periodic in
 
 Two properties are load-bearing because the burn history paid for them:
 
-* **the eval window is `eval_batches × batch × seq_len` BYTES** (AGENTS §2.6),
-  printed on the eval line by the trainer. A BPB is only comparable within one
-  window, and quoting "20 batches" without `batch × seq_len` is not a number.
+* **the eval window is `eval_bytes` BYTES** (a legacy snapshot's
+  `eval_batches × batch × seq_len` is the same quantity), printed on the eval
+  line by the trainer. A BPB is only comparable within one window, and quoting
+  "20 batches" without `batch × seq_len` is not a number.
 * **the eval stream never trains.** The split is by byte range, not by a flag,
   so a train batch cannot be drawn from the eval tail (`c4214ad`'s no-leak
   enforcement).
@@ -54,7 +55,7 @@ from typing import IO
 
 import torch
 
-from ..config import TrainConfig
+from ..config import MIN_EVAL_BYTES, TrainConfig
 from ..instrument import loud
 
 DEFAULT_RING = 64 << 20  # burn's 64 MB ring
@@ -717,9 +718,57 @@ def open_source(
     return ByteStream(p, batch, seq_len, ring_bytes=ring_bytes)
 
 
+#: The floor of a defensible eval window lives in `config.py`, beside the field
+#: it validates (`MIN_EVAL_BYTES`): one definition, imported here by the loader.
+
+
 def eval_window_bytes(cfg: TrainConfig) -> int:
-    """`eval_batches × batch × seq_len` — the ONLY comparable window size."""
-    return cfg.eval_batches * cfg.batch * cfg.seq_len
+    """The scored window in BYTES: `eval_bytes`, or the legacy batch override.
+
+    `eval_batches` is the recorded protocol of old checkpoints; when it is set
+    it wins, so their curve stays readable. Everything else derives the batch
+    count from `eval_bytes` and refuses a window below [`MIN_EVAL_BYTES`].
+    """
+    if cfg.eval_batches is not None:
+        if cfg.eval_batches < 1:
+            loud(
+                f"eval_batches={cfg.eval_batches}: the window is a positive number "
+                f"of batches. Escape: eval_batches >= 1, or leave it unset and set "
+                f"eval_bytes >= {MIN_EVAL_BYTES}."
+            )
+        return cfg.eval_batches * cfg.batch * cfg.seq_len
+    if cfg.eval_bytes < MIN_EVAL_BYTES:
+        loud(
+            f"eval_bytes={cfg.eval_bytes} is below the {MIN_EVAL_BYTES} B floor. "
+            f"One 64 KB window has a 95 % interval of about ±0.19 BPB on this "
+            f"corpus, so a narrower window is not a measurement. Escape: "
+            f"eval_bytes >= {MIN_EVAL_BYTES} (196608 is the default and the "
+            f"flagship's window)."
+        )
+    return cfg.eval_bytes
+
+
+def eval_batches_for(cfg: TrainConfig) -> int:
+    """How many `batch × seq_len` windows make the configured EVAL WINDOW.
+
+    This is the ONE place a window width becomes a batch count. `eval_bytes`
+    must be a whole number of windows: a partial window would make the last
+    batch a different size from the rest, i.e. a different measurement.
+    """
+    if cfg.eval_batches is not None:
+        eval_window_bytes(cfg)
+        return cfg.eval_batches
+    step = cfg.batch * cfg.seq_len
+    window = eval_window_bytes(cfg)
+    if step <= 0:
+        loud(f"batch x seq_len = {cfg.batch} x {cfg.seq_len} is not a window")
+    if window % step:
+        loud(
+            f"eval_bytes={window} is not a multiple of batch x seq_len = {step}: "
+            f"the last eval batch would be a different size. Escape: a window "
+            f"that is a whole number of {step}-byte batches (196608 at b8 s1024)."
+        )
+    return window // step
 
 
 def distinct_scored_bytes(stream: ByteStream, batches: int) -> int:
@@ -785,11 +834,33 @@ def open_streams(
     """
     tr = run.train
     if tr.eval_data:
+        window = eval_window_bytes(tr)
+        batches = eval_batches_for(tr)
+        size = Path(tr.eval_data).stat().st_size
+        lo = tr.eval_offset
+        if not 0 <= lo < size:
+            loud(
+                f"eval_offset={lo} is outside {tr.eval_data} ({size} B). Escape: "
+                f"0 <= eval_offset < {size}."
+            )
+        # The PINNED range: `batches` full `batch × (seq_len + 1)` reads from
+        # `lo`. A window that runs off the file would wrap and re-score its
+        # head while printing a distinct-bytes count — refuse instead.
+        span = batches * tr.batch * (tr.seq_len + 1)
+        if lo + span > size:
+            loud(
+                f"eval_offset={lo} + eval window ({batches} x {tr.batch} x "
+                f"{tr.seq_len + 1} = {span} source bytes) exceeds {tr.eval_data} "
+                f"({size} B). The stream would wrap and score bytes twice. "
+                f"Escape: eval_offset <= {max(0, size - span)}, or a larger eval "
+                f"file."
+            )
         ev = ByteStream(
             tr.eval_data,
             tr.batch,
             tr.seq_len,
-            ring_bytes=min(ring_bytes, max(1 << 20, eval_window_bytes(tr))),
+            lo=lo,
+            ring_bytes=min(ring_bytes, max(1 << 20, window)),
         )
         if eval_only:
             return None, ev
@@ -814,14 +885,21 @@ def open_streams(
             '`data = "/path/to/corpus.bin"` (a flat .bin of bytes).'
         )
     _refuse_dir(Path(tr.data), "data")
-    ev_bytes = min(max(eval_window_bytes(tr), 1), 1 << 20) if tr.eval else 0
-    hi_train, _ = split_points(Path(tr.data).stat().st_size, ev_bytes)
+    size = Path(tr.data).stat().st_size
+    requested = eval_window_bytes(tr) if tr.eval else 0
+    ev_bytes = min(max(requested, 1), 1 << 20) if tr.eval else 0
+    hi_train, _ = split_points(size, ev_bytes)
+    lo = hi_train + (tr.eval_offset if tr.eval else 0)
+    if tr.eval and lo >= size:
+        loud(
+            f"eval_offset={tr.eval_offset} starts at byte {lo}, at/after the end of "
+            f"{tr.data} ({size} B). Escape: a smaller offset."
+        )
     ev = (
-        ByteStream(tr.data, tr.batch, tr.seq_len, lo=hi_train, ring_bytes=1 << 20)
+        ByteStream(tr.data, tr.batch, tr.seq_len, lo=lo, ring_bytes=1 << 20)
         if tr.eval
         else None
     )
-    requested = eval_window_bytes(tr) if tr.eval else 0
     if ev is not None and ev_bytes < requested:
         # COUNTED, never silent: the request is larger than the tail this
         # stream may read, so the stream wraps and the eval re-scores bytes it
@@ -829,11 +907,10 @@ def open_streams(
         # and its `over N B` counts DISTINCT bytes (`distinct_scored_bytes`).
         ev.eval_tail_capped = (requested, ev_bytes)
         print(
-            f"eval_tail_capped={requested}/{ev_bytes}: eval_batches x batch x seq_len "
-            f"asks for {requested} B but the eval tail is capped at {ev_bytes} B; the "
-            f"stream wraps and `over N B` counts distinct bytes only. Escape: shrink "
-            f"eval_batches/batch/seq_len below {1 << 20} B, or point eval_data at a "
-            f"larger held-out file."
+            f"eval_tail_capped={requested}/{ev_bytes}: eval_bytes={requested} asks "
+            f"for more than the {1 << 20} B cap on the eval tail; the stream wraps "
+            f"and `over N B` counts distinct bytes only. Escape: shrink eval_bytes "
+            f"below {1 << 20} B, or point eval_data at a larger held-out file."
         )
     if eval_only:
         return None, ev

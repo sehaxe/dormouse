@@ -113,7 +113,8 @@ def test_the_eval_line_prints_the_counter(tmp_path, monkeypatch):
     stream = ByteStream(run.train.data, 2, 64, lo=0, hi=256)
     stream.eval_tail_capped = (1_638_400, CAP)
     monkeypatch.setattr(loopmod, "evaluate", lambda *a, **k: (1.0, CAP, 1.0, []))
-    line, _loss, scored = _eval_line(torch.nn.Identity(), stream, run.train, 2, None, 5)
+    line, _loss, scored, _fin = _eval_line(torch.nn.Identity(), stream, run.train, 2, None, 5)
     assert scored == CAP
     assert "over 1048576 B" in line
+    assert "bpb_fin=" in line and "bpb_mean=" in line
     assert "eval_tail_capped=1638400/1048576" in line
