@@ -225,7 +225,19 @@ uv run --extra gpu python scripts/bench_compile.py \
 ... --opt-arms on --opt-steps 20
 ```
 
-## 9. What is NOT measured here
+## 9. Full CPU suite
+
+`pytest tests -q` in the worktree (`CUDA_VISIBLE_DEVICES=""`), 1 938 collected:
+**one failure, `tests/test_sft_v2.py::test_the_manifest_accounts_for_every_row`**
+— `code_fable: manifest vs files disagree`, i.e. a worktree-data artefact (the
+manifest is tracked, the `sft_pairs` corpus rows are not). It fails **identically
+on clean main `e2a0542`**, so it is not this lane's. The four failures the brief
+lists (`test_export`, `test_fullattn::gate_7`, `test_loop_blocks`,
+`test_prelude`) do not reproduce in this worktree — all 46 tests in those four
+files pass — and nothing new is red because of this change. `ruff check` is
+clean on the three touched Python files.
+
+## 10. What is NOT measured here
 
 * Every millisecond, B/s, TFLOP/s, MFU and GiB in the arms table — the card was
   busy. The CPU smoke of the same program passes both correctness gates
