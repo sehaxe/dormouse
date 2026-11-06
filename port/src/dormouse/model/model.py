@@ -26,7 +26,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..config import ModelConfig
+from .. import stepaudit
+from ..config import ModelConfig, validate_block_form
 from ..instrument import Counters, loud
 from ..losses import fixed_cross_entropy, logit_softcap
 from .act_mem import ActivationOffload
@@ -49,6 +50,7 @@ from .mtp import MTPHead
 from .prelude import UniqueLayer
 from .qat_cache import QuantCache, attach_qat_caches, take_qat_refresh_counts
 from .sigreg import sigreg_loss, stride_sample
+from .transformer import TransformerBlock
 from .tsct import make_projection, set_factor_qat_seed
 
 
@@ -56,6 +58,9 @@ class DormouseModel(nn.Module):
     def __init__(self, cfg: ModelConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
         self.cfg = cfg
+        # The runtime seam a hand-built/mutated config reaches; `__post_init__`
+        # and `config.validate` own the same refusals (ADR-0019).
+        validate_block_form(cfg)
         # Same two refusals `config.validate` owns (bad name; `conv` with
         # `use_byteflow=false`), held at the seam a hand-built model reaches.
         codec_kind(cfg)
@@ -230,6 +235,39 @@ class DormouseModel(nn.Module):
             return
         d = cfg.d_model
         self.embed = nn.Embedding(cfg.vocab, d, device=device)
+        if cfg.block_form == "transformer":
+            # THE VANILLA FORM (`block_form`, `model/transformer.py`): the same
+            # embedding and the same final norm/head/CE, a stack of UNIQUE
+            # pre-LN blocks instead of the loop. The early return skips every
+            # loop-only module (KDA/CSA/mHC/Engram/controller/readout,
+            # prelude/coda, LayerRoPE, halt/aux heads, host tables), so the tree
+            # and the parameter count are the control's — not the loop's with a
+            # dormant copy beside it.
+            n_layers = cfg.n_layers or cfg.loop_blocks * cfg.max_iter
+            self.transformer_blocks = nn.ModuleList(
+                [
+                    TransformerBlock(cfg, n_layers=n_layers, device=device)
+                    for _ in range(n_layers)
+                ]
+            )
+            self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
+            if cfg.tie_embeddings:
+                self.lm_head = TiedHead(self.embed)
+            else:
+                head_rank = min(cfg.rank, d, cfg.vocab)
+                self.lm_head = make_projection(d, cfg.vocab, cfg, rank=head_rank, device=device)
+            # `dense_qat` is refused on this form (`validate_block_form`), so the
+            # only cache to collect is a `use_tsct` head's own.
+            self._qat_caches = attach_qat_caches(self, dense=False)
+            # The attributes `DormouseModel.forward` reads before it dispatches,
+            # and the ones the trainer's eval/checkpoint readers expect.
+            self.bf = None
+            self._act_offload = None
+            self.halt = None
+            self.dspark = None
+            self.last_halt = None
+            self.last_breakdown = {}
+            return
         if cfg.layerrope:
             if cfg.layerrope_form == "paper":
                 #: The paper form (`layerrope.py`): FOUR sites per loop body,
@@ -812,6 +850,12 @@ class DormouseModel(nn.Module):
         ce_fixed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The plain byte-level stack: embedding → prelude → loop → coda → RMSNorm → lm_head."""
+        if self.cfg.block_form == "transformer":
+            # The dispatch `block_form` exists for: the SAME embedding, final norm,
+            # head and CE, a different block stack (never a second model class).
+            return self._forward_transformer(
+                input_ids, targets, counters, loss_mask, ce_fixed, breakdown
+            )
         h0 = self.embed(input_ids)
         # The prelude: unique layers, once, before the shared loop. The loop's
         # contract is `[b, t, d_model]` in the embedding's dtype — asserted at
@@ -1137,6 +1181,50 @@ class DormouseModel(nn.Module):
             # owns the decision — it masks a non-finite loss and gates the
             # update on the device (ADR-0018 rule 2). The assert used to fire
             # before the firewall could see the value.
+        return logits, loss
+
+    def _forward_transformer(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None,
+        counters: Counters,
+        loss_mask: torch.Tensor | None,
+        ce_fixed: bool,
+        breakdown: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """`block_form="transformer"`: embed → unique blocks → norm → head → CE.
+
+        The objective is the SAME final-CE term `_forward_byte_lm` adds (the
+        control's own `F.cross_entropy`, here through `_byte_ce`), and `fin`
+        is the number `breakdown` reports for a looped model — one readout, so
+        `per_iter` is empty. No aux term, no L_Rec, no per-iteration CE: those
+        are loop-only and `validate_block_form` refuses their weights.
+        """
+        h = self.embed(input_ids)
+        for block in stepaudit.iterations("forward.transformer_blocks", self.transformer_blocks):
+            h = block(h, counters)
+            counters.count("transformer_block")
+        hn = self.norm(h.to(torch.float32))
+        logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
+        if self.cfg.logit_softcap > 0.0:
+            logits = logit_softcap(logits, self.cfg.logit_softcap)
+        loss = None
+        if targets is not None:
+            if loss_mask is None:
+                loss = _byte_ce(logits, targets, fixed=ce_fixed, counters=counters)
+                assert loss is not None
+            else:
+                if ce_fixed:
+                    ce = fixed_cross_entropy(
+                        logits, targets, reduction="none", counters=counters
+                    ).reshape(-1, 1)
+                else:
+                    ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
+                loss = masked_ce_mean(ce, loss_mask)
+            if breakdown:
+                # Eval-only host read (the same contract `_forward_byte_lm`'s
+                # breakdown block documents): never in a training step.
+                self.last_breakdown = {"fin": float(loss.detach()), "per_iter": []}
         return logits, loss
 
 

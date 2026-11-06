@@ -1,0 +1,43 @@
+# mirror_control — `scripts/control_transformer.py`'s plain decoder, in the trainer.
+#
+# The 2026-11-06 control beat the KDA/CSA/mHC/Engram block by 0.126 BPB at equal
+# bytes on all eight eval windows (docs/reviews/2026-11-06-control-transformer.md).
+# This preset is that block as a first-class `block_form`, so an A/B runs both
+# forms through the SAME data stream, eval window, optimizer, checkpoint and BPB
+# accounting. It is sized from the control's measured bill: `288·d² + 48·T·d`
+# per byte at L=12, T=1024 gives d=304, 8 heads x 38, FFN 4x (1216) —
+# 13 478 752 control parameters, FlopCounterMode 135.36 vs the flagship's
+# 137.42 MFLOP/B (-1.5%).
+#
+# NOT the control's optimizer: the trainer's own (MixOptimizer/WSD) runs, which
+# is the point of the A/B — the form is the only variable.
+
+d_model = 304
+n_heads = 8
+head_dim = 38
+d_ffn = 1216
+vocab = 256
+max_seq_len = 1024
+max_iter = 1
+loop_blocks = 1
+n_layers = 12
+
+# The vanilla decoder: no KDA, no CSA, no mHC, no AttnRes, no Engram, no
+# LayerRoPE, no host tables, no aux head. `block_form` refuses each one if on.
+block_form = "transformer"
+use_kda = false
+use_csa = false
+use_mhc = false
+use_attnres = false
+use_engram = false
+layerrope = false
+
+# The control's FFN/head are dense and untied. The expert slot is never built on
+# this form; the two fields only keep a `block_form=kda` read of this file legal
+# for the A/B's opposite arm.
+n_experts = 1
+moe_topk = 0
+use_tsct = false
+
+# bf16 compute (fp32 masters), as the control's autocast runs it.
+bf16 = true

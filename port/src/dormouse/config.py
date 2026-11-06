@@ -167,6 +167,10 @@ DEAD_SNAPSHOT_KEYS = {
     "dist_capacity": ("6f75dfa", ""),
 }
 
+#: The `block_form` literals — which block tree `DormouseModel` builds:
+#: `kda` is the loop (every number on record), `transformer` is the vanilla
+#: decoder control (`model/transformer.py`). A name that is not here is LOUD.
+BLOCK_FORMS = ("kda", "transformer")
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive", "batched", "bucketed")
@@ -372,6 +376,30 @@ class ModelConfig:
     vocab: int = 256
     max_seq_len: int = 512
     max_iter: int = 4
+    #: ---- THE BLOCK FORM: the architecture under test (`model/transformer.py`) ----
+    #: `"kda"` (the default) is today's `LoopBlock` tree — the weight-shared
+    #: loop with KDA/Engram/MoE/readout — and must stay bit-identical when
+    #: selected. `"transformer"` is a VANILLA pre-LN decoder: causal
+    #: scaled-dot-product attention with RoPE, a GELU FFN, no KDA, no CSA, no
+    #: mHC, no Engram, no LayerRoPE, no residual scale, no aux head. It is
+    #: `scripts/control_transformer.py`'s block, run inside this model so the
+    #: trainer/data/eval/optimizer are shared — the 2026-11-06 control measured
+    #: 0.13-0.37 BPB BETTER than the KDA loop at equal bytes
+    #: (`docs/reviews/2026-11-06-control-transformer.md`), so the architecture
+    #: must be selectable, not assumed.
+    #:
+    #: The two forms share the token embedding, the final norm, the byte head
+    #: and the CE (`DormouseModel` dispatches on this field); they do not share
+    #: a block. `"transformer"` refuses every KDA-loop knob it cannot honour
+    #: (see `validate_block_form`), because a flag that reaches no code is a
+    #: config that lies.
+    block_form: str = "kda"
+    #: The number of UNIQUE transformer blocks `block_form="transformer"`
+    #: builds. `0` = unset = `loop_blocks × max_iter` (today's number of body
+    #: instantiations, so a form switch keeps the loop's depth by default).
+    #: Refused on `block_form="kda"`: the loop's depth is `loop_blocks`, and a
+    #: second, inert depth field is the config-lies defect.
+    n_layers: int = 0
     #: ---- UNIQUE BLOCKS INSIDE THE LOOP (`model/loopblock.py`) ----
     #: The number of DISTINCT loop blocks the loop cycles over:
     #:
@@ -1648,6 +1676,7 @@ class ModelConfig:
                 f"tree with no forward and no gradient — a config that lies about "
                 f"the model. Escape: loop_blocks <= max_iter, or raise max_iter."
             )
+        validate_block_form(self)
 
 
 @dataclass
@@ -2697,9 +2726,101 @@ def validate_ffn(model: ModelConfig) -> None:
         )
 
 
+#: The knobs that only the KDA loop reads. `block_form="transformer"` builds no
+#: `LoopBlock`, so any one of these being on is a config that lies about what
+#: the run computes — refused LOUDLY, never silently dropped.
+_KDA_ONLY_FORM_FLAGS = ("use_kda", "use_csa", "use_mhc", "use_attnres", "use_engram", "layerrope")
+#: The training terms defined on the loop's per-iteration readout. The vanilla
+#: decoder has no loop, no per-iteration CE and no `last_mtp`/`last_halt`; a
+#: nonzero weight would build a head that no forward reaches.
+_LOOP_ONLY_LOSS_WEIGHTS = (
+    "halt_weight",
+    "jepa_weight",
+    "sigreg_weight",
+    "dspark_weight",
+    "mtp_weight",
+    "energy_weight",
+)
+
+
+def validate_block_form(model: ModelConfig) -> None:
+    """`block_form` and the flags each form can honour — LOUD, one place.
+
+    Called from `ModelConfig.__post_init__` (so `parse_preset`, `--set` through
+    `dataclasses.replace` and a hand-built config all pass through it),
+    `validate`, and `DormouseModel.__init__` (the runtime seam a hand-built
+    config reaches). The `transformer` form is `scripts/control_transformer.py`'s
+    block: it has no KDA, CSA, mHC, AttnRes, Engram, LayerRoPE, loop, prelude,
+    coda, aux head or host memory, so every flag that names one is refused
+    rather than left inert.
+    """
+    if model.block_form not in BLOCK_FORMS:
+        loud(
+            f"block_form={model.block_form!r} is not a block tree. Known: "
+            f"{list(BLOCK_FORMS)} — 'kda' is the loop every number on record "
+            f"runs, 'transformer' is the vanilla decoder control "
+            f"(`model/transformer.py`). Escape: name one of those."
+        )
+    if model.block_form == "kda":
+        if model.n_layers:
+            loud(
+                f"n_layers={model.n_layers} with block_form='kda': the loop's depth "
+                f"is `loop_blocks` (each body is a full LoopBlock), and n_layers "
+                f"counts UNIQUE transformer blocks only. Escape: n_layers=0, or "
+                f"block_form='transformer'."
+            )
+        return
+    if model.max_iter != 1:
+        loud(
+            f"block_form='transformer' with max_iter={model.max_iter}: the vanilla "
+            f"decoder is a stack of UNIQUE blocks, not a weight-shared loop, so a "
+            f"depth above 1 would either run one block twice (not the control) or "
+            f"repeat the same K/V state. Escape: max_iter=1 (and set n_layers for "
+            f"depth), or block_form='kda'."
+        )
+    bad = [name for name in _KDA_ONLY_FORM_FLAGS if getattr(model, name)]
+    if bad:
+        loud(
+            f"block_form='transformer' refuses {bad}: the vanilla decoder has no "
+            f"KDA, CSA, mHC, AttnRes, Engram or LayerRoPE, so the flag(s) would "
+            f"reach no code while the snapshot reported them on. Escape: "
+            f"{', '.join(f'{name}=false' for name in bad)}, or block_form='kda'."
+        )
+    aux = [name for name in _LOOP_ONLY_LOSS_WEIGHTS if getattr(model, name) != 0.0]
+    if aux:
+        loud(
+            f"block_form='transformer' refuses {aux}: every one of these terms is "
+            f"defined on the loop's per-iteration readout, and the vanilla decoder "
+            f"has no loop (one block stack, one final CE). Escape: "
+            f"{', '.join(f'{name}=0.0' for name in aux)}, or block_form='kda'."
+        )
+    if model.prelude_layers or model.coda_layers:
+        loud(
+            f"block_form='transformer' with prelude_layers={model.prelude_layers}/"
+            f"coda_layers={model.coda_layers}: those are the loop's UNIQUE-LAYER "
+            f"wrappers (`model/prelude.py`), not part of the control decoder. "
+            f"Escape: prelude_layers=0 and coda_layers=0, or block_form='kda'."
+        )
+    if model.use_byteflow:
+        loud(
+            "block_form='transformer' with use_byteflow=true: both byteflow shapes "
+            "return before the byte stack (Option A is a standalone net, Option B "
+            "runs the loop over patch latents), so the transformer blocks would "
+            "never run. Escape: use_byteflow=false, or block_form='kda'."
+        )
+    if model.dense_qat != "none":
+        loud(
+            f"block_form='transformer' with dense_qat={model.dense_qat!r}: the "
+            f"transformer block's projections are plain `nn.Linear` and do not "
+            f"read the dense-QAT projector, so the arm would be silently absent. "
+            f"Escape: dense_qat='none', or block_form='kda'."
+        )
+
+
 def validate(model: ModelConfig) -> None:
     """Coherence checks the burn side does in `config::validate`. Loud, never
     clamped: a clamped width is exactly the silent collapse ADR-0011 bans."""
+    validate_block_form(model)
     validate_ffn(model)
     if model.d_model <= 0 or model.vocab <= 0:
         loud(f"d_model and vocab must be > 0, got {model.d_model}/{model.vocab}")
@@ -4602,6 +4723,13 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"none, Option B runs it over K patch latents), so there is no iteration "
             f"to wrap and the arm would be inert. Escape: use_byteflow=false, or "
             f"activation_recompute='none'."
+        )
+    if model.block_form == "transformer" and tcfg.segment_len:
+        loud(
+            f"segment_len={tcfg.segment_len} with block_form='transformer': the "
+            f"segmented path carries the KDA recurrence's state across cuts, and the "
+            f"vanilla decoder has no state to carry (its K/V context is the window). "
+            f"Escape: segment_len=0, or block_form='kda'."
         )
     if not model.layerrope:
         return

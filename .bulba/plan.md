@@ -992,6 +992,33 @@ testable and A/B-able (ADR-0017).
       failures (`test_export`, `test_fullattn::gate_7`, `test_loop_blocks`,
       `test_prelude`), reproduced on clean `907b3b5`; ruff clean.
 
+- [x] P-BLOCKFORM. port (Python): `block_form` — the measured control as a
+      first-class block form. `ModelConfig.block_form: "kda" | "transformer"`
+      plus `n_layers` (`0` = `loop_blocks × max_iter`); `DormouseModel`
+      dispatches in ONE class: the same embedding, final norm, byte head and CE,
+      then either today's `LoopBlock` or `n_layers` unique pre-LN blocks
+      (`model/transformer.py`: causal SDPA + RoPE, GELU 4×, LayerNorm, GPT-2
+      residual scaling — `scripts/control_transformer.py`'s `Block`).
+      `"transformer"` LOUD-refuses `max_iter != 1`, use_kda/use_csa/use_mhc/
+      use_attnres/use_engram/layerrope, every loop-only loss weight, prelude/
+      coda, byteflow, dense_qat and `segment_len`, each with its `Escape:`.
+      `configs/mirror_control.toml` (d=304, 12 layers, 8×38, ffn=1216, max_iter=1)
+      prints **13 478 448** params via `info` against the control script's
+      13 478 752 (−304 = shared final RMSNorm vs its affine LayerNorm; 0.0023 %).
+      Gates `tests/test_block_form.py` (20; each of a-f + resume identity proven
+      red by a scratch revert, every file restored sha256): kda bit-identical to
+      clean `main ff34bf7` (state/logits/loss/gradient pins), the refusals, the
+      count, strict checkpoint round-trip + bit-exact next-step loss on resume,
+      20-step CPU runs of both forms with `stepaudit` showing no host read on a
+      non-report step, and `load_run(--set block_form=...)` reaching the model
+      (logits differ from the kda form at the same seed/inputs). `block_form` is
+      resume identity (a switch is refused, naming `model.block_form`). Full CPU
+      suite green after copying the untracked `port/checkpoints/*.config.toml` +
+      `port/sft_pairs/` artifacts (otherwise three `test_config` reds and
+      `test_sft_v2::test_the_manifest...`, identical on a clean worktree); ruff
+      clean. **NOT wired:** recurrent decode/serve (KDA state), and the
+      graph/QAT arms are unmeasured on this form.
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)
