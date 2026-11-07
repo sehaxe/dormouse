@@ -312,9 +312,7 @@ class KDAAttention(nn.Module):
                 qat_linear(self.g_proj, c, *dq),
             )
         weights = [
-            dense_qat_weight(
-                lin.weight, dq[0], dq[1], cache=getattr(lin, "_qat_cache", None)
-            )
+            dense_qat_weight(lin.weight, dq[0], dq[1], cache=getattr(lin, "_qat_cache", None))
             for lin in (self.q_proj, self.k_proj, self.v_proj, self.g_proj)
         ]
         out = F.linear(c, torch.cat(weights, dim=0))
@@ -520,8 +518,7 @@ class KDAAttention(nn.Module):
             return out.reshape(b, t, d), ht
         counters.count("kda_step_torch", t)
         counters.why = (  # type: ignore[attr-defined]
-            "grad enabled: fused_recurrent_kda ships no backward, so the torch "
-            "recurrence ran"
+            "grad enabled: fused_recurrent_kda ships no backward, so the torch recurrence ran"
             if ok
             else why
         )

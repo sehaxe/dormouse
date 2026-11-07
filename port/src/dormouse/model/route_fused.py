@@ -128,7 +128,10 @@ if triton is not None:
 
     @triton.jit
     def _route_kernel(
-        X, B, IDX, W,
+        X,
+        B,
+        IDX,
+        W,
         E: tl.constexpr,
         K: tl.constexpr,
         BLOCK_E: tl.constexpr,
@@ -155,7 +158,10 @@ if triton is not None:
 
     @triton.jit
     def _route_bwd_kernel(
-        X, IDX, DW, DLOG,
+        X,
+        IDX,
+        DW,
+        DLOG,
         E: tl.constexpr,
         K: tl.constexpr,
         BLOCK_E: tl.constexpr,
@@ -199,9 +205,7 @@ class _RouteFused(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits, bias, k):
         assert logits.ndim == 2 and bias.shape == (logits.shape[1],)
-        assert logits.is_contiguous() and bias.is_contiguous(), (
-            "the route kernel reads dense rows"
-        )
+        assert logits.is_contiguous() and bias.is_contiguous(), "the route kernel reads dense rows"
         ctx.set_materialize_grads(False)
         if logits.is_cuda:
             n, e = logits.shape
@@ -209,8 +213,14 @@ class _RouteFused(torch.autograd.Function):
             weight = torch.empty(n, k, dtype=logits.dtype, device=logits.device)
             block = triton.next_power_of_2(e)
             _route_kernel[(n,)](
-                logits, bias, index, weight,
-                E=e, K=k, BLOCK_E=block, num_warps=4,
+                logits,
+                bias,
+                index,
+                weight,
+                E=e,
+                K=k,
+                BLOCK_E=block,
+                num_warps=4,
             )
             ctx.save_for_backward(logits, index)
             ctx.mark_non_differentiable(index)
@@ -232,8 +242,14 @@ class _RouteFused(torch.autograd.Function):
             dlog = torch.empty_like(logits)
             block = triton.next_power_of_2(e)
             _route_bwd_kernel[(n,)](
-                logits, index, dweight, dlog,
-                E=e, K=index.shape[1], BLOCK_E=block, num_warps=4,
+                logits,
+                index,
+                dweight,
+                dlog,
+                E=e,
+                K=index.shape[1],
+                BLOCK_E=block,
+                num_warps=4,
             )
             return dlog, None, None
         # The CPU path runs the reference formula, so `_route_bwd_kernel`'s
@@ -286,7 +302,9 @@ if triton is not None:
 
     @triton.jit
     def _count_permute_kernel(
-        IDS, STARTS, ORDER,
+        IDS,
+        STARTS,
+        ORDER,
         N: tl.constexpr,
         BLOCK: tl.constexpr,
     ):

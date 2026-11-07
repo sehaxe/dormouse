@@ -865,8 +865,10 @@ class LoopBlock(nn.Module):
             #: boolean (already in every snapshot); `activation_recompute` names
             #: the three arms the bench compares. A run that sets both to
             #: different modes is refused at the config seam.
-            mode = self.recompute if self.recompute != "none" else (
-                "full" if self.iter_checkpoint else "none"
+            mode = (
+                self.recompute
+                if self.recompute != "none"
+                else ("full" if self.iter_checkpoint else "none")
             )
             if mode == "full" and torch.is_grad_enabled():
 
@@ -1296,8 +1298,10 @@ class LoopBlock(nn.Module):
         # update (module docstring states the mapping).
         gain_attn = gains[1] if gains is not None else None
         gain_mlp = gains[3] if gains is not None else None
-        fused_y = self.fused_kda_tail and fused_kda.combine_supported(attn, branch, ffn) and (
-            gain_attn is None or fused_kda.combine_supported(gain_attn, gain_mlp)
+        fused_y = (
+            self.fused_kda_tail
+            and fused_kda.combine_supported(attn, branch, ffn)
+            and (gain_attn is None or fused_kda.combine_supported(gain_attn, gain_mlp))
         )
         if fused_y:
             y = fused_kda.combine(
@@ -1420,9 +1424,9 @@ class LoopBlock(nn.Module):
             # bounded distribution (`losses.logit_softcap`).
             logits = logit_softcap(logits, self.logit_softcap)
         if ce_fixed:
-            ce = fixed_cross_entropy(
-                logits, targets, reduction="none", counters=counters
-            ).reshape(-1, 1)
+            ce = fixed_cross_entropy(logits, targets, reduction="none", counters=counters).reshape(
+                -1, 1
+            )
         else:
             ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
         # `doc_masking`: the mean over the SELECTED positions only (the

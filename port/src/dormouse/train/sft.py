@@ -1385,30 +1385,30 @@ def sft_train(
             with torch.no_grad():
                 batches = eval_batches_for(cfg)
             for _ in range(batches):
-                    ex, ey = eval_stream.next_batch()
-                    if device is not None:
-                        ex, ey = ex.to(device), ey.to(device)
-                    emask = sft_mask(ex)
-                    elogits, _en, _ec = model(ex)
-                    flat = emask.reshape(-1)
-                    if cfg.ce_fixed:
-                        # The eval scores the run's own objective.
-                        ece = fixed_cross_entropy(elogits[flat], ey.reshape(-1)[flat])
-                    else:
-                        ece = F.cross_entropy(elogits[flat], ey.reshape(-1)[flat])
-                    ce_total += float(ece)
-                    batches += 1
-                    # The conditioning metric: at the assistant marker's
-                    # position the model predicts the FIRST answer byte — the
-                    # one byte that cannot be guessed from the answer alone.
-                    is_a = ex == ASSIST
-                    assist = is_a.to(torch.int8).argmax(dim=1)
-                    rows = torch.arange(ex.shape[0], device=ex.device)
-                    per_row = elogits.reshape(ex.shape[0], ex.shape[1], -1)
-                    pred = per_row[rows, assist].argmax(dim=-1)
-                    true = ey[rows, assist]
-                    first_ok += int((pred == true).sum())
-                    first_n += int(ex.shape[0])
+                ex, ey = eval_stream.next_batch()
+                if device is not None:
+                    ex, ey = ex.to(device), ey.to(device)
+                emask = sft_mask(ex)
+                elogits, _en, _ec = model(ex)
+                flat = emask.reshape(-1)
+                if cfg.ce_fixed:
+                    # The eval scores the run's own objective.
+                    ece = fixed_cross_entropy(elogits[flat], ey.reshape(-1)[flat])
+                else:
+                    ece = F.cross_entropy(elogits[flat], ey.reshape(-1)[flat])
+                ce_total += float(ece)
+                batches += 1
+                # The conditioning metric: at the assistant marker's
+                # position the model predicts the FIRST answer byte — the
+                # one byte that cannot be guessed from the answer alone.
+                is_a = ex == ASSIST
+                assist = is_a.to(torch.int8).argmax(dim=1)
+                rows = torch.arange(ex.shape[0], device=ex.device)
+                per_row = elogits.reshape(ex.shape[0], ex.shape[1], -1)
+                pred = per_row[rows, assist].argmax(dim=-1)
+                true = ey[rows, assist]
+                first_ok += int((pred == true).sum())
+                first_n += int(ex.shape[0])
             model.train()
             ce = ce_total / max(batches, 1)
             frac = first_ok / max(first_n, 1)

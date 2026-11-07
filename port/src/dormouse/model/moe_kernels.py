@@ -812,7 +812,6 @@ def _wgrad_kernel(
     )
 
 
-
 @triton.jit
 def _combine_fwd_kernel(
     y_ptr,

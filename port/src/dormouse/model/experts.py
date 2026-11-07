@@ -900,9 +900,7 @@ class TSCTGLU(nn.Module):
         # The down map is f -> d; its `U` lives on the f side and its `V` writes d.
         self.down_u = nn.Parameter(init_u(f, rank_down, device))
         self.down_s = nn.Parameter(torch.ones(rank_down, device=device))
-        self.down_v = nn.Parameter(
-            torch.randn(rank_down, d, device=device) / math.sqrt(rank_down)
-        )
+        self.down_v = nn.Parameter(torch.randn(rank_down, d, device=device) / math.sqrt(rank_down))
         #: The dense form's two biases, kept here so the full-rank
         #: reparameterisation is EXACT rather than "exact up to biases": the
         #: hidden `f` bias enters the gate before the GLU, the `d` bias leaves
@@ -913,9 +911,7 @@ class TSCTGLU(nn.Module):
     def _fq(self, t: torch.Tensor) -> torch.Tensor:
         if self.factor_qat == "none":
             return t
-        return factor_qat_project(
-            t, self.factor_qat, self.factor_qat_alpha, cache=self._qat_cache
-        )
+        return factor_qat_project(t, self.factor_qat, self.factor_qat_alpha, cache=self._qat_cache)
 
     def _proj(
         self, x: torch.Tensor, u: torch.Tensor, s: torch.Tensor, v: torch.Tensor
@@ -1209,10 +1205,7 @@ class SparseMoE(nn.Module):
                     f"set the controller step positive."
                 )
             if self.tsct_revive_noise < 0.0:
-                loud(
-                    f"tsct_revive_noise={self.tsct_revive_noise} is negative. "
-                    f"Escape: >= 0."
-                )
+                loud(f"tsct_revive_noise={self.tsct_revive_noise} is negative. Escape: >= 0.")
         self.experts = nn.ModuleList(
             DualLatentGLU(
                 d,
@@ -1349,18 +1342,14 @@ class SparseMoE(nn.Module):
         #: casts, still 3 launches for the whole build at E=512.
         if self.tsct_packed:
             e, r = cfg.n_experts, cfg.rank
-            self.packed_v = nn.Parameter(
-                torch.randn(e, r, f, device=device) / math.sqrt(r)
-            )
+            self.packed_v = nn.Parameter(torch.randn(e, r, f, device=device) / math.sqrt(r))
             self.packed_s = nn.Parameter(torch.ones(e, 2, r, device=device))
             params: list[nn.Parameter] = [self.packed_v, self.packed_s]
             if not self.share_u:
                 self.packed_gate_u = nn.Parameter(
                     torch.randn(e, d, r, device=device) / math.sqrt(d)
                 )
-                self.packed_up_u = nn.Parameter(
-                    torch.randn(e, d, r, device=device) / math.sqrt(d)
-                )
+                self.packed_up_u = nn.Parameter(torch.randn(e, d, r, device=device) / math.sqrt(d))
                 params += [self.packed_gate_u, self.packed_up_u]
             # The optimizer marker: `[E, rows, cols]` is a BATCH of 2-D matrices,
             # and `train.optim.is_muon_param` reads this attribute (not the rank
@@ -1930,14 +1919,15 @@ class SparseMoE(nn.Module):
         g = torch.Generator(device=counts.device).manual_seed(seed + step)
         with torch.no_grad():
             sigma = self.tsct_revive_noise * donor.v.detach().std()
-            pairs = [(receiver.v, donor.v), (receiver.gate_s, donor.gate_s),
-                     (receiver.up_s, donor.up_s)]
+            pairs = [
+                (receiver.v, donor.v),
+                (receiver.gate_s, donor.gate_s),
+                (receiver.up_s, donor.up_s),
+            ]
             if donor.w is not None and receiver.w is not None:
                 pairs.append((receiver.w, donor.w))
             for dst, src in pairs:
-                noise = torch.randn(
-                    src.shape, generator=g, device=src.device, dtype=src.dtype
-                )
+                noise = torch.randn(src.shape, generator=g, device=src.device, dtype=src.dtype)
                 dst.copy_(src.detach() + noise * sigma)
             counts[cold] = 0.0
             counts[hot] = 0.0
@@ -2102,8 +2092,7 @@ class SparseMoE(nn.Module):
                 f"moe_shared_compute=false."
             )
         shapes = [
-            (tuple(ex.gate_s.shape), tuple(ex.up_s.shape), tuple(ex.v.shape))
-            for ex in self.experts
+            (tuple(ex.gate_s.shape), tuple(ex.up_s.shape), tuple(ex.v.shape)) for ex in self.experts
         ]
         if any(s != shapes[0] for s in shapes[1:]):
             loud(
@@ -2273,16 +2262,10 @@ class SparseMoE(nn.Module):
             "packed_v": tuple(f"{prefix}experts.{e}.v" for e in range(self.n_experts)),
             # ALL gate_s then ALL up_s: the pack is `[E, 2, rank]`, so the
             # gather's two halves are `vals[:E]` and `vals[E:]`.
-            "packed_s": tuple(
-                f"{prefix}experts.{e}.gate_s" for e in range(self.n_experts)
-            )
+            "packed_s": tuple(f"{prefix}experts.{e}.gate_s" for e in range(self.n_experts))
             + tuple(f"{prefix}experts.{e}.up_s" for e in range(self.n_experts)),
-            "packed_gate_u": tuple(
-                f"{prefix}experts.{e}.gate_u" for e in range(self.n_experts)
-            ),
-            "packed_up_u": tuple(
-                f"{prefix}experts.{e}.up_u" for e in range(self.n_experts)
-            ),
+            "packed_gate_u": tuple(f"{prefix}experts.{e}.gate_u" for e in range(self.n_experts)),
+            "packed_up_u": tuple(f"{prefix}experts.{e}.up_u" for e in range(self.n_experts)),
         }
 
     def _translate(
@@ -2366,9 +2349,7 @@ class SparseMoE(nn.Module):
         unpacked model (and the reverse) without a converter script. The values
         are the same tensors: the translation only regroups the keys.
         """
-        dest = super().state_dict(
-            destination=destination, prefix=prefix, keep_vars=keep_vars
-        )
+        dest = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
         form = self.tsct_packed if packed_form is None else bool(packed_form)
         if form != self.tsct_packed:
             self._translate(dest, prefix, to_packed=form)
@@ -2409,20 +2390,14 @@ class SparseMoE(nn.Module):
             self._packed_params = (
                 self.packed_v,
                 self.packed_s,
-                *(
-                    (self.packed_gate_u, self.packed_up_u)
-                    if hasattr(self, "packed_gate_u")
-                    else ()
-                ),
+                *((self.packed_gate_u, self.packed_up_u) if hasattr(self, "packed_gate_u") else ()),
             )
             self._bind_packed()
         self._bank_cache = None
         self._bank_epoch += 1
 
     @torch.compiler.disable
-    def _banks(
-        self, dt: torch.dtype, counters: Counters | None = None
-    ) -> tuple[torch.Tensor, ...]:
+    def _banks(self, dt: torch.dtype, counters: Counters | None = None) -> tuple[torch.Tensor, ...]:
         """The expert bank as `[E, ·]` tensors for the batched matmuls — CACHED IN `dt`.
 
         Two caches' lessons paid here. (1) The naive form stacked per forward
@@ -2496,11 +2471,7 @@ class SparseMoE(nn.Module):
             and (
                 self._packed_params[0]
                 if self._packed_params
-                else (
-                    self._shared_params[0]
-                    if self._shared_params
-                    else self.experts[0].gate_u
-                )
+                else (self._shared_params[0] if self._shared_params else self.experts[0].gate_u)
             ).requires_grad
         )
         if self.moe_bank_epoch:
@@ -2796,9 +2767,7 @@ class SparseMoE(nn.Module):
         `[E, top, d]` allocation becomes 12 GiB.
         """
         values = [int(c) for c in counts.tolist()]
-        ranked = sorted(
-            (i for i, c in enumerate(values) if c > 0), key=lambda i: (-values[i], i)
-        )
+        ranked = sorted((i for i, c in enumerate(values) if c > 0), key=lambda i: (-values[i], i))
         plan: list[tuple[list[int], int]] = []
         members: list[int] = []
         rows = 0
@@ -2900,9 +2869,7 @@ class SparseMoE(nn.Module):
         local = []
         for members, cap in plan:
             idx = torch.tensor(members, dtype=torch.long, device=index.device)
-            base.index_copy_(
-                0, idx, offset + torch.arange(len(members), device=index.device) * cap
-            )
+            base.index_copy_(0, idx, offset + torch.arange(len(members), device=index.device) * cap)
             local.append((idx, cap))
             offset += len(members) * cap
         if keep is None:
@@ -2916,12 +2883,11 @@ class SparseMoE(nn.Module):
         offset = 0
         for idx, cap in local:
             bank = flat.narrow(0, offset, idx.numel() * cap).view(idx.numel(), cap, self.d)
-            g = torch.bmm(bank, gate_u.index_select(0, idx)) * gate_s.index_select(
-                0, idx
-            )[:, None, :]
-            u = torch.bmm(bank, up_u.index_select(0, idx)) * up_s.index_select(0, idx)[
-                :, None, :
-            ]
+            g = (
+                torch.bmm(bank, gate_u.index_select(0, idx))
+                * gate_s.index_select(0, idx)[:, None, :]
+            )
+            u = torch.bmm(bank, up_u.index_select(0, idx)) * up_s.index_select(0, idx)[:, None, :]
             h = F.silu(g) * u if self._glu is None else self._glu(g, u)
             ys.append(torch.bmm(h, v.index_select(0, idx)).reshape(idx.numel() * cap, self.f))
             offset += idx.numel() * cap
@@ -3243,9 +3209,7 @@ class SparseMoE(nn.Module):
             if notes:
                 counters.why = "; ".join(notes)  # type: ignore[attr-defined]
             return self._expert_pass(
-                lambda: self._bucketed_dispatch(
-                    x, weight, index, order, keep_rows, counters
-                ),
+                lambda: self._bucketed_dispatch(x, weight, index, order, keep_rows, counters),
                 counters,
             )
         if self.moe_kernel == "batched":
@@ -3253,9 +3217,7 @@ class SparseMoE(nn.Module):
                 counters.why = "; ".join(notes)  # type: ignore[attr-defined]
             counters.count("moe_batched_calls")
             return self._expert_pass(
-                lambda: self._batched_dispatch(
-                    x, weight, index, order, keep_rows, counters
-                ),
+                lambda: self._batched_dispatch(x, weight, index, order, keep_rows, counters),
                 counters,
             )
         if self.moe_kernel == "triton":
@@ -3303,9 +3265,7 @@ class SparseMoE(nn.Module):
                 counters.why = "; ".join(notes)  # type: ignore[attr-defined]
             counters.count("moe_padded_bmm")
             return self._expert_pass(
-                lambda: self._padded_dispatch(
-                    x, weight, index, order, keep_rows, counters
-                ),
+                lambda: self._padded_dispatch(x, weight, index, order, keep_rows, counters),
                 counters,
             )
         counters.count("moe_naive_dispatch")
@@ -3348,17 +3308,13 @@ class SparseMoE(nn.Module):
         counters.count("moe_dropless")
         if self.moe_kernel == "bucketed":
             return self._expert_pass(
-                lambda: self._bucketed_dispatch(
-                    x, weight, index, order, keep_rows, counters
-                ),
+                lambda: self._bucketed_dispatch(x, weight, index, order, keep_rows, counters),
                 counters,
             )
         if self.moe_kernel == "batched":
             counters.count("moe_batched_calls")
             return self._expert_pass(
-                lambda: self._batched_dispatch(
-                    x, weight, index, order, keep_rows, counters
-                ),
+                lambda: self._batched_dispatch(x, weight, index, order, keep_rows, counters),
                 counters,
             )
         why = None

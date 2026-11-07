@@ -181,9 +181,7 @@ class MHCMix(nn.Module):
         # module's OWN weight dtype (fp32 here; a bf16 test module keeps bf16)
         # because the hyper-network's next op is a matmul with those weights.
         flat = flat.float()
-        return (flat / torch.sqrt(flat.pow(2).mean(-1, keepdim=True) + EPS)).to(
-            self.phi_pre.dtype
-        )
+        return (flat / torch.sqrt(flat.pow(2).mean(-1, keepdim=True) + EPS)).to(self.phi_pre.dtype)
 
     def _pre_tilde(self, x_streams: torch.Tensor) -> torch.Tensor:
         """Eq. 7's `H̃_pre`, unconstrained — `block.rs:158-168`."""

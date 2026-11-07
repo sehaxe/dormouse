@@ -692,11 +692,7 @@ class _Pre(torch.autograd.Function):
         xn = torch.empty((bt, kd), device=xl.device, dtype=torch.float32)
         raw = torch.empty((bt, COLS), device=xl.device, dtype=torch.float32)
         dot = torch.empty((bt, COLS), device=xl.device, dtype=torch.float32)
-        normed = (
-            torch.empty((bt, d), device=xl.device, dtype=torch.float32)
-            if has_norm
-            else None
-        )
+        normed = torch.empty((bt, d), device=xl.device, dtype=torch.float32) if has_norm else None
         normed_mlp = (
             torch.empty((bt, d), device=xl.device, dtype=torch.float32)
             if has_norm and has_mlp
@@ -731,7 +727,18 @@ class _Pre(torch.autograd.Function):
             num_warps=_warps(tile),
         )
         ctx.save_for_backward(
-            xl, xn, raw, dot, phi_pre, phi_post, phi_res, a_pre, a_post, a_res, gain, gain_mlp,
+            xl,
+            xn,
+            raw,
+            dot,
+            phi_pre,
+            phi_post,
+            phi_res,
+            a_pre,
+            a_post,
+            a_res,
+            gain,
+            gain_mlp,
             ctx_t,
         )
         ctx.cnt = cnt

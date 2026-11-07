@@ -485,8 +485,7 @@ def make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:
                 if body.get("stream"):
                     return self._error(
                         400,
-                        "stream=true with `tools` is not supported yet: a tool "
-                        "call is one message",
+                        "stream=true with `tools` is not supported yet: a tool call is one message",
                     )
                 return self._tool_response(prompt, n, schemas, cid, created)
             if body.get("stream"):

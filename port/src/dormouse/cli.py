@@ -755,9 +755,7 @@ def rl_cmd(
     )
     held = report.get("eval")
     held_field = (
-        ""
-        if not held
-        else f" pass@1={held['pass@1']:.3f} pass@budget={held['pass@budget']:.3f}"
+        "" if not held else f" pass@1={held['pass@1']:.3f} pass@budget={held['pass@budget']:.3f}"
     )
     console.print(
         f"[green]rl done[/] steps={report['steps']} loss={report['loss']:.4f} "
@@ -812,7 +810,9 @@ def eval_cmd(
     if eval_stream is None:
         raise LoudError("no eval stream (the snapshot carries eval_data or eval=true)")
     loss, scored, fin, _per_iter = _evaluate(
-        model, eval_stream, eval_batches_for(run.train),
+        model,
+        eval_stream,
+        eval_batches_for(run.train),
         device=None if dev.type == "cpu" else dev,
     )
     console.print(

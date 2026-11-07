@@ -57,9 +57,7 @@ class DenseFFN(nn.Module):
         self.capacity = 0.0
 
     def _glu(self, g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        return expert_glu(
-            self.expert_act, g, u, beta1=self.beta1, beta2=self.beta2, c0=self.c0
-        )
+        return expert_glu(self.expert_act, g, u, beta1=self.beta1, beta2=self.beta2, c0=self.c0)
 
     def _linear(self, linear: nn.Linear, x: torch.Tensor) -> torch.Tensor:
         w = dense_qat_weight(

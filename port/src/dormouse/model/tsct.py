@@ -155,9 +155,7 @@ def mm_fp8_shape_ok(k: int, n: int) -> bool:
     return k % 16 == 0 and n % 16 == 0
 
 
-def _fp8_reason(
-    x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype
-) -> tuple[str, str] | None:
+def _fp8_reason(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> tuple[str, str] | None:
     """`None` if the fp8 lane can run THIS call, else `(reason, detail)`.
 
     The ORDER is the operands' own properties first (dtype, rank, the
@@ -570,9 +568,7 @@ def qat_linear(linear: nn.Linear, x: torch.Tensor, kind: str, alpha: float) -> t
         return linear(x)
     # `_qat_cache` is attached by `DormouseModel.__init__` (`attach_qat_caches`);
     # a bare `nn.Linear` outside a model has none and takes the per-forward path.
-    w = dense_qat_project(
-        linear.weight, kind, alpha, cache=getattr(linear, "_qat_cache", None)
-    )
+    w = dense_qat_project(linear.weight, kind, alpha, cache=getattr(linear, "_qat_cache", None))
     return F.linear(x, w, linear.bias)
 
 

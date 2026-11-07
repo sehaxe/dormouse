@@ -231,21 +231,23 @@ def active_macs_per_token(
         shared_rank=shared_rank,
     )
     if ffn_form == "bank":
-        return body + ffn_macs_per_token(
-            "bank",
-            d_model,
-            f,
-            rank=ffn_rank,
-            shared_rank=shared_rank,
-            n_experts=n_experts,
-            topk=topk,
-        ) - d_model * f
+        return (
+            body
+            + ffn_macs_per_token(
+                "bank",
+                d_model,
+                f,
+                rank=ffn_rank,
+                shared_rank=shared_rank,
+                n_experts=n_experts,
+                topk=topk,
+            )
+            - d_model * f
+        )
     return body
 
 
-def attn_param_delta(
-    d_model: int, n_heads: int, attn_latent_rank: int, n_kv_heads: int
-) -> int:
+def attn_param_delta(d_model: int, n_heads: int, attn_latent_rank: int, n_kv_heads: int) -> int:
     """Parameters added by the latent + GQA versus the four `d×d` projections.
 
     `beta_proj [n_heads, d]` is unchanged in every arm, so it cancels.

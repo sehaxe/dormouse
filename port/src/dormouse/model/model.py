@@ -286,10 +286,7 @@ class DormouseModel(nn.Module):
             # dormant copy beside it.
             n_layers = cfg.n_layers or cfg.loop_blocks * cfg.max_iter
             self.transformer_blocks = nn.ModuleList(
-                [
-                    TransformerBlock(cfg, n_layers=n_layers, device=device)
-                    for _ in range(n_layers)
-                ]
+                [TransformerBlock(cfg, n_layers=n_layers, device=device) for _ in range(n_layers)]
             )
             self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
             if cfg.tie_embeddings:
