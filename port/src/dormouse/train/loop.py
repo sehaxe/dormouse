@@ -1854,10 +1854,14 @@ def train(
             kw["ce_fixed"] = True
         if cfg.segment_len:
             # The SEGMENTED training forward: the window is cut into
-            # `segment_len`-position segments and the KDA state is carried across
-            # them as a graph edge (`loopblock._forward_segmented`), so a window
+            # `segment_len`-byte segments and BOTH cross-position states are
+            # carried across them as graph edges (`loopblock._forward_segmented`)
+            # — KDA's tensor state and, on that arm, the CSA ring with the
+            # partial chunk a cut splits (`csa._carried_state`), so a window
             # longer than one forward fits in VRAM can be trained. Same logits
-            # shape, same loss. The EVAL path does not pass it: an eval saves no
+            # shape, same loss. The offset is not passed: the CSA ring's
+            # `n·chunk + count` IS the byte position, so the state is the
+            # timeline. The EVAL path does not pass it: an eval saves no
             # activations, so it needs no segmentation, and leaving it one-shot
             # keeps the held-out number comparable with the record.
             kw["segment_len"] = cfg.segment_len

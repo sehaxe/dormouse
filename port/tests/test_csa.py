@@ -208,19 +208,29 @@ def test_gate_6_unsupported_combinations_are_loud():
         validate(tiny_cfg(use_csa=True, use_kda=False))
     with pytest.raises(LoudError, match="attn_kind"):
         validate(tiny_cfg(use_csa=True, attn_kind="full"))
-    with pytest.raises(LoudError, match="use_csa"):
-        _validate_segment(tiny_cfg(use_csa=True), TrainConfig(segment_len=32, seq_len=SEQ))
+    # The SEGMENT pair is legal now: a chunk a cut splits is carried and
+    # completed by the next segment (`test_segment_csa.py` is the parity gate).
+    # What stays refused is a segment shorter than one chunk.
+    _validate_segment(
+        tiny_cfg(use_csa=True, moe_topk=0, moe_capacity=0),
+        TrainConfig(segment_len=32, seq_len=SEQ),
+    )
+    with pytest.raises(LoudError, match="csa_chunk"):
+        _validate_segment(
+            tiny_cfg(use_csa=True, csa_chunk=8),
+            TrainConfig(segment_len=4, seq_len=SEQ),
+        )
     # The runtime seam: a hand-built model never calls `validate`.
-    model = DormouseModel(tiny_cfg(use_csa=True))
+    model = DormouseModel(tiny_cfg(use_csa=True, moe_topk=0, moe_capacity=0))
     ids, targets = _batch()
-    with pytest.raises(AssertionError, match="use_csa"):
-        model(ids, targets, segment_len=32)
+    logits, loss, c = model(ids, targets, segment_len=32)
+    assert logits.shape == (BATCH * SEQ, 256) and c["loop_segments"] == 2
     # topk > t is fine at runtime: the selection is min(topk, available).
     wide = DormouseModel(tiny_cfg(use_csa=True, csa_topk=1000, use_engram=False, moe_topk=0))
     logits, loss, _ = wide(ids, targets)
     assert loss is not None and torch.isfinite(loss)
     print("loud: csa_chunk/csa_kv_dim/csa_topk, use_msa, use_byteflow, use_kda=false, "
-          "attn_kind='full', segment_len>0; topk=1000 ran")
+          "attn_kind='full', segment_len<csa_chunk; segment_len=32 ran; topk=1000 ran")
 
 
 # --- 7. no host read in the forward ---------------------------------------

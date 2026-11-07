@@ -736,7 +736,10 @@ class DormouseModel(nn.Module):
         `segment_len` is the SEGMENTED TRAINING path (`loopblock`, off at 0):
         the trainer passes `train.segment_len`, which cuts the window into
         segments and carries the KDA state across them so a window longer than
-        one forward fits in VRAM can be trained. It is a memory decision, not a
+        one forward fits in VRAM can be trained. With `use_csa` the CSA ring is
+        carried too, including the partial chunk a cut splits (it is completed
+        by the next segment from its carried `sum`/`count`; nothing is dropped,
+        nothing is padded), so the pair is legal. It is a memory decision, not a
         model change (the logits agree with the one-shot forward to fp32
         round-off), and the returned logits keep the `[b*t, vocab]` shape, so
         the trainer's loss code is untouched. The EVAL path deliberately does

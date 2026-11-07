@@ -52,8 +52,10 @@ choice** (both printed per row):
 * `attn_window` with `segment_len>0` is refused: a cut hides the bytes before
   it, so the first positions of a segment would read a NARROWER band than the
   one-shot forward and the segmentation would change the model;
-* `use_csa` with `segment_len>0` is refused for the same class of reason (the
-  half-full chunk's boundary rule is undecided);
+* `use_csa` with `segment_len>0` is now ALLOWED (2026-11-08: the partial chunk
+  is carried and completed by the next segment — `tests/test_segment_csa.py`);
+  every CSA arm in this table also sets `attn_window`, which is the refusal
+  that keeps its row at 0, and a CSA-only arm would now be segmented;
 * only `kda_only` at 262 144 keeps `segment_len=32768`.
 
 The flattening claim is therefore WITHIN an arm, across its two lengths, which
@@ -197,7 +199,7 @@ def segment_why(arm: str, length: int) -> str:
     if length <= SEGMENT:
         return f"segment_len={SEGMENT} >= seq_len={length}: refused as pointless"
     if _arm_only(arm):
-        return "attn_window/use_csa refuse segment_len>0 (a cut would narrow the band)"
+        return "this arm overrides attn_window (refused with segment_len) or another flag"
     return f"segment_len={SEGMENT}: the arm adds no branch, and KDA carries O(1) state"
 
 

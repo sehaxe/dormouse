@@ -467,9 +467,6 @@ EXCUSED_FUNCTIONS = {
     "attach_qat_caches": "setup, once per run",
     "CSAState.reserve": "state reservation, once per decode/prefill shape",
     "CompressedSelectiveAttention._hier_fine": "CSA construction, once per module",
-    "CompressedSelectiveAttention.forward_state": (
-        "CSA arm only (use_csa); the chunk walk carries state forward one chunk at a time"
-    ),
     "memory_table": "CSA construction, once per module",
     "KDAAttention.step_state": "decode only (one position at a time), never a training step",
     "decode_bytes": "decode only",
