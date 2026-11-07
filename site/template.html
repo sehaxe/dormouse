@@ -50,7 +50,7 @@
     font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased;
   }
   .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
-  section{padding:88px 0;border-top:1px solid var(--line)}
+  section{padding:76px 0;border-top:1px solid var(--line)}
   section:first-of-type{border-top:0}
   /* A full-viewport poster that PINS, so the next section slides over it —
      one transition, no scroll-jacking, no library. */
@@ -71,9 +71,13 @@
     padding-bottom:14px;border-bottom:1px solid var(--line)}
   .shead .num{color:var(--accent)}
   .smeta{margin-left:auto;text-transform:none;letter-spacing:0}
-  .bytes{margin:22px 0 0;font-family:var(--mono);font-size:13px;line-height:1.7;
-    letter-spacing:.02em;white-space:pre;overflow-x:auto;color:#4a4e56;
-    font-variant-numeric:tabular-nums}
+  .heat{display:block;width:100%;height:44px;margin:26px 0 0;
+    image-rendering:pixelated;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+    opacity:.95}
+  .bytes{margin:16px 0 0;font-family:var(--mono);
+    font-size:clamp(11px,1.05vw,17px);line-height:1.42;letter-spacing:0;
+    white-space:pre;overflow-x:auto;color:#4a4e56;
+    font-variant-numeric:tabular-nums;font-weight:400}
   .bytes b{font-weight:400}
   .sfoot{display:flex;justify-content:space-between;align-items:center;gap:18px;
     margin-top:18px;padding-top:14px;border-top:1px solid var(--line);
@@ -152,6 +156,50 @@
     ul.retractions li{grid-template-columns:1fr;gap:6px}
     td,th{padding:10px 8px}
   }
+
+  /* ---- the poster (v3): binary rain behind, type in front ---- */
+  .hero{position:sticky;top:0;z-index:0;min-height:100svh;display:flex;
+        align-items:center;overflow:hidden}
+  .hero .content{position:relative;z-index:2;width:100%}
+  .hero h1{font-size:clamp(56px,9vw,132px);letter-spacing:-.04em;margin:14px 0 0}
+  .hero .lede{margin-top:26px;max-width:62ch}
+  .hero-stats{display:flex;flex-wrap:wrap;gap:34px;margin-top:38px;
+    font-family:var(--mono);font-size:13px;color:var(--dim);letter-spacing:.02em}
+  .hero-stats b{color:var(--text);font-weight:400;font-size:15px;margin-right:4px}
+  .hero-stats .hint{margin-left:auto;color:#5b6069;animation:blink 2.6s steps(2) infinite;
+    display:flex;align-items:center;gap:8px}
+  .hero-stats .hint::after{content:"";width:1px;height:22px;
+    background:linear-gradient(180deg,var(--accent),transparent)}
+  @keyframes blink{0%,60%{opacity:.45}61%,100%{opacity:1}}
+  #rain{position:absolute;inset:0;z-index:0;width:100%;height:100%;
+        opacity:.75;pointer-events:none;display:block}
+  /* the scrim: the rain fades out where the type lives, so the text is never
+     competing with a digit for the same pixel. */
+  .hero::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
+    background:
+      linear-gradient(90deg,rgba(11,12,14,.98) 0%,rgba(11,12,14,.95) 34%,rgba(11,12,14,.55) 56%,rgba(11,12,14,0) 78%),
+      linear-gradient(180deg,rgba(11,12,14,.9) 0%,rgba(11,12,14,0) 22%,rgba(11,12,14,0) 74%,rgba(11,12,14,.95) 100%)}
+  @media (prefers-reduced-motion:reduce){#rain{display:none}}
+  .tape{position:absolute;left:0;right:0;bottom:0;z-index:2;overflow:hidden;
+    border-top:1px solid var(--line);background:rgba(9,10,12,.96);
+    -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
+  .tape-in{display:inline-block;white-space:nowrap;padding:9px 0;
+    font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:#6f747d;
+    animation:tape 44s linear infinite}
+  .tape-in b{color:var(--accent);font-weight:400}
+  .tape{-webkit-mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent);
+        mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent)}
+  @keyframes tape{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+  .hero:hover .tape-in{animation-play-state:paused}
+  @media (prefers-reduced-motion:reduce){.tape-in{animation:none}}
+  /* the title glitches for 220 ms every 7 s — a CRT artefact, not a loop */
+  .hero h1{animation:glitchy 7s steps(1) infinite}
+  @keyframes glitchy{
+    0%,96%{text-shadow:none;transform:none}
+    96.5%{text-shadow:-2px 0 rgba(217,160,91,.55),2px 0 rgba(120,170,255,.45);transform:translateX(1px)}
+    97.5%{text-shadow:2px 0 rgba(217,160,91,.55),-2px 0 rgba(120,170,255,.45);transform:translateX(-1px)}
+    98.5%{text-shadow:none;transform:none}
+    100%{text-shadow:none;transform:none}}
 </style>
 </head>
 <body>
@@ -159,27 +207,35 @@
 <div class="wrap">
 
   <section class="hero">
+    <canvas id="rain" aria-hidden="true"></canvas>
     <div class="content">
       <div class="kicker">one RTX 5070 Ti · 16 GB · sm_120</div>
-      <h1>dormouse<span class="dot">.</span></h1>
+      <h1><span id="scramble">dormouse</span><span class="dot">.</span></h1>
       <p class="lede">
         A byte-level language model that lives on <strong>one workstation</strong>.
         Published with the measurements that justify it — and the ones that
         <strong>refute</strong> it.
       </p>
-      <div class="scrollcue"><i></i><span>scroll — the evidence is below</span></div>
+      <div class="hero-stats">
+        <span><b id="hBpb">—</b> bits / byte</span>
+        <span><b id="hMb">—</b> MB seen</span>
+        <span><b id="hSpeed">—</b> step</span>
+        <span class="hint">scroll</span>
+      </div>
     </div>
+    <div class="tape" aria-hidden="true"><div class="tape-in" id="tape"></div></div>
   </section>
 
   <!-- The hero image is not an illustration: 1024 held-out bytes, each tinted
        by how much it surprised THIS checkpoint. Rendered from
        site/assets/surprise.json, written by port/scripts/surprise_map.py. -->
-  <section class="surprise">
+  <section class="surprise" id="s0">
     <div class="shead">
       <span class="num">[0]</span>
       <span>what the model sees</span>
       <span class="smeta" id="sMeta">held-out english · 1 024 bytes</span>
     </div>
+    <canvas class="heat" id="heat" width="1024" height="44" aria-hidden="true"></canvas>
     <pre class="bytes" id="bytes" aria-label="held-out text tinted by the model's surprise"></pre>
     <div class="sfoot">
       <span id="sMean">—</span>
@@ -283,6 +339,105 @@
 
 </div>
 
+<script>
+(() => {
+  const cv = document.getElementById('rain');
+  if (!cv || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const gl = cv.getContext('webgl', { antialias: false, alpha: true, premultipliedAlpha: true });
+  if (!gl) { cv.remove(); return; }
+
+  // A 2-glyph atlas drawn by the 2D canvas: '0' and '1'. One texture, sampled
+  // per cell, so the rain is characters rather than blocks.
+  const at = document.createElement('canvas');
+  at.width = 64; at.height = 64;
+  const c2 = at.getContext('2d');
+  c2.fillStyle = '#000'; c2.fillRect(0, 0, 64, 64);
+  c2.fillStyle = '#fff';
+  c2.font = 'bold 54px ui-monospace, "DejaVu Sans Mono", monospace';
+  c2.textAlign = 'center'; c2.textBaseline = 'middle';
+  c2.fillText('0', 16, 34); c2.fillText('1', 48, 34);
+
+  const vs = 'attribute vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }';
+  const fs = `precision highp float;
+uniform vec2 u_res; uniform float u_t; uniform sampler2D u_atlas;
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+void main(){
+  float cellW = 15.0;
+  float cellH = 19.0;
+  vec2 g = gl_FragCoord.xy / vec2(cellW, cellH);
+  float col = floor(g.x);
+  float rowAll = g.y;
+  float fx = fract(g.x);
+  float fy = 1.0 - fract(g.y);
+
+  float speed = 0.9 + 2.4 * hash(vec2(col, 11.0));
+  float phase = hash(vec2(col, 23.0));
+  float rows = u_res.y / cellH;
+  float headRow = mod(u_t * speed + phase * rows, rows + 26.0) - 13.0;
+  float d = headRow - rowAll;
+  float trail = d >= 0.0 ? exp(-d * 0.16) : 0.0;
+
+  float cell = floor(rowAll);
+  float rate = floor(u_t * (2.0 + 5.0 * hash(vec2(col, 7.0))));
+  float pick = hash(vec2(col, cell) + rate);
+  float glyph = texture2D(u_atlas, vec2(step(0.5, pick) * 0.5 + fx * 0.5, fy)).r;
+
+  float a = trail * glyph;
+  float head = smoothstep(1.6, 0.0, abs(d));
+  vec3 amber = vec3(0.85, 0.63, 0.36);
+  vec3 col3 = mix(amber * 0.5, vec3(1.0, 0.97, 0.92), head);
+  a = step(0.16, a) * clamp(a * 1.7, 0.0, 1.0);
+  gl_FragColor = vec4(col3 * a, a);
+}`;
+  const sh = (t, src) => { const o = gl.createShader(t); gl.shaderSource(o, src); gl.compileShader(o); return o; };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { cv.remove(); return; }
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, at);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.uniform1i(gl.getUniformLocation(prog, 'u_atlas'), 0);
+
+  const uRes = gl.getUniformLocation(prog, 'u_res');
+  const uT = gl.getUniformLocation(prog, 'u_t');
+  const resize = () => {
+    const dpr = Math.min(devicePixelRatio || 1, 1.5);
+    const w = Math.max(1, Math.floor(cv.clientWidth * dpr));
+    const h = Math.max(1, Math.floor(cv.clientHeight * dpr));
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    gl.viewport(0, 0, w, h);
+    gl.uniform2f(uRes, w, h);
+  };
+  const draw = (t) => { gl.uniform1f(uT, t); gl.drawArrays(gl.TRIANGLES, 0, 3); };
+  resize();
+  draw(6.0);
+
+  let raf = 0, t0 = performance.now(), visible = true;
+  const loop = (now) => { if (!visible) return; raf = requestAnimationFrame(loop); resize(); draw((now - t0) / 1000); };
+  new IntersectionObserver(([e]) => {
+    visible = e.isIntersecting;
+    if (visible) { cancelAnimationFrame(raf); raf = requestAnimationFrame(loop); }
+  }, { threshold: 0 }).observe(cv);
+  addEventListener('resize', resize);
+  raf = requestAnimationFrame(loop);
+})();
+
+</script>
 <script id="data" type="application/json">/*__DATA__*/null</script>
 <script id="surprise" type="application/json">/*__SURPRISE__*/null</script>
 <script>
@@ -305,11 +460,27 @@
     const esc = (c) => c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c;
     let out = '';
     for (let i = 0; i < bits.length; i++) {
-      out += `<b style="color:${col[band(bits[i])]}">${esc(sj.text[i])}</b>`;
+      const bd = band(bits[i]);
+      const bg = bd >= 3 ? ';background:rgba(217,160,91,.10)' : '';
+      out += `<b style="color:${col[bd]}${bg}">${esc(sj.text[i])}</b>`;
       if ((i + 1) % cols === 0) out += '\n';
     }
     document.getElementById('bytes').innerHTML = out.trimEnd();
     const mean = bits.reduce((a, b) => a + b, 0) / bits.length;
+    // the strip: one column per byte, height = surprise, colour = the same bands
+    const hc = document.getElementById('heat');
+    if (hc) {
+      hc.width = bits.length;
+      const ctx = hc.getContext('2d');
+      const maxB = Math.max(...bits, 1);
+      for (let i = 0; i < bits.length; i++) {
+        const v = bits[i] / maxB;
+        ctx.fillStyle = col[band(bits[i])];
+        ctx.globalAlpha = 0.15 + 0.85 * v;
+        ctx.fillRect(i, 44 - Math.max(2, Math.round(v * 44)), 1, Math.max(2, Math.round(v * 44)));
+      }
+      ctx.globalAlpha = 1;
+    }
     document.getElementById('sMean').textContent =
       `mean ${mean.toFixed(3)} bits / byte over ${bits.length} held-out bytes`;
     document.getElementById('sMeta').textContent =
@@ -396,6 +567,65 @@
   document.getElementById('runs-table').innerHTML = (d.runs || []).map(r => `<tr>
     <td class="label">${r.run}</td><td>${r.source || '—'}</td><td>${r.opt || '—'}</td>
     <td>${r.batch}×${r.seq}</td><td>${fmt(r.mb, 0)}</td><td>${fmt(r.bpb, 3)}</td></tr>`).join('');
+
+  const scramble = document.getElementById('scramble');
+  const word = 'dormouse';
+  if (scramble && !reduced) {
+    let start = 0;
+    const total = 780;
+    const tick = (now) => {
+      if (!start) start = now;
+      const t = now - start;
+      let out = '';
+      for (let i = 0; i < word.length; i++) {
+        out += t >= (i / word.length) * total ? word[i] : (Math.random() < 0.5 ? '0' : '1');
+      }
+      scramble.textContent = out;
+      if (t < total) requestAnimationFrame(tick);
+      else scramble.textContent = word;
+    };
+    requestAnimationFrame(tick);
+  }
+  // A camera push: as the hero leaves, it scales up and fades, so the pinned
+  // section reads as a scene change rather than a stuck block.
+  const heroEl = document.querySelector('.hero .content');
+  if (heroEl && !reduced) {
+    let raf2 = 0;
+    addEventListener('scroll', () => {
+      if (raf2) return;
+      raf2 = requestAnimationFrame(() => {
+        raf2 = 0;
+        const y = window.scrollY;
+        const h = window.innerHeight || 1;
+        const k = Math.min(y / h, 1);
+        heroEl.style.transform = `translate3d(0, ${(k * -30).toFixed(1)}px, 0) scale(${(1 + k * 0.04).toFixed(3)})`;
+        heroEl.style.opacity = String(1 - k * 0.55);
+      });
+    }, { passive: true });
+  }
+
+  const tapeFacts = [
+    'flagship3 · 1.520 bits per byte at 246 MB',
+    '95,035,200 parameters · 12 unique layers · d_model 832',
+    '1M context · 34 MB of state',
+    'Muon bf16 Newton–Schulz · 1.92× the step for +0.01 BPB',
+    '3-step Newton–Schulz rejected: +0.27 BPB at [832, 3072]',
+    'one RTX 5070 Ti · 16 GB · sm_120',
+    'every number on this page is computed from the run logs'
+  ];
+  const tapeEl = document.getElementById('tape');
+  if (tapeEl) {
+    const line = tapeFacts.map(t => `<b>·</b> ${t} `).join('');
+    tapeEl.innerHTML = line + line;   // duplicated for a seamless -50% loop
+  }
+
+  if (pts.length) {
+    document.getElementById('hBpb').textContent = fmt(pts[pts.length - 1].bpb, 3);
+    document.getElementById('hMb').textContent = fmt(pts[pts.length - 1].mb, 0);
+  }
+  if (control && bestSafe) {
+    document.getElementById('hSpeed').textContent = fmt(bestSafe.kbs / control.kbs, 2) + '×';
+  }
 
   document.getElementById('built').textContent = 'built from ' + (d.stats.runs_on_record) + ' log files';
 
