@@ -66,11 +66,45 @@
   h1 .dot{color:var(--accent)}
   .lede{max-width:68ch;font-size:20px;line-height:1.5;color:#cfccc6;margin:22px 0 0}
   .lede strong{color:var(--text);font-weight:600}
-  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:44px 0 0;perspective:1000px}
-  .stats .card{transform-style:preserve-3d;transition:transform .35s cubic-bezier(.2,.7,.2,1),border-color .35s ease}
+  .poster{display:grid;grid-template-columns:1.12fr .88fr;gap:56px;align-items:center}
+  .poster-copy{min-width:0}
+  .scrollcue{margin-top:44px;display:flex;align-items:center;gap:10px;color:var(--dim);
+    font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase}
+  .scrollcue i{display:block;width:1px;height:34px;background:linear-gradient(180deg,var(--accent),transparent);
+    animation:drip 2.4s ease-in-out infinite}
+  @keyframes drip{0%,100%{transform:scaleY(.35);opacity:.4;transform-origin:top}50%{transform:scaleY(1);opacity:1;transform-origin:top}}
+
+  .poster-card-wrap{perspective:1100px;will-change:transform}
+  .poster-card{position:relative;border-radius:16px;padding:22px 22px 18px;
+    background:linear-gradient(158deg,#171a20 0%,#101216 55%,#0c0e11 100%);
+    border:1px solid #262a31;box-shadow:0 50px 90px -50px #000,0 0 0 1px rgba(255,255,255,.02) inset;
+    transform:rotateY(-13deg) rotateX(7deg);transform-style:preserve-3d;
+    animation:float 9s ease-in-out infinite}
+  @keyframes float{
+    0%,100%{transform:rotateY(-13deg) rotateX(7deg) translateY(0)}
+    50%{transform:rotateY(-11deg) rotateX(6deg) translateY(-9px)}}
+  .poster-card::before{content:"";position:absolute;inset:0;border-radius:16px;pointer-events:none;
+    background-image:repeating-linear-gradient(0deg,rgba(255,255,255,.03) 0 1px,transparent 1px 4px),
+                     repeating-linear-gradient(90deg,rgba(255,255,255,.03) 0 1px,transparent 1px 4px);
+    mix-blend-mode:overlay;opacity:.7}
+  .poster-card::after{content:"";position:absolute;inset:0;border-radius:16px;pointer-events:none;
+    background:linear-gradient(115deg,transparent 34%,rgba(255,255,255,.08) 47%,transparent 60%);
+    opacity:0;transition:opacity .45s ease}
+  .poster-card:hover::after{opacity:1}
+  .pc-top{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;
+    color:var(--dim);letter-spacing:.04em;text-transform:uppercase}
+  .pc-main{display:flex;align-items:baseline;gap:10px;margin:18px 0 4px}
+  .pc-num{font-family:var(--mono);font-size:56px;line-height:1;letter-spacing:-.03em}
+  .pc-unit{font-family:var(--mono);font-size:13px;color:var(--accent);letter-spacing:.1em}
+  .pc-spark{width:100%;height:74px;display:block;margin:10px 0 6px}
+  .pc-spark polyline{fill:none;stroke:var(--accent);stroke-width:1.6}
+  .pc-spark circle{fill:var(--accent)}
+  .pc-foot{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;
+    color:var(--dim);border-top:1px solid #23262c;padding-top:12px}
+
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:56px 0 0}
+  .stats .card{transition:border-color .35s ease}
   .stats .card:hover{border-color:#33373f}
-  .stats .card .n,.stats .card .k,.stats .card .s{transform:translateZ(22px)}
-  .stats .card{box-shadow:0 0 0 rgba(0,0,0,0)}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px}
   .card .n{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:34px;line-height:1.1;color:var(--accent)}
   .card .k{font-size:13px;color:var(--dim);margin-top:8px}
@@ -129,6 +163,10 @@
   footer a{color:var(--text);text-decoration:none;border-bottom:1px solid var(--line)}
   footer .row{display:flex;gap:24px;flex-wrap:wrap}
   .meta{font-family:var(--mono);font-size:12px}
+  @media (max-width:860px){
+    .poster{grid-template-columns:1fr;gap:36px}
+    .poster-card{transform:none;animation:none}
+  }
   @media (max-width:720px){
     h1{font-size:40px}.stats{grid-template-columns:1fr}
     ul.retractions li{grid-template-columns:1fr;gap:6px}
@@ -143,14 +181,29 @@
   <section class="hero">
     <canvas id="rain" aria-hidden="true"></canvas>
     <div class="content">
-    <div class="kicker">one RTX 5070 Ti · 16 GB · sm_120</div>
-    <h1>dormouse<span class="dot">.</span></h1>
-    <p class="lede">
-      A byte-level language model that trains on <strong>one workstation</strong>.
-      Published with the measurements that justify it — and the ones that
-      <strong>refute</strong> it. Every number below is computed from the run logs
-      at build time; if a log is missing, the number is missing.
-    </p>
+    <div class="poster">
+      <div class="poster-copy">
+        <div class="kicker">one RTX 5070 Ti · 16 GB · sm_120</div>
+        <h1>dormouse<span class="dot">.</span></h1>
+        <p class="lede">
+          A byte-level language model that lives on <strong>one workstation</strong>.
+          Published with the measurements that justify it — and the ones that
+          <strong>refute</strong> it. Every number on this page is computed from the
+          run logs at build time; if a log is missing, the number is missing.
+        </p>
+        <div class="scrollcue"><i></i><span>the proof is below</span></div>
+      </div>
+
+      <div class="poster-card-wrap" id="posterWrap" aria-hidden="true">
+        <div class="poster-card">
+          <div class="pc-top"><span>flagship3</span><span>12 layers · 95.0M</span></div>
+          <div class="pc-main"><span class="pc-num" id="pcBpb">—</span><span class="pc-unit">bits / byte</span></div>
+          <svg class="pc-spark" id="pcSpark" viewBox="0 0 300 74" preserveAspectRatio="none"></svg>
+          <div class="pc-foot"><span id="pcMb">— seen</span><span id="pcSpeed">— step</span><span>fwedu · held-out</span></div>
+        </div>
+      </div>
+    </div>
+
     <div class="stats" id="stats" data-reveal>
       <div class="card" data-tilt>
         <div class="n">1M</div>
@@ -429,6 +482,45 @@ void main(){
   document.getElementById('runs-table').innerHTML = (d.runs || []).map(r => `<tr>
     <td class="label">${r.run}</td><td>${r.source || '—'}</td><td>${r.opt || '—'}</td>
     <td>${r.batch}×${r.seq}</td><td>${fmt(r.mb, 0)}</td><td>${fmt(r.bpb, 3)}</td></tr>`).join('');
+
+  // The poster card is drawn from the same curve: last point, and the shape.
+  const last = pts[pts.length - 1];
+  if (last) {
+    document.getElementById('pcBpb').textContent = fmt(last.bpb, 3);
+    document.getElementById('pcMb').textContent = fmt(last.mb, 0) + ' MB seen';
+    const sx = 300 / Math.max(pts.length - 1, 1);
+    const ys = pts.map(p => p.bpb);
+    const lo = Math.min(...ys), hi = Math.max(...ys);
+    const path = pts.map((p, i) => {
+      const x = (i * sx).toFixed(1);
+      const y = (66 - ((p.bpb - lo) / Math.max(hi - lo, 1e-9)) * 52 + 2).toFixed(1);
+      return `<circle cx="${x}" cy="${y}" r="1.5"/>`;
+    }).join('');
+    const line = pts.map((p, i) => {
+      const x = (i * sx).toFixed(1);
+      const y = (66 - ((p.bpb - lo) / Math.max(hi - lo, 1e-9)) * 52 + 2).toFixed(1);
+      return `${i ? 'L' : 'M'}${x},${y}`;
+    }).join(' ');
+    document.getElementById('pcSpark').innerHTML = `<polyline points="${line.replace(/[ML]/g, ' ').trim()}"/>${path}`;
+  }
+  if (control && bestSafe) {
+    document.getElementById('pcSpeed').textContent = fmt(bestSafe.kbs / control.kbs, 2) + '× step';
+  }
+
+  // Parallax on the poster: the wrapper moves, the card keeps its float.
+  const wrap = document.getElementById('posterWrap');
+  if (wrap && !reduced) {
+    let raf = 0;
+    addEventListener('scroll', () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        const y = Math.min(Math.max(window.scrollY, 0), 900);
+        wrap.style.transform = `translate3d(0, ${(-y * 0.05).toFixed(1)}px, 0)`;
+        wrap.style.opacity = String(Math.max(0.25, 1 - y / 1200));
+      });
+    }, { passive: true });
+  }
 
   document.getElementById('built').textContent = 'built from ' + (d.stats.runs_on_record) + ' log files';
 
