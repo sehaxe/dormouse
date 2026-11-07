@@ -747,6 +747,9 @@ class CompressedSelectiveAttention(nn.Module):
         """
         b, qn, _ = q.shape
         keep = None  # [b,Q,k] indices into the parent level's entries
+        sel = None   # [b,Q,n_parent] flags of the previous level, inside the loop
+        last_allowed = None
+        n_parent = 0
         parent_chunk = 0
         for scores, allowed, lv_v, chunk, name in levels:
             n = lv_v.shape[1]
@@ -766,13 +769,19 @@ class CompressedSelectiveAttention(nn.Module):
                 return self._attend(q, k, v, flat)
             if keep is not None:
                 ratio = parent_chunk // chunk
-                parent = torch.arange(n, device=q.device) // ratio  # [n]
-                sel = torch.zeros(b, qn, keep.shape[-1], dtype=torch.bool, device=q.device)
+                # `sel` is one flag per ENTRY OF THE PREVIOUS LEVEL, so its last
+                # dim is `n_parent`, not `keep.shape[-1]`: with `topk < n_parent`
+                # the old allocation was short and scatter_ raised at 16 392
+                # bytes on the live longctx config (math audit, 2026-11-08).
+                parent = torch.arange(n, device=q.device) // ratio  # [n], each entry's parent
+                sel = torch.zeros(b, qn, n_parent, dtype=torch.bool, device=q.device)
                 sel.scatter_(2, keep, True)  # [b,Q,parents]
                 allowed = allowed & sel.index_select(2, parent)
                 scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
             k_lv = min(self.topk, n)
             keep = scores.topk(k_lv, dim=-1).indices  # [b,Q,k_lv]
+            last_allowed = allowed                   # [b,Q,n] for THIS level
+            n_parent = n
             parent_chunk = chunk
             counters.count(name, b * qn * k_lv)
         ratio = parent_chunk // self.chunk
@@ -782,7 +791,18 @@ class CompressedSelectiveAttention(nn.Module):
         # The last contained level's entries can over-cover a partial window
         # (`ceil(t/c) · ratio >= ceil(t/chunk)`): those indices do not exist.
         valid = cand < n_fine
+        # The parent must have been ALLOWED, not merely selected: a masked parent
+        # still appears in `keep` (topk over finfo.min), and its children passed
+        # `cand < pos`, so a one-shot `forward` could read a future-containing
+        # parent that a ring `forward_state` does not have. That divergence is
+        # 5.96e-2 on the audit's fixture; this mask is the fix.
         ok = valid & (cand < pos.view(1, -1, 1))
+        if last_allowed is not None:
+            # `keep` selects the LAST level's entries, so the parent flags are
+            # that level's own `allowed` mask — not `sel`, which describes the
+            # level before it.
+            parent_ok = last_allowed.gather(2, keep)   # [b,Q,k_lv]
+            ok = ok & parent_ok.repeat_interleave(ratio, dim=-1)
         cand = cand.clamp(max=max(n_fine - 1, 0))
         k_g = (
             k.unsqueeze(1)

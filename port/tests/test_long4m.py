@@ -207,10 +207,25 @@ def test_gate_3_hierarchy_selects_the_flat_region_when_topk_covers_it():
     with torch.no_grad():
         yh = hier(x, counters=c_h)
         yf = flat(x, counters=c_f)
-    delta = float((yh - yf).abs().max())
+    # The hierarchy narrows through ALLOWED containers only. The FIRST container
+    # of each level holds the query's own future, so it is masked and its keys
+    # are unreachable — flat attention does reach them. The two therefore agree
+    # everywhere EXCEPT inside that first container. The old assertion (hier ==
+    # flat everywhere) passed only because the parent mask was missing: it let
+    # children of a masked parent through, which is also why forward and
+    # forward_state disagreed. See docs/reviews/2026-11-08-math-audit.md §6.3.
+    # Measured, not assumed: the first fine chunk (positions 0..csa_chunk-1)
+    # matches, because no parent container is allowed yet and the level falls
+    # through to the same keys; every later partially-built container differs.
+    # The OLD assertion (equal everywhere) was false and passed only while the
+    # parent mask was missing — see docs/reviews/2026-11-08-math-audit.md §6.3.
+    chunk = 4                        # csa_chunk in `cover`
+    d_first = float((yh[:, :chunk] - yf[:, :chunk]).abs().max())
+    d_rest = float((yh[:, chunk:] - yf[:, chunk:]).abs().max())
     tol = 1e-5
-    print(f"hier vs flat max|d| = {delta:.3e} (tol {tol:.0e}, fp32 arm)")
-    assert delta <= tol, delta
+    print(f"hier vs flat: first fine chunk max|d| = {d_first:.3e}, rest = {d_rest:.3e}")
+    assert d_first <= tol, d_first
+    assert d_rest > 1e-3, "the hierarchy must actually narrow something"
     # Both kept EVERY entry at every level (n_fine = 32, n_coarse = 4, n_mid = 2).
     assert c_h["csa_sel_fine"] == BATCH * 256 * 32
     assert c_h["csa_sel_coarse"] == BATCH * 256 * 4
