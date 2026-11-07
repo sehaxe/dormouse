@@ -1186,6 +1186,29 @@ def _totals(claims: list[Claim]) -> dict[str, int]:
     return dict(t)
 
 
+def _repo_relative(refs: list[str], repo: Path | str) -> list[str]:
+    """A path in the ledger must resolve from the repo root: `tools/check_doc_refs.py`
+    resolves doc references there, and the evidence a report writes is often
+    package-relative (`configs/b1.toml`). Prefixing `port/` makes the emitted
+    table verifiable instead of adding dangling references (10 in the first run)."""
+    root = Path(repo)
+    out: list[str] = []
+    for ref in refs:
+        kind, _, name = ref.partition(":")
+        p = Path(name)
+        if (
+            kind in ("config", "checkpoint", "log")
+            and not p.is_absolute()
+            and not name.startswith(("~", "logs/"))
+        ):
+            for prefix in ("port", "python"):
+                if (root / prefix / name).exists():
+                    ref = f"{kind}:{prefix}/{name}"
+                    break
+        out.append(ref)
+    return out
+
+
 def render(claims: list[Claim], args, gate: list[Claim]) -> str:
     t = _totals(claims)
     docs = sorted({c.doc for c in claims})
@@ -1340,7 +1363,7 @@ def render(claims: list[Claim], args, gate: list[Claim]) -> str:
             w("| file:line | claim | derived | delta | rel | evidence |")
             w("|---|---:|---:|---:|---:|---|")
             for c in sorted(by_doc[doc], key=lambda c: -c.rel):
-                ev = ", ".join(c.evidence) or "—"
+                ev = ", ".join(_repo_relative(c.evidence, args.repo)) or "—"
                 w(
                     f"| `{c.doc}:{c.line}` | {c.raw} | {_fmt(c.derived, c.unit)} | "
                     f"{c.delta:+.4g} | {c.rel:.1f}× | `{ev}` |"
@@ -1421,7 +1444,7 @@ def render(claims: list[Claim], args, gate: list[Claim]) -> str:
     w("| file:line | value | unit | kind | status | derived | evidence |")
     w("|---|---:|---|---|---|---:|---|")
     for c in sorted(claims, key=lambda c: (c.doc, c.line, c.unit, c.value)):
-        ev = ", ".join(c.evidence) or "—"
+        ev = ", ".join(_repo_relative(c.evidence, args.repo)) or "—"
         w(
             f"| `{c.doc}:{c.line}` | {c.raw} | {c.unit} | {c.kind} | {c.status} | "
             f"{_fmt(c.derived, c.unit)} | `{ev}` |"
