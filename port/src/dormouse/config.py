@@ -1070,8 +1070,9 @@ class ModelConfig:
     #: controller OFF and adds the Switch/GShard term
     #: `moe_aux_coef · E · Σ_e f_e · P_e` to the training loss (differentiable
     #: through the router only).
-    #: Why `prop` exists (measured 2026-11-04, `docs/reviews/2026-11-04-routing-
-    #: collapse-CONFIRMED.md`): `m400` at step 149 999 carries a saved bias of
+    #: Why `prop` exists (measured 2026-11-04, see
+    #: `docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md`):
+    #: `m400` at step 149 999 carries a saved bias of
     #: `[-218.27, +72.67]` and its router keeps **9 of 512** experts alive
     #: (top-10 = 100% of all assignments). The bias-less router reads 80/512, so
     #: the controller is what collapsed the bank. `sign` is a cumulative
@@ -1990,6 +1991,24 @@ class TrainConfig:
     #: reads 0.513 BPB at 1.0, 0.198 for pure AdamW, 0.069 at 8x, diverges at
     #: 8e-3 absolute. 1.0 = the historical behaviour, bit-identical.
     muon_lr_mult: float = 1.0
+
+    #: How the Muon half's step is scaled per matrix shape (`optim.Muon._muon_scale`).
+    #: `shape_fair` multiplies by `sqrt(cols)` so
+    #: that `RMS(dW) = lr` on EVERY shape. The old rule, `sqrt(max(1, rows/cols))`,
+    #: left the update at 1.0e-5…2.0e-5 at `lr=3e-4` against AdamW's 3.0e-4 — a
+    #: 15x…55x deficit that was NOT uniform across shapes, so the factorised bank
+    #: (`v [64,2730]`, 52.3x) was punished 3.5x harder than a dense matrix
+    #: (`[3072,832]`, 15.0x). That asymmetry contaminated every bank-vs-dense A/B.
+    #: Measured: `docs/reviews/2026-11-07-muon-audit.md` §D2.
+    #: DEFAULT IS `uniform` UNTIL THE A/B LANDS. `shape_fair` multiplies the step
+    #: by ~sqrt(cols) (28.8x on [832,832], 55x on [832,3072]), which is a much
+    #: larger change than the measured optimum `muon_lr_mult=12`; flipping the
+    #: default before measuring would silently rescale every running experiment.
+    #: The arm matrix is: uniform+mult=12 (today's winner) vs shape_fair+mult≈0.42
+    #: (the same effective step on the modal shape, minus the asymmetry) vs
+    #: shape_fair+mult=1.0. `uniform` also reproduces the pre-fix step bit-for-bit,
+    #: so old runs resume unchanged.
+    muon_lr_mode: str = "uniform"
     #: The Newton–Schulz CHAIN's dtype (`OPT_DTYPES`): `fp32` (the default) is
     #: every number on record; `bf16` runs the polynomial — BOTH arms, `classic`
     #: and `gram` — in bf16 with explicit fp32 in/out casts (nanogpt's practice;

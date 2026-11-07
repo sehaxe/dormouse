@@ -1303,6 +1303,7 @@ def train(
         # dtype rungs follow).
         muon_chunk_elems=cfg.muon_chunk_elems,
         muon_lr_mult=cfg.muon_lr_mult,
+        muon_lr_mode=cfg.muon_lr_mode,
         # The AdamW denominator floor (`train.adam_eps`): a one-line experiment
         # with a sourced mechanism — the equilibrium logit scale is bounded by
         # about log(1/eps), and 1e-8's ~18.4 nats sits above the fp32

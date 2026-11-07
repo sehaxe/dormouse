@@ -73,7 +73,7 @@ class Holder(nn.Module):
         self.bias = nn.Parameter(torch.zeros(5))
 
 
-def sealed(shape: tuple[int, int], mult: float = 1.0):
+def sealed(shape: tuple[int, int], mult: float = 1.0, mode: str = "uniform"):
     """(model, w0, g, optimizer) — routing asserted, so a rename cannot move it."""
     torch.manual_seed(0)
     model = Holder(shape)
@@ -81,7 +81,7 @@ def sealed(shape: tuple[int, int], mult: float = 1.0):
     w0 = model.w.detach().clone()
     g = torch.randn(shape)
     model.w.grad = g.clone()
-    opt = MixOptimizer(model, lr=LR, wd=0.1, opt="mix", muon_lr_mult=mult)
+    opt = MixOptimizer(model, lr=LR, wd=0.1, opt="mix", muon_lr_mult=mult, muon_lr_mode=mode)
     assert opt.routing["w"] == "muon", opt.routing
     return model, w0, g, opt
 
@@ -107,7 +107,13 @@ def step_delta(shape, mult, lr_write=None):
 
 # ---------------------------------------------------------------------- tests --
 def test_muon_matches_the_reference_transcription() -> None:
-    """Same direction, same magnitude at the same LR — the math is the reference."""
+    """Same direction, same magnitude at the same LR — the math is the reference.
+
+    Pinned in `uniform` mode: the historical `sqrt(max(1, rows/cols))` scale is
+    what this reference transcription was calibrated against. `shape_fair` is a
+    deliberate magnitude change (see `TrainConfig.muon_lr_mode`), so it gets its
+    own test below rather than loosening this bound.
+    """
     for shape in SHAPES:
         ours, g = step_delta(shape, 1.0)
         ref = reference_step(g)

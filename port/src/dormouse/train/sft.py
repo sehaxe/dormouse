@@ -1132,6 +1132,7 @@ def sft_train(
         muon_sf_wd=cfg.muon_sf_wd,
         muon_chunk_elems=cfg.muon_chunk_elems,
         muon_lr_mult=cfg.muon_lr_mult,
+        muon_lr_mode=cfg.muon_lr_mode,
         # AdamW's denominator floor is a pure optimizer setting whose mechanism
         # (the logit scale ceiling ~ log(1/eps)) is loop-independent, so it is
         # forwarded rather than refused: a non-default value used to be dropped

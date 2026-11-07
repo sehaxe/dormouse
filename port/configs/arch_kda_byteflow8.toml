@@ -1,0 +1,34 @@
+# Arch arm A: the KDA block as a 12-layer stack, no bank, no engram, no CSA.
+# The question: with a WORKING Muon (muon_lr_mult tuned) and a dense FFN, does
+# the linear-attention block beat a dense transformer at equal params and bytes?
+# Every earlier KDA verdict was measured with the Muon LR bug
+# (docs/reviews/2026-11-07-muon-audit.md), so this arm is new information.
+d_model = 832
+n_heads = 13
+head_dim = 64
+d_ffn = 1792   # 95,875,404 params — within 0.9% of the dense arm's 95,035,200
+vocab = 256
+max_seq_len = 1024
+
+block_form = "kda"
+loop_blocks = 12
+max_iter = 12
+
+ffn_form = "dense"
+use_tsct = false
+n_experts = 1
+moe_topk = 0
+
+use_csa = false
+use_mhc = false
+use_attnres = false
+use_engram = false
+layerrope = false
+bf16 = true
+
+# ByteFlow: the compute unit becomes a patch of bytes instead of a single byte.
+# Args: block_form="kda" is REQUIRED by the construction (both byteflow shapes
+# return before the byte stack), so this arm can only exist in the KDA lane.
+use_byteflow = true
+byteflow_codec = "conv"
+byteflow_patch_bytes = 8

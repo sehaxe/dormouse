@@ -1,0 +1,48 @@
+# flagship3_dense — a plain 12-layer transformer at the flagship's compute bill.
+#
+# Rationale (measured, 2026-11-06):
+#   * a 13.5M vanilla decoder beat our 102.7M KDA/CSA/mHC/Engram block by 0.126 BPB
+#     at equal bytes on all eight eval windows (docs/reviews/2026-11-06-control-transformer.md);
+#   * loops lose at iso-FLOPs: each recurrence is worth 0.46 of a unique block
+#     (arXiv 2604.21106v3), so 1 unique layer x 3 iterations is 14% of a 12-layer
+#     model at the same layer-passes (docs/research/2026-11-06-depth-recurrence.md);
+#   * nothing beats a dense transformer at <=200M params in a compute-matched test
+#     (docs/research/2026-11-06-architecture-at-100m.md).
+#
+# Sizing: keep MFLOP/byte at or below the old flagship's 137.4 so the throughput
+# comparison is honest. With L=12, d=832 (13 heads x 64), f=3072: params ~94.6M, 6N/patch over a
+# 4.485 B/patch average = ~126.6 MFLOP/byte (-7.9% vs 137.4).
+# The 4.485 B/patch factor is the trainer's measured average patch length; the
+# exact number is printed by `scripts/flops_ledger.py` and asserted in tests.
+
+d_model = 832
+n_heads = 13
+head_dim = 64
+d_ffn = 3072
+vocab = 256
+max_seq_len = 1024
+max_iter = 1
+loop_blocks = 1
+n_layers = 12
+
+block_form = "transformer"
+use_kda = false
+use_csa = false
+use_mhc = false
+use_attnres = false
+use_engram = false
+layerrope = false
+
+n_experts = 1
+moe_topk = 0
+use_tsct = false
+
+bf16 = true
+
+# ByteFlow: the compute unit becomes a patch of bytes instead of one byte.
+# Measured on the old block form (2026-10-31): 2.04x step speed after the bf16
+# fix, and -0.3725 BPB at 199M (control 3.6152 vs channel 3.2427). The codec is
+# the conv one: 5.4% of the step (0.84 + 0.91 ms) against 34.8% for attention.
+use_byteflow = true
+byteflow_codec = "conv"
+byteflow_patch_bytes = 8

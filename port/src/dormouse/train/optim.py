@@ -889,12 +889,19 @@ class Muon(Optimizer):
         sf: bool = False,
         sf_beta: float = SF_BETA1,
         chunk_elems: int = MUON_CHUNK_ELEMS,
+        lr_mode: str = "shape_fair",
     ) -> None:
         _check_ns_kind(ns_kind)
         _check_colrow_3d(colrow_3d)
         _check_dtype("state_dtype", state_dtype)
         _check_dtype("ns_dtype", ns_dtype)
         _check_muon_variant(variant)
+        if lr_mode not in ("shape_fair", "uniform"):
+            loud(
+                f"lr_mode={lr_mode!r}: known modes are 'shape_fair' and 'uniform' "
+                f"(see `TrainConfig.muon_lr_mode`). Escape: one of those two."
+            )
+        self.lr_mode = lr_mode
         if isinstance(ns_steps, bool) or not isinstance(ns_steps, int) or ns_steps < 1:
             loud(
                 f"ns_steps={ns_steps!r} is not an iteration count: it must be a "
@@ -1098,8 +1105,7 @@ class Muon(Optimizer):
                         f"one matrix. Escape: run the batched step (MixOptimizer "
                         f"does), or tsct_packed=false."
                     )
-                scale = max(1.0, p.shape[0] / p.shape[1]) ** 0.5
-                self._step_one(p, lr, mu, ns, scale)
+                self._step_one(p, lr, mu, ns, self._muon_scale(p.shape[0], p.shape[1]))
         return loss
 
     def _orthogonalize(self, x: torch.Tensor, steps: int) -> torch.Tensor:
@@ -1116,6 +1122,22 @@ class Muon(Optimizer):
         if self.ns_dtype == "fp32":
             return zeropower_via_ns(x, steps, self.ns_kind)
         return zeropower_via_ns(x, steps, self.ns_kind, self.ns_dtype)
+
+    def _muon_scale(self, rows: int, cols: int) -> float:
+        """The per-shape factor that turns the polar step into `RMS(dW) = lr`.
+
+        After `colrow_normalize` every row of the update has norm 1, so the
+        per-element RMS of the bare update is `1/sqrt(cols)` and the applied step
+        is `lr * scale / sqrt(cols)`. The audit (`docs/reviews/2026-11-07-muon-audit.md`
+        §D2) measured the old `sqrt(max(1, rows/cols))` and found RMS from 1.0e-5
+        to 2.0e-5 at `lr=3e-4` against AdamW's 3.0e-4 — a 15x-55x deficit, and
+        NOT uniform across shapes, so a factorised bank was punished harder than
+        a dense matrix. `shape_fair` therefore uses `sqrt(cols)`, which cancels
+        the `1/sqrt(cols)` exactly. `uniform` keeps the old value bit-for-bit.
+        """
+        if self.lr_mode == "uniform":
+            return max(1.0, rows / cols) ** 0.5
+        return float(cols) ** 0.5
 
     def _step_one(
         self,
@@ -1361,7 +1383,7 @@ class Muon(Optimizer):
         for grp in stepaudit.iterations("muon.groups", self._groups):
             group = self.param_groups[grp.gi]
             lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
-            scale = max(1.0, grp.shape[0] / grp.shape[1]) ** 0.5
+            scale = self._muon_scale(grp.shape[0], grp.shape[1])
             params = grp.params
             grp.tsct_row = (
                 expert_scales.index_select(0, grp.tsct_ids)
@@ -1710,15 +1732,26 @@ class MixOptimizer:
         muon_chunk_elems: int = MUON_CHUNK_ELEMS,
         tsct_expert_lr: float = 0.0,
         muon_lr_mult: float = 1.0,
+        muon_lr_mode: str = "shape_fair",
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
+        self.muon_lr_mode = muon_lr_mode
         if not (muon_lr_mult > 0.0):
             loud(
                 f"muon_lr_mult={muon_lr_mult}: the Muon half's LR is "
                 f"`lr * muon_lr_mult`, so a value <= 0 would freeze it or flip "
                 f"the sign. Escape: muon_lr_mult>0 (1.0 = the historical "
                 f"shared-LR behaviour)."
+            )
+        if muon_lr_mode not in ("shape_fair", "uniform"):
+            loud(
+                f"muon_lr_mode={muon_lr_mode!r}: known modes are 'shape_fair' "
+                f"and 'uniform'. `shape_fair` scales the Muon step by sqrt(cols) "
+                f"so that RMS(dW) = lr on EVERY matrix shape (measured "
+                f"2026-11-07: the old scale left [832,3072] at 5.4e-6 against "
+                f"AdamW's 3.0e-4, a 55x deficit); `uniform` reproduces the "
+                f"pre-fix step bit-for-bit for old runs. Escape: one of those two."
             )
         if tsct_expert_lr < 0.0:
             loud(
@@ -1796,6 +1829,7 @@ class MixOptimizer:
                 # multiply is the seam that makes that reachable without moving
                 # the AdamW half. 1.0 is the historical behaviour, bit-identical.
                 lr=lr * muon_lr_mult,
+                lr_mode=self.muon_lr_mode,
                 momentum=momentum,
                 ns_steps=ns_steps,
                 ns_kind=ns_kind,
