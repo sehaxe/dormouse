@@ -121,8 +121,21 @@ def plausible(token: str) -> bool:
 	return True
 
 
+#: Historical documents (`docs/reviews`, `docs/research`, `docs/archive`) describe
+#: the tree as it was on their date. On 2026-11-07 the live package moved
+#: `port/` -> `python/`; a dated report that says `port/src/...` is a true record
+#: of that day, so the alias resolves it instead of forcing a rewrite of history.
+PATH_ALIASES = (("port/", "python/"),)
+
+
 def exists(repo_rel: str) -> bool:
-	return (ROOT / repo_rel).exists()
+	if (ROOT / repo_rel).exists():
+		return True
+	for old_prefix, new_prefix in PATH_ALIASES:
+		if repo_rel.startswith(old_prefix):
+			if (ROOT / (new_prefix + repo_rel[len(old_prefix):])).exists():
+				return True
+	return False
 
 
 def main() -> int:
