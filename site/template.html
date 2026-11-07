@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dormouse — measured, not asserted</title>
+<meta name="description" content="A byte-level language model trained on one 16 GB card. Every number computed from the run logs, every retraction kept.">
+<style>
+  :root{
+    --bg:#0b0c0e; --panel:#121418; --line:#23262c; --text:#e8e6e1;
+    --dim:#8a8f98; --accent:#d9a05b; --good:#7fb069; --bad:#c46a5a;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+    font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  section{padding:88px 0;border-top:1px solid var(--line)}
+  section:first-of-type{border-top:0}
+
+  /* hero */
+  .kicker{font-family:var(--mono);font-size:13px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
+  h1{font-size:64px;line-height:1.05;font-weight:600;letter-spacing:-.02em;margin:18px 0 0}
+  h1 .dot{color:var(--accent)}
+  .lede{max-width:68ch;font-size:20px;line-height:1.5;color:#cfccc6;margin:22px 0 0}
+  .lede strong{color:var(--text);font-weight:600}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:44px 0 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px}
+  .card .n{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:34px;line-height:1.1;color:var(--accent)}
+  .card .k{font-size:13px;color:var(--dim);margin-top:8px}
+  .card .s{font-family:var(--mono);font-size:12px;color:var(--dim);margin-top:12px;opacity:.8}
+
+  h2{font-size:20px;font-weight:600;margin:0 0 6px;letter-spacing:-.01em}
+  .sub{color:var(--dim);font-size:14px;margin:0 0 28px;max-width:68ch}
+
+  /* tables */
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  th{font-family:var(--mono);font-size:12px;font-weight:400;color:var(--dim);text-align:right;
+     padding:0 12px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th:first-child,td:first-child{text-align:left;padding-left:0}
+  td{font-family:var(--mono);font-size:14px;text-align:right;padding:12px;border-bottom:1px solid var(--line);white-space:nowrap}
+  tr:last-child td{border-bottom:0}
+  td.label{font-family:var(--sans);color:#cfccc6}
+  .bar{height:4px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:8px;min-width:90px}
+  .bar i{display:block;height:100%;background:var(--accent)}
+  .best{color:var(--good)}
+  .worst{color:var(--bad)}
+
+  /* curve */
+  .curve{margin:8px 0 0;width:100%;height:auto;display:block}
+  .curve .grid{stroke:var(--line);stroke-width:1}
+  .curve .line{fill:none;stroke:var(--accent);stroke-width:2}
+  .curve .pt{fill:var(--accent)}
+  .curve text{fill:var(--dim);font-family:var(--mono);font-size:11px}
+
+  /* retractions */
+  ul.retractions{list-style:none;margin:0;padding:0}
+  ul.retractions li{border-bottom:1px solid var(--line);padding:18px 0;display:grid;grid-template-columns:1fr 1fr;gap:24px}
+  ul.retractions li:last-child{border-bottom:0}
+  ul.retractions .was{font-family:var(--mono);font-size:14px;color:var(--bad)}
+  ul.retractions .now{font-family:var(--mono);font-size:14px;color:var(--good)}
+  ul.retractions .why{grid-column:1/-1;color:var(--dim);font-size:14px}
+
+  footer{padding:56px 0 80px;border-top:1px solid var(--line);color:var(--dim);font-size:13px}
+  footer a{color:var(--text);text-decoration:none;border-bottom:1px solid var(--line)}
+  footer .row{display:flex;gap:24px;flex-wrap:wrap}
+  .meta{font-family:var(--mono);font-size:12px}
+  @media (max-width:720px){
+    h1{font-size:40px}.stats{grid-template-columns:1fr}
+    ul.retractions li{grid-template-columns:1fr;gap:6px}
+    td,th{padding:10px 8px}
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <section>
+    <div class="kicker">one RTX 5070 Ti · 16 GB · sm_120</div>
+    <h1>dormouse<span class="dot">.</span></h1>
+    <p class="lede">
+      A byte-level language model that trains on <strong>one workstation</strong>.
+      Published with the measurements that justify it — and the ones that
+      <strong>refute</strong> it. Every number below is computed from the run logs
+      at build time; if a log is missing, the number is missing.
+    </p>
+    <div class="stats" id="stats">
+      <div class="card">
+        <div class="n">1M</div>
+        <div class="k">context length at constant memory</div>
+        <div class="s">34 MB of state: KDA 393 KB + CSA 32 MB + HCA 1 MB</div>
+      </div>
+      <div class="card">
+        <div class="n" id="speedup">—</div>
+        <div class="k">training-step speed from one config rung</div>
+        <div class="s">bf16 Newton–Schulz, 5 steps · inside the ±0.02 BPB noise floor</div>
+      </div>
+      <div class="card">
+        <div class="n" id="runs">—</div>
+        <div class="k">runs on record, every one kept</div>
+        <div class="s" id="runsub">including the retracted ones</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>The optimizer was 70% of the step</h2>
+    <p class="sub">
+      Muon's Newton–Schulz chain ran 579 GFLOP of fp32 matmuls per step on the
+      CUDA-core lane — 223 ms of a 307 ms step, measured against AdamW at the
+      same shape. Moving the chain to bf16 puts it on the tensor cores. Same
+      polynomial, same direction, different silicon.
+    </p>
+    <table>
+      <thead><tr><th>rung</th><th>kB/s</th><th>ms / step</th><th>speed</th><th>Δ BPB</th></tr></thead>
+      <tbody id="rungs"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Bits per byte, on bytes actually seen</h2>
+    <p class="sub">
+      Held-out BPB on a fixed English window, plotted against training bytes.
+      The last point is a real run, not an extrapolation — and the retractions
+      below say which earlier points were not.
+    </p>
+    <svg class="curve" id="curve" viewBox="0 0 640 220" role="img" aria-label="held-out BPB against bytes seen"></svg>
+    <div class="meta" id="curvemeta" style="color:var(--dim);margin-top:8px"></div>
+  </section>
+
+  <section>
+    <h2>Runs with a held-out number</h2>
+    <p class="sub">Longest first. A run appears here only if it produced an eval on the held-out window.</p>
+    <table>
+      <thead><tr><th>run</th><th>source</th><th>opt</th><th>batch × seq</th><th>MB</th><th>BPB</th></tr></thead>
+      <tbody id="runs-table"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>What is not true</h2>
+    <p class="sub">
+      The distinguishing part. Every entry was published here first, then
+      measured wrong. Deleting them would be the one dishonest move available,
+      so they stay next to what replaced them.
+    </p>
+    <ul class="retractions">
+      <li>
+        <div class="was">“16× from the recipe ladder”</div>
+        <div class="now">1.89× from the optimizer rung, measured</div>
+        <div class="why">The 16× was Ripple-65B's result at 4B parameters, not ours. Our own recipe knobs are still unmeasured; the step-speed win that is measured belongs to bf16 Newton–Schulz.</div>
+      </li>
+      <li>
+        <div class="was">“3 Newton–Schulz steps are a tie”</div>
+        <div class="now">+0.27 BPB at [832, 3072]</div>
+        <div class="why">The published non-monotone result, and this repo's own “1.17e-15 from the manifold”, were both measured on rank-64 factors. On the dense stack's shapes the 3-step chain does not converge, and a non-orthogonal Muon update is a badly scaled momentum step. Two arms, two precisions, both red.</div>
+      </li>
+      <li>
+        <div class="was">“209× less compute than GPT-2”</div>
+        <div class="now">53×, and only per byte</div>
+        <div class="why">The first figure counted GPT-2's 40 GB of text as 40 G positions; at ~4 bytes per BPE token it is 10 G positions. The corrected ratio is still large, but it is a ratio of compute per byte, not of capability.</div>
+      </li>
+      <li>
+        <div class="was">“1.927 BPB at 98 MB”</div>
+        <div class="now">1.660 BPB at the same bytes</div>
+        <div class="why">The first curve was captured before the Muon learning-rate fix (a scheduler overwrote the group's LR every step). The corrected curve is 1.660 → 1.519 BPB, a slope of −0.107 per doubling.</div>
+      </li>
+    </ul>
+  </section>
+
+  <footer>
+    <div class="row">
+      <a href="https://github.com/sehaxe/dormouse">github.com/sehaxe/dormouse</a>
+      <span class="meta">MIT · Python lane live, Rust lane frozen</span>
+      <span class="meta">no web fonts · no analytics</span>
+      <span class="meta" id="built"></span>
+    </div>
+  </footer>
+
+</div>
+
+<script id="data" type="application/json">/*__DATA__*/null</script>
+<script>
+(() => {
+  const d = JSON.parse(document.getElementById('data').textContent);
+  const fmt = (x, n = 1) => Number(x).toFixed(n);
+
+  // stats
+  const rungs = d.rungs || [];
+  const control = rungs.find(r => r.tag === 'muon_fp32');
+  // The headline speedup is the best rung that ALSO passed the quality gate.
+  // A faster row that costs 0.27 BPB is not a win and must never drive the card.
+  const safeRungs = rungs.filter(r => r.safe && r.tag !== 'muon_fp32');
+  const bestSafe = safeRungs.reduce((a, b) => (!a || b.kbs > a.kbs ? b : a), null);
+  const bestAny = rungs.reduce((a, b) => (!a || b.kbs > a.kbs ? b : a), null);
+  if (control && bestSafe) {
+    document.getElementById('speedup').textContent = fmt(bestSafe.kbs / control.kbs, 2) + '×';
+  }
+  document.getElementById('runs').textContent = d.stats.runs_on_record;
+  document.getElementById('runsub').textContent =
+    d.stats.runs_with_bpb + ' with a held-out BPB · including the retracted ones';
+
+  // ladder
+  const max = Math.max(...rungs.map(r => r.kbs), 1);
+  document.getElementById('rungs').innerHTML = rungs.map(r => {
+    const rel = control ? r.kbs / control.kbs : 1;
+    const speedCls = r.tag === 'muon_fp32' ? '' : (r.safe ? 'best' : '');
+    const d = r.dbpb;
+    const q = d == null ? '<td>—</td>'
+      : `<td class="${r.safe ? 'best' : 'worst'}">${d > 0 ? '+' : ''}${fmt(d, 2)}</td>`;
+    const note = r.safe ? '' : ' <span style="color:var(--bad);font-family:var(--mono);font-size:11px">rejected</span>';
+    return `<tr>
+      <td class="label">${r.label}${note}<div class="bar"><i style="width:${(r.kbs / max * 100).toFixed(0)}%;${r.safe ? '' : 'background:var(--bad)'}"></i></div></td>
+      <td>${fmt(r.kbs, 1)}</td>
+      <td>${fmt(r.ms_per_step, 0)}</td>
+      <td class="${speedCls}">${r.tag === 'muon_fp32' ? 'baseline' : fmt(rel, 2) + '×'}</td>
+      ${q}
+    </tr>`;
+  }).join('');
+
+  // curve
+  const pts = (d.curve || []);
+  const svg = document.getElementById('curve');
+  if (pts.length > 1) {
+    const W = 640, H = 220, L = 44, R = 12, T = 12, B = 28;
+    const xs = pts.map(p => p.mb), ys = pts.map(p => p.bpb);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs);
+    const y0 = Math.min(...ys) - 0.05, y1 = Math.max(...ys) + 0.05;
+    const X = v => L + (v - x0) / Math.max(x1 - x0, 1e-9) * (W - L - R);
+    const Y = v => T + (1 - (v - y0) / Math.max(y1 - y0, 1e-9)) * (H - T - B);
+    const path = pts.map((p, i) => `${i ? 'L' : 'M'}${X(p.mb).toFixed(1)},${Y(p.bpb).toFixed(1)}`).join(' ');
+    const grid = [0, .5, 1].map(f => {
+      const y = T + f * (H - T - B);
+      return `<line class="grid" x1="${L}" y1="${y}" x2="${W - R}" y2="${y}"/>` +
+        `<text x="0" y="${y + 4}">${fmt(y1 - f * (y1 - y0), 2)}</text>`;
+    }).join('');
+    const dots = pts.map(p => `<circle class="pt" cx="${X(p.mb).toFixed(1)}" cy="${Y(p.bpb).toFixed(1)}" r="3"/>`).join('');
+    const last = pts[pts.length - 1];
+    svg.innerHTML = grid +
+      `<path class="line" d="${path}"/>${dots}` +
+      `<text x="${L}" y="${H - 8}">${fmt(x0, 0)} MB</text>` +
+      `<text x="${W - R}" y="${H - 8}" text-anchor="end">${fmt(x1, 0)} MB</text>` +
+      `<text x="${X(last.mb).toFixed(1)}" y="${(Y(last.bpb) - 10).toFixed(1)}" text-anchor="end">${fmt(last.bpb, 3)} BPB</text>`;
+    document.getElementById('curvemeta').textContent =
+      `${pts.length} held-out points · ${fmt(x1, 0)} MB seen · last ${fmt(last.bpb, 3)} BPB`;
+  } else {
+    svg.remove();
+  }
+
+  // runs
+  document.getElementById('runs-table').innerHTML = (d.runs || []).map(r => `<tr>
+    <td class="label">${r.run}</td><td>${r.source || '—'}</td><td>${r.opt || '—'}</td>
+    <td>${r.batch}×${r.seq}</td><td>${fmt(r.mb, 0)}</td><td>${fmt(r.bpb, 3)}</td></tr>`).join('');
+
+  document.getElementById('built').textContent = 'built from ' + (d.stats.runs_on_record) + ' log files';
+})();
+</script>
+</body>
+</html>

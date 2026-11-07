@@ -29,3 +29,4 @@ sft_pairs/v2/**/*.jsonl
 .ruff_cache/
 *.orig
 *.rej
+site/gen/target/
