@@ -10,8 +10,10 @@ checkpoint and resume are shared, and only the block differs.
 
 THE BLOCK IS THE CONTROL'S, TRANSCRIBED. Pre-LayerNorm, no biases, packed
 `qkv` (`3·d²`), RoPE on `head_dim`, `F.scaled_dot_product_attention(is_causal=True)`,
-GELU 4x FFN (`d_ffn = 4·d_model`), GPT-2 residual scaling on the two output
-projections (`0.02/sqrt(2·n_layers)`). Parameters per block:
+GELU FFN (`d_ffn = 4·d_model` in the control; an arm sets `d_ffn` and
+`flagship3_dense` runs 3.69×, so the width is the config's, not this file's),
+GPT-2 residual scaling on the two output projections
+(`0.02/sqrt(2·n_layers)`). Parameters per block:
 `4·d²` attention + `2·d·d_ffn` FFN + `4·d` of LayerNorm, which at
 `d=304, ffn=1216` is 1 110 208 — the control's own count.
 
