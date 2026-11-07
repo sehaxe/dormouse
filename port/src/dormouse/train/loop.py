@@ -1851,6 +1851,11 @@ def train(
             x, y = stream.next_batch()
             full.fill(x, y)
             full.set_lr(lr)
+            # `FullGraph.set_lr` writes ONE value into every group, so the Muon
+            # half's own `lr * muon_lr_mult` goes in after it — the same seam
+            # the eager and `opt_graph` paths use. Without this the multiplier
+            # would be silently replaced by the AdamW LR for the whole capture.
+            opt.set_lr(lr, muon_lr)
             full.step()
         else:
             # ---- the EAGER step (and `opt_graph`'s stage takeover) ---------
