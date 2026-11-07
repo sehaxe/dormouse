@@ -22,7 +22,7 @@ cd /home/sehaxe/dormouse/port
 export PYTHONPATH=$PWD/src
 export CUDA_VISIBLE_DEVICES=0
 PY=.venv/bin/python
-OUT=/home/sehaxe/logs/e1v2
+OUT=${OUT:-/home/sehaxe/logs/e1v2}
 mkdir -p "$OUT"
 
 BYTES=${BYTES:-250000000}   # 0.25 GB per arm per seed
