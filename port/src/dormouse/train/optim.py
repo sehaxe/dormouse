@@ -1851,6 +1851,15 @@ class MixOptimizer:
         #: expert's `v` to a row id, and the step turns the current counts into
         #: one `[1 + ΣE]` device vector. `0.0` off: no map, no vector, no row
         #: multiply, so the default path is byte-identical.
+        #: The Muon half's LR multiplier (`train.muon_lr_mult`). It lives HERE
+        #: because the trainer's schedule writes `group["lr"]` on every step
+        #: (`loop.py`), and the constructor's `lr * muon_lr_mult` is overwritten
+        #: before the first step reads it — measured 2026-11-07: with that write
+        #: in place `muon_lr_mult=8` and `1` produced a BIT-IDENTICAL update, so
+        #: a 3000-step A/B of the knob measured the knob off. `set_lr` is the one
+        #: seam that applies it; `loop.py`/`sft.py` call it instead of writing a
+        #: group's LR themselves.
+        self.muon_lr_mult = float(muon_lr_mult)
         self.tsct_expert_lr = float(tsct_expert_lr)
         self._tsct_moes: list[nn.Module] = []
         self._tsct_offset: dict[int, int] = {}
@@ -1869,6 +1878,42 @@ class MixOptimizer:
         if self.muon is not None:
             self.muon._tsct_moes = self._tsct_moes
             self.muon._tsct_offset = self._tsct_offset
+
+    def set_lr(self, lr: float, muon_lr: float | None = None) -> None:
+        """Write the schedule's LR into both halves — the trainer's per-step call.
+
+        `muon_lr` is the SF arm's own (constant-after-warmup) schedule; `None`
+        means "the same shape as the AdamW half". The Muon group gets
+        `muon_lr * self.muon_lr_mult`, which is the ONLY place the multiplier is
+        applied during training: the constructor's `lr * muon_lr_mult` is a
+        starting value, and every schedule write goes through here.
+
+        Why a method and not four inline loops: `train/loop.py` and
+        `train/sft.py` both walked the groups themselves until 2026-11-07, and
+        both silently replaced the Muon half's LR with the AdamW one on every
+        step. One definition, so the next group (or the next multiplier) cannot
+        be missed at one call site.
+        """
+        if muon_lr is None:
+            muon_lr = lr
+
+        def put(group: dict, value: float) -> None:
+            if torch.is_tensor(group["lr"]):
+                # The `opt_graph` arm: `group["lr"]` is a 0-dim DEVICE tensor a
+                # captured op reads, and assigning a float would replace the
+                # object the replay reads for the rest of the run
+                # (`dion/cuda_graph.py:70-78`). Fill IN PLACE, exactly as
+                # `graph.set_lr` does for the value it writes.
+                group["lr"].fill_(value)
+            else:
+                group["lr"] = value
+
+        for group in self.adamw.param_groups:  # stepaudit-excuse: <=8 groups, one scalar
+            put(group, lr)
+        if self.muon is None:
+            return
+        for group in self.muon.param_groups:  # stepaudit-excuse: <=8 groups, one scalar
+            put(group, muon_lr * self.muon_lr_mult)
 
     def enable_bnb8bit(self) -> None:
         """Swap the plain AdamW for bitsandbytes' 8-bit state, LOUD on absence.

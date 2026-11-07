@@ -37,8 +37,8 @@ momentum, and a wrong `0.2·√(max)` factor (§5).
 
 **Instruments.** Every number is CPU, no GPU touched (`CUDA_VISIBLE_DEVICES=""`),
 `port/` tree at the audit branch's baseline commit, which is byte-identical to
-`main`'s working tree on 2026-11-07 (`optim.py` `HEAD 72f4a1c` + the
-`muon_lr_mult` working-tree diff). The reference is
+`main`'s working tree on 2026-11-07 (tree `7771d7d`, `optim.py`'s last commit
+`72f4a1c`, plus the `muon_lr_mult` working-tree diff). The reference is
 `KellerJordan/muon@master:muon.py`, **fetched 2026-11-07, 286 lines,
 sha256 `2479665a90124f62e4df557816665851ca317e42fcfda2af1da02c1f44ab5f3d`**, and
 transcribed in `port/tests/test_muon_reference.py` (not a dependency).
@@ -55,7 +55,7 @@ Inside the Muon half, per shape group (`optim.py:1361-1455`) and per write
 | # | operation | where | arithmetic | changes the step size? |
 |---|---|---|---|---|
 | 1 | momentum | `_momentum_update_` `optim.py:818-855`, called `:1421` | `m ← μ·m + (1−μ)·g`, `μ=0.95`, **in place, fp32** (`muon_state_dtype="fp32"`); the bf16 rung keeps an fp32 accumulator and rounds only the store (`:850-855`) | **No.** The next op is scale-invariant, so the `(1−μ)` normalisation and even a wrong `μ` cannot move the magnitude. |
-| 2 | Newton–Schulz | `zeropower_via_ns` `optim.py:225-301`, batched twin `_classic_ns_batch` `:333-384`, dispatch `:1530` | `x = g/ (‖g‖_F + 1e-7)` (`:341/:344`); transpose if tall (`:345-348`); 5 iterations of `gram=x·xᵀ`, `poly = b·gram + c·(gram·gram)`, `x = a·x + poly·x` with the Jordan triple `(3.4445, −4.7750, 2.0315)` (`optim.py:87`); transposed back; `to(float32)`. `ns_dtype="fp32"` by default; reference runs this chain in **bf16**. | **No.** It produces a matrix with singular values ≈1 — the measured 5-step chain's Frobenius norm is **0.905·√n** on `[256,256]`, not exactly `√n` (`tests/test_muon_fast.py` is the orthogonality gate). It is also scale-invariant: the same `g` and `1000·g` give a bit-identical update. |
+| 2 | Newton–Schulz | `zeropower_via_ns` `optim.py:225-301`, batched twin `_classic_ns_batch` `:333-384`, dispatch `:1530` | `x = g / (‖g‖_F + 1e-7)` (`:341/:344`); transpose if tall (`:345-348`); 5 iterations of `gram=x·xᵀ`, `poly = b·gram + c·(gram·gram)`, `x = a·x + poly·x` with the Jordan triple `(3.4445, −4.7750, 2.0315)` (`optim.py:87`); transposed back; `to(float32)`. `ns_dtype="fp32"` by default; reference runs this chain in **bf16**. | **No.** It produces a matrix with singular values ≈1 — the measured 5-step chain's Frobenius norm is **0.905·√n** on `[256,256]`, not exactly `√n` (`tests/test_muon_fast.py` is the orthogonality gate). It is also scale-invariant: the same `g` and `1000·g` give a bit-identical update. |
 | 3 | ColRow normalisation | `colrow_normalize` `optim.py:457-491`, 2-D form `:486-488`, called `:1496`/`:1480` | `x /= ‖x‖_col + 1e-7` then `x /= ‖x‖_row + 1e-7` — **every row ends at norm 1** | **Yes, and it is the whole magnitude.** `‖ΔW‖_F = √rows` for *any* input, so per-element RMS = `1/√cols`. This is Muon+'s Eq. (4) (`Norm_ColRow(Ortho(M))`), not a defect — it is the documented, A/B'd arm (`colrow_3d="colrow"`, `:471-484`). |
 | 4 | aspect scale | `optim.py:1364` (`scale = max(1, rows/cols)**0.5`), `:1101` for the per-param path | the reference's own `max(1, A/B)**0.5` (`muon_ref.py:40`) | Yes, by `√(rows/cols)` for tall matrices only. Matches the reference. |
 | 5 | weight decay | `optim.py:1816` | `wd=sf_wd if muon_sf else 0.0` — **the Muon group runs at `wd=0`** in every non-SF run; the reference applies `p.mul_(1 − lr·wd)` (`muon_ref.py:92`) | No (0 here, and 0.1·lr at most elsewhere). It is a real difference from the reference, but it is OFF, so it cannot explain a 0.24 BPB gap in this A/B. |
@@ -125,8 +125,8 @@ in the Muon group**; AdamW holds 466 752 (0.49 %): `embed.weight` and `lm_head`
 | `[832,832]` `proj` (out) | 12 | 8.31M | 1.040e-5 | 3.000e-4 | **28.8x** | 28.8 |
 
 Element-weighted mean deficit **29.8x**; geometric mean **25.0x**. The AdamW RMS
-is `lr` exactly on the first step (`lr·sign(g)`), which is what `optim.py`'s own
-optimizer-audit table measured too (4.98e-4 at `lr=5e-4`).
+is `lr` exactly on the first step (`lr·sign(g)`), which is what the 2026-11-06
+audit's table measured too (4.98e-4 at `lr=5e-4`).
 
 **The single line: `optim.py:1798` (`lr=lr * muon_lr_mult`, with
 `muon_lr_mult=1.0`).** It is the one expression that decides the Muon half's
@@ -154,11 +154,11 @@ else in the update rule to fix.
   (the `1e-6`/`1e3` table above). The clip only ever moves the AdamW half, and
   only down — it is not a lever on the gap.
 - *a missing `0.2`*: the reference at HEAD has **no** `0.2` (its scale is
-  `max(1,A/B)**0.5`, `muon.py`:40); if the older `0.2·√max` convention were used,
-  the update would be `0.2·lr` = 6e-5 per element, still 5x below AdamW's `lr`
-  and still 3.5x below our own measured 2.1e-5 at `[3072,768]`. Adding `0.2`
-  would make the gap *worse* for the wide and square shapes and better only for
-  the wide ones. It is not the missing factor; the missing factor is `√c`.
+  `max(1,A/B)**0.5`, `muon.py`:40). If the older `0.2·√max` convention were used,
+  the update would be 5.43e-5 per element on `[256,256]` and 5.71e-5 on both
+  `[768,3072]`/`[3072,768]` (the `RMS ref0.2` column above) — 2.6-10x better than
+  ours, and still **5.3-5.5x below** the AdamW half's `lr`. It would narrow the
+  gap, not close it, and it is not the missing factor; the missing factor is `√c`.
 
 ## 4. Why `muon_lr_mult=8` changed nothing — the knob is dead (D1)
 
@@ -191,7 +191,7 @@ End to end on the port's own trainer (CPU, `configs/audit_d128.toml`, 4 layers,
 | tree | loss @ step 20 | loss @ step 40 |
 |---|---:|---:|
 | measured code (`main`'s working tree) | 5.6416 | 5.2603 |
-| one line: `group["lr"] = muon_lr * cfg.muon_lr_mult` | 5.0438 | 3.8434 |
+| one line: `group["lr"] = muon_lr * cfg.muon_lr_mult` (the A/B's patch; §7 is the real one) | 5.0438 | 3.8434 |
 
 `/tmp/opencode/f3muon8/f3muon8.config.toml:187` proves the run really was launched
 with `muon_lr_mult = 8.0`. So the 8x A/B was not an 8x A/B: the knob was off, and the two runs are not even
@@ -200,8 +200,8 @@ the same recipe — `f3muon8` ran `steps=2000` and its WSD decay tails off from
 2000 (`~/logs/f3muon8.jsonl` vs `~/logs/night_opt/mix_s1.jsonl`). The 0.0083 BPB
 between them (2.1867 vs 2.1784) is a schedule tail plus noise. The knob's
 deadness is not inferred from that pair — it is proved directly, in the table
-above and in `port/scripts/audit_mult_liveness.py`. `train/sft.py:1215-1218` carries the same four lines and therefore the same
-dead knob.
+above and in `port/scripts/audit_mult_liveness.py`. `train/sft.py:1215-1218`
+carries the same four lines and therefore the same dead knob.
 
 **And 8 would not have been enough anyway.** The multiplier that puts the Muon
 half's per-element step at the AdamW half's is `√c` (or `c/√(max(1,r/c))`), i.e.
@@ -218,7 +218,7 @@ That is the arithmetic the 8x A/B missed.
 (`optim.py:830-855`, `:1148-1151`). bf16 shares fp32's **exponent** range
 (min normal 1.2e-38), so nothing at 1e-6..1e-3 underflows:
 
-| `|g|` scale | mean rel. error of the cast | entries rounded to 0 | sign kept |
+| `‖g‖` scale | mean rel. error of the cast | entries rounded to 0 | sign kept |
 |---|---:|---:|---:|
 | 1e-6 | 1.4e-3 | **0.0 %** | 100 % |
 | 1e-5 | 1.4e-3 | **0.0 %** | 100 % |
@@ -229,7 +229,7 @@ The real bf16 hazard is the opposite of underflow: **swamping**. When the buffer
 is larger than the gradient by more than bf16's 0.4 % resolution, the increment
 is rounded away by the store:
 
-| `|m|` | `|g|` | increment `(1−μ)|g|` | resolution `0.4 %·|m|` | entries where `bf16(0.95m+0.05g) == bf16(0.95m)` |
+| `‖m‖` | `‖g‖` | increment `(1−μ)‖g‖` | resolution `0.4 %·‖m‖` | entries where `bf16(0.95m+0.05g) == bf16(0.95m)` |
 |---|---|---:|---:|---:|
 | 1e-3 | 1e-6 | 5.0e-8 | 4.0e-6 | 95.8 % |
 | 1e+0 | 1e-6 | 5.0e-8 | 4.0e-3 | 98.5 % |
@@ -268,10 +268,10 @@ At d=128 the per-shape deficit is 5.7x (`[512,128]`), 11.3x (`[128,128]`) and
 22.6x (`[128,512]`) — geometric mean **11.3**, so **12 is the parity arm** and
 **24 is 2x overdrive**. The reading:
 
-- The gap at `mult=1` is **+0.418 BPB**, the same sign and shape as the 95M A/B's
-  +0.242 (bigger, because this model is 25x smaller and 1000 steps is
-  proportionally later). Same checkpoint-free, training-free question, same
-  answer.
+- The gap at `mult=1` is **+0.418 BPB**, the same sign as the 95M A/B's +0.242
+  and larger: 4.1 MB seen over 854 k params is **4.8 bytes/param** against the
+  95M arm's 0.78, so this model is much further along its curve and *still*
+  loses. Same question, same answer.
 - Closing the effective-LR gap does not merely shrink the gap: it **reverses
   the sign**. At parity the Muon half beats AdamW by 0.66 BPB in 1000 steps.
 - The arm still improves at 2x parity (2.562 vs 2.586), so the optimum here is
@@ -284,8 +284,8 @@ mechanism, not a recipe.
 
 ## 7. The patch (proposal, not merged)
 
-Branch `muon-audit`, commit "fix(opt): one LR seam, and the Muon half keeps its
-multiplier". Three files and one new method; **it changes no default**
+Branch `muon-audit`, commit "fix(opt): one LR seam, so the schedule cannot drop
+the Muon half's multiplier". Three files and one new method; **it changes no default**
 (`muon_lr_mult` stays 1.0, so a run that does not set it is bit-identical — 40
 CPU steps, `loss=5.2603` on both trees), and it is what makes any further
 multiplier A/B mean anything.
@@ -300,16 +300,17 @@ multiplier A/B mean anything.
 +        """Write the schedule's LR into both halves — the trainer's per-step call."""
 +        if muon_lr is None:
 +            muon_lr = lr
++        def put(group, value):                    # the opt_graph arm holds a 0-dim
++            if torch.is_tensor(group["lr"]):      # DEVICE tensor the replay reads:
++                group["lr"].fill_(value)          # fill IN PLACE (a float
++            else:                                 # assignment would freeze it)
++                group["lr"] = value
 +        for group in self.adamw.param_groups:
-+            group["lr"] = lr
++            put(group, lr)
 +        if self.muon is None:
 +            return
-+        value = muon_lr * self.muon_lr_mult
 +        for group in self.muon.param_groups:
-+            if torch.is_tensor(group["lr"]):      # the opt_graph arm: fill IN PLACE
-+                group["lr"].fill_(value)          # (a float assignment would
-+            else:                                 #  freeze the replay's tensor)
-+                group["lr"] = value
++            put(group, muon_lr * self.muon_lr_mult)
 --- a/port/src/dormouse/train/loop.py
 +++ b/port/src/dormouse/train/loop.py
              graph.set_lr(lr)
@@ -415,8 +416,9 @@ not a re-run. Specifically:
    first-order decrease. **Red on the measured code** (`AttributeError:
    'MixOptimizer' object has no attribute 'set_lr'`), green after the patch.
 3. `test_no_trainer_writes_group_lr_behind_the_optimizer` — no
-   `group["lr"] = ` statement in `train/loop.py` or `train/sft.py`, and both call
-   the seam. **Red on the measured code** (`loop.py:1758` is the first offender),
+   `group["lr"] = lr` statement in `train/loop.py` or `train/sft.py` (the SF
+   arm's `= muon_lr * mult` write-back is a different quantity and is allowed),
+   and both files call the seam. **Red on the measured code** (`loop.py:1758` is the first offender),
    green after.
 
 Verified on the branch:
@@ -428,7 +430,8 @@ Verified on the branch:
 - the patch changes **no default**: 40 CPU steps of `configs/audit_d128.toml`
   with `muon_lr_mult=1` give `loss=5.2603` on both trees, bit-identical; the same
   tree with `muon_lr_mult=8` gives `loss=3.8434` (it was inert before).
-- full CPU suite: 4 failures, all of them **pre-existing and environmental** —
+- full CPU suite: **4 failed, 1866 passed, 127 skipped, 1 xfailed** (338 s); the 4
+  failures are **pre-existing and environmental** —
   `tests/test_config.py` (×3) and `tests/test_sft_v2.py` need
   `port/checkpoints/` and a corpus manifest, both untracked and absent from a
   worktree; reproduced identically on a pristine `7771d7d` worktree. No new
