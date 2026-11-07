@@ -408,6 +408,34 @@ class ModelConfig:
     #: Refused on `block_form="kda"`: the loop's depth is `loop_blocks`, and a
     #: second, inert depth field is the config-lies defect.
     n_layers: int = 0
+    #: ---- THE RECIPE KNOBS (unique stack only; every one defaults OFF) ----
+    #: The 2026-11-06 Ripple-65B ladder compounded SIX cheap recipe changes into
+    #: 16x compute efficiency at 4B on code CE (`docs/reviews/2026-11-08-
+    #: ripple-65b.md`), which is larger than any architectural delta measured in
+    #: this repo. These four are the cheap, independent members of that list;
+    #: each is one A/B at 95M and none of them changes a default.
+    #:
+    #: `value_residual` (ResFormer, 2410.17897): every block's attention writes
+    #: `v + α_i · v_first`, where `v_first` is block 0's value and `α_i` is a
+    #: learned per-head scalar initialised to ZERO — so the arm starts bit-equal
+    #: to off and learns how much of the first layer's value to reuse.
+    value_residual: bool = False
+    #: `attn_gate` (sigmoid attention, 2505.06708): `y *= sigmoid(W_g · ln1(x))`
+    #: with one gate per head. The bias initialises to +4.0 (sigmoid ≈ 0.982) so
+    #: the arm starts near the ungated block instead of halving its attention
+    #: write at step 0.
+    attn_gate: bool = False
+    #: `ffn_clip` (GPT-OSS, 2505.09388 §2.1): clip the GELU activation before
+    #: `fc2` at this value; `0.0` = off. The paper's 7.0 is the value to try.
+    ffn_clip: float = 0.0
+    #: `nope_layers`: the LAST N blocks skip RoPE (Ripple ladder v1.5's "global
+    #: NoPE"; 2501.18795). Position enters through the earlier blocks and is
+    #: carried by the residual stream; the tail attends position-free. `0` = off.
+    #: NOT the paper's setting — they apply NoPE to the full-attention half of an
+    #: SWA/global hybrid and this stack has no SWA half — it is the cheapest
+    #: testable proxy at 95M, and it is refused on `block_stack != "uniform"`
+    #: because the hybrid's transformer blocks are not the stack's tail.
+    nope_layers: int = 0
     #: ---- THE BLOCK STACK: one form for the depth, or a frontier HYBRID ----
     #: `"uniform"` (the default) is every run on record: `block_form` names the
     #: only block tree, and `loop_blocks`/`max_iter`/`n_layers` keep their exact
@@ -2237,9 +2265,10 @@ class TrainConfig:
     decay_frac: float = 0.1
     #: The LR the WSD decay lands on, as a fraction of `lr` (`wsd_lr`'s
     #: `final_frac`): the last step trains at `lr * min_lr_frac`. 0.1 is the
-    #: schedule's long-standing floor; a small value (0.01) is a full anneal to
-    #: (almost) zero. A PROGRESS key for the same reason as `decay_frac`: it
-    #: shapes the remaining LR path, never the forward.
+    #: schedule's long-standing floor; 0.0 is a FULL cooldown to zero (the
+    #: Ripple-65B ladder v1.5 arm), and 0.01 is a near-zero anneal. A PROGRESS
+    #: key for the same reason as `decay_frac`: it shapes the remaining LR
+    #: path, never the forward.
     min_lr_frac: float = 0.1
     #: JSONL telemetry sink: one row per event (log line, eval, checkpoint),
     #: consumed by `dormouse plot`. Empty = off. A PROGRESS key: it is where
@@ -2932,6 +2961,22 @@ def _validate_hybrid(model: ModelConfig) -> None:
             f"shared loop and its depth is n_layers, not max_iter. Escape: "
             f"max_iter=1, or block_stack='uniform' for the loop."
         )
+    if model.nope_layers:
+        loud(
+            f"block_stack={model.block_stack!r} with nope_layers="
+            f"{model.nope_layers}: `nope_layers` means 'the LAST N blocks of the "
+            f"stack', and a hybrid stack's last blocks are whatever the ratio ends "
+            f"on, not the transformer half. Escape: nope_layers=0, or "
+            f"block_stack='uniform'."
+        )
+    if model.value_residual:
+        loud(
+            f"block_stack={model.block_stack!r} with value_residual=true: the arm "
+            f"carries the FIRST block's attention value, and a hybrid stack's "
+            f"first block is a KDA `LoopBlock`, which produces no attention value "
+            f"of that shape — the carry would start from nothing. Escape: "
+            f"value_residual=false, or block_stack='uniform'."
+        )
     if model.loop_blocks != 1:
         loud(
             f"block_stack={model.block_stack!r} with loop_blocks="
@@ -3102,7 +3147,45 @@ def validate_block_form(model: ModelConfig) -> None:
                 f"{', '.join(f'{n}={getattr(ModelConfig, n)!r}' for n in mod)}, or "
                 f"block_form='transformer'."
             )
+        recipe = [
+            name
+            for name in ("value_residual", "attn_gate", "ffn_clip", "nope_layers")
+            if getattr(model, name) != getattr(ModelConfig, name)
+        ]
+        if recipe:
+            loud(
+                f"block_form='kda' refuses {recipe}: these are recipe knobs on the "
+                f"UNIQUE transformer block (`model/transformer.py`), and the KDA "
+                f"loop block reads none of them. Escape: "
+                f"{', '.join(f'{n}={getattr(ModelConfig, n)!r}' for n in recipe)}, "
+                f"or block_form='transformer'."
+            )
         return
+    if model.value_residual and (model.mod_capacity < 1.0 or model.mod_top_k):
+        loud(
+            f"value_residual=true with mod_capacity={model.mod_capacity}/"
+            f"mod_top_k={model.mod_top_k}: a Mixture-of-Depths block sees only the "
+            f"routed C tokens, so block 0's value does not cover the rows a later "
+            f"block routes. The two arms are separate A/Bs. Escape: "
+            f"value_residual=false, or mod_capacity=1.0 with mod_top_k=0."
+        )
+    if model.ffn_clip < 0.0:
+        loud(
+            f"ffn_clip={model.ffn_clip}: a clip CEILING on a post-GELU activation is "
+            f">= 0 (0.0 = off). A negative value would zero the FFN's hidden state. "
+            f"Escape: ffn_clip >= 0 (7.0 is the GPT-OSS value)."
+        )
+    if model.nope_layers < 0:
+        loud(
+            f"nope_layers={model.nope_layers}: a layer COUNT is >= 0 (0 = off, RoPE "
+            f"everywhere). Escape: nope_layers >= 0."
+        )
+    if model.nope_layers > (model.n_layers or model.loop_blocks * model.max_iter):
+        loud(
+            f"nope_layers={model.nope_layers} > the stack's depth: this stack builds "
+            f"`n_layers or loop_blocks × max_iter` blocks, so a larger count would "
+            f"silently mean 'all of them'. Escape: nope_layers <= n_layers."
+        )
     if not 0.0 < model.mod_capacity <= 1.0:
         loud(
             f"mod_capacity={model.mod_capacity}: the paper's capacity is the "
@@ -5006,13 +5089,13 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"meaningful range — 0 is a constant LR after warmup and 1 is a decay "
             f"from step 0. Escape: 0 <= decay_frac <= 1 (0.1 is the default)."
         )
-    if not 0.0 < tcfg.min_lr_frac <= 1.0:
+    if not 0.0 <= tcfg.min_lr_frac <= 1.0:
         loud(
             f"min_lr_frac={tcfg.min_lr_frac}: `wsd_lr`'s `final_frac` is the LR "
-            f"the decay LANDS on, so it must be in (0, 1] — 0 asks for a division "
-            f"by a zero LR basin and >1 would make the 'decay' an increase. "
-            f"Escape: 0 < min_lr_frac <= 1 (0.1 is the default, 0.01 is a full "
-            f"anneal to near zero)."
+            f"the decay LANDS on, so it must be in [0, 1] — 0 is a full cooldown "
+            f"to zero and >1 would make the 'decay' an increase. "
+            f"Escape: 0 <= min_lr_frac <= 1 (0.1 is the default, 0.0 is a full "
+            f"anneal to zero)."
         )
     if tcfg.grad_accum > 1 and tcfg.opt_graph:
         loud(

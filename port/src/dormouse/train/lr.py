@@ -36,13 +36,19 @@ def wsd_lr(
     decay_steps: int = 0,
     final_frac: float = 0.1,
 ) -> float:
-    """The learning rate at `step` (0-based), in `[final_frac·peak, peak]`."""
+    """The learning rate at `step` (0-based), in `[final_frac·peak, peak]`.
+
+    `final_frac=0.0` is a FULL cooldown to zero — the Ripple-65B ladder v1.5 arm
+    (`docs/reviews/2026-11-08-ripple-65b.md`), which is why the bound below is
+    `>= 0` rather than `> 0`: a schedule that ends at 0.1×peak is not the same
+    arm as one that ends at 0, and the difference is measurable at 95M.
+    """
     if total_steps < 1:
         loud(f"total_steps={total_steps} must be >= 1")
     if peak_lr <= 0.0:
         loud(f"peak_lr={peak_lr} must be > 0")
-    if not 0.0 < final_frac <= 1.0:
-        loud(f"final_frac={final_frac} must be in (0, 1]")
+    if not 0.0 <= final_frac <= 1.0:
+        loud(f"final_frac={final_frac} must be in [0, 1] (0 = a full cooldown to zero)")
     if warmup_steps < 0 or decay_steps < 0:
         loud(f"warmup_steps={warmup_steps} decay_steps={decay_steps} must be >= 0")
     if warmup_steps == 0:

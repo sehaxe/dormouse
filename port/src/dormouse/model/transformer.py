@@ -138,7 +138,9 @@ class TransformerBlock(nn.Module):
     `_block` and passes the rest through unchanged (see the module docstring).
     """
 
-    def __init__(self, cfg, *, n_layers: int, device: torch.device | str = "cpu") -> None:
+    def __init__(
+        self, cfg, *, n_layers: int, layer_idx: int = 0, device: torch.device | str = "cpu"
+    ) -> None:
         super().__init__()
         d, ffn, heads, hd = cfg.d_model, cfg.d_ffn, cfg.n_heads, cfg.head_dim
         assert heads * hd == d, "validate() pins n_heads*head_dim == d_model"
@@ -150,12 +152,38 @@ class TransformerBlock(nn.Module):
         self.head_dim = hd
         self.scale = 1.0 / math.sqrt(hd)
         self.compute_dtype = torch.bfloat16 if cfg.bf16 else torch.float32
+        #: `nope_layers` = the LAST N blocks of the stack skip RoPE. The block
+        #: is built with its own index so the rule is per-instance, not a
+        #: global flag the forward would have to re-derive.
+        self.nope = bool(cfg.nope_layers) and layer_idx >= n_layers - cfg.nope_layers
+        #: The carry is a property of the STACK, not of α: block 0 has no α but
+        #: is the source, so `last_v` is set whenever the arm is on.
+        self.value_residual = bool(cfg.value_residual)
+        self.ffn_clip = float(cfg.ffn_clip)
         self.ln1 = nn.LayerNorm(d, device=device)
         self.qkv = nn.Linear(d, 3 * d, bias=False, device=device)
         self.proj = nn.Linear(d, d, bias=False, device=device)
         self.ln2 = nn.LayerNorm(d, device=device)
         self.fc = nn.Linear(d, ffn, bias=False, device=device)
         self.fc2 = nn.Linear(ffn, d, bias=False, device=device)
+        #: Value residuals (`value_residual`): a per-head scale on block 0's
+        #: value, ZERO-initialised so the arm starts bit-equal to off. Block 0
+        #: IS the source (`v_first`), so it gets no α — an α there would be a
+        #: parameter with no reader, the dead-capacity defect this port audits.
+        self.v_res_alpha: nn.Parameter | None = None
+        if cfg.value_residual and layer_idx > 0:
+            self.v_res_alpha = nn.Parameter(torch.zeros(1, heads, 1, 1, device=device))
+        #: Sigmoid attention gate (`attn_gate`): one logit per head from `ln1`.
+        #: bias=+4.0 keeps sigmoid(≈0.982) near the ungated write at step 0 —
+        #: a zero-bias gate would halve the attention output before it learns.
+        self.gate: nn.Linear | None = None
+        if cfg.attn_gate:
+            self.gate = nn.Linear(d, heads, device=device)
+            nn.init.zeros_(self.gate.weight)
+            nn.init.constant_(self.gate.bias, 4.0)
+        #: Block 0's value for the NEXT block's `value_residual` (None until the
+        #: first forward; the model threads it, the block never looks ahead).
+        self.last_v: torch.Tensor | None = None
         # The control's init (`Control._init` + its residual scaling): every
         # projection N(0, 0.02), then the two writes into the residual stream
         # shrunk by sqrt(2·L) so the stream does not grow with depth. LayerNorm
@@ -181,46 +209,76 @@ class TransformerBlock(nn.Module):
         #: The last forward's BCE aux value, DETACHED (log-cadence read only).
         self.last_aux: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """`x [b, t, d]` in the residual dtype → `[b, t, d]` in the same dtype."""
+    def forward(
+        self,
+        x: torch.Tensor,
+        counters: Counters | None = None,
+        v_first: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """`x [b, t, d]` in the residual dtype → `[b, t, d]` in the same dtype.
+
+        `v_first` is block 0's value when `value_residual` is on (the caller
+        threads it through `last_v`); `None` on the first block and on every
+        default run.
+        """
         if self.router is None:
-            return self._block(x, counters)
-        return self._forward_mod(x, counters)
+            return self._block(x, counters, v_first=v_first)
+        return self._forward_mod(x, counters, v_first=v_first)
 
     def _block(
         self,
         x: torch.Tensor,
         counters: Counters | None = None,
         rope: tuple[torch.Tensor, torch.Tensor] | None = None,
+        v_first: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The plain block. `rope` is the pre-built `(cos, sin)` table of a
         compacted MoD call (per-token ORIGINAL positions); `None` is today's
-        table over positions `0..t-1`."""
+        table over positions `0..t-1`, and `self.nope` skips it entirely."""
         pdt = self.qkv.weight.dtype
         if x.dtype is not pdt:
             x = x.to(pdt)
         b, t, _ = x.shape
         d = self.d
-        qkv = mm_mixed(self.ln1(x), self.qkv.weight, self.compute_dtype, counters)
+        h1 = self.ln1(x)
+        qkv = mm_mixed(h1, self.qkv.weight, self.compute_dtype, counters)
         q, k, v = qkv.split(d, dim=-1)
         q = q.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        if rope is None:
-            cos, sin = rope_tables(t, self.head_dim, x.device, q.dtype)
-        else:
-            cos, sin = rope
-        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        if self.value_residual:
+            if v_first is None:
+                v_first = v
+            else:
+                v = v + self.v_res_alpha.to(v.dtype) * v_first
+            self.last_v = v_first
+        if not self.nope:
+            if rope is None:
+                cos, sin = rope_tables(t, self.head_dim, x.device, q.dtype)
+            else:
+                cos, sin = rope
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
+        if self.gate is not None:
+            g = torch.sigmoid(F.linear(h1, self.gate.weight, self.gate.bias))
+            y = y * g.transpose(1, 2).unsqueeze(-1).to(y.dtype)
         y = y.transpose(1, 2).reshape(b, t, d)
         # Every projection runs in the compute dtype; the residual add is the
         # fp32 stream (mm_mixed's contract, widened back here).
         x = x + mm_mixed(y, self.proj.weight, self.compute_dtype, counters).to(x.dtype)
         h = mm_mixed(self.ln2(x), self.fc.weight, self.compute_dtype, counters)
-        h = mm_mixed(F.gelu(h), self.fc2.weight, self.compute_dtype, counters)
+        h = F.gelu(h)
+        if self.ffn_clip > 0.0:
+            h = h.clamp(max=self.ffn_clip)
+        h = mm_mixed(h, self.fc2.weight, self.compute_dtype, counters)
         return x + h.to(x.dtype)
 
-    def _forward_mod(self, x: torch.Tensor, counters: Counters | None) -> torch.Tensor:
+    def _forward_mod(
+        self,
+        x: torch.Tensor,
+        counters: Counters | None,
+        v_first: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Route `C = mod_capacity_tokens(...)` tokens through the block.
 
         One `topk` on the router score, gather into fixed buffers in POSITION
@@ -243,7 +301,7 @@ class TransformerBlock(nn.Module):
         cos_tab, sin_tab = rope_tables(t, self.head_dim, x.device, self.compute_dtype)
         cos = cos_tab[0, 0][pbuf].unsqueeze(1)
         sin = sin_tab[0, 0][pbuf].unsqueeze(1)
-        y = self._block(buf, counters, rope=(cos, sin))
+        y = self._block(buf, counters, rope=(cos, sin), v_first=v_first)
         # Eq. 1: `r_i · f_i(X̃) + x_i`. The router weight is ON the gradient
         # path, which is the only gradient the router gets from the LM term
         # (the top-k identity itself is not differentiable).

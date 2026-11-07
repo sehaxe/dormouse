@@ -249,7 +249,10 @@ class DormouseModel(nn.Module):
             # it before its head, and the channel applies it before `out_proj`.
             n_layers = cfg.n_layers or cfg.loop_blocks * cfg.max_iter
             self.transformer_blocks = nn.ModuleList(
-                [TransformerBlock(cfg, n_layers=n_layers, device=device) for _ in range(n_layers)]
+                [
+                    TransformerBlock(cfg, n_layers=n_layers, layer_idx=i, device=device)
+                    for i in range(n_layers)
+                ]
             )
             self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
             # `byte_patch` is the dense-stack arm of `compat_armed`; this is
@@ -311,7 +314,10 @@ class DormouseModel(nn.Module):
             # dormant copy beside it.
             n_layers = cfg.n_layers or cfg.loop_blocks * cfg.max_iter
             self.transformer_blocks = nn.ModuleList(
-                [TransformerBlock(cfg, n_layers=n_layers, device=device) for _ in range(n_layers)]
+                [
+                    TransformerBlock(cfg, n_layers=n_layers, layer_idx=i, device=device)
+                    for i in range(n_layers)
+                ]
             )
             self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
             if cfg.tie_embeddings:
@@ -1348,8 +1354,10 @@ class DormouseModel(nn.Module):
         """
         h = self.embed(input_ids)
         mod_aux = None
+        v_first = None
         for block in stepaudit.iterations("forward.transformer_blocks", self.transformer_blocks):
-            h = block(h, counters)
+            h = block(h, counters, v_first=v_first)
+            v_first = block.last_v
             counters.count("transformer_block")
             aux = getattr(block, "last_aux", None)
             if aux is not None:
