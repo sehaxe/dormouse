@@ -889,7 +889,7 @@ class Muon(Optimizer):
         sf: bool = False,
         sf_beta: float = SF_BETA1,
         chunk_elems: int = MUON_CHUNK_ELEMS,
-        lr_mode: str = "shape_fair",
+        lr_mode: str = "uniform",
     ) -> None:
         _check_ns_kind(ns_kind)
         _check_colrow_3d(colrow_3d)
@@ -1724,7 +1724,7 @@ class MixOptimizer:
         muon_chunk_elems: int = MUON_CHUNK_ELEMS,
         tsct_expert_lr: float = 0.0,
         muon_lr_mult: float = 1.0,
-        muon_lr_mode: str = "shape_fair",
+        muon_lr_mode: str = "uniform",
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")

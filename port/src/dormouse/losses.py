@@ -89,7 +89,12 @@ def logit_softcap(logits: torch.Tensor, cap: float) -> torch.Tensor:
             f"so 0 divides by zero and a negative cap reflects the logits. Escape: "
             f"cap > 0, or leave logit_softcap=0.0 (the off default)."
         )
-    return cap * torch.tanh(logits / cap)
+    # A non-finite logit must STAY non-finite: `cap * tanh(inf/cap)` is a
+    # perfectly finite +cap with a zero gradient, so the softcap would erase the
+    # overflow before either the loss or the gradient check could see it (found
+    # by the numerics audit, 2026-11-08). `where` keeps every finite value
+    # bit-identical and forwards inf/nan to the trainer's firewall.
+    return torch.where(torch.isfinite(logits), cap * torch.tanh(logits / cap), logits)
 
 
 def ce_margin(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -139,6 +144,11 @@ class _FixedCE(torch.autograd.Function):
         loss = torch.log1p(s * torch.exp(u.clamp(U_MIN, U_MAX)))
         loss = torch.where(u > U_MAX, u + torch.log(s), loss)
         loss = torch.where(u < U_MIN, torch.zeros_like(loss), loss)
+        # ...and the same blind spot from the other side: a `+inf` TARGET logit
+        # makes `u = -inf`, takes the branch above, and returns exactly 0.0 —
+        # a perfect-prediction reading of a numerics failure. Keep it non-finite
+        # so the trainer's NaN firewall owns the decision (device-side: no read).
+        loss = torch.where(torch.isfinite(zt), loss, zt)
         # `shift = u - loss` is the log of the non-target denominator's share;
         # written this way (`-log(s) - softplus(-lw)` = the same number) it has
         # no `1e4 - 1e4` cancellation when the target is far BELOW the max.

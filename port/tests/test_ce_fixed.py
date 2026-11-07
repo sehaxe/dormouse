@@ -599,3 +599,35 @@ def test_the_rl_log_probability_seam_matches_and_sums_to_zero():
     drained = c.drain()
     assert drained["ce_cliff_tokens"] == 0 and drained["ce_clamp_hits"] == 0
     assert float(per_row.sum(-1).abs().max()) <= 1e-6
+
+
+def test_the_firewalls_do_not_swallow_a_non_finite_logit():
+    """inf must reach the trainer's NaN firewall, not read as a perfect prediction.
+
+    Two blind spots found by the numerics audit (2026-11-08):
+    * `fixed_cross_entropy` returned exactly 0.0 for a +inf TARGET logit
+      (`u = -inf` takes the `u < U_MIN` branch);
+    * `logit_softcap` mapped any inf to a finite `+cap` with a zero gradient.
+    Both are one-line checks away, and both were dormant — which is why nobody
+    noticed. This gate is what makes them not dormant.
+    """
+    import torch
+
+    from dormouse.losses import fixed_cross_entropy, logit_softcap
+
+    # softcap: a finite logit is unchanged, an inf survives
+    z = torch.tensor([[1.0, -2.0, 0.5]])
+    assert torch.allclose(logit_softcap(z, 15.0), 15.0 * torch.tanh(z / 15.0))
+    bad = torch.tensor([[1.0, float("inf"), 0.5]])
+    out = logit_softcap(bad, 15.0)
+    assert not torch.isfinite(out[0, 1]), out
+    assert torch.equal(out[0, [0, 2]], logit_softcap(z, 15.0)[0, [0, 2]])
+
+    # fixed CE: a +inf target logit must not come back as 0.0
+    logits = torch.tensor([[0.0, 1.0, 2.0]])
+    targets = torch.tensor([2])
+    ok = fixed_cross_entropy(logits, targets, reduction="none")
+    assert torch.isfinite(ok).all()
+    logits[0, 2] = float("inf")
+    bad_loss = fixed_cross_entropy(logits, targets, reduction="none")
+    assert not torch.isfinite(bad_loss).all(), bad_loss
