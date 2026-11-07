@@ -400,8 +400,9 @@ that accepts the shared config.
 
 ```
 port/tests/test_optimizer_suite.py                     34 passed
-test_muon_reference + clip_grads + lr_tail + lrband
-  + train4 + posttrain_fixes                           94 passed
+test_optimizer_suite + muon_reference + clip_grads
+  + lr_tail + lrband + train4 + posttrain_fixes
+  + full_graph + full_graph_m400b       141 passed, 8 skipped (GPU)
 test_config + sft + sft_v2 + rl_train + nan_firewall
   + opt_graph + dead_knob_audit                        4 failed (environment)
 ```
