@@ -2,258 +2,243 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<!--
-
-  01000100 01001111 01010010 01001101 01001111 01010101 01010011 01000101
-  --------------------------------------------------------------------------
-  dormouse — a byte-level language model on one workstation.
-
-  FOR HUMANS
-  ├── read      this page, top to bottom; every number is a measured run
-  ├── source    https://github.com/sehaxe/dormouse
-  └── agents    298 markdown files under docs/ and research/
-
-  FOR AGENTS
-  ├── data      <script id="data"> at the bottom: runs, rungs, curve
-  ├── image     <script id="surprise">: 1024 bytes + per-byte -log2 p
-  └── build     site/gen (Rust, std + serde_json) reads logs/**/*.jsonl
-
--->
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dormouse — measured, not asserted</title>
+<title>dormouse — a byte-level model on one workstation</title>
 <meta name="description" content="A byte-level language model trained on one 16 GB card. Every number computed from the run logs, every retraction kept.">
 <style>
   :root{
-    --bg:#05070a; --panel:#0a0e12; --panel2:#0d1319;
-    --line:#1b2530; --line2:#26333f;
-    --ink:#cfdae2; --dim:#5d7180;
-    --green:#00e08a; --green-dim:#0a6b46;
-    --hot:#ff3b5c;
+    --bg:#0a0a0b; --panel:#0f0f11; --panel2:#141417;
+    --line:#1f1f23; --line2:#2b2b30;
+    --ink:#ededee; --dim:#8b8b92; --dimmer:#5c5c63;
+    --accent:#9ab8ff; --hot:#ff6b7a;
     --mono:"DejaVu Sans Mono","Liberation Mono",ui-monospace,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   }
   *{box-sizing:border-box}
-  html{background:var(--bg);-webkit-text-size-adjust:100%}
-  body{margin:0;color:var(--ink);font-family:var(--mono);font-size:13.5px;line-height:1.6;
-    background:
-      repeating-linear-gradient(0deg,rgba(255,255,255,.022) 0 1px,transparent 1px 4px),
-      repeating-linear-gradient(90deg,rgba(255,255,255,.022) 0 1px,transparent 1px 4px),
-      var(--bg);
-    -webkit-font-smoothing:none;font-smooth:never}
-  a{color:var(--green);text-decoration:none;border-bottom:1px solid var(--green-dim)}
-  a:hover{border-bottom-color:var(--green)}
-  .wrap{max-width:1120px;margin:0 auto;padding:0 20px}
-
-  /* ---- top bar ---- */
-  .bar{position:fixed;top:0;left:0;right:0;z-index:40;height:34px;display:flex;
-    align-items:center;gap:16px;padding:0 14px;font-size:11px;letter-spacing:.08em;
-    text-transform:uppercase;color:var(--dim);
-    background:rgba(5,7,10,.92);border-bottom:1px solid var(--line)}
-  .bar b{color:var(--green);font-weight:400}
-  .bar .sp{margin-left:auto}
-  .bar a{color:var(--dim);border:0}
-  .bar a:hover{color:var(--ink)}
-
-  /* ---- hero ---- */
-  .hero{position:relative;min-height:100svh;display:flex;align-items:center;
-    padding:120px 0 90px;overflow:hidden;border-bottom:1px solid var(--line)}
-  #rain{position:absolute;inset:0;width:100%;height:100%;z-index:0;opacity:.5;
-    -webkit-mask-image:linear-gradient(90deg,transparent 0%,transparent 40%,#000 58%);
-    mask-image:linear-gradient(90deg,transparent 0%,transparent 40%,#000 58%)}
-  .hero-in{position:relative;z-index:2;width:100%}
-  .tag{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
-  .tag b{color:var(--green);font-weight:400}
-  #pixTitle{display:block;margin:22px 0 0;image-rendering:pixelated;
-    width:100%;max-width:760px;height:auto}
-  .lede{margin:26px 0 0;max-width:60ch;font-size:14px;line-height:1.7;color:#a9b8c4}
-  .lede b{color:var(--ink);font-weight:400}
-  .hstats{display:flex;flex-wrap:wrap;gap:0;margin:34px 0 0;border:1px solid var(--line);
-    background:var(--panel);width:fit-content}
-  .hstats span{padding:10px 16px;border-right:1px solid var(--line);font-size:11px;
-    letter-spacing:.06em;color:var(--dim);text-transform:uppercase}
-  .hstats span:last-child{border-right:0}
-  .hstats b{display:block;font-size:18px;letter-spacing:0;color:var(--green);
-    font-weight:400;text-transform:none;margin-bottom:2px}
-
-  /* ---- the tape ---- */
-  .tape{position:absolute;left:0;right:0;bottom:0;z-index:3;overflow:hidden;
-    border-top:1px solid var(--line);background:rgba(5,7,10,.95)}
-  .tape-in{display:inline-block;white-space:nowrap;padding:8px 0;font-size:10.5px;
-    letter-spacing:.08em;color:#4e6270;animation:tape 52s linear infinite}
-  .tape-in b{color:var(--green);font-weight:400}
-  @keyframes tape{from{transform:translateX(0)}to{transform:translateX(-50%)}}
-
-  /* ---- sections ---- */
-  section.blk{padding:64px 0;border-top:1px solid var(--line)}
-  section.blk:first-of-type{border-top:0}
-  h2{font-size:12px;font-weight:400;letter-spacing:.14em;text-transform:uppercase;
-    color:var(--ink);margin:0 0 6px}
-  h2 .n{color:var(--green);margin-right:10px}
-  .sub{color:var(--dim);font-size:12px;margin:0 0 26px;max-width:86ch;line-height:1.7}
-
-  /* ---- tables ---- */
-  table{width:100%;border-collapse:collapse;font-size:12.5px}
-  th{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);
-    font-weight:400;text-align:right;padding:8px 10px;border-bottom:1px solid var(--line2)}
-  th:first-child{text-align:left;padding-left:0}
-  td{text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)}
-  td:first-child{text-align:left;padding-left:0}
-  tr:hover td{background:var(--panel)}
-  .ok{color:var(--green)}
-  .bad{color:var(--hot)}
+  html{background:var(--bg);-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+  body{margin:0;color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.6;
+    -webkit-font-smoothing:antialiased}
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+  .mono{font-family:var(--mono)}
   .dim{color:var(--dim)}
 
-  /* ---- the portrait ---- */
-  .heat{display:block;width:100%;height:52px;image-rendering:pixelated;
-    border:1px solid var(--line);background:var(--panel)}
-  .bytes{margin:0;padding:14px;border:1px solid var(--line);border-top:0;
-    background:var(--panel);font-size:11.5px;line-height:1.5;white-space:pre;
-    overflow-x:auto;color:#3d4d59;letter-spacing:0}
-  .bytes b{font-weight:400}
+  /* nav */
+  nav{position:fixed;top:0;left:0;right:0;z-index:50;height:52px;display:flex;align-items:center;
+    background:rgba(10,10,11,.82);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+  nav .wrap{width:100%;display:flex;align-items:center;gap:26px;height:100%;font-family:var(--mono);font-size:12.5px}
+  nav b{font-weight:400;color:var(--ink)}
+  nav a{color:var(--dim)}
+  nav a:hover{color:var(--ink)}
+  nav .sp{margin-left:auto}
+  nav .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);display:inline-block;margin-right:7px;
+    box-shadow:0 0 10px var(--accent)}
 
-  /* ---- cards ---- */
-  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
-  .card{border:1px solid var(--line2);background:var(--panel);padding:16px;
-    box-shadow:4px 4px 0 rgba(0,224,138,.07)}
-  .card .k{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
-  .card .v{font-size:26px;color:var(--green);margin:6px 0 8px;line-height:1}
-  .card .d{font-size:11px;color:var(--dim);line-height:1.6}
+  /* hero */
+  header{padding:132px 0 0}
+  .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+  h1{font-family:var(--mono);font-weight:400;font-size:clamp(34px,5.4vw,64px);line-height:1.06;
+    letter-spacing:-.03em;margin:18px 0 0;max-width:20ch}
+  h1 em{font-style:normal;color:var(--dim)}
+  .sub{margin:22px 0 0;max-width:62ch;color:#b9b9c0;font-size:16px;line-height:1.65}
+  .sub b{color:var(--ink);font-weight:600}
+  .cta{display:flex;gap:10px;margin:30px 0 0;flex-wrap:wrap}
+  .btn{font-family:var(--mono);font-size:12.5px;padding:10px 16px;border-radius:7px;border:1px solid var(--line2);
+    color:var(--ink);background:var(--panel2);display:inline-flex;align-items:center;gap:8px}
+  .btn:hover{background:#1b1b1f;border-color:#3a3a40}
+  .btn.p{background:var(--ink);color:#0a0a0b;border-color:var(--ink)}
+  .btn.p:hover{background:#fff}
 
-  /* ---- curve ---- */
-  .curve{width:100%;height:auto;display:block;border:1px solid var(--line);background:var(--panel)}
-  .curve .grid{stroke:#16202a;stroke-width:1}
-  .curve .line{fill:none;stroke:var(--green);stroke-width:1.5}
-  .curve .pt{fill:var(--green)}
-  .curve text{fill:var(--dim);font-family:var(--mono);font-size:10px}
+  /* media card */
+  .stage{margin:52px 0 0;border:1px solid var(--line);border-radius:14px;overflow:hidden;
+    background:var(--panel)}
+  .stage video{display:block;width:100%;height:auto;aspect-ratio:16/9;object-fit:cover}
+  .stage .cap{display:flex;align-items:center;gap:18px;padding:13px 16px;border-top:1px solid var(--line);
+    font-family:var(--mono);font-size:11.5px;color:var(--dim)}
+  .stage .cap b{color:var(--ink);font-weight:400}
+  .stage .cap .sp{margin-left:auto}
 
-  /* ---- retractions ---- */
-  ol.retr{list-style:none;margin:0;padding:0;counter-reset:r}
-  ol.retr li{border:1px solid var(--line);border-left:2px solid var(--hot);
-    padding:14px 16px;margin-bottom:10px;background:var(--panel)}
-  ol.retr .was{color:var(--hot);font-size:12px}
-  ol.retr .now{color:var(--green);font-size:12px}
-  ol.retr .why{color:var(--dim);font-size:11.5px;margin-top:6px;line-height:1.65}
+  /* sections */
+  section{padding:88px 0;border-top:1px solid var(--line);margin-top:88px}
+  header + section{margin-top:64px}
+  h2{font-family:var(--mono);font-weight:400;font-size:13px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--dim);margin:0 0 10px}
+  h2 span{color:var(--dimmer);margin-right:10px}
+  h3{font-size:22px;font-weight:500;letter-spacing:-.01em;margin:0 0 8px}
+  .lead{color:var(--dim);max-width:70ch;margin:0 0 30px;line-height:1.7}
 
-  footer{padding:40px 0 70px;border-top:1px solid var(--line);color:var(--dim);font-size:11px}
-  footer .row{display:flex;gap:20px;flex-wrap:wrap;align-items:center}
+  /* cards */
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+  .card{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--panel)}
+  .card video{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#000}
+  .card .b{padding:16px 16px 18px}
+  .card .k{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dimmer)}
+  .card .t{font-size:15.5px;margin:6px 0 6px}
+  .card .d{font-size:13px;color:var(--dim);line-height:1.6}
+  .card .d b{color:var(--ink);font-weight:500}
 
-  @media (max-width:820px){
-    .cards{grid-template-columns:1fr}
-    .hstats span{padding:8px 12px}
-    section.blk{padding:48px 0}
+  /* stats */
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  .stat{border:1px solid var(--line);border-radius:12px;padding:20px;background:var(--panel)}
+  .stat .v{font-family:var(--mono);font-size:34px;line-height:1;letter-spacing:-.02em}
+  .stat .k{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dimmer);margin-top:10px}
+  .stat .d{font-size:12.5px;color:var(--dim);margin-top:8px;line-height:1.6}
+
+  /* tables */
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{font-family:var(--mono);font-weight:400;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--dimmer);text-align:right;padding:0 12px 10px;border-bottom:1px solid var(--line)}
+  th:first-child{text-align:left;padding-left:0}
+  td{text-align:right;padding:11px 12px;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12.5px}
+  td:first-child{text-align:left;padding-left:0;font-family:var(--sans);font-size:13.5px}
+  tr:hover td{background:var(--panel)}
+  .ok{color:#9ee6b0}
+  .bad{color:var(--hot)}
+  .note{font-family:var(--mono);font-size:11px;color:var(--dimmer)}
+
+  /* retractions */
+  ul.ret{list-style:none;margin:0;padding:0}
+  ul.ret li{border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:12px;background:var(--panel)}
+  ul.ret .was{font-family:var(--mono);font-size:12.5px;color:var(--hot)}
+  ul.ret .now{font-family:var(--mono);font-size:12.5px;color:#9ee6b0;margin-top:4px}
+  ul.ret .why{color:var(--dim);font-size:13px;margin-top:8px;line-height:1.65}
+
+  footer{border-top:1px solid var(--line);padding:40px 0 70px;color:var(--dimmer);font-family:var(--mono);font-size:11.5px}
+  footer .row{display:flex;gap:22px;flex-wrap:wrap;align-items:center}
+
+  @media (max-width:860px){
+    .grid,.stats{grid-template-columns:1fr}
+    section{padding:64px 0;margin-top:64px}
+    header{padding-top:104px}
   }
   @media (prefers-reduced-motion:reduce){
-    #rain{display:none}.tape-in{animation:none}
+    video{display:none}
+    html{scroll-behavior:auto}
   }
 </style>
 </head>
 <body>
 
-<div class="bar">
-  <b>dormouse</b><span>v0 · measured</span>
+<nav><div class="wrap">
+  <b>dormouse</b>
+  <a href="#measure">measurements</a>
+  <a href="#runs">runs</a>
+  <a href="#retracted">retractions</a>
   <span class="sp"></span>
-  <a href="https://github.com/sehaxe/dormouse">source</a>
-  <span id="clock">--:--:--</span>
-</div>
+  <a href="https://github.com/sehaxe/dormouse"><span class="dot"></span>source</a>
+</div></nav>
 
-<section class="hero">
-  <canvas id="rain" aria-hidden="true"></canvas>
-  <div class="wrap hero-in">
-    <div class="tag">one RTX 5070 Ti · 16 GB · <b>sm_120</b></div>
-    <canvas id="pixTitle" aria-label="dormouse"></canvas>
-    <p class="lede">
-      A byte-level language model that lives on <b>one workstation</b>.
-      Published with the measurements that justify it — and the ones that <b>refute</b> it.
-    </p>
-    <div class="hstats">
-      <span><b id="hBpb">—</b>bits / byte</span>
-      <span><b id="hMb">—</b>MB seen</span>
-      <span><b id="hSpeed">—</b>step speed</span>
+<header><div class="wrap">
+  <div class="kicker">one RTX 5070 Ti · 16 GB · sm_120</div>
+  <h1>A byte-level model that lives on <em>one workstation.</em></h1>
+  <p class="sub">Published with the measurements that justify it — and the ones that <b>refute</b> it.
+    Every number on this page is computed from the run logs at build time.</p>
+  <div class="cta">
+    <a class="btn p" href="#measure">Read the measurements</a>
+    <a class="btn" href="https://github.com/sehaxe/dormouse">Source ↗</a>
+  </div>
+  <div class="stage">
+    <video src="media/rain.webm" poster="media/rain.jpg" preload="auto" autoplay muted loop playsinline aria-label="binary rain, 0 and 1"></video>
+    <div class="cap"><b>flagship3</b><span>12 unique layers · 95,035,200 parameters</span>
+      <span class="sp">the alphabet is 256 bytes; the rain is its binary shadow</span></div>
+  </div>
+</div></header>
+
+<section id="measure"><div class="wrap">
+  <h2><span>01</span>what the runs say</h2>
+  <h3>Three numbers, each one a measurement</h3>
+  <p class="lead">Context, step speed and the size of the record. Nothing here is a projection.</p>
+  <div class="stats">
+    <div class="stat"><div class="v">1M</div><div class="k">context</div>
+      <div class="d">34 MB of state: KDA 393 KB + CSA 32 MB + HCA 1 MB</div></div>
+    <div class="stat"><div class="v" id="sSpeed">—</div><div class="k">step speed</div>
+      <div class="d">bf16 Newton–Schulz at 5 steps, inside the ±0.02 BPB noise floor</div></div>
+    <div class="stat"><div class="v" id="sRuns">—</div><div class="k">runs on record</div>
+      <div class="d"><span id="sRunsSub">—</span>, including the ones later retracted</div></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <h2><span>02</span>what the model sees</h2>
+  <h3>1024 held-out bytes, one forward</h3>
+  <p class="lead">Height is the model's surprise at that byte (<span class="mono">−log2 p</span>), measured
+    on a pinned English window. The text below the strip is the same 1024 bytes, tinted by the same value.</p>
+  <div class="card">
+    <video src="media/heat.webm" poster="media/heat.jpg" preload="auto" autoplay muted loop playsinline aria-label="per-byte surprise across the held-out window"></video>
+    <div class="b">
+      <div class="k">flagship3 · <span id="sMeta">—</span></div>
+      <div class="t"><span id="sMean">—</span></div>
+      <pre class="mono" id="bytes" style="margin:14px 0 0;font-size:11.5px;line-height:1.5;white-space:pre;overflow-x:auto;color:#3f3f45"></pre>
     </div>
   </div>
-  <div class="tape" aria-hidden="true"><div class="tape-in" id="tape"></div></div>
-</section>
+</div></section>
 
-<section class="blk wrap" id="s0">
-  <h2><span class="n">[0]</span>what the model sees</h2>
-  <p class="sub">1024 held-out bytes of English, one forward of the flagship3 checkpoint.
-    Height is surprise, colour is the same four bands as the text below.</p>
-  <canvas class="heat" id="heat" width="1024" height="52" aria-hidden="true"></canvas>
-  <pre class="bytes" id="bytes" aria-label="held-out text tinted by the model's surprise"></pre>
-  <p class="sub" style="margin:14px 0 0"><span id="sMean">—</span> · <span id="sMeta">—</span></p>
-</section>
-
-<section class="blk wrap">
-  <h2><span class="n">[1]</span>three numbers the page proves</h2>
-  <p class="sub">Each one is computed from the logs at build time.</p>
-  <div class="cards">
-    <div class="card"><div class="k">context</div><div class="v">1M</div>
-      <div class="d">34 MB of state: KDA 393 KB + CSA 32 MB + HCA 1 MB</div></div>
-    <div class="card"><div class="k">step speed</div><div class="v" id="cSpeed">—</div>
-      <div class="d">bf16 Newton–Schulz at 5 steps · inside the ±0.02 BPB noise floor</div></div>
-    <div class="card"><div class="k">runs on record</div><div class="v" id="cRuns">—</div>
-      <div class="d"><span id="cRunsSub">—</span>, including the retracted ones</div></div>
+<section><div class="wrap">
+  <h2><span>03</span>the curve</h2>
+  <h3>Bits per byte, on bytes actually seen</h3>
+  <p class="lead" id="curveMeta">—</p>
+  <div class="card">
+    <video src="media/curve.webm" poster="media/curve.jpg" preload="auto" autoplay muted loop playsinline aria-label="held-out BPB against training bytes"></video>
+    <div class="b"><div class="k">held-out BPB · English window</div>
+      <div class="t" id="curveFinal">—</div>
+      <div class="d">The last point is a real run, not an extrapolation.</div></div>
   </div>
-</section>
+</div></section>
 
-<section class="blk wrap">
-  <h2><span class="n">[2]</span>the optimizer was 70% of the step</h2>
-  <p class="sub">Muon's Newton–Schulz chain ran 579 GFLOP of fp32 matmuls per step on the
-    CUDA-core lane — 223 ms of a 307 ms step. bf16 puts the same chain on the tensor cores.
-    A faster rung that costs BPB is marked rejected and never drives a headline.</p>
+<section><div class="wrap">
+  <h2><span>04</span>the optimizer</h2>
+  <h3>70% of every step was one chain of matmuls</h3>
+  <p class="lead">Muon's Newton–Schulz iteration ran 579 GFLOP of fp32 per step on the CUDA-core lane —
+    223 ms of a 307 ms step. bf16 puts the same chain on the tensor cores. A faster rung that costs BPB
+    is marked rejected and never drives a headline.</p>
   <table>
     <thead><tr><th>rung</th><th>kB/s</th><th>ms/step</th><th>speed</th><th>Δ BPB</th></tr></thead>
     <tbody id="rungs"></tbody>
   </table>
-</section>
+  <p class="note" style="margin-top:14px">9 arms · 40 steps each · same shape · 2026-11-08</p>
+</div></section>
 
-<section class="blk wrap">
-  <h2><span class="n">[3]</span>bits per byte, on bytes actually seen</h2>
-  <p class="sub">Held-out BPB on a fixed English window against training bytes.
-    The last point is a real run, not an extrapolation.</p>
-  <svg class="curve" id="curve" viewBox="0 0 720 240" role="img" aria-label="held-out BPB against bytes seen"></svg>
-  <p class="sub" style="margin:14px 0 0" id="curveMeta">—</p>
-</section>
-
-<section class="blk wrap">
-  <h2><span class="n">[4]</span>runs with a held-out number</h2>
-  <p class="sub">Longest first. A run appears only if it produced an eval on the held-out window.</p>
+<section id="runs"><div class="wrap">
+  <h2><span>05</span>runs</h2>
+  <h3>Every run with a held-out number</h3>
+  <p class="lead">Longest first. A run appears here only if it produced an eval on the held-out window.</p>
   <table>
     <thead><tr><th>run</th><th>source</th><th>opt</th><th>batch × seq</th><th>MB</th><th>BPB</th></tr></thead>
-    <tbody id="runs"></tbody>
+    <tbody id="runsBody"></tbody>
   </table>
-</section>
+</div></section>
 
-<section class="blk wrap">
-  <h2><span class="n">[5]</span>what is not true</h2>
-  <p class="sub">Every entry was published here first, then measured wrong. Deleting them
-    would be the one dishonest move available, so they stay next to what replaced them.</p>
-  <ol class="retr">
+<section id="retracted"><div class="wrap">
+  <h2><span>06</span>retractions</h2>
+  <h3>What is not true</h3>
+  <p class="lead">Every entry was published here first, then measured wrong. Deleting them would be the one
+    dishonest move available, so they stay next to what replaced them.</p>
+  <ul class="ret">
     <li><div class="was">“16× from the recipe ladder”</div>
       <div class="now">1.92× from the optimizer rung, measured</div>
       <div class="why">The 16× was Ripple-65B's result at 4B parameters, not ours.</div></li>
     <li><div class="was">“3 Newton–Schulz steps are a tie”</div>
       <div class="now">+0.27 BPB at [832, 3072]</div>
-      <div class="why">The published non-monotone result and this repo's own “1.17e-15 from
-        the manifold” were both measured on rank-64 factors. On the dense stack the 3-step
-        chain does not converge.</div></li>
+      <div class="why">The published non-monotone result, and this repo's own “1.17e-15 from the manifold”,
+        were both measured on rank-64 factors. On the dense stack the 3-step chain does not converge.</div></li>
     <li><div class="was">“209× less compute than GPT-2”</div>
       <div class="now">53×, and only per byte</div>
-      <div class="why">The first figure counted GPT-2's 40 GB as 40 G positions; at ~4 bytes
-        per BPE token it is 10 G.</div></li>
+      <div class="why">The first figure counted GPT-2's 40 GB as 40 G positions; at ~4 bytes per BPE token
+        it is 10 G.</div></li>
     <li><div class="was">“1.927 BPB at 98 MB”</div>
       <div class="now">1.660 BPB at the same bytes</div>
-      <div class="why">Captured before the Muon learning-rate fix (a scheduler overwrote the
-        group's LR every step).</div></li>
-  </ol>
-</section>
+      <div class="why">Captured before the Muon learning-rate fix (a scheduler overwrote the group's LR
+        every step).</div></li>
+  </ul>
+</div></section>
 
-<footer class="wrap">
-  <div class="row">
-    <a href="https://github.com/sehaxe/dormouse">github.com/sehaxe/dormouse</a>
-    <span>MIT</span><span>python lane live · rust lane frozen</span>
-    <span id="built">—</span>
-  </div>
-</footer>
+<footer><div class="wrap row">
+  <span>dormouse</span>
+  <a href="https://github.com/sehaxe/dormouse">github.com/sehaxe/dormouse</a>
+  <span>MIT</span>
+  <span>python lane live · rust lane frozen</span>
+  <span id="built" class="sp" style="margin-left:auto"></span>
+</div></footer>
 
 <script id="data" type="application/json">{"curve":[{"bpb":1.79,"mb":49.15},{"bpb":1.66,"mb":98.3},{"bpb":1.58,"mb":147.46},{"bpb":1.54,"mb":196.61},{"bpb":1.52,"mb":245.76}],"rungs":[{"dbpb":0.0,"kbs":28.29,"label":"fp32 NS · 5 steps (the control)","ms_per_step":289.54,"safe":true,"tag":"muon_fp32"},{"dbpb":-0.01,"kbs":28.04,"label":"bf16 optimizer state only","ms_per_step":292.18,"safe":true,"tag":"state_bf16"},{"dbpb":0.27,"kbs":36.99,"label":"fp32 NS · 3 steps","ms_per_step":221.47,"safe":false,"tag":"ns3"},{"dbpb":0.01,"kbs":54.45,"label":"bf16 NS · 5 steps","ms_per_step":150.45,"safe":true,"tag":"ns_bf16"},{"dbpb":0.26,"kbs":58.76,"label":"bf16 NS · 3 steps","ms_per_step":139.4,"safe":false,"tag":"ns_bf16_3"},{"dbpb":0.26,"kbs":57.88,"label":"bf16 NS · 3 steps · bf16 state","ms_per_step":141.53,"safe":false,"tag":"muon_fast"}],"runs":[{"batch":8,"bpb":1.52,"mb":245.76,"opt":"mix","run":"flagship3","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":1.57,"mb":187.49,"opt":"mix","run":"bytes_s1","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":1.63,"mb":124.99,"opt":"mix","run":"bytes_s1","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":2.12,"mb":124.99,"opt":"mix","run":"bytes_s1","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":1.93,"mb":98.3,"opt":"mix","run":"f3short","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":1.77,"mb":73.73,"opt":"adamw","run":"adam_s1","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":1.77,"mb":73.73,"opt":"adamw","run":"adam_s2","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":2.01,"mb":73.73,"opt":"mix","run":"mix_s1","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":2.02,"mb":73.73,"opt":"mix","run":"mix_s2","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":1.68,"mb":73.73,"opt":"mix","run":"m12_s1","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":1.68,"mb":73.73,"opt":"mix","run":"m12_s2","seq":1024,"source":"flagship3_dense"},{"batch":8,"bpb":1.69,"mb":73.73,"opt":"mix","run":"m16_s1","seq":1024,"source":"flagship3_dense"}],"stats":{"longest_mb":245.76,"runs_on_record":425,"runs_with_bpb":33}}</script>
 <script id="surprise" type="application/json">{"ckpt":"flagship3","offset":100000000,"bytes":1024,"cols":64,"text":"ion for the years to come include an artisanal bakery, midwife services, a room for fermenting food, another room for art therapy for children of all genders, a space for dance, and a room for civic services\u00b7\u00b7\u00b7providing help with filling out government forms for people don\u00b7\u00b7\u00b7t know how to read or write or are not computer literate. \u00b7\u00b7\u00b7These are just a few possibilities, because we want to keep speaking with the community and coming to understand what they want and what kind of services would be useful to them.\u00b7\u00b7\u00b7\u00b7As they forge ahead with this work, the CAMs remain mindful of the need to stay independent. \u00b7\u00b7\u00b7This has all been done through unpaid volunteer work, and we\u00b7\u00b7\u00b7ve never received any kind of government funds,\u00b7\u00b7\u00b7 says Lourdes. \u00b7\u00b7\u00b7Everything has been either volunteer labor or individual donations from people who care about the project.\u00b7\u00b7\u00b7 Most monetary and in-kind donations the projects receive from outside the island come from Puerto Ricans in the diaspora. Forming this regional network is also a key st","bits":[3.853,0.074,1.272,4.081,0.523,0.066,0.035,2.269,0.17,0.171,0.299,6.91,0.522,0.026,0.071,1.031,1.019,1.902,0.262,0.044,3.748,0.778,1.334,0.863,0.564,2.482,0.006,10.168,0.856,0.015,0.059,0.117,0.358,2.137,2.754,0.957,1.83,2.495,1.037,0.234,1.268,3.537,0.01,4.531,0.076,0.051,4.819,2.352,6.228,0.615,0.15,4.677,3.525,0.015,4.641,3.32,3.673,2.187,1.68,1.857,0.075,1.955,4.551,3.199,3.1,0.284,0.576,0.226,0.046,1.889,0.645,0.005,0.978,7.396,4.39,2.803,2.045,1.434,0.435,2.426,0.451,0.043,0.029,4.465,4.197,5.125,3.846,0.082,0.257,0.006,3.876,0.129,2.256,0.383,4.318,1.242,5.519,1.031,3.921,0.002,0.899,0.14,9.186,0.488,0.001,0.001,0.004,0.025,4.668,2.514,0.086,0.054,0.325,0.595,0.049,0.016,0.02,2.568,3.101,0.107,3.222,3.231,1.873,3.182,3.356,0.216,0.005,0.161,0.516,3.256,0.147,0.053,0.015,4.673,2.795,1.105,0.184,0.015,0.071,0.0,0.0,0.636,4.368,0.513,0.035,2.294,1.955,0.209,0.175,6.42,2.658,0.421,3.158,0.002,0.001,0.994,3.215,0.009,1.132,5.548,2.801,2.408,4.295,0.367,0.014,0.561,2.52,0.287,0.078,0.013,4.664,2.995,3.467,2.713,0.03,1.907,0.002,0.491,0.091,0.027,0.004,2.497,0.751,3.428,1.897,0.082,0.06,0.289,0.773,0.078,0.015,0.014,3.698,6.313,1.715,0.001,0.552,0.026,2.552,3.954,1.467,0.0,0.014,0.002,0.001,0.228,9.027,0.004,1.188,5.279,1.498,0.922,0.654,0.055,0.026,1.249,0.002,0.0,0.029,5.64,1.806,2.071,0.019,1.625,4.982,0.163,0.003,0.0,0.021,4.833,3.27,3.888,1.515,0.39,0.0,0.0,0.521,3.979,1.343,0.034,0.411,7.884,2.996,2.706,0.001,0.0,0.001,0.223,0.0,0.0,0.0,0.91,4.744,0.715,0.654,2.654,1.325,0.63,5.897,1.52,0.552,0.079,3.755,2.352,0.645,0.0,0.0,0.0,0.153,6.993,2.947,2.169,2.302,0.0,0.111,0.0,0.041,5.273,0.041,0.003,0.009,0.203,3.557,0.052,0.002,0.024,0.573,0.148,0.005,4.461,0.278,2.527,1.035,0.385,3.133,1.628,0.025,3.915,2.183,0.145,0.007,0.023,0.087,3.327,1.485,0.079,3.848,2.307,5.358,0.157,4.789,0.313,0.187,0.043,4.707,0.635,1.322,0.737,4.319,0.16,0.028,3.162,0.928,8.328,2.962,2.718,0.303,0.0,0.015,0.884,11.417,4.431,1.271,7.217,0.003,0.429,1.734,0.2,0.471,3.114,0.001,0.011,2.466,0.037,1.719,0.026,4.207,0.072,0.116,0.0,0.042,1.071,0.295,1.195,0.517,0.061,0.008,3.317,3.049,2.231,0.289,0.024,0.002,0.88,0.001,0.001,0.0,0.018,0.0,0.0,3.116,0.834,2.362,5.565,0.553,0.042,0.0,0.0,0.0,0.008,3.96,0.387,0.152,3.648,2.96,0.056,0.008,0.023,0.203,0.033,0.003,5.289,3.004,0.007,0.0,0.004,5.0,3.371,4.227,2.617,0.08,0.21,0.0,0.0,0.09,4.172,0.248,0.023,0.0,0.043,2.0,0.137,0.087,0.599,3.834,1.523,0.554,1.242,0.684,0.05,0.01,0.015,0.034,0.757,2.347,0.789,0.009,0.006,3.902,1.01,1.201,6.921,0.137,0.001,0.018,2.691,0.237,1.297,5.043,0.657,0.086,0.008,0.004,0.032,0.002,0.001,0.001,0.0,0.179,2.323,0.144,1.494,0.0,0.057,1.847,0.531,0.058,1.396,0.074,2.845,1.271,0.04,0.006,0.509,3.213,0.923,0.017,0.012,1.798,0.093,2.226,0.001,0.06,8.304,0.535,0.122,0.003,0.569,0.118,0.008,0.022,3.72,4.548,0.814,0.006,0.029,0.021,0.002,0.704,0.129,2.633,1.755,0.307,0.0,0.0,0.028,2.702,0.024,0.436,5.451,1.252,0.766,1.563,0.001,0.0,0.428,2.717,0.024,0.111,3.81,1.612,0.442,3.275,2.23,0.439,0.0,0.006,0.28,4.103,1.954,0.108,2.563,0.217,0.068,1.811,0.026,5.624,1.165,2.579,2.326,1.694,4.274,2.421,8.413,0.071,0.056,0.001,1.067,4.557,0.649,0.018,0.001,0.169,1.295,0.128,6.165,0.054,0.162,4.82,0.676,0.267,0.613,0.754,0.004,1.686,0.095,0.095,1.413,5.89,6.013,3.572,5.81,0.048,5.134,0.295,3.505,0.247,0.018,0.0,0.109,5.424,3.053,1.952,0.094,0.095,0.0,0.002,0.178,0.968,0.013,0.002,1.368,0.074,0.081,0.484,5.145,1.881,1.539,0.001,0.86,1.031,0.072,0.004,3.484,2.628,0.759,0.777,0.026,2.46,0.03,7.002,0.423,0.555,0.001,0.0,0.001,0.003,0.0,0.008,2.963,0.279,3.041,0.002,0.074,1.07,0.118,2.746,0.031,0.012,4.781,1.183,1.116,0.018,2.785,0.966,3.04,2.331,1.346,0.01,0.12,0.001,0.006,3.891,1.86,0.175,0.099,0.16,2.808,3.983,1.074,0.022,0.0,0.0,0.0,0.11,8.056,0.812,4.983,2.013,2.181,0.017,0.044,7.006,2.367,2.325,0.086,2.464,0.005,0.06,0.001,0.001,4.363,3.3,1.669,0.067,0.173,1.739,0.686,1.878,0.573,0.107,0.01,2.466,1.681,3.105,0.0,0.003,3.398,0.001,0.004,4.605,2.849,0.071,0.001,0.001,0.019,3.868,0.16,2.077,1.141,0.277,0.0,0.024,0.009,0.092,1.81,2.194,1.204,0.077,6.402,0.276,0.067,0.001,0.219,0.039,0.01,0.002,5.736,1.651,0.774,0.001,0.0,0.001,0.082,0.0,0.001,0.0,0.381,2.817,4.964,2.119,0.198,1.617,3.496,1.096,0.0,0.01,0.008,1.051,0.078,1.198,0.013,0.004,5.641,2.38,3.532,4.748,4.086,6.267,3.953,2.323,0.88,0.525,0.003,0.042,6.773,1.293,0.022,1.624,0.148,2.576,0.03,0.1,0.001,0.0,0.09,5.072,0.345,0.617,0.033,2.258,0.015,0.036,0.001,0.014,4.798,7.304,0.088,0.007,0.001,0.001,0.012,5.943,2.433,0.068,0.084,0.021,0.001,0.016,0.01,0.001,2.125,9.045,2.048,4.713,0.783,0.376,1.672,1.991,0.056,0.025,3.959,0.721,2.487,1.637,0.382,0.001,0.002,0.0,0.002,0.001,0.499,5.123,3.163,1.046,1.106,0.001,0.108,0.032,0.0,1.59,1.164,3.669,3.664,0.023,0.001,0.001,4.757,2.107,0.294,0.0,0.0,0.0,0.307,1.716,1.121,0.008,0.124,4.095,1.074,3.354,1.728,0.138,2.785,0.474,0.008,0.011,0.002,0.038,1.36,0.196,0.138,0.925,3.437,1.567,0.998,3.046,0.002,0.0,0.0,2.404,1.608,0.001,0.033,2.116,4.944,1.344,1.188,0.007,0.02,4.736,2.656,3.781,2.458,2.342,0.606,0.039,0.11,0.019,3.035,2.022,0.123,0.009,2.981,0.121,6.489,8.328,0.24,0.05,0.012,0.141,4.798,0.683,0.161,0.079,0.001,0.07,0.002,0.0,0.021,0.062,5.3,1.868,2.451,2.514,3.573,1.32,0.382,0.206,0.002,0.0,0.0,3.273,0.099,5.066,0.257,2.802,0.341,0.024,0.001,0.081,1.449,4.561,2.171,1.369,0.058,0.02,4.258,2.416,2.386,2.39,0.349,0.001,0.001,0.553,1.35,1.186,0.11,0.298,5.336,5.002,1.933,0.02,0.002,0.001,1.414,5.461,1.066,1.463,4.67,0.052,2.63,0.116,0.006,0.001,0.097,7.832,4.122,3.038,0.981,0.129,0.112,0.144,3.522,2.008,2.134,1.773,2.685,3.379,1.115,4.695,0.089,0.077,1.471,0.092,0.037,0.132,5.529,2.592,3.693,2.854,0.265,0.312,0.033,0.139,1.426,1.253,5.419,1.306,0.271,6.82,4.095,0.114,0.0,0.047,1.628,0.257,2.921,0.036,0.02,5.072,0.395,4.249,0.867,0.383,0.005,5.631,0.031,0.064,6.386,1.983,1.826,0.124,0.005,0.001,0.0,0.417,2.289,0.364,0.022,1.912,2.311,0.329,0.001,0.002,2.516,0.612,6.08,0.489,0.042,0.091,3.583,1.186,1.047]}</script>
@@ -261,150 +246,6 @@
 (() => {
   const d = JSON.parse(document.getElementById('data').textContent);
   const fmt = (x, n = 1) => Number(x).toFixed(n);
-  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const ACCENT = '#00e08a';
-  const HOT = '#ff3b5c';
-
-  /* ---------------------------------------------------------------- clock */
-  const clock = document.getElementById('clock');
-  if (clock) {
-    const tick = () => {
-      const t = new Date();
-      clock.textContent = [t.getHours(), t.getMinutes(), t.getSeconds()]
-        .map(v => String(v).padStart(2, '0')).join(':');
-    };
-    tick();
-    setInterval(tick, 1000);
-  }
-
-  /* ------------------------------------------------------- pixel headline */
-  // Draw at 8 px, threshold to 1 bit, then let CSS scale it with
-  // image-rendering:pixelated. That is what makes it a bitmap rather than
-  // blurry text — no font file, no font licence, no webfont request.
-  const title = document.getElementById('pixTitle');
-  const word = 'dormouse.';
-  if (title) {
-    const off = document.createElement('canvas');
-    const octx = off.getContext('2d', { willReadFrequently: true });
-    const FONT = 'bold 14px "DejaVu Sans Mono", "Liberation Mono", monospace';
-    octx.font = FONT;
-    const w = Math.max(8, Math.ceil(octx.measureText(word).width));
-    off.width = w;
-    off.height = 16;
-    octx.font = FONT;
-    octx.textBaseline = 'alphabetic';
-    octx.fillStyle = '#fff';
-    octx.fillText(word, 0, 12);
-
-    const img = octx.getImageData(0, 0, w, 16);
-    for (let i = 0; i < img.data.length; i += 4) {
-      const on = img.data[i + 3] > 128;
-      img.data[i] = 255;
-      img.data[i + 1] = 255;
-      img.data[i + 2] = 255;
-      img.data[i + 3] = on ? 255 : 0;
-    }
-    octx.putImageData(img, 0, 0);
-
-    title.width = w;
-    title.height = 16;
-    const ctx = title.getContext('2d');
-    ctx.imageSmoothingEnabled = false;
-
-    const paint = (cols) => {
-      ctx.clearRect(0, 0, w, 16);
-      ctx.drawImage(off, 0, 0, Math.max(1, cols), 16, 0, 0, Math.max(1, cols), 16);
-    };
-    paint(w);   // no wipe: a headline must never be caught half-drawn
-  }
-
-  /* ---------------------------------------------------------- binary rain */
-  const cv = document.getElementById('rain');
-  if (cv && !reduced) {
-    const gl = cv.getContext('webgl', { antialias: false, alpha: true, premultipliedAlpha: true });
-    if (gl) {
-      const at = document.createElement('canvas');
-      at.width = 64; at.height = 64;
-      const c2 = at.getContext('2d');
-      c2.fillStyle = '#000'; c2.fillRect(0, 0, 64, 64);
-      c2.fillStyle = '#fff';
-      c2.font = 'bold 54px "DejaVu Sans Mono", monospace';
-      c2.textAlign = 'center'; c2.textBaseline = 'middle';
-      c2.fillText('0', 16, 34); c2.fillText('1', 48, 34);
-
-      const vs = 'attribute vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }';
-      const fs = `precision highp float;
-uniform vec2 u_res; uniform float u_t; uniform sampler2D u_atlas;
-float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
-void main(){
-  float cellW = 15.0, cellH = 19.0;
-  vec2 g = gl_FragCoord.xy / vec2(cellW, cellH);
-  float col = floor(g.x);
-  float rowAll = g.y;
-  float fx = fract(g.x), fy = 1.0 - fract(g.y);
-  float speed = 0.9 + 2.4 * hash(vec2(col, 11.0));
-  float phase = hash(vec2(col, 23.0));
-  float rows = u_res.y / cellH;
-  float headRow = mod(u_t * speed + phase * rows, rows + 26.0) - 13.0;
-  float d = headRow - rowAll;
-  float trail = d >= 0.0 ? exp(-d * 0.16) : 0.0;
-  float cell = floor(rowAll);
-  float rate = floor(u_t * (2.0 + 5.0 * hash(vec2(col, 7.0))));
-  float pick = hash(vec2(col, cell) + rate);
-  float glyph = texture2D(u_atlas, vec2(step(0.5, pick) * 0.5 + fx * 0.5, fy)).r;
-  float a = trail * glyph;
-  float head = smoothstep(1.6, 0.0, abs(d));
-  vec3 green = vec3(0.0, 0.88, 0.54);
-  vec3 c = mix(green * 0.45, vec3(0.75, 1.0, 0.88), head);
-  a = step(0.16, a) * clamp(a * 1.7, 0.0, 1.0);
-  gl_FragColor = vec4(c * a, a);
-}`;
-      const sh = (t, src) => { const o = gl.createShader(t); gl.shaderSource(o, src); gl.compileShader(o); return o; };
-      const prog = gl.createProgram();
-      gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs));
-      gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
-      gl.linkProgram(prog);
-      if (gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-        gl.useProgram(prog);
-        const buf = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-        const loc = gl.getAttribLocation(prog, 'p');
-        gl.enableVertexAttribArray(loc);
-        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-        const tex = gl.createTexture();
-        gl.bindTexture(gl.TEXTURE_2D, tex);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, at);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.uniform1i(gl.getUniformLocation(prog, 'u_atlas'), 0);
-        const uRes = gl.getUniformLocation(prog, 'u_res');
-        const uT = gl.getUniformLocation(prog, 'u_t');
-        const resize = () => {
-          const dpr = Math.min(devicePixelRatio || 1, 1.5);
-          const w = Math.max(1, Math.floor(cv.clientWidth * dpr));
-          const h = Math.max(1, Math.floor(cv.clientHeight * dpr));
-          if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
-          gl.viewport(0, 0, w, h);
-          gl.uniform2f(uRes, w, h);
-        };
-        const draw = (t) => { gl.uniform1f(uT, t); gl.drawArrays(gl.TRIANGLES, 0, 3); };
-        resize(); draw(6.0);
-        let raf = 0, t0 = performance.now(), vis = true;
-        const loop = (now) => { if (!vis) return; raf = requestAnimationFrame(loop); resize(); draw((now - t0) / 1000); };
-        new IntersectionObserver(([e]) => {
-          vis = e.isIntersecting;
-          if (vis) { cancelAnimationFrame(raf); raf = requestAnimationFrame(loop); }
-        }, { threshold: 0 }).observe(cv);
-        addEventListener('resize', resize);
-        raf = requestAnimationFrame(loop);
-      } else {
-        cv.style.display = 'none';
-      }
-    }
-  }
 
   /* ------------------------------------------------------------- the rungs */
   const rungs = d.rungs || [];
@@ -423,50 +264,28 @@ void main(){
       <td>${r.label}${note}</td>
       <td>${fmt(r.kbs, 1)}</td>
       <td>${fmt(r.ms_per_step, 0)}</td>
-      <td class="${r.tag === 'muon_fp32' ? 'dim' : (r.safe ? 'ok' : 'bad')}">${r.tag === 'muon_fp32' ? 'baseline' : fmt(rel, 2) + '×'}</td>
+      <td class="${r.tag === 'muon_fp32' ? 'note' : (r.safe ? 'ok' : 'bad')}">${r.tag === 'muon_fp32' ? 'baseline' : fmt(rel, 2) + '×'}</td>
       ${q}</tr>`;
   }).join('');
 
+  if (speedup) document.getElementById('sSpeed').textContent = fmt(speedup, 2) + '×';
+  document.getElementById('sRuns').textContent = d.stats.runs_on_record;
+  document.getElementById('sRunsSub').textContent = d.stats.runs_with_bpb + ' with a held-out BPB';
+
   /* ------------------------------------------------------------- the curve */
   const pts = d.curve || [];
-  const svg = document.getElementById('curve');
-  if (pts.length > 1) {
-    const W = 720, H = 240, L = 58, R = 18, T = 14, B = 34;
-    const xs = pts.map(p => p.mb), ys = pts.map(p => p.bpb);
-    const x0 = Math.min(...xs), x1 = Math.max(...xs);
-    const y0 = Math.min(...ys) - 0.04, y1 = Math.max(...ys) + 0.04;
-    const X = v => L + (v - x0) / Math.max(x1 - x0, 1e-9) * (W - L - R);
-    const Y = v => T + (1 - (v - y0) / Math.max(y1 - y0, 1e-9)) * (H - T - B);
-    const grid = [0, .25, .5, .75, 1].map(f => {
-      const y = T + f * (H - T - B);
-      return `<line class="grid" x1="${L}" y1="${y.toFixed(1)}" x2="${W - R}" y2="${y.toFixed(1)}"/>` +
-        `<text x="0" y="${(y + 3).toFixed(1)}">${fmt(y1 - f * (y1 - y0), 2)}</text>`;
-    }).join('');
-    const path = pts.map((p, i) => `${i ? 'L' : 'M'}${X(p.mb).toFixed(1)},${Y(p.bpb).toFixed(1)}`).join(' ');
-    const dots = pts.map(p => `<circle class="pt" cx="${X(p.mb).toFixed(1)}" cy="${Y(p.bpb).toFixed(1)}" r="2.2"/>`).join('');
+  if (pts.length) {
     const last = pts[pts.length - 1];
-    svg.innerHTML = grid + `<path class="line" d="${path}"/>${dots}` +
-      `<text x="${L}" y="${H - 10}">${fmt(x0, 0)} MB</text>` +
-      `<text x="${W - R}" y="${H - 10}" text-anchor="end">${fmt(x1, 0)} MB</text>` +
-      `<text x="${(X(last.mb) - 8).toFixed(1)}" y="${(Y(last.bpb) - 9).toFixed(1)}" text-anchor="end">${fmt(last.bpb, 3)} BPB</text>`;
     document.getElementById('curveMeta').textContent =
-      `${pts.length} held-out points · ${fmt(x1, 0)} MB seen · last ${fmt(last.bpb, 3)} BPB`;
-    document.getElementById('hBpb').textContent = fmt(last.bpb, 3);
-    document.getElementById('hMb').textContent = fmt(last.mb, 0);
+      `${pts.length} held-out points over ${fmt(last.mb, 0)} MB of training bytes.`;
+    document.getElementById('curveFinal').innerHTML =
+      `<span class="mono">${fmt(last.bpb, 3)}</span> bits per byte at ${fmt(last.mb, 0)} MB`;
   }
-
-  if (speedup) {
-    document.getElementById('hSpeed').textContent = fmt(speedup, 2) + '×';
-    const cs = document.getElementById('cSpeed');
-    if (cs) cs.textContent = fmt(speedup, 2) + '×';
-  }
-  document.getElementById('cRuns').textContent = d.stats.runs_on_record;
-  document.getElementById('cRunsSub').textContent = d.stats.runs_with_bpb + ' with a held-out BPB';
 
   /* ------------------------------------------------------------- the runs */
-  document.getElementById('runs').innerHTML = (d.runs || []).map(r => `<tr>
-    <td>${r.run}</td><td class="dim">${r.source || '—'}</td><td class="dim">${r.opt || '—'}</td>
-    <td class="dim">${r.batch}×${r.seq}</td><td>${fmt(r.mb, 0)}</td><td class="ok">${fmt(r.bpb, 3)}</td>
+  document.getElementById('runsBody').innerHTML = (d.runs || []).map(r => `<tr>
+    <td>${r.run}</td><td>${r.source || '—'}</td><td>${r.opt || '—'}</td>
+    <td>${r.batch}×${r.seq}</td><td>${fmt(r.mb, 0)}</td><td class="ok">${fmt(r.bpb, 3)}</td>
   </tr>`).join('');
 
   /* --------------------------------------------------------- the portrait */
@@ -475,53 +294,20 @@ void main(){
     const cols = sj.cols || 64;
     const bits = sj.bits;
     const band = (b) => b < 0.6 ? 0 : b < 1.6 ? 1 : b < 2.6 ? 2 : b < 4.2 ? 3 : 4;
-    const col = ['#2b3742', '#3f5147', '#2f7a5c', '#00b273', ACCENT];
+    const col = ['#3a3a40', '#565660', '#8a8a96', '#c9c9d2', '#ffffff'];
     const esc = (c) => c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c;
     let out = '';
     for (let i = 0; i < bits.length; i++) {
-      const bd = band(bits[i]);
-      out += `<b style="color:${col[bd]}">${esc(sj.text[i])}</b>`;
+      out += `<b style="color:${col[band(bits[i])]};font-weight:400">${esc(sj.text[i])}</b>`;
       if ((i + 1) % cols === 0) out += '\n';
     }
     document.getElementById('bytes').innerHTML = out.trimEnd();
-
-    const hc = document.getElementById('heat');
-    if (hc) {
-      hc.width = bits.length;
-      const ctx = hc.getContext('2d');
-      const maxB = Math.max(...bits, 1);
-      for (let i = 0; i < bits.length; i++) {
-        const v = bits[i] / maxB;
-        const h = Math.max(2, Math.round(v * 52));
-        ctx.fillStyle = col[band(bits[i])];
-        ctx.globalAlpha = 0.2 + 0.8 * v;
-        ctx.fillRect(i, 52 - h, 1, h);
-      }
-      ctx.globalAlpha = 1;
-    }
     const mean = bits.reduce((a, b) => a + b, 0) / bits.length;
-    document.getElementById('sMean').textContent = `mean ${mean.toFixed(3)} bits / byte over ${bits.length} held-out bytes`;
-    document.getElementById('sMeta').textContent = `${sj.ckpt} · off=${sj.offset}`;
+    document.getElementById('sMean').textContent = `mean ${mean.toFixed(3)} bits / byte`;
+    document.getElementById('sMeta').textContent = `off=${sj.offset}`;
   }
 
-  /* --------------------------------------------------------------- the tape */
-  const facts = [
-    'flagship3 · 1.520 bits per byte at 246 MB',
-    '95,035,200 parameters · 12 unique layers · d_model 832',
-    '1M context · 34 MB of state',
-    'bf16 Newton–Schulz · 1.92× the step for +0.01 BPB',
-    '3-step Newton–Schulz rejected · +0.27 BPB at [832, 3072]',
-    'one RTX 5070 Ti · 16 GB · sm_120',
-    'every number here is computed from the run logs'
-  ];
-  const tape = document.getElementById('tape');
-  if (tape) {
-    const line = facts.map(t => `<b>·</b> ${t} `).join('');
-    tape.innerHTML = line + line;
-  }
-
-  document.getElementById('built').textContent =
-    `built from ${d.stats.runs_on_record} log files`;
+  document.getElementById('built').textContent = `${d.stats.runs_on_record} log files`;
 })();
 
 </script>

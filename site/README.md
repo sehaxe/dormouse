@@ -9,13 +9,13 @@ cargo run --release --offline -- \
   --logs /home/sehaxe/logs \
   --quality-logs /home/sehaxe/logs/muonq \
   --surprise ../assets/surprise.json \
-  --script ../pixel.js \
+  --script ../site.js \
   --template ../template.html \
   --out ../index.html
 ```
 
-`template.html` is the markup, `pixel.js` is all the behaviour (binary rain
-shader, the 1-bit headline, the ladder, the curve, the portrait), and
+`template.html` is the markup, `site.js` is the behaviour (ladder, curve,
+portrait), `video.py` renders the three motion cards from the logs, and
 `assets/surprise.json` is the hero image's data — 1024 held-out bytes with their
 per-byte surprise, written by `port/scripts/surprise_map.py`.
 
