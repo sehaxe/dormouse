@@ -171,6 +171,14 @@ DEAD_SNAPSHOT_KEYS = {
 #: `kda` is the loop (every number on record), `transformer` is the vanilla
 #: decoder control (`model/transformer.py`). A name that is not here is LOUD.
 BLOCK_FORMS = ("kda", "transformer")
+#: The `block_stack` literals and the ratio spelling. `uniform` (the default) is
+#: every run on record: one block form for the whole depth, chosen by
+#: `block_form`. A HYBRID stack is the frontier's 3:1 mix (Qwen3-Next, Kimi
+#: Linear): `K` KDA loop blocks, then `A` attention blocks, repeated. The value
+#: is the ratio itself (`"3:1"`); `"hybrid"` is the shorthand for the canonical
+#: `"3:1"` that names the mode in prose and in a refusal.
+BLOCK_STACKS = ("uniform", "hybrid")
+HYBRID_RATIO = "3:1"
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive", "batched", "bucketed")
@@ -400,6 +408,30 @@ class ModelConfig:
     #: Refused on `block_form="kda"`: the loop's depth is `loop_blocks`, and a
     #: second, inert depth field is the config-lies defect.
     n_layers: int = 0
+    #: ---- THE BLOCK STACK: one form for the depth, or a frontier HYBRID ----
+    #: `"uniform"` (the default) is every run on record: `block_form` names the
+    #: only block tree, and `loop_blocks`/`max_iter`/`n_layers` keep their exact
+    #: meanings — selecting it changes no parameter, no RNG draw, no bit.
+    #:
+    #: `"K:A"` (e.g. `"3:1"`) is a HYBRID stack: K `LoopBlock`s (the KDA block
+    #: of `block_form="kda"`), then A vanilla `TransformerBlock`s
+    #: (`model/transformer.py`), repeated over `n_layers` blocks. `"hybrid"` is
+    #: the shorthand for the canonical `"3:1"`. The KDA block is the same module
+    #: the `kda` form builds (controller, KDA/CSA/mHC/Engram, FFN); the
+    #: attention block is the same module the `transformer` form builds, with
+    #: the residual scaling of the FULL `n_layers` depth. The objective is the
+    #: transformer form's: one final CE from `norm`+`lm_head`, no L_Rec — the
+    #: deep-supervision terms belong to a weight-shared loop, and a stack runs
+    #: every block once.
+    #:
+    #: LOUD refusals, because each combination would run a different model than
+    #: the config claims: `block_form != "kda"` (there is no KDA block to mix),
+    #: `max_iter != 1` (the stack is not a loop), a ratio that does not divide
+    #: `n_layers`, `loop_blocks != 1` (inert), and the flags the attention
+    #: half cannot honour (Engram host offload, recompute, segmentation,
+    #: LayerRoPE, prelude/coda, MoD, QAT). `n_layers` is the DEPTH here — the
+    #: same "number of unique blocks" it means on the transformer form.
+    block_stack: str = "uniform"
     #: ---- MIXTURE-OF-DEPTHS over the transformer form (`model/transformer.py`) ----
     #: Per-block token routing, arXiv:2404.02258v1 §3.4. `1.0` (the default)
     #: builds NO router and runs the plain block, bit for bit; `< 1.0` routes
@@ -2780,6 +2812,181 @@ _LOOP_ONLY_LOSS_WEIGHTS = (
 )
 
 
+def hybrid_ratio(model: ModelConfig) -> tuple[int, int] | None:
+    """The `(kda, attention)` cycle of `block_stack`, or `None` on `uniform`.
+
+    One parser for the field (the model build, the refusals below and the
+    parameter ledger all call it), so a ratio cannot mean two things. `"hybrid"`
+    is the shorthand for the canonical `"3:1"`; anything else must be two
+    positive integers `K:A`. A malformed value is LOUD — never a silent `3:1`.
+    """
+    value = model.block_stack
+    if value == "uniform":
+        return None
+    text = HYBRID_RATIO if value == "hybrid" else value
+    parts = text.split(":")
+    if len(parts) != 2 or not all(p.isdigit() and int(p) >= 1 for p in parts):
+        loud(
+            f"block_stack={value!r} is not a stack. Known: 'uniform' (one form "
+            f"for the whole depth), or a ratio 'K:A' of K KDA blocks then A "
+            f"attention blocks (the frontier's '3:1'; 'hybrid' is shorthand for "
+            f"it). Escape: name one of those."
+        )
+    return int(parts[0]), int(parts[1])
+
+
+def block_kinds(depth: int, ratio: tuple[int, int]) -> tuple[str, ...]:
+    """The ordered hybrid stack: `('kda',)*K + ('attn',)*A`, repeated to `depth`.
+
+    The mixed stack must tile exactly, because the alternative is a depth the
+    config does not name (a truncated last cycle) or a ratio the model does not
+    run. ONE definition: `DormouseModel` builds from this tuple and the gate
+    asserts on it.
+    """
+    k, a = ratio
+    cycle = k + a
+    if depth < 1:
+        loud(
+            f"block_stack={k}:{a} with n_layers={depth}: the hybrid stack's depth "
+            f"is n_layers (the number of UNIQUE blocks), so it is >= 1. Escape: "
+            f"n_layers = a multiple of the {cycle}-block cycle (12 for '3:1')."
+        )
+    if depth % cycle:
+        loud(
+            f"block_stack={k}:{a} with n_layers={depth}: the ratio's cycle is "
+            f"{cycle} blocks ({k} KDA + {a} attention), and {cycle} does not "
+            f"divide {depth}. Escape: n_layers a multiple of {cycle} (e.g. "
+            f"{cycle * (depth // cycle + 1)}), or a ratio whose cycle divides "
+            f"{depth}."
+        )
+    kinds: list[str] = []
+    for _ in range(depth // cycle):
+        kinds.extend(["kda"] * k)
+        kinds.extend(["attn"] * a)
+    return tuple(kinds)
+
+
+def _validate_hybrid(model: ModelConfig) -> None:
+    """Every `block_stack != "uniform"` combination that cannot run — LOUD.
+
+    Called from `validate_block_form` (and therefore from `__post_init__`, the
+    loader, `validate` and the model seam). One place: a second list elsewhere
+    would drift, and an arm that is silently partial is the defect ADR-0019 bans.
+    """
+    ratio = hybrid_ratio(model)
+    assert ratio is not None
+    if model.block_form != "kda":
+        loud(
+            f"block_stack={model.block_stack!r} with block_form="
+            f"{model.block_form!r}: a hybrid stack's KDA half IS the "
+            f"`block_form='kda'` block (`LoopBlock`), and the transformer form "
+            f"builds no KDA block to mix. Escape: block_form='kda', or "
+            f"block_stack='uniform' for the pure transformer control."
+        )
+    if model.max_iter != 1:
+        loud(
+            f"block_stack={model.block_stack!r} with max_iter={model.max_iter}: a "
+            f"hybrid stack runs each unique block ONCE, so it is not a weight-"
+            f"shared loop and its depth is n_layers, not max_iter. Escape: "
+            f"max_iter=1, or block_stack='uniform' for the loop."
+        )
+    if model.loop_blocks != 1:
+        loud(
+            f"block_stack={model.block_stack!r} with loop_blocks="
+            f"{model.loop_blocks}: the hybrid stack's depth is n_layers="
+            f"{model.n_layers} and loop_blocks is the loop's body count, which "
+            f"this stack does not run. Escape: loop_blocks=1, or "
+            f"block_stack='uniform'."
+        )
+    block_kinds(model.n_layers, ratio)
+    if model.use_attnres:
+        loud(
+            f"block_stack={model.block_stack!r} with use_attnres=true: AttnRes "
+            f"re-scores the loop's ITERATION history, and a hybrid block sees one "
+            f"iteration, so the mechanism would reach no history while the config "
+            f"reported it on. Escape: use_attnres=false, or block_stack='uniform'."
+        )
+    if model.prelude_layers or model.coda_layers:
+        loud(
+            f"block_stack={model.block_stack!r} with prelude_layers="
+            f"{model.prelude_layers}/coda_layers={model.coda_layers}: those are "
+            f"the loop's UNIQUE-LAYER wrappers (`model/prelude.py`), not part of "
+            f"the stack. Escape: prelude_layers=0 and coda_layers=0, or "
+            f"block_stack='uniform'."
+        )
+    if model.layerrope:
+        loud(
+            f"block_stack={model.block_stack!r} with layerrope=true: LayerRoPE's "
+            f"gain table is indexed by the loop's iteration/block depth, and the "
+            f"hybrid stack has no such index. Escape: layerrope=false, or "
+            f"block_stack='uniform'."
+        )
+    if model.use_byteflow:
+        loud(
+            f"block_stack={model.block_stack!r} with use_byteflow=true: both "
+            f"byteflow shapes return before the byte stack, so the hybrid blocks "
+            f"would never run. Escape: use_byteflow=false, or "
+            f"block_stack='uniform'."
+        )
+    mod = [
+        name
+        for name in ("mod_capacity", "mod_top_k", "mod_aux_weight")
+        if getattr(model, name) != getattr(ModelConfig, name)
+    ]
+    if mod:
+        loud(
+            f"block_stack={model.block_stack!r} refuses {mod}: Mixture-of-Depths "
+            f"is built into the TRANSFORMER block only, so a hybrid stack would "
+            f"route tokens through A of its K+A blocks and pass the KDA half "
+            f"unchanged — a partial arm wearing the flag. Escape: "
+            f"{', '.join(f'{n}={getattr(ModelConfig, n)!r}' for n in mod)}, or "
+            f"block_stack='uniform'."
+        )
+    qat = [
+        name
+        for name in ("factor_qat", "dense_qat")
+        if getattr(model, name) != getattr(ModelConfig, name)
+    ]
+    if qat:
+        loud(
+            f"block_stack={model.block_stack!r} refuses {qat}: the KDA half's "
+            f"TSCT/attention sites read the QAT projectors and the transformer "
+            f"half's plain `nn.Linear`s do not, so the arm would quantize part of "
+            f"the stack while the snapshot reported it on. Escape: "
+            f"{', '.join(f'{n}={getattr(ModelConfig, n)!r}' for n in qat)}, or "
+            f"block_stack='uniform'."
+        )
+    if model.moe_lb_mode != "sign":
+        loud(
+            f"block_stack={model.block_stack!r} with moe_lb_mode="
+            f"{model.moe_lb_mode!r}: the `aux` load-balance term is added by the "
+            f"KDA loop's `loop.moe` accumulator, and a hybrid stack has no single "
+            f"loop to read. Escape: moe_lb_mode='sign', or block_stack='uniform'."
+        )
+    if model.halt_mode:
+        loud(
+            f"block_stack={model.block_stack!r} with halt_mode=true: the halt "
+            f"policy caps a LOOP's depth, and a hybrid stack has no loop to cap. "
+            f"Escape: halt_mode=false, or block_stack='uniform'."
+        )
+    if model.z_loss > 0.0:
+        loud(
+            f"block_stack={model.block_stack!r} with z_loss={model.z_loss}: the "
+            f"z-term is added on the loop's final-logits path (`DormouseModel.forward`), "
+            f"and the hybrid stack's readout is the transformer form's, which does "
+            f"not carry it. Escape: z_loss=0.0, or block_stack='uniform'."
+        )
+    aux = [name for name in _LOOP_ONLY_LOSS_WEIGHTS if getattr(model, name) != 0.0]
+    if aux:
+        loud(
+            f"block_stack={model.block_stack!r} refuses {aux}: every one of these "
+            f"terms is defined on the loop's per-iteration readout, and the hybrid "
+            f"stack is a single final CE (one pass per block). Escape: "
+            f"{', '.join(f'{name}=0.0' for name in aux)}, or "
+            f"block_stack='uniform'."
+        )
+
+
 def validate_block_form(model: ModelConfig) -> None:
     """`block_form` and the flags each form can honour — LOUD, one place.
 
@@ -2809,6 +3016,13 @@ def validate_block_form(model: ModelConfig) -> None:
             f"loop_blocks × max_iter on block_form='transformer'). Escape: "
             f"n_layers >= 0, or 0 to derive it."
         )
+    if model.block_stack != "uniform":
+        # The hybrid stack is its own tree: the KDA half is the `kda` form's
+        # block, the attention half the transformer form's, and the refusals
+        # that pair generates live in one function. It returns HERE because the
+        # `kda` branch below refuses `n_layers`, which IS the hybrid depth.
+        _validate_hybrid(model)
+        return
     if model.block_form == "kda":
         if model.n_layers:
             loud(
@@ -4856,6 +5070,55 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"vanilla decoder has no state to carry (its K/V context is the window). "
             f"Escape: segment_len=0, or block_form='kda'."
         )
+    if model.block_stack != "uniform":
+        # The hybrid stack runs each KDA block ONCE and its attention blocks have
+        # no state at all, so the loop's memory arms either partial or inert:
+        # refuse them instead of reporting an arm that covers A of K+A blocks.
+        if tcfg.segment_len:
+            loud(
+                f"segment_len={tcfg.segment_len} with block_stack="
+                f"{model.block_stack!r}: the segmented path carries the KDA "
+                f"recurrence's state across cuts, and the hybrid stack has no "
+                f"single loop whose state crosses them (each KDA block runs once, "
+                f"the attention blocks carry nothing). Escape: segment_len=0, or "
+                f"block_stack='uniform'."
+            )
+        if tcfg.activation_offload > 0.0:
+            loud(
+                f"activation_offload={tcfg.activation_offload} with block_stack="
+                f"{model.block_stack!r}: the saved-tensor hook pair is priced on "
+                f"the loop block's save set and the hybrid stack's attention half "
+                f"saves a different set, so the budget would park a graph nobody "
+                f"measured. Escape: activation_offload=0.0, or "
+                f"block_stack='uniform'."
+            )
+        if tcfg.activation_recompute != "none" or tcfg.iter_checkpoint:
+            loud(
+                f"activation_recompute={tcfg.activation_recompute!r}/"
+                f"iter_checkpoint={tcfg.iter_checkpoint} with block_stack="
+                f"{model.block_stack!r}: the recompute arms are wired on the KDA "
+                f"loop block only, so the attention half would keep its full save "
+                f"set while the log reported the arm on. Escape: "
+                f"activation_recompute='none' and iter_checkpoint=false, or "
+                f"block_stack='uniform'."
+            )
+        if tcfg.rand_depth:
+            loud(
+                f"rand_depth=true with block_stack={model.block_stack!r}: the "
+                f"adaptive-depth arm samples a LOOP's iteration count, and the "
+                f"hybrid stack's depth is the fixed n_layers={model.n_layers}. "
+                f"Escape: rand_depth=false, or block_stack='uniform'."
+            )
+        if tcfg.engram_ram:
+            loud(
+                f"engram_ram=true with block_stack={model.block_stack!r}: the "
+                f"host-table path assumes the KDA loop owns the Engram update, and "
+                f"the hybrid stack's attention blocks sit outside that loop while "
+                f"the KDA blocks' host rows would cross the bus every step. The "
+                f"pair is unmeasured; refuse it rather than save VRAM that the log "
+                f"does not price. Escape: engram_ram=false, or "
+                f"block_stack='uniform'."
+            )
     if not model.layerrope:
         return
     # `full_graph` is ALLOWED. The per-depth gain is selected by a Python depth
