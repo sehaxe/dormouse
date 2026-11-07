@@ -2791,6 +2791,17 @@ def validate_block_form(model: ModelConfig) -> None:
             f"runs, 'transformer' is the vanilla decoder control "
             f"(`model/transformer.py`). Escape: name one of those."
         )
+    if model.n_layers < 0:
+        # `n_layers = cfg.n_layers or loop_blocks * max_iter` in the model
+        # treats a negative value as truthy and `range(-1)` builds ZERO blocks:
+        # a "transformer" that is embedding -> norm -> head, with the snapshot
+        # still saying `n_layers = -1`. A negative count has no meaning on
+        # either form, so refuse it where the field is defined.
+        loud(
+            f"n_layers={model.n_layers}: a block count is >= 0 (0 = unset = "
+            f"loop_blocks × max_iter on block_form='transformer'). Escape: "
+            f"n_layers >= 0, or 0 to derive it."
+        )
     if model.block_form == "kda":
         if model.n_layers:
             loud(
