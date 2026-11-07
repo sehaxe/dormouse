@@ -1,84 +1,84 @@
-# Contributing to dormouse
+# Contributing
 
-**Read [`AGENTS.md`](AGENTS.md) §1 first.** It is the rulebook: loud failures,
-A/B or death, zero host-device sync, one claim one evidence, and the machine
-facts that decide which of those are even possible here. This file is only the
-map of where things are and which command answers which question.
+This repository has two lanes and one rule set. Read the rule set first; it is
+short and every rule exists because something went wrong.
 
-There is no open-source contribution process to speak of. This is one
-maintainer's repository, and the workflow below is the one that actually runs.
+## The two lanes
 
-## Before you edit
-
-| you want to | do this |
-|---|---|
-| change code, or fix a bug | `tools/wt.sh new <task>` — one task per worktree, off `HEAD` |
-| test your change | `tools/wt.sh test <task>` — runs our three crates plus the vendored-library gate |
-| run something heavy (a build, a training run) | `tools/build_lock.sh run <label> -- <cmd>` |
-
-`tools/wt.sh` is not ceremony: a worktree off `HEAD` is a **different build** if
-the shared tree is dirty (ADR-0022), and uncommitted vendor patches do not
-travel. Builds are serial because a mold link on a 64 GB box has frozen the
-desktop three times (§2.4).
-
-## Which command for which question
-
-| you want | command | cost |
+| lane | where | what it is |
 |---|---|---|
-| does it typecheck | `cargo check-train` | ~20-60 s |
-| run the test suite | `cargo test-core` / `test-data` / `test-train` | 40-90 s |
-| run a short probe (20 steps, read one counter) | `cargo build-probe` | ~1-3 min |
-| run a real training run | `cargo build-train` | 4-6 min |
+| **Rust** | `crates/`, `tools/` | the burn/cubecl implementation: kernels, ADRs, the published site |
+| **Python** | `port/` | the training port: config, model, trainer, post-training, scripts |
 
-`cargo build --release` to answer a question `cargo check` answers in 20 seconds
-is the most expensive mistake available here, and it has been made four times in
-one day. The reasoning is in [`docs/guides/build-time.md`](docs/guides/build-time.md).
+They share the docs (`docs/`) and the data (`data_local/`, untracked).
 
-## The four rules that most often get broken
+## The rules that matter
 
-Everything else is in `AGENTS.md` §1. These four are the ones with a recorded
-cost.
+1. **A number is a claim, and a claim names its evidence.** Every measurement in
+   a doc carries the config, the date, the commit, and the log path. A number
+   without those is deleted, not softened.
+2. **A verdict needs a decision rule written before the run.** "It looks better"
+   is not a verdict. State the threshold (e.g. `> 2 × spread and ≥ 0.02 BPB`),
+   the seeds, the steps, and what result would kill the arm.
+3. **A mechanism must prove it ran.** Every mechanism has a counter
+   (`csa_forward`, `moe_expert_calls`, `engram_rows`, …). A config that claims
+   the mechanism while the counter is zero is a bug, not a result.
+4. **A knob must reach code.** If a config field is declared, validated, and
+   read by nothing (or overwritten later), that is the defect class this repo has
+   paid for most: `muon_lr_mult`, `fused_residual`, `doc_masking`, `seq_len=512`.
+   `scripts/dead_knob_audit.py` exists to catch the next one.
+5. **One heavy thing at a time.** One GPU process; agents are CPU-only. A full
+   test suite next to three agents has OOM'd this machine.
+6. **Off by default, and off means bit-identical.** A new mechanism ships behind
+   a flag; the flag off must reproduce the previous numbers exactly, and a test
+   must pin that.
+7. **Every fix lands with a gate that fails on the un-fixed code.** Show it red,
+   then green. A test that cannot fail is decoration.
 
-1. **Every degradation is LOUD, COUNTED, or a defect.** A silent fallback
-   usually computes the *right answer*, so the run looks fine and is a year
-   slow. Missing data stops the run and is never synthesized; shape mismatches
-   assert; a tripped assertion stops the run for a human — resuming with the
-   same `--ckpt-name` is the recovery action, not a substitute for the error.
-   §1.1, and the three marks are the whole taxonomy.
-2. **A bit-for-bit or "verified" claim names its external source.** "Verified
-   against the reference" is not a claim. Naming the file, or saying plainly
-   that no external reference exists, is. §1.4.
-3. **A mechanism is judged against its own removal or deleted.** 3 seeds per
-   arm, at a fixed step budget; a tie deletes the mechanism. The queue is
-   [`docs/protocols/AB-PROTOCOL.md`](docs/protocols/AB-PROTOCOL.md) — read its
-   "unrun" label before quoting any of it.
-4. **One heavy thing at a time.** One GPU process, one build. Two legal
-   processes colliding once wrote garbage weights into a checkpoint. §2.4-2.5.
+## Before you commit
 
-## Rules for the change itself
+```bash
+bash scripts/gate_fast.sh                 # ruff, format, doc refs, dead knobs, cargo
+bash scripts/gate_fast.sh --changed       # CI mode: format only the touched files
+pre-commit run --all-files                # the same, wired into git
+```
 
-- A file moves once. No stub at the old path, every reference rewritten in the
-  same commit, and `python3 tools/check_doc_refs.py` green before you commit
-  (§1.8). Adding a document means a line in `docs-site/tools/manifest.mjs`.
-- Commit per task, in the repo's style (`fix(core): …`, `land(mor): …`, `!` for
-  breaking). No `git add .` — stage the paths you touched.
-- **No push, no force-push, no destructive git operation without the owner's
-  OK.** Local reversible actions are free.
-- Do not edit a file another agent is in. If a fix can only live in someone
-  else's file, report it as `file:line` instead.
-- Never fix unrelated things in the same diff. Follow-ups get reported.
-- CPU-only tests cannot catch the backend-specific class. The gate for that is
-  `cargo test -p backend-parity --features cuda --test backend_parity`, and it
-  must be run for any change to a kernel, a dtype or a device path.
+## Tests
 
-## Naming conventions
+```bash
+cd port && PYTHONPATH=$PWD/src .venv/bin/python -m pytest -q            # CPU suite
+cd port && CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m pytest -q -m gpu   # GPU-marked
+```
 
-`docs/glossary.md` is authoritative and its last section is a live list of
-places a document and the code disagree about a name. Use the word from there.
-When a document and the code disagree, fix one of them — never invent a third
-name (§1.7).
+Non-negotiable: **never skip or delete a failing test** — fix the code it accuses.
+`@pytest.mark.local_pin` is for tests that pin one machine's bit-exact output;
+every such pin needs a behavioural sibling that runs in CI.
 
-## License
+## Style
 
-MIT ([`LICENSE`](LICENSE)). The vendored forks under `vendor/` keep their own
-upstream notices and terms; see each directory's `LICENSE` for its scope.
+See `docs/guides/style.md`. Short version: `ruff check` and `ruff format` are the
+arbiter; 100 columns; type hints on public functions; no commented-out code; no
+"for later" scaffolding.
+
+## Pull requests
+
+- One task per branch, one branch per worktree (`git worktree add`).
+- Commit style: `type(scope): the change, in the imperative` — `fix(moe): …`.
+- The PR body states: what changed, what was measured, what could regress, and
+  which gate would catch that regression.
+- Green `python` and `cpu` CI jobs are required; `cuda-compile`, `lint` and
+  `coverage` are informative until they are closed (see ci.yml comments).
+- No push to `main` without the owner's explicit approval.
+
+## Where things live
+
+```
+crates/          Rust lane (core, data, train, cli)
+port/src/        Python package: config, model/, train/, post/, serve
+port/scripts/    drivers: bench_*, ab_*, audit_*, queue_*, sweep_*
+port/tests/      pytest, one file per behaviour area
+docs/adr/        decisions with numbers and dates
+docs/reviews/    measurement reports (the ledger of what we know)
+docs/research/   literature reviews with arXiv ids, versions, tables
+lectures/        the SVD lecture (standalone, no dependency on the model)
+```

@@ -1,0 +1,44 @@
+# Pre-commit: the fast gate, before the commit.
+#
+# Install once:  uv tool install pre-commit && pre-commit install
+# Run manually:  pre-commit run --all-files
+#
+# Design rule: every hook here either (a) fails on a real defect the repo has
+# actually shipped, or (b) is a formatter that cannot argue. A hook that reports
+# but never blocks is the "green tick beside a red gate" this repo has paid for
+# before (see .github/workflows/ci.yml, the lint job's comment).
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check (lint)
+        entry: bash -c 'cd port && .venv/bin/ruff check src scripts tests'
+        language: system
+        pass_filenames: false
+        files: ^port/.*\.py$
+
+      - id: ruff-format
+        name: ruff format (only the files this commit touches)
+        entry: bash -c 'cd port && .venv/bin/ruff format'
+        language: system
+        files: ^port/.*\.py$
+
+      - id: doc-refs
+        name: doc references must resolve
+        entry: python3 tools/check_doc_refs.py
+        language: system
+        pass_filenames: false
+        files: \.(py|md|rs|toml)$
+
+      - id: no-dead-knob-in-presets
+        name: a preset must not set a field nothing reads
+        entry: bash -c 'cd port && PYTHONPATH=src .venv/bin/python scripts/dead_knob_audit.py --preset-glob "configs/**/*.toml" >/dev/null 2>&1; [ $? -ne 2 ]'
+        language: system
+        pass_filenames: false
+        files: ^port/(configs|src/dormouse/config)\.?.*$
+
+      - id: python-compile
+        name: python files must at least parse
+        entry: python3 -m compileall -q
+        language: system
+        files: ^port/.*\.py$
