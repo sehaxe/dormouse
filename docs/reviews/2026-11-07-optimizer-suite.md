@@ -2,7 +2,7 @@
 
 Hostile read of every training knob the 2026-11-07 Muon audit did not already
 clear, against a numeric fingerprint written in
-`port/tests/test_optimizer_suite.py` (33 gates, CPU only,
+`port/tests/test_optimizer_suite.py` (34 gates, CPU only,
 `CUDA_VISIBLE_DEVICES=""`). The reference for each gate is implemented in the
 test — `torch.optim.AdamW`, a written-out WSD closed form, a hand-transcribed
 AdamW/EMA/schedule-free recurrence — not imported from the code it judges.
@@ -325,6 +325,11 @@ Fingerprint: `test_bf16_*`, `test_muon_bf16_state_*`, `test_muon_chunking_*`.
 * The `ns_dtype="bf16"` rung remains an approximation by design (the docstring
   says so; `tests/test_muon_fast.py` holds its orthogonality bound); it is not
   a storage copy of the master.
+* There is no bf16 *master-storage* copy in the checkpoint either: the storage
+  rungs are `fp8`/`nvfp4`/`ternary` (`model.quant`), `quant="none"` writes the
+  fp32 masters, and `unpack_state_dict` restores fp32. The only bf16 storage on
+  the training path is `muon_state_dtype`, measured above; a model forward's
+  bf16 cast is transient and never becomes the optimizer's parameter.
 
 ---
 
@@ -394,7 +399,7 @@ that accepts the shared config.
 ## Verification
 
 ```
-port/tests/test_optimizer_suite.py                     33 passed
+port/tests/test_optimizer_suite.py                     34 passed
 test_muon_reference + clip_grads + lr_tail + lrband
   + train4 + posttrain_fixes                           94 passed
 test_config + sft + sft_v2 + rl_train + nan_firewall

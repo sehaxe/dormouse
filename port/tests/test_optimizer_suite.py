@@ -403,6 +403,30 @@ def test_the_training_stage_clips_before_opt_step(monkeypatch, tmp_path):
     assert calls == ["clip", "step"], f"clip must precede the step: {calls}"
 
 
+def test_the_loop_clips_every_parameter_not_one_group(monkeypatch, tmp_path):
+    """`opt_stage` hands `clip_grads` the WHOLE `model.parameters()` tree.
+
+    Revert: pass only `muon_params` (or one group) -> the spy's id set misses
+    the AdamW half and the norm no longer bounds the step it feeds.
+    """
+    import dormouse.train.loop as loop_mod
+
+    run = tiny_run(tmp_path, steps=1, log_every=1, grad_clip=0.5)
+    model = DormouseModel(run.model)
+    seen: set[int] = set()
+    real = loop_mod.clip_grads
+
+    def spy(params, max_norm):
+        seen.update(id(p) for p in params)
+        return real(params, max_norm)
+
+    monkeypatch.setattr(loop_mod, "clip_grads", spy)
+    train(model, run, log=lambda *_: None)
+    assert seen == {id(p) for p in model.parameters()}, (
+        f"the clip saw {len(seen)}/{len(list(model.parameters()))} parameters"
+    )
+
+
 def test_clip_update_ratio_is_one_at_step_one_and_ten_percent_later():
     """The ratio of clipped to unclipped updates — the measured size of the knob.
 
