@@ -53,7 +53,11 @@ run() { # tag config batch bytes_per_step seed
   grep -oE "eval step=[0-9]+ off=[0-9]+ bpb_fin=[0-9.]+" "$OUT/${tag}_s${seed}.log" | tail -4
 }
 
-for seed in 1 2; do
+# SEEDS=1 runs the first seed only: the pre-registered rule is a 0.02/0.05
+# decision band, so a single seed settles it whenever the gap is outside that
+# band; the second seed is only worth its hours in the ambiguous middle.
+SEEDS=${SEEDS:-2}
+for seed in $(seq 1 "$SEEDS"); do
   run bytes configs/flagship3_dense.toml     8  $((8*1024))  $seed
   run patch configs/arch_dense_byteflow8.toml 32 $((32*1024)) $seed
 done
@@ -71,7 +75,7 @@ def last_eval(p):
 out = Path(sys.argv[1])
 for tag in ("bytes", "patch"):
     vals = []
-    for seed in (1, 2):
+    for seed in range(1, int(__import__("os").environ.get("SEEDS", "2")) + 1):
         p = out / f"{tag}_s{seed}.jsonl"
         if p.exists():
             bpb, seen = last_eval(p)
