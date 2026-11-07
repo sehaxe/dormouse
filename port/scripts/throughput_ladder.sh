@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# Throughput ladder — pure SPEED, zero quality risk.
+# Throughput ladder — pure SPEED, zero quality risk in the measurement itself.
 #
-# Our measured MFU is 13.9% (6.35 TFLOP/s of a 45.7 TFLOP/s bf16 peak) and a
-# warm step leaves the card idle most of the time. Ripple-65B reports 40% MFU on
-# a 65B dense model with "simple sharding, no custom kernels" — so the gap is
-# not the card, it is the step. Every factor recovered here multiplies the
-# patch/recipe/MoD gains instead of competing with them.
+# The measured split at b=8, s=1024 on `flagship3_dense` (median of the JSONL
+# logs, 2026-11-08):
+#   opt=adamw, grad_accum=3   78.3 kB/s  -> 0.104 s per micro-batch, optimizer ~0
+#   opt=mix,   grad_accum=3   50.2 kB/s  -> 0.49  s per step of 3 micro-batches
+# so the Muon pass costs ~0.22 s per step while fwd+bwd of one micro-batch
+# costs ~0.09 s: the OPTIMIZER is 2.4x the model's own compute.
 #
-# Each arm runs STEPS steps (default 40, the first 10 are compile warmup) and we
-# take the steady-state bytes/s off the JSONL log line, not the wall clock.
+# Muon's NS chain at these shapes is 12 matrices of [832, 3072] in fp32:
+#   gram 4.25 + squares 1.15 + px 4.25 GFLOP = 9.65 GFLOP/iter/matrix
+#   5 iterations x 12 matrices = 579 GFLOP per step, on the CUDA-core fp32 lane
+# That is the whole 0.22 s. The rungs that move it are all ALREADY IMPLEMENTED:
+#   ns_dtype=bf16            tensor cores instead of CUDA cores
+#   muon_state_dtype=bf16    half the momentum traffic (18% measured before)
+#   ns_steps=3               -40% of the arithmetic (published as non-monotone)
+#   torch_compile / opt_graph  launch overhead, not arithmetic
 #
-#   bytes  b=8   main arms: batch 8/16/32, compile off/on, opt_graph off/on
-#   patch  b=32  the same at patch-8 (the E1 arm's own best batch)
+# This ladder measures the seconds. The BPB cost of each rung is a separate A/B
+# (`scripts/muon_precision_ab.sh`) because a precision rung is a math change.
 set -u
 cd /home/sehaxe/dormouse/port
 export PYTHONPATH=$PWD/src
@@ -20,42 +27,44 @@ PY=.venv/bin/python
 OUT=/home/sehaxe/logs/thru
 mkdir -p "$OUT"
 STEPS=${STEPS:-40}
+D=configs/flagship3_dense.toml
 
-arm() { # tag config batch extra...
-  local tag=$1 cfg=$2 batch=$3; shift 3
-  $PY -u -m dormouse.cli train "$cfg" \
-    --data ../data_local/best/fwedu.bin --set steps=$STEPS --set batch=$batch \
-    --set seq_len=1024 --set opt=mix --set muon_lr_mult=12 --set lr=3e-4 \
-    --set eval=false --set mix_plan=configs/mix_v7.toml --set doc_masking=false \
+arm() { # tag extra-set-args...
+  local tag=$1; shift
+  $PY -u -m dormouse.cli train $D \
+    --data ../data_local/best/fwedu.bin \
+    --set steps=$STEPS --set batch=8 --set seq_len=1024 --set opt=mix \
+    --set muon_lr_mult=12 --set lr=3e-4 --set eval=false \
+    --set mix_plan=configs/mix_v7.toml --set doc_masking=false \
     --set log_every=10 --set ckpt_every=1000000 --set out_dir=/tmp/opencode/thru_$tag \
     --json-log "$OUT/$tag.jsonl" "$@" > "$OUT/$tag.log" 2>&1
   echo "=== $tag done $(date +%H:%M:%S)"
 }
 
-D=configs/flagship3_dense.toml
-P=configs/arch_dense_byteflow8.toml
-arm bytes_b8        $D  8
-arm bytes_b16       $D 16
-arm bytes_b32       $D 32
-arm bytes_b8_comp   $D  8 --set torch_compile=true
-arm bytes_b16_comp  $D 16 --set torch_compile=true
-arm bytes_b8_graph  $D  8 --set opt_graph=true
-arm patch_b32       $P 32
-arm patch_b64       $P 64
-arm patch_b32_comp  $P 32 --set torch_compile=true
+# --- the optimizer's precision rungs (the 2.4x) ----------------------------
+arm muon_fp32        # control: ns fp32, state fp32, 5 steps
+arm ns_bf16          --set ns_dtype=bf16
+arm ns3              --set ns_steps=3
+arm ns_bf16_3        --set ns_dtype=bf16 --set ns_steps=3
+arm state_bf16       --set muon_state_dtype=bf16
+arm muon_fast        --set ns_dtype=bf16 --set ns_steps=3 --set muon_state_dtype=bf16
+
+# --- the launch rungs -------------------------------------------------------
+arm compile          --set torch_compile=true
+arm graph            --set opt_graph=true
+arm muon_fast_graph  --set ns_dtype=bf16 --set ns_steps=3 --set muon_state_dtype=bf16 \
+                     --set opt_graph=true
 
 $PY - "$OUT" <<'PY'
 import json, sys
 from pathlib import Path
-print(f"{'arm':16s} {'B/s':>10s} {'B/step':>8s} {'us/byte':>8s}")
-rows = []
+print(f"{'arm':18s} {'kB/s':>8s} {'steps/s':>8s} {'ms/step':>8s}")
 for p in sorted(Path(sys.argv[1]).glob("*.jsonl")):
     logs = [json.loads(l) for l in p.read_text().splitlines() if '"log"' in l]
     if not logs:
-        print(f"{p.stem:16s} {'(no log line)':>10s}")
-        continue
+        print(f"{p.stem:18s} (no log line)"); continue
     r = logs[-1]
-    rows.append((r["tokens_per_s"], p.stem, r["bytes_seen"] / (r["step"] + 1)))
-for rate, tag, bps in sorted(rows, reverse=True):
-    print(f"{tag:16s} {rate:10.0f} {bps:8.0f} {1e6/rate:8.2f}")
+    bps = r["bytes_seen"] / (r["step"] + 1)          # 8192 at b8 s1024 ga1
+    rate = r["tokens_per_s"]
+    print(f"{p.stem:18s} {rate/1e3:8.1f} {rate/bps:8.2f} {1e3/(rate/bps):8.0f}")
 PY
