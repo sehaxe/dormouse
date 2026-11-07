@@ -13,7 +13,19 @@
     --accent:#2f6fd0; --hot:#c0392b; --good:#2e7d4f;
     --mono:"DejaVu Sans Mono","Liberation Mono",ui-monospace,monospace;
     --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    --glass:rgba(252,250,245,.74); --glass-line:rgba(255,255,255,.75);
+    --nav:rgba(246,243,236,.75); --hero-ink:#141b26; --hero-dim:#3c4555;
   }
+  html[data-theme="dark"]{
+    --bg:#0a0b0d; --panel:#101216; --panel2:#14171c;
+    --line:#1e2128; --line2:#2a2e37;
+    --ink:#e8e6e1; --dim:#8b8f98; --dimmer:#5c6068;
+    --accent:#7aa2e8; --hot:#ff6b7a; --good:#5fbf7f;
+    --glass:rgba(16,18,22,.55); --glass-line:rgba(255,255,255,.08);
+    --nav:rgba(10,11,13,.72); --hero-ink:#f2f0ea; --hero-dim:#b9bcc4;
+  }
+  html{color-scheme:light}
+  html[data-theme="dark"]{color-scheme:dark}
   *{box-sizing:border-box}
   html{background:var(--bg);-webkit-text-size-adjust:100%;scroll-behavior:smooth}
   body{margin:0;color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.6;
@@ -25,8 +37,12 @@
 
   /* nav */
   nav{position:fixed;top:0;left:0;right:0;z-index:50;height:52px;display:flex;align-items:center;
-    background:rgba(246,243,236,.75);backdrop-filter:blur(12px) saturate(1.2);
-    border-bottom:1px solid rgba(0,0,0,.06)}
+    background:var(--nav);backdrop-filter:blur(12px) saturate(1.2);
+    border-bottom:1px solid var(--line)}
+  .theme{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--dim);background:transparent;border:1px solid var(--line2);border-radius:6px;
+    padding:4px 8px;cursor:pointer}
+  .theme:hover{color:var(--ink)}
   nav .wrap{width:100%;display:flex;align-items:center;gap:26px;height:100%;
     font-family:var(--mono);font-size:12.5px}
   nav b{font-weight:600;color:var(--ink)}
@@ -37,28 +53,31 @@
     margin-right:7px;box-shadow:0 0 0 3px rgba(46,125,79,.15)}
 
   /* hero: the pixel sky, with a frosted panel on it */
-  header{position:relative;padding:120px 0 92px;
-    background:#cfe0f4 url("media/sky.webp") center top/cover no-repeat}
-  header::after{content:"";position:absolute;inset:0;pointer-events:none;
-    background:linear-gradient(180deg,rgba(246,243,236,0) 58%,rgba(246,243,236,.5) 82%,var(--bg) 100%)}
+  header{position:relative;padding:120px 0 92px;overflow:hidden;
+    background:#101216 url("media/hero.jpg") center/cover no-repeat}
+  #heroCanvas{position:absolute;inset:0;width:100%;height:100%;display:block;z-index:0}
+  header::after{content:"";position:absolute;inset:0;pointer-events:none;z-index:1;
+    background:linear-gradient(180deg,rgba(246,243,236,0) 62%,rgba(246,243,236,.55) 86%,var(--bg) 100%)}
+  html[data-theme="dark"] header::after{
+    background:linear-gradient(180deg,rgba(10,11,13,0) 58%,rgba(10,11,13,.6) 86%,var(--bg) 100%)}
   header .wrap{position:relative;z-index:1}
-  .glass{background:rgba(255,255,255,.62);border:1px solid rgba(255,255,255,.75);
+  .glass{position:relative;z-index:2;background:var(--glass);border:1px solid var(--glass-line);
     -webkit-backdrop-filter:blur(16px) saturate(1.25);backdrop-filter:blur(16px) saturate(1.25);
-    border-radius:20px;padding:34px 36px;max-width:760px;
-    box-shadow:0 40px 80px -50px rgba(24,38,66,.55),0 1px 0 rgba(255,255,255,.6) inset}
-  .kicker{font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:#4d5c74}
+    border-radius:20px;padding:34px 36px;max-width:780px;
+    box-shadow:0 40px 80px -50px rgba(24,38,66,.55),0 1px 0 rgba(255,255,255,.35) inset}
+  .kicker{font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--hero-dim)}
   h1{font-family:var(--mono);font-weight:400;font-size:clamp(30px,4.6vw,54px);line-height:1.08;
-    letter-spacing:-.03em;margin:16px 0 0;color:#141b26}
-  h1 em{font-style:normal;color:#5c6a80}
-  .sub{margin:20px 0 0;max-width:60ch;color:#3c4555;font-size:15.5px;line-height:1.65}
-  .sub b{color:#141b26;font-weight:600}
+    letter-spacing:-.03em;margin:16px 0 0;color:var(--hero-ink)}
+  h1 em{font-style:normal;color:var(--hero-dim)}
+  .sub{margin:20px 0 0;max-width:60ch;color:var(--hero-dim);font-size:15.5px;line-height:1.65}
+  .sub b{color:var(--hero-ink);font-weight:600}
   .cta{display:flex;gap:10px;margin:26px 0 0;flex-wrap:wrap}
   .btn{font-family:var(--mono);font-size:12.5px;padding:10px 16px;border-radius:8px;
-    border:1px solid rgba(20,27,38,.12);color:#141b26;background:rgba(255,255,255,.7);
+    border:1px solid var(--line2);color:var(--hero-ink);background:rgba(255,255,255,.55);
     display:inline-flex;align-items:center;gap:8px}
   .btn:hover{background:#fff}
-  .btn.p{background:#141b26;color:#fdfcf8;border-color:#141b26}
-  .btn.p:hover{background:#000}
+  .btn.p{background:var(--hero-ink);color:var(--bg);border-color:var(--hero-ink)}
+  .btn.p:hover{opacity:.9}
 
   /* media card */
   .stage{margin:0 0 40px;border:1px solid var(--line);border-radius:16px;overflow:hidden;
@@ -75,7 +94,7 @@
   h2{font-family:var(--mono);font-weight:400;font-size:12.5px;letter-spacing:.12em;
     text-transform:uppercase;color:var(--dimmer);margin:0 0 10px}
   h2 span{color:var(--accent);margin-right:10px}
-  h3{font-size:22px;font-weight:600;letter-spacing:-.01em;margin:0 0 8px;color:#141b26}
+  h3{font-size:22px;font-weight:600;letter-spacing:-.01em;margin:0 0 8px;color:var(--ink)}
   .lead{color:var(--dim);max-width:70ch;margin:0 0 30px;line-height:1.7}
 
   /* cards */
@@ -102,9 +121,9 @@
     color:var(--dimmer);text-align:right;padding:0 12px 10px;border-bottom:1px solid var(--line2)}
   th:first-child{text-align:left;padding-left:0}
   td{text-align:right;padding:11px 12px;border-bottom:1px solid var(--line);
-    font-family:var(--mono);font-size:12.5px;color:#33322e}
+    font-family:var(--mono);font-size:12.5px;color:var(--dim)}
   td:first-child{text-align:left;padding-left:0;font-family:var(--sans);font-size:13.5px;color:var(--ink)}
-  tr:hover td{background:#fbf9f3}
+  tr:hover td{background:var(--panel)}
   .ok{color:var(--good)} .bad{color:var(--hot)} .note{font-family:var(--mono);font-size:11px;color:var(--dimmer)}
 
   /* retractions */
@@ -115,7 +134,7 @@
   ul.ret .now{font-family:var(--mono);font-size:12.5px;color:var(--good);margin-top:4px}
   ul.ret .why{color:var(--dim);font-size:13px;margin-top:8px;line-height:1.65}
 
-  pre.bytes{margin:0;padding:14px 16px;border-top:1px solid var(--line);background:#fbf9f3;
+  pre.bytes{margin:0;padding:14px 16px;border-top:1px solid var(--line);background:var(--panel2);
     font-family:var(--mono);font-size:11.5px;line-height:1.5;white-space:pre;overflow-x:auto;color:#b6ac9a}
   pre.bytes b{font-weight:400}
 
@@ -142,10 +161,12 @@
   <a href="#runs">runs</a>
   <a href="#retracted">retractions</a>
   <span class="sp"></span>
+  <button class="theme" id="themeBtn" type="button" aria-label="theme">auto</button>
   <a href="https://github.com/sehaxe/dormouse"><span class="dot"></span>source</a>
 </div></nav>
 
 <header>
+  <canvas id="heroCanvas" aria-hidden="true"></canvas>
   <div class="wrap">
     <div class="glass">
       <div class="kicker">one RTX 5070 Ti · 16 GB · sm_120</div>
@@ -265,6 +286,155 @@
 <script id="surprise" type="application/json">{"ckpt":"flagship3","offset":100000000,"bytes":1024,"cols":64,"text":"ion for the years to come include an artisanal bakery, midwife services, a room for fermenting food, another room for art therapy for children of all genders, a space for dance, and a room for civic services\u00b7\u00b7\u00b7providing help with filling out government forms for people don\u00b7\u00b7\u00b7t know how to read or write or are not computer literate. \u00b7\u00b7\u00b7These are just a few possibilities, because we want to keep speaking with the community and coming to understand what they want and what kind of services would be useful to them.\u00b7\u00b7\u00b7\u00b7As they forge ahead with this work, the CAMs remain mindful of the need to stay independent. \u00b7\u00b7\u00b7This has all been done through unpaid volunteer work, and we\u00b7\u00b7\u00b7ve never received any kind of government funds,\u00b7\u00b7\u00b7 says Lourdes. \u00b7\u00b7\u00b7Everything has been either volunteer labor or individual donations from people who care about the project.\u00b7\u00b7\u00b7 Most monetary and in-kind donations the projects receive from outside the island come from Puerto Ricans in the diaspora. Forming this regional network is also a key st","bits":[3.853,0.074,1.272,4.081,0.523,0.066,0.035,2.269,0.17,0.171,0.299,6.91,0.522,0.026,0.071,1.031,1.019,1.902,0.262,0.044,3.748,0.778,1.334,0.863,0.564,2.482,0.006,10.168,0.856,0.015,0.059,0.117,0.358,2.137,2.754,0.957,1.83,2.495,1.037,0.234,1.268,3.537,0.01,4.531,0.076,0.051,4.819,2.352,6.228,0.615,0.15,4.677,3.525,0.015,4.641,3.32,3.673,2.187,1.68,1.857,0.075,1.955,4.551,3.199,3.1,0.284,0.576,0.226,0.046,1.889,0.645,0.005,0.978,7.396,4.39,2.803,2.045,1.434,0.435,2.426,0.451,0.043,0.029,4.465,4.197,5.125,3.846,0.082,0.257,0.006,3.876,0.129,2.256,0.383,4.318,1.242,5.519,1.031,3.921,0.002,0.899,0.14,9.186,0.488,0.001,0.001,0.004,0.025,4.668,2.514,0.086,0.054,0.325,0.595,0.049,0.016,0.02,2.568,3.101,0.107,3.222,3.231,1.873,3.182,3.356,0.216,0.005,0.161,0.516,3.256,0.147,0.053,0.015,4.673,2.795,1.105,0.184,0.015,0.071,0.0,0.0,0.636,4.368,0.513,0.035,2.294,1.955,0.209,0.175,6.42,2.658,0.421,3.158,0.002,0.001,0.994,3.215,0.009,1.132,5.548,2.801,2.408,4.295,0.367,0.014,0.561,2.52,0.287,0.078,0.013,4.664,2.995,3.467,2.713,0.03,1.907,0.002,0.491,0.091,0.027,0.004,2.497,0.751,3.428,1.897,0.082,0.06,0.289,0.773,0.078,0.015,0.014,3.698,6.313,1.715,0.001,0.552,0.026,2.552,3.954,1.467,0.0,0.014,0.002,0.001,0.228,9.027,0.004,1.188,5.279,1.498,0.922,0.654,0.055,0.026,1.249,0.002,0.0,0.029,5.64,1.806,2.071,0.019,1.625,4.982,0.163,0.003,0.0,0.021,4.833,3.27,3.888,1.515,0.39,0.0,0.0,0.521,3.979,1.343,0.034,0.411,7.884,2.996,2.706,0.001,0.0,0.001,0.223,0.0,0.0,0.0,0.91,4.744,0.715,0.654,2.654,1.325,0.63,5.897,1.52,0.552,0.079,3.755,2.352,0.645,0.0,0.0,0.0,0.153,6.993,2.947,2.169,2.302,0.0,0.111,0.0,0.041,5.273,0.041,0.003,0.009,0.203,3.557,0.052,0.002,0.024,0.573,0.148,0.005,4.461,0.278,2.527,1.035,0.385,3.133,1.628,0.025,3.915,2.183,0.145,0.007,0.023,0.087,3.327,1.485,0.079,3.848,2.307,5.358,0.157,4.789,0.313,0.187,0.043,4.707,0.635,1.322,0.737,4.319,0.16,0.028,3.162,0.928,8.328,2.962,2.718,0.303,0.0,0.015,0.884,11.417,4.431,1.271,7.217,0.003,0.429,1.734,0.2,0.471,3.114,0.001,0.011,2.466,0.037,1.719,0.026,4.207,0.072,0.116,0.0,0.042,1.071,0.295,1.195,0.517,0.061,0.008,3.317,3.049,2.231,0.289,0.024,0.002,0.88,0.001,0.001,0.0,0.018,0.0,0.0,3.116,0.834,2.362,5.565,0.553,0.042,0.0,0.0,0.0,0.008,3.96,0.387,0.152,3.648,2.96,0.056,0.008,0.023,0.203,0.033,0.003,5.289,3.004,0.007,0.0,0.004,5.0,3.371,4.227,2.617,0.08,0.21,0.0,0.0,0.09,4.172,0.248,0.023,0.0,0.043,2.0,0.137,0.087,0.599,3.834,1.523,0.554,1.242,0.684,0.05,0.01,0.015,0.034,0.757,2.347,0.789,0.009,0.006,3.902,1.01,1.201,6.921,0.137,0.001,0.018,2.691,0.237,1.297,5.043,0.657,0.086,0.008,0.004,0.032,0.002,0.001,0.001,0.0,0.179,2.323,0.144,1.494,0.0,0.057,1.847,0.531,0.058,1.396,0.074,2.845,1.271,0.04,0.006,0.509,3.213,0.923,0.017,0.012,1.798,0.093,2.226,0.001,0.06,8.304,0.535,0.122,0.003,0.569,0.118,0.008,0.022,3.72,4.548,0.814,0.006,0.029,0.021,0.002,0.704,0.129,2.633,1.755,0.307,0.0,0.0,0.028,2.702,0.024,0.436,5.451,1.252,0.766,1.563,0.001,0.0,0.428,2.717,0.024,0.111,3.81,1.612,0.442,3.275,2.23,0.439,0.0,0.006,0.28,4.103,1.954,0.108,2.563,0.217,0.068,1.811,0.026,5.624,1.165,2.579,2.326,1.694,4.274,2.421,8.413,0.071,0.056,0.001,1.067,4.557,0.649,0.018,0.001,0.169,1.295,0.128,6.165,0.054,0.162,4.82,0.676,0.267,0.613,0.754,0.004,1.686,0.095,0.095,1.413,5.89,6.013,3.572,5.81,0.048,5.134,0.295,3.505,0.247,0.018,0.0,0.109,5.424,3.053,1.952,0.094,0.095,0.0,0.002,0.178,0.968,0.013,0.002,1.368,0.074,0.081,0.484,5.145,1.881,1.539,0.001,0.86,1.031,0.072,0.004,3.484,2.628,0.759,0.777,0.026,2.46,0.03,7.002,0.423,0.555,0.001,0.0,0.001,0.003,0.0,0.008,2.963,0.279,3.041,0.002,0.074,1.07,0.118,2.746,0.031,0.012,4.781,1.183,1.116,0.018,2.785,0.966,3.04,2.331,1.346,0.01,0.12,0.001,0.006,3.891,1.86,0.175,0.099,0.16,2.808,3.983,1.074,0.022,0.0,0.0,0.0,0.11,8.056,0.812,4.983,2.013,2.181,0.017,0.044,7.006,2.367,2.325,0.086,2.464,0.005,0.06,0.001,0.001,4.363,3.3,1.669,0.067,0.173,1.739,0.686,1.878,0.573,0.107,0.01,2.466,1.681,3.105,0.0,0.003,3.398,0.001,0.004,4.605,2.849,0.071,0.001,0.001,0.019,3.868,0.16,2.077,1.141,0.277,0.0,0.024,0.009,0.092,1.81,2.194,1.204,0.077,6.402,0.276,0.067,0.001,0.219,0.039,0.01,0.002,5.736,1.651,0.774,0.001,0.0,0.001,0.082,0.0,0.001,0.0,0.381,2.817,4.964,2.119,0.198,1.617,3.496,1.096,0.0,0.01,0.008,1.051,0.078,1.198,0.013,0.004,5.641,2.38,3.532,4.748,4.086,6.267,3.953,2.323,0.88,0.525,0.003,0.042,6.773,1.293,0.022,1.624,0.148,2.576,0.03,0.1,0.001,0.0,0.09,5.072,0.345,0.617,0.033,2.258,0.015,0.036,0.001,0.014,4.798,7.304,0.088,0.007,0.001,0.001,0.012,5.943,2.433,0.068,0.084,0.021,0.001,0.016,0.01,0.001,2.125,9.045,2.048,4.713,0.783,0.376,1.672,1.991,0.056,0.025,3.959,0.721,2.487,1.637,0.382,0.001,0.002,0.0,0.002,0.001,0.499,5.123,3.163,1.046,1.106,0.001,0.108,0.032,0.0,1.59,1.164,3.669,3.664,0.023,0.001,0.001,4.757,2.107,0.294,0.0,0.0,0.0,0.307,1.716,1.121,0.008,0.124,4.095,1.074,3.354,1.728,0.138,2.785,0.474,0.008,0.011,0.002,0.038,1.36,0.196,0.138,0.925,3.437,1.567,0.998,3.046,0.002,0.0,0.0,2.404,1.608,0.001,0.033,2.116,4.944,1.344,1.188,0.007,0.02,4.736,2.656,3.781,2.458,2.342,0.606,0.039,0.11,0.019,3.035,2.022,0.123,0.009,2.981,0.121,6.489,8.328,0.24,0.05,0.012,0.141,4.798,0.683,0.161,0.079,0.001,0.07,0.002,0.0,0.021,0.062,5.3,1.868,2.451,2.514,3.573,1.32,0.382,0.206,0.002,0.0,0.0,3.273,0.099,5.066,0.257,2.802,0.341,0.024,0.001,0.081,1.449,4.561,2.171,1.369,0.058,0.02,4.258,2.416,2.386,2.39,0.349,0.001,0.001,0.553,1.35,1.186,0.11,0.298,5.336,5.002,1.933,0.02,0.002,0.001,1.414,5.461,1.066,1.463,4.67,0.052,2.63,0.116,0.006,0.001,0.097,7.832,4.122,3.038,0.981,0.129,0.112,0.144,3.522,2.008,2.134,1.773,2.685,3.379,1.115,4.695,0.089,0.077,1.471,0.092,0.037,0.132,5.529,2.592,3.693,2.854,0.265,0.312,0.033,0.139,1.426,1.253,5.419,1.306,0.271,6.82,4.095,0.114,0.0,0.047,1.628,0.257,2.921,0.036,0.02,5.072,0.395,4.249,0.867,0.383,0.005,5.631,0.031,0.064,6.386,1.983,1.826,0.124,0.005,0.001,0.0,0.417,2.289,0.364,0.022,1.912,2.311,0.329,0.001,0.002,2.516,0.612,6.08,0.489,0.042,0.091,3.583,1.186,1.047]}</script>
 <script>
 (() => {
+  /* ---------------------------------------------------------------- theme */
+  // auto -> follows prefers-color-scheme; light/dark pin it. Persisted, and the
+  // attribute is set before the page paints (the script is at the end of body,
+  // so the browser's own color-scheme picks the first paint and this only
+  // confirms it).
+  const html = document.documentElement;
+  const sys = matchMedia('(prefers-color-scheme: dark)');
+  const saved = () => { try { return localStorage.getItem('dormouse-theme') || 'auto'; } catch { return 'auto'; } };
+  const resolve = (m) => (m === 'auto' ? (sys.matches ? 'dark' : 'light') : m);
+  const apply = () => {
+    const mode = saved();
+    html.dataset.theme = resolve(mode);
+    const btn = document.getElementById('themeBtn');
+    if (btn) btn.textContent = mode;
+  };
+  apply();
+  sys.addEventListener('change', apply);
+  addEventListener('DOMContentLoaded', () => {
+    const btn = document.getElementById('themeBtn');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      const order = ['auto', 'light', 'dark'];
+      const next = order[(order.indexOf(saved()) + 1) % order.length];
+      try { localStorage.setItem('dormouse-theme', next); } catch {}
+      apply();
+    });
+  });
+
+  /* ------------------------------------------------------------ hero shader */
+  // The photo, printed: a halftone whose dot grid slides under the pointer.
+  // One texture, one pass; the dots are the picture, not an overlay on it.
+  const cv = document.getElementById('heroCanvas');
+  if (cv) {
+    const gl = cv.getContext('webgl', { antialias: false, alpha: false, premultipliedAlpha: false });
+    if (!gl) { cv.style.display = 'none'; }
+    else {
+      const vs = 'attribute vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }';
+      const fs = `precision highp float;
+uniform vec2 u_res; uniform vec2 u_mouse; uniform float u_time; uniform float u_theme;
+uniform sampler2D u_tex; uniform vec2 u_img;
+void main(){
+  vec2 uv = gl_FragCoord.xy / u_res;
+  // cover-fit the photo
+  float ra = u_res.x / u_res.y, ia = u_img.x / u_img.y;
+  vec2 sc = ra > ia ? vec2(1.0, ia / ra) : vec2(ra / ia, 1.0);
+  vec2 tuv = (uv - 0.5) * sc + 0.5;
+  // the pointer slides the dot grid, and the texture with it a little
+  vec2 par = (u_mouse - 0.5) * vec2(0.035, 0.025);
+  vec3 c = texture2D(u_tex, clamp(tuv + par * 0.6, 0.001, 0.999)).rgb;
+  float l = dot(c, vec3(0.299, 0.587, 0.114));
+
+  vec2 gp = (uv + par) * vec2(300.0, 300.0 / (u_res.x / u_res.y));
+  vec2 f = fract(gp) - 0.5;
+  float r = 0.08 + 0.42 * pow(clamp(l, 0.0, 1.0), 0.7);
+  float dots = smoothstep(r, r - 0.05, length(f));
+
+  vec3 paper = mix(vec3(0.965, 0.953, 0.925), vec3(0.039, 0.043, 0.051), u_theme);
+  vec3 ink   = mix(vec3(0.10, 0.11, 0.13), vec3(0.93, 0.92, 0.90), u_theme);
+  vec3 photo = mix(c, vec3(l), 0.25);
+  vec3 wash  = mix(photo * 1.02 + 0.32, photo * 0.55, u_theme);
+  vec3 col = mix(wash, ink, dots * 0.92);
+  // a whisper of paper grain so the flat areas are not flat
+  col += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233))) * 43758.5453) - 0.5) * 0.015;
+  gl_FragColor = vec4(col, 1.0);
+}`;
+      const sh = (t, src) => { const o = gl.createShader(t); gl.shaderSource(o, src); gl.compileShader(o); return o; };
+      const prog = gl.createProgram();
+      gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs));
+      gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        cv.style.display = 'none';
+      } else {
+        gl.useProgram(prog);
+        const buf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+        const loc = gl.getAttribLocation(prog, 'p');
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+        const uRes = gl.getUniformLocation(prog, 'u_res');
+        const uMouse = gl.getUniformLocation(prog, 'u_mouse');
+        const uTime = gl.getUniformLocation(prog, 'u_time');
+        const uTheme = gl.getUniformLocation(prog, 'u_theme');
+        const uImg = gl.getUniformLocation(prog, 'u_img');
+        const uTex = gl.getUniformLocation(prog, 'u_tex');
+        gl.uniform1i(uTex, 0);
+
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([16,18,22,255]));
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.uniform2f(uImg, 1600, 900);
+
+        const img = new Image();
+        img.onload = () => {
+          try {
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+            gl.uniform2f(uImg, img.naturalWidth, img.naturalHeight);
+          } catch (e) {
+            // file:// images are cross-origin to the canvas: no texture, no
+            // shader. Hide the canvas so the CSS photo shows instead of grey.
+            cv.style.display = 'none';
+          }
+        };
+        img.onerror = () => { cv.style.display = 'none'; };
+        img.src = 'media/hero.jpg';
+
+        let mx = 0.5, my = 0.5, tx = 0.5, ty = 0.5;
+        const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+        addEventListener('pointermove', (e) => {
+          const r = cv.getBoundingClientRect();
+          tx = Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1);
+          ty = Math.min(Math.max((e.clientY - r.top) / r.height, 0), 1);
+        }, { passive: true });
+
+        const resize = () => {
+          const dpr = Math.min(devicePixelRatio || 1, 1.6);
+          const w = Math.max(1, Math.floor(cv.clientWidth * dpr));
+          const h = Math.max(1, Math.floor(cv.clientHeight * dpr));
+          if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+          gl.viewport(0, 0, w, h);
+          gl.uniform2f(uRes, w, h);
+        };
+        const draw = (t) => {
+          resize();
+          mx += (tx - mx) * 0.06; my += (ty - my) * 0.06;
+          gl.uniform2f(uMouse, mx, my);
+          gl.uniform1f(uTime, t);
+          gl.uniform1f(uTheme, html.dataset.theme === 'dark' ? 1 : 0);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+        };
+        draw(0);
+        if (!reduced) {
+          const loop = (now) => { draw(now / 1000); requestAnimationFrame(loop); };
+          requestAnimationFrame(loop);
+        } else {
+          addEventListener('pointermove', () => draw(0), { passive: true });
+        }
+        addEventListener('resize', () => draw(0));
+      }
+    }
+  }
+
   const d = JSON.parse(document.getElementById('data').textContent);
   const fmt = (x, n = 1) => Number(x).toFixed(n);
 
