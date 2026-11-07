@@ -10,8 +10,8 @@ AdamW/EMA/schedule-free recurrence — not imported from the code it judges.
 The audit's question is the ruler: after `muon_lr_mult`, which knobs are
 **DEAD** (the value never reaches the arithmetic), **MIS-SCALED** (it reaches
 the arithmetic as a different number), or **LIES** (the code does not do what
-the field/docstring says)? Four more were found, all silent; three are fixed
-here and the fourth is a documented boundary.
+the field/docstring says)? Five more silent wiring defects were found and fixed
+here; three boundaries and proposals are ranked at the end.
 
 ## Verdicts
 
