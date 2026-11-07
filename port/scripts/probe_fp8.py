@@ -60,7 +60,7 @@ def main() -> None:
     torch.manual_seed(0)
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
-    x = x * (0.5 + torch.rand(M, 1, device="cuda"))   # per-row spread, like ln1 output
+    x = x * (0.5 + torch.rand(M, 1, device="cuda", dtype=torch.bfloat16))  # per-row spread
     x[0, :64] *= 40.0                                  # one outlier row: the fp8 failure mode
 
     # --- 1. does the kernel accept the call? ---------------------------------
