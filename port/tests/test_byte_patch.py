@@ -327,3 +327,23 @@ def test_the_impossible_combinations_refuse_loudly():
     # at load, not at the first step.
     with pytest.raises(LoudError, match="seq_len=1001"):
         load_run("arch_dense_byteflow8", train_overrides={"seq_len": 1001})
+
+
+def test_the_patch_form_publishes_the_breakdown_the_eval_loop_reads():
+    """A byte_patch forward with `breakdown=True` must write `last_breakdown["fin"]`.
+
+    The held-out eval reads exactly that key (`train/loop.py:_eval_loss`), and
+    this path used to leave `last_breakdown` as `{}` — so every patch eval died
+    with `KeyError: 'fin'`. Found by E1 on 2026-11-08: the arm had never been
+    evaluated end to end, which is why the bug survived nine gates.
+    """
+    cfg = ModelConfig(**BYTE_PATCH)
+    model = DormouseModel(cfg)
+    torch.manual_seed(0)
+    ids = torch.randint(0, 256, (1, 32))
+    _, loss, _ = model(ids, ids.roll(-1, dims=1), breakdown=True)
+    assert loss is not None
+    bd = model.last_breakdown
+    assert "fin" in bd, f"the eval loop would raise KeyError: 'fin' (got {sorted(bd)})"
+    assert "per_iter" in bd and bd["per_iter"] == []
+    assert abs(bd["fin"] - float(loss.detach())) < 1e-6

@@ -797,7 +797,9 @@ class DormouseModel(nn.Module):
             logits, loss = self._forward_net(input_ids, targets, counters, ce_fixed)
         elif self.bf is not None:
             self._refuse_segmented(segment_len)
-            logits, loss = self._forward_channel(input_ids, targets, counters, depth, ce_fixed)
+            logits, loss = self._forward_channel(
+                input_ids, targets, counters, depth, ce_fixed, breakdown
+            )
         else:
             # The host-offload arm is a TRAINING decision: `no_grad` saves
             # nothing, so an eval/decode call never installs the hooks even with
@@ -891,6 +893,7 @@ class DormouseModel(nn.Module):
         counters: Counters,
         depth: int | None = None,
         ce_fixed: bool = False,
+        breakdown: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Option B: front stage → this model's loop OR dense stack → back stage.
 
@@ -974,7 +977,14 @@ class DormouseModel(nn.Module):
             out_acc, _, _ = self.loop(x, None, None, None, counters=counters, depth=depth)
         logits = bf.net.decode_chunks(bf.out_proj(out_acc), h, sel)  # [b, t, vocab]
         flat = logits.reshape(-1, self.cfg.vocab)
-        return flat, _byte_ce(flat, targets, fixed=ce_fixed, counters=counters)
+        loss = _byte_ce(flat, targets, fixed=ce_fixed, counters=counters)
+        # The SAME breakdown contract `_readout` keeps: the eval loop reads
+        # `last_breakdown["fin"]` and this path never wrote it, so every
+        # byte_patch eval died with KeyError: 'fin' (found by E1, 2026-11-08 —
+        # the arm had never been evaluated end to end).
+        if breakdown and loss is not None and targets is not None:
+            self.last_breakdown = {"fin": float(loss.detach()), "per_iter": []}
+        return flat, loss
 
     def _forward_byte_lm(
         self,
