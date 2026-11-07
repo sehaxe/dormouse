@@ -37,9 +37,15 @@ Two properties are load-bearing because the burn history paid for them:
 
 `doc_masking=true` (a THIRD reader, [`DocPackedStream`][dormouse.train.data.
 DocPackedStream]) replaces the train stream with one DOCUMENT per row and a
-`[b,t]` loss mask; the eval stream stays flat. It needs `<data>.docs.json`
-(the offsets `scripts/build_doc_sidecar.py` derives), refuses without it, and
-is by STEP on resume, not by flat byte — see the class docstring for why.
+`[b,t]` loss mask. It needs `<data>.docs.json` (the offsets
+`scripts/build_doc_sidecar.py` derives), refuses without it, and is by STEP on
+resume, not by flat byte — see the class docstring for why. The eval stream
+keeps its fixed `eval_bytes` window (the recorded, comparable number); when a
+sidecar exists beside the eval file it is a
+[`MaskedByteStream`][dormouse.train.data.MaskedByteStream] and excludes the
+same cross-document targets train does. No eval sidecar keeps the flat window
+and names that policy (`eval_docmask=flat (no sidecar)`) rather than inventing
+boundaries.
 """
 
 from __future__ import annotations
@@ -697,6 +703,115 @@ class DocPackedStream:
         self.source.close()
 
 
+class MaskedByteStream:
+    """A FLAT eval window with the SAME cross-document targets masked as train.
+
+    `DocPackedStream` is the training reader and it never puts two documents in
+    one row. Eval must stay a fixed `eval_bytes` window (the recorded,
+    comparable held-out number), so it cannot be packed: the same bytes are
+    read in the same `batch × (seq_len + 1)` geometry. What it CAN share is the
+    definition of a boundary — a target whose successor byte is a document
+    start is excluded from the mean, exactly as the packed trainer excludes the
+    last byte of a document. The model still sees the flat context (eval
+    trains nothing); only the scored positions match the training objective.
+
+    The boundary source is the SAME `<data>.docs.json` sidecar train reads. A
+    source with no sidecar is not masked and says so (`doc_boundary_policy =
+    "flat (no sidecar)"`), because inventing boundaries for eval would make the
+    held-out number a different instrument than the one on record.
+    """
+
+    is_masked = True
+
+    def __init__(self, stream: ByteStream, starts: list[int], policy: str = "sidecar") -> None:
+        self.stream = stream
+        self.batch, self.seq_len = stream.batch, stream.seq_len
+        self.lo, self.hi = stream.lo, stream.hi
+        self._starts = starts
+        self._pos = self.lo
+        self._base = self.lo
+        #: Forwarded: the eval line prints the same cap on both readers.
+        self.eval_tail_capped = stream.eval_tail_capped
+        #: What the eval line prints, so a flat eval is never mistaken for a
+        #: masked one (`sidecar` | `flat (no sidecar)`).
+        self.doc_boundary_policy = policy
+
+    @property
+    def position(self) -> int:
+        return self._pos
+
+    def _is_start(self, pos: int) -> bool:
+        i = bisect.bisect_left(self._starts, pos)
+        return i < len(self._starts) and self._starts[i] == pos
+
+    def _raw(self, n: int) -> bytes:
+        """`n` bytes from the cursor, wrapping at `hi` into `lo` (the ring's rule)."""
+        out = bytearray()
+        p = self._pos
+        remaining = n
+        while remaining:
+            take = min(remaining, self.hi - p)
+            out += self.stream.read_at(p, take)
+            remaining -= take
+            p = self.lo if p + take >= self.hi else p + take
+        self._pos = p
+        return bytes(out)
+
+    def next_batch_masked(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One flat window: `(x, y, mask)` with cross-document targets masked."""
+        window = self.batch * (self.seq_len + 1)
+        self._base = self._pos
+        ids = torch.tensor(list(self._raw(window)), dtype=torch.long).view(
+            self.batch, self.seq_len + 1
+        )
+        mask = torch.ones(self.batch, self.seq_len, dtype=torch.bool)
+        for row in range(self.batch):
+            row_base = self._base + row * (self.seq_len + 1)
+            for j in range(self.seq_len):
+                target = row_base + j + 1
+                if target >= self.hi:
+                    # The ring's synthetic seam (file end -> file start, or the
+                    # eval tail's hi -> lo) is not a document continuation.
+                    mask[row, j] = False
+                elif self._is_start(target):
+                    mask[row, j] = False
+        return ids[:, :-1].contiguous(), ids[:, 1:].contiguous(), mask
+
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        loud(
+            "next_batch() on a masked eval stream: the window carries a loss mask. "
+            "Escape: read `next_batch_masked()` (the eval does this when "
+            "doc_masking=true)."
+        )
+
+    def distinct_scored_bytes(self, batches: int) -> int:
+        """Distinct byte positions this masked, possibly wrapped window scores."""
+        span = self.hi - self.lo
+        window = self.batch * (self.seq_len + 1)
+        seen = bytearray(span)
+        for k in range(batches):
+            base = (k * window) % span
+            for row in range(self.batch):
+                start = (base + row * (self.seq_len + 1)) % span
+                for j in range(self.seq_len):
+                    if start + j + 1 >= span:
+                        continue  # wraps to the range head: masked
+                    if self._is_start(self.lo + start + j + 1):
+                        continue
+                    seen[start + j] = 1
+        return sum(seen)
+
+    def rewind(self) -> None:
+        self.stream.rewind()
+        self._pos = self.lo
+
+    def skip_bytes(self, n: int) -> None:
+        self.stream.skip_bytes(n)
+        self._pos = self.stream._pos
+
+    def close(self) -> None:
+        self.stream.close()
+
 
 def open_source(
     path: str | Path,
@@ -811,6 +926,26 @@ def split_points(size: int, eval_bytes: int) -> tuple[int, int]:
     return size - eval_bytes, size
 
 
+def _mask_eval(ev: ByteStream | None, path: str | Path, enabled: bool) -> ByteStream | None:
+    """Give the eval stream the SAME boundary source train reads, counted if absent.
+
+    A sidecar beside `path` means the eval scores the same objective train does
+    (a target that lands on a document start is excluded from both). No
+    sidecar means the fixed byte window stays the recorded flat instrument; the
+    stream carries `doc_boundary_policy` so the eval line names it rather than
+    silently mixing two instruments.
+    """
+    if ev is None:
+        return None
+    if not enabled:
+        ev.doc_boundary_policy = "flat (doc_masking=false)"
+        return ev
+    if doc_sidecar_path(path).is_file():
+        return MaskedByteStream(ev, load_doc_starts(path), "sidecar")
+    ev.doc_boundary_policy = "flat (no sidecar)"
+    return ev
+
+
 def open_streams(
     run, *, ring_bytes: int = DEFAULT_RING, eval_only: bool = False
 ) -> tuple[ByteStream | DocPackedStream | None, ByteStream | None]:
@@ -822,10 +957,12 @@ def open_streams(
 
     `doc_masking=true` replaces the TRAIN stream with a
     [`DocPackedStream`][dormouse.train.data.DocPackedStream] (one document per
-    row, mask included) and leaves the eval stream flat ON PURPOSE: the
-    held-out BPB is the recorded, comparable number, and re-cutting its window
-    would make every doc-masked run's eval a different measurement. The flag
-    changes what the training objective sees, not the held-out instrument.
+    row, mask included). The eval stream keeps its fixed `eval_bytes` window —
+    that is the recorded, comparable number — but when a sidecar exists beside
+    the eval file it becomes a [`MaskedByteStream`][dormouse.train.data.
+    MaskedByteStream] and excludes the SAME cross-document targets train does.
+    No sidecar keeps the flat window and prints `doc_boundary_policy="flat (no
+    sidecar)"` on the eval line: an unknown boundary is not invented for eval.
 
     `eval_only=True` is the mixture's call site: the TRAIN side comes from
     `MixtureStream`, so building (and validating) a second, unused train stream
@@ -862,6 +999,7 @@ def open_streams(
             lo=lo,
             ring_bytes=min(ring_bytes, max(1 << 20, window)),
         )
+        ev = _mask_eval(ev, tr.eval_data, tr.doc_masking)
         if eval_only:
             return None, ev
         if not tr.data:
@@ -912,6 +1050,7 @@ def open_streams(
             f"and `over N B` counts distinct bytes only. Escape: shrink eval_bytes "
             f"below {1 << 20} B, or point eval_data at a larger held-out file."
         )
+    ev = _mask_eval(ev, tr.data, tr.doc_masking)
     if eval_only:
         return None, ev
     train = ByteStream(

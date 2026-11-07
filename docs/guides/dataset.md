@@ -59,8 +59,27 @@ file:
 <data>.bin.docs.json  {"version": 1, "size": <bytes>, "starts": [0, 6295756, ...]}
 ```
 
-`open_streams` refuses loudly when the sidecar is missing. As of 2026-10-26 only
-`web.bin` and `reasoning.bin` carry one.
+`open_streams` refuses loudly when the sidecar is missing. The boundary set is
+produced by `scripts/build_doc_sidecar.py` from the source records, never
+guessed: parquet/jsonl domains replay the exact rows the builder wrote
+(`--domain code|math|wiki_ru|instruct`), whole-file shards are matched by head,
+tail and full content (`--source-dir`), and a flat concatenation with no record
+token is REFUSED (`--refuse --reason ...`). `scripts/docmask_audit.py` prints
+the per-source verdict (REAL / BOGUS / MISSING / REFUSED-BY-BUILDER); a BOGUS
+sidecar cuts at file seams, not document seams.
+
+Current state of `mix_v7`: **9/12 sources REAL, 23.17 GB = 96.8%** — fwedu,
+cosmo, ru, math, finemath, science, code, wiki_ru, instruct. `wiki_en`,
+`reasoning` and `rudialog` (762 MB, 3.2%) are REFUSED-BY-BUILDER: each mix4
+shard is a flat concatenation of many articles/traces/dialogues with no record
+token, and the 6.3 MB file seams are the BOGUS sidecars this gate deletes.
+`configs/mix_v7_docmask.toml` is mix_v7 with those three sources removed and
+the stage weights renormalized.
+
+Eval keeps the fixed `eval_bytes` window (the recorded, comparable number). If a
+sidecar sits beside the eval file, the eval masks the SAME cross-document
+targets train does (`eval_docmask=sidecar`); otherwise it stays flat and the eval
+line says `eval_docmask=flat (no sidecar)` rather than inventing boundaries.
 
 `doc_masking` requires the dropless route (`moe_capacity=0`): the capacity-padded
 dispatch picks which rows an expert keeps from the whole batch, so a padded row
@@ -71,12 +90,13 @@ on the forward. The config refuses the pair.
 
 ```bash
 # single domain, long context, document masking
-dormouse train medium --set data=data_local/mix4/web.bin \
-  --set data_local/mix4/web.bin --set doc_masking=true --set moe_capacity=0.0 \
+dormouse train medium --set data=data_local/mix4/code.bin \
+  --set doc_masking=true --set moe_capacity=0.0 \
   --set seq_len=8192 --set max_seq_len=8192
 
-# multi-domain with the staged recipe (no doc_masking: its sidecars are per file)
-dormouse train medium --set mix_plan=port/configs/mix_v4.toml
+# multi-domain, document masking (only sources with a REAL sidecar)
+dormouse train flagship3_dense --set mix_plan=port/configs/mix_v7_docmask.toml \
+  --set doc_masking=true --eval data_local/mix4/web_eval.bin
 ```
 
 `mix_plan` and `data` are mutually exclusive: the plan owns the streams and the
