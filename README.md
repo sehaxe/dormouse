@@ -11,8 +11,10 @@ claim measured, and every retraction kept.**
 [![CUDA](https://img.shields.io/badge/CUDA-sm_120-green.svg)](https://developer.nvidia.com/cuda-gpus)
 [![burn](https://img.shields.io/badge/burn-0.22.0--pre.4-red.svg)](https://github.com/burn-rs/burn)
 
-Rust · burn + cubecl · one RTX 5060 Ti (16 GB, sm_120) · 6 workspace crates +
-a 20-crate vendored kernel library
+**Two lanes:** `python/` is the live one (config, model, trainer, post-training).
+`crates/` is the Rust/burn lane — **frozen** since 2026-11-07: it compiles and its
+tests run, but no new work lands there until the Python lane's numbers settle.
+One RTX 5070 Ti (16 GB, sm_120).
 
 </div>
 
