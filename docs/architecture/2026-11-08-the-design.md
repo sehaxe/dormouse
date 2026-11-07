@@ -80,3 +80,36 @@ A 1B model trained on 22-88 GB of bytes will sit at GPT-2-small-class loss and
 below frontier models on knowledge. What it *can* win: efficiency per FLOP, 1M
 context at constant memory, byte-level multilingual behaviour, and cost. Those are
 the four claims this design is built to make.
+
+## Do we need a tokenizer? (owner question, 2026-11-08)
+
+The evidence says: **a tokenizer wins at equal FLOPs, and loses at equal
+parameters** — and we are parameter-bound at 95M, not FLOP-bound (the card is
+idle 87% of a warm step).
+
+Cost of a tokenizer at OUR size, computed from `d_model=832`:
+
+| vocab | embedding params | share of a 95M model | bytes/position |
+|---|---:|---:|---:|
+| 4 096 | 3.4M | 3.6% | ~4 |
+| 16 384 | 13.6M | 14.3% | ~4 |
+| **32 768** | **27.3M** | **28.7%** | ~4 |
+| 65 536 | 54.5M | 57.4% | ~4 |
+| 128 000 | 106.5M | 112.1% | ~4 |
+
+So a 32k BPE tokenizer takes **29% of a 95M model** and buys 4 bytes/position.
+A factored embedding (vocab × 64 + 64 × d) costs 2.2M instead of 27.3M — 2.3% —
+which makes the tokenizer affordable when and only when it is factored.
+
+Byte patching at 8 bytes/position costs **0 embedding parameters** and 2.9% of
+the step in codec FLOPs, and gives **twice** the bytes per position of BPE.
+
+**Therefore:** at ≤400M, patching dominates a plain tokenizer on every axis we can
+measure (parameters, bytes/position, codec cost). A tokenizer becomes the better
+choice only if E1 shows patches cost quality — and then only with a factored
+embedding, never a plain 32k×832 table.
+
+The literature agrees on the direction and disagrees on the crossover: byte-level
+models lose at equal FLOPs below 1B (2610.05978v1) and BLT overtakes BPE at ~7B
+(2412.09871). Patching is the attempt to move that crossover below 100M by making
+one position worth 8 bytes without a vocabulary.
