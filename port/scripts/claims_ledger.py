@@ -89,14 +89,34 @@ RETRACTED_NUMBERS = (
     ("bpb", 6.453, r"engram", "the memory-enabled run scored by a memory-disabled eval"),
     ("params", 7_500_000, r"small", "pre-2026-09-27 repricing (`small` = 7.5M)"),
     ("params", 12_200_000, r"base", "pre-2026-09-27 repricing (`base` = 12.2M)"),
-    ("ratio", 11.2, r"fused|kda", "only the forward claim survives; the fwd+bwd bench ran the tensor adjoint"),
-    ("speed", 956.0, r"kda|no-kda|ablation", "measured alongside a live run: a ratio, not an absolute"),
-    ("speed", 188.0, r"kda|no-kda|ablation", "measured alongside a live run: a ratio, not an absolute"),
+    (
+        "ratio",
+        11.2,
+        r"fused|kda",
+        "only the forward claim survives; the fwd+bwd bench ran the tensor adjoint",
+    ),
+    (
+        "speed",
+        956.0,
+        r"kda|no-kda|ablation",
+        "measured alongside a live run: a ratio, not an absolute",
+    ),
+    (
+        "speed",
+        188.0,
+        r"kda|no-kda|ablation",
+        "measured alongside a live run: a ratio, not an absolute",
+    ),
     ("speed", 8303.0, r"opt|optimizer", "step-0 warmup artifact (opt is 43 ms warm)"),
     ("speed", 10809.0, r"opt|optimizer", "step-0 warmup artifact (step is ~245 ms warm)"),
     ("ratio", 1.7, r"fused", "`fused` whole-loop was 1.3x SLOWER at flagship (ADR-0009; §3.2)"),
     ("ratio", 2.0, r"fused", "`fused` whole-loop was 1.3x SLOWER at flagship (ADR-0009; §3.2)"),
-    ("delta", 0.026, r"gr|gated residual", "the GR readout ran before the write; the arm has never been A/B'd"),
+    (
+        "delta",
+        0.026,
+        r"gr|gated residual",
+        "the GR readout ran before the write; the arm has never been A/B'd",
+    ),
 )
 
 # A qualifier on the line means the document knows it is quoting the
@@ -251,7 +271,9 @@ def _params_value(raw: str, suffix: str | None) -> float:
 def _is_delta(prefix: str, suffix: str) -> bool:
     if re.search(r"[±+−~-]\s*$", prefix):
         return True
-    return bool(re.match(r"\s*(?:BPB\s+)?(?:away|above|below|worse|better|gap|premium|spread|band)", suffix))
+    return bool(
+        re.match(r"\s*(?:BPB\s+)?(?:away|above|below|worse|better|gap|premium|spread|band)", suffix)
+    )
 
 
 def _metric(context: str) -> str:
@@ -459,7 +481,10 @@ def _cell_claims(
                     doc=doc,
                     line=lineno,
                     raw=raw.strip(),
-                    value=_params_value(m.group("v") + ("" if not m.group("f") else "." + m.group("f")), m.group("suf")),
+                    value=_params_value(
+                        m.group("v") + ("" if not m.group("f") else "." + m.group("f")),
+                        m.group("suf"),
+                    ),
                     unit="params",
                     kind="",
                     evidence=list(ev),
@@ -554,7 +579,11 @@ def iter_claims(path: Path, doc: str) -> list[Claim]:
                 intro = []
             ev = _evidence(_clean(line))
             if ev:
-                intro = [r for r in dict.fromkeys(ev) if r.split(":")[0] in ("log", "checkpoint", "config")]
+                intro = [
+                    r
+                    for r in dict.fromkeys(ev)
+                    if r.split(":")[0] in ("log", "checkpoint", "config")
+                ]
                 intro_lines = lineno
             elif lineno - intro_lines > 6:
                 intro = []
@@ -582,7 +611,10 @@ class Artifacts:
         self._run_cache: dict[tuple[str, int], dict] = {}
 
     def _find_python(self) -> str:
-        for c in (self.repo / "port" / ".venv" / "bin" / "python", self.repo / ".venv" / "bin" / "python"):
+        for c in (
+            self.repo / "port" / ".venv" / "bin" / "python",
+            self.repo / ".venv" / "bin" / "python",
+        ):
             if c.exists():
                 return str(c)
         return sys.executable
@@ -881,22 +913,26 @@ def retraction(claim: Claim, arts: Artifacts) -> str:
     if claim.unit != "params":
         for n in _run_names(claim):
             if n in RETRACTIONS:
-                return "%s (%s)" % RETRACTIONS[n]
+                return "{} ({})".format(*RETRACTIONS[n])
             for key, (reason, cite) in RETRACTIONS.items():
                 if n.startswith(key):
-                    return "%s (%s)" % (reason, cite)
+                    return f"{reason} ({cite})"
 
     # Pre-fix in-VRAM Engram: the eval forward passed hashed_ids=None. The
     # config says whether the arm was in VRAM; the doc date says whether the
     # fix had landed. A speed claim is not an eval reading, so it survives.
-    if claim.unit in ("bpb", "ratio", "delta") and doc_date(claim.doc) and doc_date(claim.doc) < ENGRAM_FIX_DATE:
+    if (
+        claim.unit in ("bpb", "ratio", "delta")
+        and doc_date(claim.doc)
+        and doc_date(claim.doc) < ENGRAM_FIX_DATE
+    ):
         cfg = arts.config_for(claim)
         if cfg is not None:
             run = derive_config_run(cfg)
             if run.get("use_engram") and run.get("engram_ram") is False:
                 return (
                     "in-VRAM Engram eval defect: `use_engram=true`, `engram_ram=false` "
-                    "in %s, before 7adda92 (AGENTS.md §3.2)" % cfg.name
+                    f"in {cfg.name}, before 7adda92 (AGENTS.md §3.2)"
                 )
 
     low = (claim.context + " " + claim.col).lower()
@@ -1002,10 +1038,8 @@ def verify(claim: Claim, arts: Artifacts) -> None:
             hit = [(r, p) for r, p in resolved if p is not None]
             missing = [r for r, p in resolved if p is None]
             if hit and claim.is_delta and len(hit) >= 2:
-                (r1, p1), (r2, p2) = hit[0], hit[1]
-                got, why, rec = derive_bpb_pair(
-                    p1, p2, arts.evals(p1), arts.evals(p2), claim.step
-                )
+                (_r1, p1), (_r2, p2) = hit[0], hit[1]
+                got, why, rec = derive_bpb_pair(p1, p2, arts.evals(p1), arts.evals(p2), claim.step)
                 if got is None:
                     if not retract:
                         claim.status = "UNVERIFIABLE"
@@ -1069,7 +1103,7 @@ def verify(claim: Claim, arts: Artifacts) -> None:
                     claim.missing = "a ratio delta needs the two ratios it subtracts; none named"
                 return
             if len(hit) >= 2:
-                (r1, p1), (r2, p2) = hit[0], hit[1]
+                (_r1, p1), (_r2, p2) = hit[0], hit[1]
                 v1, w1 = derive_speed(p1, "s_per_step")
                 v2, w2 = derive_speed(p2, "s_per_step")
                 if v1 and v2:
@@ -1190,8 +1224,10 @@ def render(claims: list[Claim], args, gate: list[Claim]) -> str:
         "named), **speculation** (nothing is named)."
     )
     w("")
-    w("Scope is `docs/reviews/**/*.md` and `docs/research/**/*.md`; this ledger "
-      "excludes itself, since its own appendix is a list of claims.")
+    w(
+        "Scope is `docs/reviews/**/*.md` and `docs/research/**/*.md`; this ledger "
+        "excludes itself, since its own appendix is a list of claims."
+    )
     w("")
     w("Verification is mechanical and deliberately narrow:")
     w("")
@@ -1271,10 +1307,7 @@ def render(claims: list[Claim], args, gate: list[Claim]) -> str:
     )
     w("")
     if gate:
-        w(
-            f"**FAIL — {len(gate)} new claim(s) name no evidence.** "
-            f"`--check` exits 1."
-        )
+        w(f"**FAIL — {len(gate)} new claim(s) name no evidence.** `--check` exits 1.")
         w("")
         for c in gate:
             w(f"* `{c.doc}:{c.line}` — {c.raw} ({c.unit})")
@@ -1288,8 +1321,10 @@ def render(claims: list[Claim], args, gate: list[Claim]) -> str:
     w("")
     risks = sorted([c for c in claims if c.mismatch], key=lambda c: (-c.rel, c.doc, c.line))
     if not risks:
-        w("None. Every claim the ledger could re-derive agrees with its artifact "
-          "within the stated floor.")
+        w(
+            "None. Every claim the ledger could re-derive agrees with its artifact "
+            "within the stated floor."
+        )
     else:
         by_doc: dict[str, list[Claim]] = defaultdict(list)
         for c in risks:
@@ -1441,7 +1476,8 @@ def run(args) -> tuple[list[Claim], list[Claim]]:
     gate = [
         c
         for c in claims
-        if doc_date(c.doc) and doc_date(c.doc) >= args.today
+        if doc_date(c.doc)
+        and doc_date(c.doc) >= args.today
         and c.status == "UNVERIFIABLE"
         and not c.evidence
     ]
@@ -1449,14 +1485,20 @@ def run(args) -> tuple[list[Claim], list[Claim]]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Ledger of every numeric claim in docs/reviews and docs/research.")
+    ap = argparse.ArgumentParser(
+        description="Ledger of every numeric claim in docs/reviews and docs/research."
+    )
     ap.add_argument("--docs", default="docs", help="docs root (scans reviews/ and research/)")
     ap.add_argument("--repo", default=".", help="root the evidence paths resolve against")
-    ap.add_argument("--today", default="2026-11-07", help="the gate's date; docs dated today or later are new")
+    ap.add_argument(
+        "--today", default="2026-11-07", help="the gate's date; docs dated today or later are new"
+    )
     ap.add_argument("--out", default="", help="write the markdown here (default stdout)")
     ap.add_argument("--csv", default="", help="write every claim as CSV")
     ap.add_argument("--no-params", action="store_true", help="skip the param-count subprocess")
-    ap.add_argument("--python", default=None, help="interpreter that can import dormouse (default: repo venv)")
+    ap.add_argument(
+        "--python", default=None, help="interpreter that can import dormouse (default: repo venv)"
+    )
     ap.add_argument("--commit", default="", help="commit named in the header")
     ap.add_argument("--check", action="store_true", help="exit 1 when the gate fails")
     args = ap.parse_args(argv)
@@ -1481,13 +1523,40 @@ def main(argv: list[str] | None = None) -> int:
         with Path(args.csv).open("w", newline="", encoding="utf-8") as fh:
             wr = csv.writer(fh)
             wr.writerow(
-                ["doc", "line", "raw", "value", "unit", "quantity", "kind", "status",
-                 "derived", "delta", "rel", "evidence", "missing", "reason"]
+                [
+                    "doc",
+                    "line",
+                    "raw",
+                    "value",
+                    "unit",
+                    "quantity",
+                    "kind",
+                    "status",
+                    "derived",
+                    "delta",
+                    "rel",
+                    "evidence",
+                    "missing",
+                    "reason",
+                ]
             )
             for c in claims:
                 wr.writerow(
-                    [c.doc, c.line, c.raw, c.value, c.quantity, c.kind, c.status, c.derived,
-                     c.delta, f"{c.rel:.3f}", " ".join(c.evidence), c.missing, c.reason]
+                    [
+                        c.doc,
+                        c.line,
+                        c.raw,
+                        c.value,
+                        c.quantity,
+                        c.kind,
+                        c.status,
+                        c.derived,
+                        c.delta,
+                        f"{c.rel:.3f}",
+                        " ".join(c.evidence),
+                        c.missing,
+                        c.reason,
+                    ]
                 )
 
     t = _totals(claims)
@@ -1502,13 +1571,16 @@ def main(argv: list[str] | None = None) -> int:
 
 def _git_commit(repo: Path) -> str:
     try:
-        return subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        ).stdout.strip() or "unknown"
+        return (
+            subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            ).stdout.strip()
+            or "unknown"
+        )
     except (OSError, subprocess.TimeoutExpired):
         return "unknown"
 
