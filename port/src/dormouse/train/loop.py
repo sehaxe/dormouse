@@ -887,6 +887,15 @@ def _eval_loss(
     depths and the one generation reads. `per_iter_mean` averages the
     per-iteration CEs over the batch — the deep-supervision shape.
 
+    Every mean is over the SCORED BYTES, not over the batches: a masked window
+    (doc_masking) scores a different number of positions per batch, and
+    averaging per-batch means weights a 123-position batch the same as a
+    125-position one whose content is 0.82 nats apart. Measured 2026-11-07 on
+    the `test_invariants_eval` fixture: the mean-of-means read 9.070214 BPB
+    where the same window's scored bytes read 9.073532 — 0.0033 BPB, 330x the
+    audit's 1e-5 gate. The flat path has equal batch sizes and keeps its
+    pre-fix arithmetic exactly (weight 1 per batch), so no flat number moves.
+
     `counters`, when given, receives THIS eval's own arm counters (the eval
     forward's `engram_rows`/`engram_arms` — the `engram=` field the eval line
     prints). They are the eval's, not the run's: a training counter would say
@@ -896,6 +905,7 @@ def _eval_loss(
     stream.rewind()
     total = 0.0
     scored = 0
+    weight_total = 0
     fin_total = 0.0
     per_iter_acc: list[float] = []
     was_training = model.training
@@ -928,17 +938,27 @@ def _eval_loss(
                 x, y, loss_mask=mask, pure=True, breakdown=True, counters=ev_counters, **kw
             )
             assert loss is not None, "an eval batch must carry targets"
-            total += float(loss)
-            scored += int(mask.sum()) if mask is not None else int(x.numel())
+            if mask is None:
+                # The flat path keeps the pre-fix arithmetic EXACTLY (weight 1
+                # per batch): a constant multiply would be a needless last-bit
+                # change to every number on record.
+                w = 1
+                scored += int(x.numel())
+            else:
+                w = int(mask.sum())
+                assert w > 0, "a masked batch with no scored position is not a measurement"
+                scored += w
+            weight_total += w
+            total += float(loss) * w
             bd = getattr(model, "last_breakdown", None)
             if bd is not None:
-                fin_total += bd["fin"]
+                fin_total += bd["fin"] * w
                 per = bd["per_iter"]
                 if not per_iter_acc:
                     per_iter_acc = [0.0] * len(per)
                 for i, v in enumerate(per):
-                    per_iter_acc[i] += v
-    n = max(batches, 1)
+                    per_iter_acc[i] += v * w
+    assert weight_total > 0, "an eval over zero scored bytes is not a measurement"
     if getattr(stream, "eval_tail_capped", None) is not None:
         # The tail is capped below the requested window, so the stream wrapped
         # and `scored` above counts duplicate rows. The printed figure is the
@@ -953,10 +973,10 @@ def _eval_loss(
     if counters is not None:
         counters.merge(ev_counters)
     return (
-        total / n,
+        total / weight_total,
         scored,
-        fin_total / n,
-        [v / n for v in per_iter_acc],
+        fin_total / weight_total,
+        [v / weight_total for v in per_iter_acc],
     )
 
 
@@ -1367,6 +1387,25 @@ def train(
         )
     elif resume:
         ck, _stored = load_ckpt(run)
+        start = int(ck["step"]) + 1
+        if start > cfg.steps:
+            # `steps` is a PROGRESS KEY, so a resume may extend it — and a resume
+            # at exactly the checkpoint's step is a legal LOAD (zero steps, but
+            # `steps == opt_steps`, so the report is true; `test_train4`'s EMA
+            # read uses it). A `steps` BEHIND the checkpoint is different: it
+            # would report fewer steps than the optimizer has taken and move
+            # nothing (measured 2026-11-07: a step-15 checkpoint resumed with
+            # steps=10 returned `{"steps": 10, "opt_steps": 15}`). LOUD, before
+            # the model is touched.
+            loud(
+                f"resume: the checkpoint is at step {start} and steps={cfg.steps} "
+                f"is behind it: the loop range [{start}, {cfg.steps}) is empty and "
+                f"the report would claim a {cfg.steps}-step run from a file whose "
+                f"optimizer is at step {start}. Escape: --set steps=N with N >= "
+                f"{start} (N == {start} is the completed run), or omit --resume to "
+                f"start a new run (a different `steps` re-plans the decay from this "
+                f"checkpoint, it does not rewind it)."
+            )
         load_model_state(model, cfg, ck["model"])
         opt.load_state_dict(ck["opt"])
         # `ns_steps` is a PROGRESS key, but torch's loader has just replaced
@@ -1374,7 +1413,6 @@ def train(
         # count or the A/B would silently keep the old chain while the snapshot
         # reported the new one.
         opt.set_ns_steps(cfg.ns_steps)
-        start = int(ck["step"]) + 1
         resumed_ema = ck.get("model_ema") if cfg.ema_decay > 0.0 else None
         if start:
             # A resumed run must continue on UNSEEN bytes: the burn failure
