@@ -1709,9 +1709,17 @@ class MixOptimizer:
         muon_sf_wd: float | None = None,
         muon_chunk_elems: int = MUON_CHUNK_ELEMS,
         tsct_expert_lr: float = 0.0,
+        muon_lr_mult: float = 1.0,
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
+        if not (muon_lr_mult > 0.0):
+            loud(
+                f"muon_lr_mult={muon_lr_mult}: the Muon half's LR is "
+                f"`lr * muon_lr_mult`, so a value <= 0 would freeze it or flip "
+                f"the sign. Escape: muon_lr_mult>0 (1.0 = the historical "
+                f"shared-LR behaviour)."
+            )
         if tsct_expert_lr < 0.0:
             loud(
                 f"tsct_expert_lr={tsct_expert_lr} is negative: it is a multiplier "
@@ -1780,7 +1788,14 @@ class MixOptimizer:
         self.muon = (
             Muon(
                 muon_params,
-                lr=lr,
+                # The Muon half's OWN LR. Measured 2026-11-06: at a shared
+                # `lr` the Muon update is 8x-52x smaller in RMS than AdamW's on
+                # the real shapes, and delivers 0.7%-17% of AdamW's first-order
+                # loss decrease — an effective LR of 3e-6..8e-5 instead of 5e-4.
+                # Muon's own published default is 0.02, i.e. 40x our lr; the
+                # multiply is the seam that makes that reachable without moving
+                # the AdamW half. 1.0 is the historical behaviour, bit-identical.
+                lr=lr * muon_lr_mult,
                 momentum=momentum,
                 ns_steps=ns_steps,
                 ns_kind=ns_kind,

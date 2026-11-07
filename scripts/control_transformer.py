@@ -212,6 +212,8 @@ def main() -> int:
     ap.add_argument("--save", type=Path, default=None,
                     help="write the final weights (for a multi-window eval)")
     ap.add_argument("--tag", default="control")
+    ap.add_argument("--vram-gib", type=float, default=2.5,
+                    help="hard allocator cap; raise it when no other job owns the card")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -221,7 +223,7 @@ def main() -> int:
         # Hard ceiling: the live flagship job owns this card. 2.5 GB is ~3x this
         # control's real footprint, and a runaway allocation dies HERE, not in
         # the 100M run it would otherwise evict.
-        torch.cuda.set_per_process_memory_fraction(2.5 / 16.0)
+        torch.cuda.set_per_process_memory_fraction(args.vram_gib / 16.0)
         torch.set_float32_matmul_precision("high")
     else:
         device = torch.device("cpu")

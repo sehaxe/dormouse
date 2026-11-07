@@ -1116,6 +1116,7 @@ def sft_train(
         muon_sf=cfg.muon_sf,
         muon_sf_wd=cfg.muon_sf_wd,
         muon_chunk_elems=cfg.muon_chunk_elems,
+        muon_lr_mult=cfg.muon_lr_mult,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
