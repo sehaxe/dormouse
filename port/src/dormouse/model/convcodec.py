@@ -115,9 +115,15 @@ __all__ = [
 #: Raw-byte vocabulary (next-byte LM), identical to `byteflow.VOCAB`.
 VOCAB = 256
 
-#: MAC per latent of the weight-shared loop this codec feeds (d=1024, 3
-#: iterations; the measured figure named in the module docstring).
-LOOP_MAC_PER_LATENT = 24_100_000
+#: MAC per latent of the weight-shared loop this codec feeds at d=1024, 3
+#: iterations (the measured figure named in the module docstring).
+LOOP_MAC_PER_LATENT_1024 = 24_100_000
+#: The SAME loop at the preset that actually runs (d_global=1536): the block's
+#: MACs scale as d^2, so (1536/1024)^2 = 2.25x. Using the 1024 figure as the
+#: ceiling let the codec spend 2.25x more than the 2% rule allows — found by the
+#: numerics audit, 2026-11-08. The gate now names the shape it is priced at.
+LOOP_D_GLOBAL = 1536
+LOOP_MAC_PER_LATENT = LOOP_MAC_PER_LATENT_1024 * (LOOP_D_GLOBAL / 1024) ** 2
 
 #: The codec may spend at most 2 % of the loop's MACs per patch. The test
 #: asserts the estimate stays under it; a future edit that adds a per-byte
@@ -254,6 +260,13 @@ class ConvCodec(nn.Module):
         # [(i-1)s, is-1]; patch 0's window is the left pad.
         prev = F.pad(x, (self.patch_bytes, 0))
         p = F.gelu(self._conv(self.patchify, prev, stride=self.patch_bytes))
+        # pad(t + s) with kernel s and stride s yields t/s + 1 columns: the last
+        # one reads the pad alone, and with K < P the selection indexes it out of
+        # bounds (data-dependent 'index P out of bounds', numerics audit
+        # 2026-11-08). Trim to the number of PATCHES the window actually holds.
+        want = x.shape[-1] // self.patch_bytes
+        if p.shape[-1] != want:
+            p = p[..., :want]
         for conv in self.convs:
             p = p + F.gelu(self._conv(conv, F.pad(p, (2, 0))))
         return p.transpose(1, 2)
