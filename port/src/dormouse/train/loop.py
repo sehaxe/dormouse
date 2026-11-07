@@ -50,6 +50,7 @@ from .data import (
     ByteStream,
     distinct_scored_bytes,
     eval_batches_for,
+    eval_train_overlap,
     eval_window_bytes,
     open_streams,
     warmup_steps,
@@ -1166,6 +1167,21 @@ def train(
             )
         else:
             stream, eval_stream = open_streams(run)
+    if eval_stream is not None:
+        # THE NO-LEAK GATE (`eval_data` and `mix_plan` were trusted): the eval
+        # window must not be bytes the train stream reads. Same file, by inode —
+        # two paths can name one file, and a BPB scored on bytes the run trained
+        # on is not held out. The single-file split already makes this 0; the
+        # check is what says so for the other two modes.
+        leaked, where = eval_train_overlap(cfg, stream, eval_stream)
+        if leaked:
+            loud(
+                f"eval/train overlap: {leaked} B of the held-out eval window are also "
+                f"read by the training stream ({where}). A BPB from this run is not "
+                f"held out. Escape: point `eval_data` at a file no training source "
+                f"reads (the night recipe uses data_local/mix4/web_eval.bin), or drop "
+                f"that source from the plan."
+            )
     if cfg.doc_masking:
         # The arm's own line: which reader ran and what it does. The row shape
         # is the whole mechanism, so a reader does not have to infer it from the
