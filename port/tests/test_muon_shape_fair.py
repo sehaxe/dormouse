@@ -18,8 +18,6 @@ CPU only: the optimizer is device-agnostic, and these are 2-D matrices.
 
 from __future__ import annotations
 
-import math
-
 import torch
 
 from dormouse.train.optim import MixOptimizer
@@ -38,6 +36,8 @@ class _Model(torch.nn.Module):
         # One 1-D parameter so the AdamW half has something: MixOptimizer splits
         # by rank, and torch refuses an empty parameter list.
         self.register_parameter("bias", torch.nn.Parameter(torch.zeros(4)))
+
+
 LR = 3e-4
 
 

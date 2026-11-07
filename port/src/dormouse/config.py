@@ -2735,9 +2735,7 @@ def validate_ffn(model: ModelConfig) -> None:
                 f"and this form has none. Escape: moe_lb_mode='sign' with "
                 f"moe_lb_coef=0, or ffn_form='bank'."
             )
-        if model.moe_lb_coef != 0.0 or (
-            model.moe_lb_mode == "prop" and model.moe_lb_gamma != 0.0
-        ):
+        if model.moe_lb_coef != 0.0 or (model.moe_lb_mode == "prop" and model.moe_lb_gamma != 0.0):
             loud(
                 f"ffn_form='dense' with a live LFB controller "
                 f"(moe_lb_mode={model.moe_lb_mode!r}, coef={model.moe_lb_coef}, "
@@ -2803,9 +2801,7 @@ def validate_ffn(model: ModelConfig) -> None:
             f"{model.moe_aux_coef}: the TSCT dispatch has no Switch/GShard term. "
             f"Escape: moe_lb_mode='sign' with moe_lb_coef=0, or ffn_form='bank'."
         )
-    if model.moe_lb_coef != 0.0 or (
-        model.moe_lb_mode == "prop" and model.moe_lb_gamma != 0.0
-    ):
+    if model.moe_lb_coef != 0.0 or (model.moe_lb_mode == "prop" and model.moe_lb_gamma != 0.0):
         loud(
             f"ffn_form='tsct' with a live LFB controller "
             f"(moe_lb_mode={model.moe_lb_mode!r}, coef={model.moe_lb_coef}, "
@@ -3635,8 +3631,7 @@ def validate(model: ModelConfig) -> None:
             model.moe_gather == "kernel"
             or model.moe_kernel == "triton"
             or (
-                model.moe_capacity == 0
-                and model.moe_kernel not in ("batched", "bucketed", "naive")
+                model.moe_capacity == 0 and model.moe_kernel not in ("batched", "bucketed", "naive")
             )
         )
         if not reachable:

@@ -940,9 +940,7 @@ class Muon(Optimizer):
         self.chunk_elems = chunk_elems
         super().__init__(params, dict(lr=lr, momentum=momentum, ns_steps=ns_steps))
         if (sf or variant != "muon") and any(
-            _is_packed_matrix_batch(p)
-            for group in self.param_groups
-            for p in group["params"]
+            _is_packed_matrix_batch(p) for group in self.param_groups for p in group["params"]
         ):
             loud(
                 "a packed 3-D bank (`tsct_packed`) with "
@@ -1068,9 +1066,7 @@ class Muon(Optimizer):
                         else:
                             ids.append(1 + base + int(p._tsct_index))
                     if any(ids):
-                        grp.tsct_ids = torch.tensor(
-                            ids, dtype=torch.int64, device=params[0].device
-                        )
+                        grp.tsct_ids = torch.tensor(ids, dtype=torch.int64, device=params[0].device)
                 self._groups.append(grp)
 
     def load_state_dict(self, state_dict) -> None:  # noqa: D102 - torch's contract
@@ -1468,11 +1464,7 @@ class Muon(Optimizer):
                     self._nor_batched(grp, start, len(params_c), params_c, update, lr, flag)
                     continue
                 k = pieces.shape[0]
-                row = (
-                    grp.tsct_row[start : start + k]
-                    if grp.tsct_row is not None
-                    else None
-                )
+                row = grp.tsct_row[start : start + k] if grp.tsct_row is not None else None
                 jobs.append((params_c, pieces, lr, scale, ns, False, row, grp.packed))
             n_batches += 1
 
