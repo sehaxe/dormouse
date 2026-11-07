@@ -113,8 +113,8 @@ class RLConfig:
     #: The loss normaliser: "prompt-mean" (this lane's rule) or "token-mean" (the
     #: control arm the notes' §4.2 A/B names).
     agg: str = "prompt-mean"
-    #: The counterfactuals a call-bearing turn needs before `agent_rl` believes
-    #: its fork-replay mean. 1 is the floor: with none the "advantage" would be
+    #: The counterfactuals a call-bearing turn needs before a fork-replay
+    #: estimator believes its mean. 1 is the floor: with none the "advantage" would be
     #: the raw pass flag, i.e. the fork estimator silently replaced by another.
     min_replays: int = 1
 

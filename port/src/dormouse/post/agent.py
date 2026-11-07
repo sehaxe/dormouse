@@ -24,9 +24,10 @@ observation. Four things make that trainable and all four are here:
   turn (reporting the turn count — never an infinite loop, never a silent
   truncation).
 
-Credit assignment is the other half and lives in `post/agent_rl.py`: the fork
-for a turn is the transcript prefix, so the advantage is
-`pass(actual) - mean(pass(replayed continuations))` per call-bearing turn.
+Credit assignment is the other half, and the fork-replay estimator that used to
+live in `post/agent_rl.py` was deleted 2026-11-08: it had no caller outside its
+own test (deletion audit, C4). A future estimator starts from the trajectory
+type here, not from that module.
 """
 
 from __future__ import annotations

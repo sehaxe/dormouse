@@ -37,7 +37,6 @@ from dormouse.post.agent import (
     calc_tool,
     parse_turn,
 )
-from dormouse.post.agent_rl import trajectory_advantages
 from dormouse.post.rl import RLConfig
 from dormouse.post.tasks import Task
 from dormouse.post.verifiers import Verdict
@@ -359,71 +358,6 @@ def test_pure_is_the_only_unsourced_callable():
     pure = Tool(mul.name, mul.schema, mul.fn, pure=True)
     traj = _trajectory(b'\x04mul\x05{"a": 2, "b": 3}\x06answer: 6\x03', expected="6", tools=[pure])
     assert traj.turns[0].observation == b"6"
-
-
-# --------------------------------------------------------------------------- (3) the credit
-
-
-def test_trajectory_advantages_match_hand_computed_values(capsys):
-    traj = _trajectory(CALL_CALC + ANSWER_4)  # one call turn (0), one answer turn (1)
-    adv = trajectory_advantages(traj, {0: [True, False]})
-    with capsys.disabled():
-        print(
-            "\nhand fixture: actual passed, turn 0 replays [True, False] -> 1 - 0.5 = 0.5;"
-            f" turn 1 made no call\n  {[(a.turn, a.span, a.weight, a.source) for a in adv]}"
-        )
-    assert [a.turn for a in adv] == [0, 0, 1, 1]
-    assert [a.weight for a in adv] == [0.5, 0.5, 0.0, 0.0]
-    assert [a.source for a in adv] == ["fork", "fork", "no_call", "no_call"]
-    assert adv[0].span[0] < adv[1].span[0], "the assistant span precedes the call span"
-    assert [a.span for a in adv[2:]] == list(traj.turns[1].supervised)
-
-    # A failing actual: 0 - mean([True, True, True, False]) = -0.75.
-    failing = _trajectory(CALL_CALC + ANSWER_4, expected="5")
-    adv = trajectory_advantages(failing, {0: [True, True, True, False]})
-    assert [a.weight for a in adv[:2]] == [-0.75, -0.75]
-    assert traj.passed is True and failing.passed is False
-
-
-def test_a_turn_that_is_not_a_fork_has_zero_weight(capsys):
-    """Only turn 2 matters: turn 1 made no call, so it is not a fork and weighs 0."""
-    no_call = TurnSpan(
-        index=0, start=0, end=6, generated=b"hello", call=None, observation=None,
-        supervised=((1, 5),),
-    )
-    call = ToolCall(name="calc", args={"expr": "1"}, raw_args='{"expr": "1"}', start=8, end=20)
-    called = TurnSpan(
-        index=1, start=6, end=24, generated=b"x", call=call, observation=b"1",
-        supervised=((7, 20), (21, 23)),
-    )
-    traj = Trajectory(
-        transcript=b"hello!" + b"x" * 18,
-        turns=(no_call, called),
-        calls=(call,),
-        verdict=Verdict(True, "sympy-equivalent", 0.0),
-        answer="1",
-        stop_reason="end",
-    )
-    adv = trajectory_advantages(traj, {1: [True, False]})
-    with capsys.disabled():
-        print(f"\nonly turn 2 matters -> {[(a.turn, a.weight, a.source) for a in adv]}")
-    assert [(a.turn, a.weight, a.source) for a in adv] == [
-        (0, 0.0, "no_call"),
-        (1, 0.5, "fork"),
-        (1, 0.5, "fork"),
-    ]
-
-
-def test_a_fork_without_replays_is_loud():
-    traj = _trajectory(CALL_CALC + ANSWER_4)
-    with pytest.raises(LoudError, match="0 replayed continuation"):
-        trajectory_advantages(traj, {})
-    with pytest.raises(LoudError, match="min_replays=2"):
-        trajectory_advantages(traj, {0: [True]}, RLConfig(min_replays=2))
-    with pytest.raises(LoudError, match="turn 9"):
-        trajectory_advantages(traj, {0: [True], 9: [True]})
-    with pytest.raises(LoudError, match="made no tool call"):
-        trajectory_advantages(traj, {1: [True]})
 
 
 # --------------------------------------------------------------------------- (4) serve
