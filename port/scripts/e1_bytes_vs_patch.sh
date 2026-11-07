@@ -26,14 +26,14 @@ OUT=${OUT:-/home/sehaxe/logs/e1v2}
 mkdir -p "$OUT"
 
 BYTES=${BYTES:-250000000}   # 0.25 GB per arm per seed
-# FAST=1 runs BOTH arms on the Muon precision rung (bf16 NS, 3 steps, bf16
-# state). It must be the SAME on both arms or the A/B compares two optimizers:
+# FAST=1 runs BOTH arms on the SAFE Muon rung (bf16 NS, 5 steps, bf16 state):
+# measured 1.89x at +0.006 BPB, while ns_steps=3 costs +0.27 BPB at our shapes. It must be the SAME on both arms or the A/B compares two optimizers:
 # the rung is a training-speed change, and the patch question is about the unit
 # of computation.
 FAST=${FAST:-0}
 FOPT=()
 if [ "$FAST" = 1 ]; then
-  FOPT=(--set ns_dtype=bf16 --set ns_steps=3 --set muon_state_dtype=bf16)
+  FOPT=(--set ns_dtype=bf16 --set muon_state_dtype=bf16)
 fi
 
 run() { # tag config batch bytes_per_step seed

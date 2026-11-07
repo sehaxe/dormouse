@@ -42,6 +42,7 @@ run bf16_5  --set ns_dtype=bf16
 run fp32_3  --set ns_steps=3
 run bf16_3  --set ns_dtype=bf16 --set ns_steps=3
 run state   --set muon_state_dtype=bf16
+run safe    --set ns_dtype=bf16 --set muon_state_dtype=bf16
 
 $PY - "$OUT" <<'PY'
 import json, sys

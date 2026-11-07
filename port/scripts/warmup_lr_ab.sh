@@ -35,7 +35,7 @@ run() { # tag extra...
     --set steps=$STEPS --set batch=8 --set seq_len=1024 --set seed=1 \
     --set opt=mix --set muon_lr_mult=12 \
     --set mix_plan=configs/mix_v7.toml --set doc_masking=false \
-    --set ns_dtype=bf16 --set ns_steps=3 --set muon_state_dtype=bf16 \
+    --set ns_dtype=bf16 --set muon_state_dtype=bf16 \
     --set eval=true --set eval_every=1000 --set log_every=1000 \
     --set ckpt_every=1000000 --set out_dir=/tmp/opencode/warmup_$tag \
     --json-log "$OUT/$tag.jsonl" "$@" > "$OUT/$tag.log" 2>&1

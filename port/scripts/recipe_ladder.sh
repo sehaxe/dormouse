@@ -26,11 +26,12 @@ PY=.venv/bin/python
 OUT=/home/sehaxe/logs/ladder
 mkdir -p "$OUT"
 BYTES=${BYTES:-120000000}
-# FAST=1 runs every arm on the fast Muon rung (see e1_bytes_vs_patch.sh).
+# FAST=1 runs every arm on the SAFE Muon rung (see e1_bytes_vs_patch.sh):
+# ns_dtype=bf16 + state bf16, ns_steps stays 5.
 FAST=${FAST:-0}
 FOPT=()
 if [ "$FAST" = 1 ]; then
-  FOPT=(--set ns_dtype=bf16 --set ns_steps=3 --set muon_state_dtype=bf16)
+  FOPT=(--set ns_dtype=bf16 --set muon_state_dtype=bf16)
 fi
 STEPS=$(( BYTES / (8 * 1024) ))
 EVAL_EVERY=$(( STEPS / 4 ))
