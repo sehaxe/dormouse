@@ -1,0 +1,27 @@
+# Arch arm B: the KDA block as a 12-layer stack with an 8-expert top-2 bank.
+# The question: with a WORKING Muon (muon_lr_mult tuned) and a dense FFN, does
+# the linear-attention block beat a dense transformer at equal params and bytes?
+# Every earlier KDA verdict was measured with the Muon LR bug
+# (docs/reviews/2026-11-07-muon-audit.md), so this arm is new information.
+d_model = 832
+n_heads = 13
+head_dim = 64
+d_ffn = 2048   # 94,072,908 params total (equal-total); top-2 of 8 active
+vocab = 256
+max_seq_len = 1024
+
+block_form = "kda"
+loop_blocks = 12
+max_iter = 12
+
+ffn_form = "bank"
+use_tsct = false
+n_experts = 8
+moe_topk = 2
+
+use_csa = false
+use_mhc = false
+use_attnres = false
+use_engram = false
+layerrope = false
+bf16 = true

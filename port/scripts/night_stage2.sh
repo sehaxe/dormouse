@@ -91,7 +91,7 @@ $PY -u -m dormouse.cli train flagship3_dense \
   --set steps=${LONG_STEPS:-40000} --set batch=8 --set seq_len=1024 --set grad_accum=3 \
   --set opt=adamw --set lr=$best --set seed=1 \
   --set eval=true --set eval_every=2000 \
-  --set mix_plan=configs/mix_v7.toml --set log_every=500 \
+  --set mix_plan=configs/mix_v7_docmask.toml --set doc_masking=true --set log_every=500 \
   --set ckpt_every=5000 --set ckpt_name=flagship3 \
   --set out_dir=/tmp/opencode/flagship3 \
   --json-log "$LOG/flagship3.jsonl" > "$LOG/flagship3.log" 2>&1
