@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .. import stepaudit
-from ..config import ModelConfig, validate_block_form
+from ..config import ModelConfig, block_kinds, hybrid_ratio, validate_block_form
 from ..instrument import Counters, loud
 from ..losses import fixed_cross_entropy, logit_softcap
 from .act_mem import ActivationOffload
@@ -240,6 +240,42 @@ class DormouseModel(nn.Module):
             return
         d = cfg.d_model
         self.embed = nn.Embedding(cfg.vocab, d, device=device)
+        if cfg.block_stack != "uniform":
+            # THE HYBRID STACK (`block_stack`): the ordered mix `[K,K,K,A]×`,
+            # built from the SAME two block modules the pure forms use — a
+            # `LoopBlock` from the KDA form and a `TransformerBlock` from the
+            # control — so the A/B changes the block order, not the block.
+            # Each KDA body runs ONCE (`LoopBlock.forward(depth=1)`), which is
+            # why `max_iter=1` is a config refusal; the objective is the
+            # transformer form's single final CE, so `block_stack="uniform"`
+            # and every loop-only loss weight stay out of this path.
+            ratio = hybrid_ratio(cfg)
+            assert ratio is not None
+            self.hybrid_blocks = nn.ModuleList(
+                [
+                    LoopBlock(cfg, device=device)
+                    if kind == "kda"
+                    else TransformerBlock(cfg, n_layers=cfg.n_layers, device=device)
+                    for kind in block_kinds(cfg.n_layers, ratio)
+                ]
+            )
+            self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
+            if cfg.tie_embeddings:
+                self.lm_head = TiedHead(self.embed)
+            else:
+                head_rank = min(cfg.rank, d, cfg.vocab)
+                self.lm_head = make_projection(d, cfg.vocab, cfg, rank=head_rank, device=device)
+            # `dense_qat`/`factor_qat` are refused on this stack, so only a
+            # `use_tsct` head (itself refused here) could own a cache.
+            self._qat_caches = attach_qat_caches(self, dense=False)
+            self.bf = None
+            self._act_offload = None
+            self.halt = None
+            self.dspark = None
+            self.last_halt = None
+            self.last_breakdown = {}
+            self.last_mod_aux = None
+            return
         if cfg.block_form == "transformer":
             # THE VANILLA FORM (`block_form`, `model/transformer.py`): the same
             # embedding and the same final norm/head/CE, a stack of UNIQUE
@@ -517,6 +553,14 @@ class DormouseModel(nn.Module):
         host. A model with no loop block (`use_byteflow` Option A builds none)
         would run the flag inert, so it refuses with the escape.
         """
+        if on and self.cfg.block_stack != "uniform":
+            loud(
+                f"iter_checkpoint=true with block_stack={self.cfg.block_stack!r}: "
+                f"the checkpoint wrapper is applied to each loop ITERATION, and the "
+                f"hybrid stack's attention blocks have no loop iteration to wrap — "
+                f"the arm would cover only the KDA half while the log reported it "
+                f"on. Escape: iter_checkpoint=false."
+            )
         n = 0
         for module in self.modules():
             if isinstance(module, LoopBlock):
@@ -543,6 +587,14 @@ class DormouseModel(nn.Module):
         from .recompute import check_mode
 
         check_mode(mode)
+        if mode != "none" and self.cfg.block_stack != "uniform":
+            loud(
+                f"activation_recompute={mode!r} with block_stack="
+                f"{self.cfg.block_stack!r}: the recompute arms are wired on the KDA "
+                f"loop block only, so the attention half would keep its full save "
+                f"set while the log reported the arm on. Escape: "
+                f"activation_recompute='none'."
+            )
         n = 0
         for module in self.modules():
             if isinstance(module, LoopBlock):
@@ -587,6 +639,14 @@ class DormouseModel(nn.Module):
         if mode == "none" and iter_checkpoint:
             mode = "full"
         self.set_recompute(mode)
+        if activation_offload > 0.0 and self.cfg.block_stack != "uniform":
+            loud(
+                f"activation_offload={activation_offload} with block_stack="
+                f"{self.cfg.block_stack!r}: the saved-tensor hook pair is priced on "
+                f"the loop block's save set, and the hybrid stack's attention half "
+                f"saves a different set — the budget would park a graph nobody "
+                f"measured. Escape: activation_offload=0.0."
+            )
         if activation_offload == 0.0:
             self._act_offload = None
             return
@@ -855,6 +915,19 @@ class DormouseModel(nn.Module):
         ce_fixed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The plain byte-level stack: embedding → prelude → loop → coda → RMSNorm → lm_head."""
+        if self.cfg.block_stack != "uniform":
+            # The ordered KDA/attention stack (`block_stack`). Its own tree, so
+            # it returns before the loop's prelude/coda/MoE/aux seam.
+            return self._forward_hybrid(
+                input_ids,
+                targets,
+                counters,
+                loss_mask,
+                ce_fixed,
+                breakdown,
+                segment_len,
+                depth,
+            )
         if self.cfg.block_form == "transformer":
             # The dispatch `block_form` exists for: the SAME embedding, final norm,
             # head and CE, a different block stack (never a second model class).
@@ -1220,6 +1293,29 @@ class DormouseModel(nn.Module):
             # trainer weights it by `mod_aux_weight` and logs it as `mod_aux=`.
             mod_aux = mod_aux / len(self.transformer_blocks)
             self.last_mod_aux = mod_aux.detach()
+        logits, loss = self._readout(h, targets, counters, loss_mask, ce_fixed, breakdown)
+        if loss is not None and mod_aux is not None and self.cfg.mod_aux_weight:
+            # The paper's §3.5 aux, weighted: `CE + α·BCE(router, top-k)`.
+            # `mod_aux` stays attached so the router learns from it.
+            loss = loss + self.cfg.mod_aux_weight * mod_aux
+        return logits, loss
+
+    def _readout(
+        self,
+        h: torch.Tensor,
+        targets: torch.Tensor | None,
+        counters: Counters,
+        loss_mask: torch.Tensor | None,
+        ce_fixed: bool,
+        breakdown: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """`norm` + `lm_head` + the single final CE, shared by both STACK forms.
+
+        ONE readout for `block_form="transformer"` and `block_stack="hybrid"`:
+        the two forms differ only in the blocks, so a second copy of the head or
+        the masked/fixed CE would be a second set of rules for the same number.
+        `breakdown` is the eval-only host read (never in a training step).
+        """
         hn = self.norm(h.to(torch.float32))
         logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
         if self.cfg.logit_softcap > 0.0:
@@ -1238,14 +1334,54 @@ class DormouseModel(nn.Module):
                     ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
                 loss = masked_ce_mean(ce, loss_mask)
             if breakdown:
-                # Eval-only host read (the same contract `_forward_byte_lm`'s
-                # breakdown block documents): never in a training step.
                 self.last_breakdown = {"fin": float(loss.detach()), "per_iter": []}
-            if mod_aux is not None and self.cfg.mod_aux_weight:
-                # The paper's §3.5 aux, weighted: `CE + α·BCE(router, top-k)`.
-                # `mod_aux` stays attached so the router learns from it.
-                loss = loss + self.cfg.mod_aux_weight * mod_aux
         return logits, loss
+
+    def _forward_hybrid(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None,
+        counters: Counters,
+        loss_mask: torch.Tensor | None,
+        ce_fixed: bool,
+        breakdown: bool,
+        segment_len: int = 0,
+        depth: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """`block_stack="K:A"`: embed → ordered KDA/attention blocks → readout.
+
+        The KDA bodies are the SAME `LoopBlock` the kda form builds, run ONCE
+        (`depth=1`) each: no weight sharing, no L_Rec, so the objective is the
+        transformer form's single final CE and the two controls are one number
+        apart. The attention bodies are the control's `TransformerBlock`, init'd
+        with the residual scaling of the FULL stack depth (`n_layers`). A
+        `LoopBlock` gets `targets=None`, which is also why the deep-supervision
+        weights are refused on this stack: the blocks receive no per-pass CE.
+        """
+        if segment_len:
+            loud(
+                f"segment_len={segment_len} with block_stack="
+                f"{self.cfg.block_stack!r}: each KDA block runs once and the "
+                f"attention blocks carry no state, so there is no single "
+                f"recurrence whose state crosses a cut. Escape: segment_len=0."
+            )
+        if depth is not None:
+            loud(
+                f"depth={depth} with block_stack={self.cfg.block_stack!r}: the "
+                f"hybrid stack's depth is fixed by n_layers="
+                f"{self.cfg.n_layers}; an adaptive depth moves a LOOP's iteration "
+                f"count, and this stack has no loop. Escape: depth=None."
+            )
+        h = self.embed(input_ids)
+        for block in stepaudit.iterations("forward.hybrid_blocks", self.hybrid_blocks):
+            if isinstance(block, LoopBlock):
+                h, _, _ = block(h, input_ids, None, None, counters=counters, depth=1)
+                counters.count("hybrid_kda")
+            else:
+                h = block(h, counters)
+                counters.count("hybrid_attn")
+            counters.count("hybrid_block")
+        return self._readout(h, targets, counters, loss_mask, ce_fixed, breakdown)
 
 
 class TiedHead(nn.Module):
