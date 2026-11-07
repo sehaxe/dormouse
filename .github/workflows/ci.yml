@@ -21,6 +21,80 @@ jobs:
       - name: cli
         run: cargo check -p dormouse-cli
 
+  # ── python lane ────────────────────────────────────────────────────────────
+  # The training port had NO CI until 2026-11-07: the Rust lane was covered and
+  # every training run, every architecture A/B and every post-training path went
+  # in untested. This job is the minimum that would have caught the defects the
+  # audits found: a config field nothing reads, a doc path that does not exist,
+  # a formatter drift, and a test suite that does not pass on a clean tree.
+
+  # ── the landing page ───────────────────────────────────────────────────────
+  # `site/` is not a workspace member (it must not disturb the frozen Rust lane),
+  # so nothing at the root compiles it. Two cheap checks: the generator builds,
+  # and the committed page is a BUILT page — no `/*__DATA__*/null` placeholder
+  # can reach main, because that page would render empty and nobody would notice.
+  site:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build the generator
+        run: cd site/gen && cargo build --release
+      - name: the committed page must be generated
+        run: |
+          test -s site/index.html
+          ! grep -q '/\*__DATA__\*/null' site/index.html
+          ! grep -q '/\*__SURPRISE__\*/null' site/index.html
+          ! grep -q '/\*__SCRIPT__\*/' site/index.html
+          grep -q 'id="data"' site/index.html
+      - name: media exists
+        run: |
+          for f in rain curve heat; do test -s "site/media/$f.webm"; test -s "site/media/$f.jpg"; done
+
+  python-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+      - name: install (frozen)
+        run: cd port && uv sync --frozen || uv sync
+      - name: ruff check
+        run: cd port && uv run ruff check src scripts tests
+      - name: ruff format (changed files only until the sweep lands)
+        run: bash scripts/gate_format.sh --changed origin/${{ github.base_ref || 'main' }}
+
+  python-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: install (frozen)
+        run: cd port && uv sync --frozen || uv sync
+      - name: pytest (CPU)
+        run: cd port && PYTHONPATH=$PWD/src uv run python -m pytest -q -p no:logging
+
+  python-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: install (frozen)
+        run: cd port && uv sync --frozen || uv sync
+      - name: doc references
+        run: python3 tools/check_doc_refs.py
+      - name: dead knobs (a preset must not set a field nothing reads)
+        run: |
+          cd port
+          PYTHONPATH=src uv run python scripts/dead_knob_audit.py --preset-glob 'configs/**/*.toml' > /tmp/dead_knobs.txt 2>&1 || rc=$?
+          rc=${rc:-0}; tail -5 /tmp/dead_knobs.txt
+          test "$rc" -ne 2
+
   # compile-only: catches cuda-feature breakages (the M4 class of regression)
   # without needing a GPU runner. Flip continue-on-error off once green.
   cuda-compile:
