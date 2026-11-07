@@ -1706,6 +1706,13 @@ class TrainConfig:
     batch: int = 8
     seq_len: int = 512
     lr: float = 3e-4
+    #: AdamW's decoupled weight decay (`p *= 1 - lr*wd`). The Muon group runs
+    #: at `wd=0` on every non-SF run by design (`optim.Muon`'s docstring: the
+    #: Muon+ColRow control carries none), and the SF arm has its own
+    #: `muon_sf_wd` at the fast iterate Z. So this field decays the AdamW half
+    #: — embeddings, norms, biases, the head, attention hashes and router
+    #: tables — and NOT the 2-D matrices Muon owns. The name is historical;
+    #: `muon_sf_wd` is the Muon half's decay knob.
     wd: float = 0.01
     grad_clip: float = 1.0
     #: ---- AGC: adaptive gradient clipping (arXiv:2102.06171 §2.2) ----

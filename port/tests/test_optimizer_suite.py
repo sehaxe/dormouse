@@ -239,6 +239,56 @@ def test_adamw_lr_is_the_value_set_mid_run_not_the_constructor_value():
     )
 
 
+def test_set_lr_fills_device_tensors_in_place_for_the_graph_arms():
+    """The graph arms read a 0-dim tensor; `set_lr` must fill, never rebind.
+
+    Revert: assign `group["lr"] = value` -> the tensor a capture recorded keeps
+    its old value and the multiplier is lost.
+    """
+    model = Holder()
+    opt = MixOptimizer(model, lr=1e-3, wd=0.0, muon_lr_mult=8.0)
+    bound = {}
+    for group in opt.adamw.param_groups + opt.muon.param_groups:
+        group["lr"] = torch.tensor(float(group["lr"]))
+        bound[id(group)] = group["lr"]
+    opt.set_lr(2e-3, 2e-3)
+    for group in opt.adamw.param_groups + opt.muon.param_groups:
+        assert group["lr"] is bound[id(group)], "the LR tensor object was replaced"
+    assert opt.adamw.param_groups[0]["lr"].item() == pytest.approx(2e-3)
+    assert opt.muon.param_groups[0]["lr"].item() == pytest.approx(2e-3 * 8.0)
+
+
+def test_the_trainer_delivers_muon_lr_mult_end_to_end(tmp_path):
+    """1 tiny training step at mult=1 vs 8: the Muon delta must scale ~8x.
+
+    This is the audit's exact failure (`loop.py` wrote the schedule LR into the
+    Muon group every step). Revert the `set_lr` seam -> the ratio is 1.0.
+    """
+    deltas = {}
+    for mult in (1.0, 8.0):
+        run = tiny_run(
+            tmp_path,
+            steps=1,
+            log_every=1,
+            ckpt_every=1000,
+            ckpt_name=f"m{mult:g}",
+            lr=1e-3,
+            warmup_tokens=0,
+            grad_clip=0.0,
+            muon_lr_mult=mult,
+        )
+        torch.manual_seed(0)
+        model = DormouseModel(run.model)
+        before = {n: p.detach().clone() for n, p in model.named_parameters()}
+        train(model, run, log=lambda *a, **k: None)
+        deltas[mult] = (
+            model.get_parameter("loop.attn.q_proj.weight").detach()
+            - before["loop.attn.q_proj.weight"]
+        )
+    ratio = deltas[8.0].norm().item() / deltas[1.0].norm().item()
+    assert ratio == pytest.approx(8.0, rel=0.02), f"muon_lr_mult delivered {ratio:.3f}x"
+
+
 # --------------------------------------------------------------------------
 # 2. global-norm gradient clip
 # --------------------------------------------------------------------------
