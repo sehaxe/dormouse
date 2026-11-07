@@ -4760,6 +4760,40 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"raw params. Materialising X every step for the shadow is the named "
             f"follow-up. Escape: muon_sf=false, or ema_decay=0.0."
         )
+    if tcfg.muon_sf and tcfg.opt != "mix":
+        loud(
+            f"muon_sf=true with opt={tcfg.opt!r}: the schedule-free wrapper rides the "
+            f"Muon group, and `opt={tcfg.opt!r}` routes every parameter to AdamW — "
+            f"there is no Muon group to wrap, so the flag would be inert while the run "
+            f"reported it on. Escape: opt='mix', or muon_sf=false. (Full schedule-free "
+            f"AdamW is the named follow-up, not this arm.)"
+        )
+    if tcfg.muon_sf and tcfg.muon_sf_wd <= 0:
+        loud(
+            f"muon_sf_wd={tcfg.muon_sf_wd}: the schedule-free arm needs weight decay "
+            f"at the FAST iterate Z, and a non-positive value leaves the theorem's "
+            f"precondition unmet — arXiv:2605.23061v1 Lemma 3.1 is what lifts the "
+            f"bounded-diameter assumption of the SF-Spectral bound "
+            f"(`docs/research/2026-10-16-sf-muon.md:77-81`, S2). The decay is "
+            f"`Z <- (1 - lr*wd)*Z - eta_hat*P_hat` (Alg 1 line 17), so it is NOT the "
+            f"AdamW group's `wd`. Escape: muon_sf_wd>0 (the arm's 0.01), or "
+            f"muon_sf=false."
+        )
+    if tcfg.muon_sf_retract:
+        loud(
+            "muon_sf_retract=true: the per-step TSCT polar retraction cannot run "
+            "under the schedule-free average. The retraction is a closest-point "
+            "projection onto the (NON-CONVEX) Stiefel manifold, while the "
+            "SF-Spectral proof's projection/Lyapunov step "
+            "(arXiv:2605.23061v1 §3.1, Thm 2.1) needs a convex set, and "
+            "X=(1-c)U1+c*U2 of retracted factors has column norms <= 1 with "
+            "equality only when the two agree — so the averaged iterate is not on "
+            "the manifold the factor contract assumes "
+            "(`docs/research/2026-10-16-sf-muon.md:82-93`, S3). This port's loop "
+            "has no `retract_tsct` call site at all, so with muon_sf=false the flag "
+            "would be inert too. Escape: muon_sf_retract=false (the default, and "
+            "the legal arm)."
+        )
 
 
 def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
@@ -4946,40 +4980,6 @@ def load_run(
             f"Alg 1 lines 5-11, transcribed by arXiv:2605.23061v1 App F). Escape: "
             f"name one of those, or land the arm in `optim.MUON_VARIANTS` and its "
             f"gate BEFORE the config can lie about it."
-        )
-    if tcfg.muon_sf and tcfg.opt != "mix":
-        loud(
-            f"muon_sf=true with opt={tcfg.opt!r}: the schedule-free wrapper rides the "
-            f"Muon group, and `opt={tcfg.opt!r}` routes every parameter to AdamW — "
-            f"there is no Muon group to wrap, so the flag would be inert while the run "
-            f"reported it on. Escape: opt='mix', or muon_sf=false. (Full schedule-free "
-            f"AdamW is the named follow-up, not this arm.)"
-        )
-    if tcfg.muon_sf and tcfg.muon_sf_wd <= 0:
-        loud(
-            f"muon_sf_wd={tcfg.muon_sf_wd}: the schedule-free arm needs weight decay "
-            f"at the FAST iterate Z, and a non-positive value leaves the theorem's "
-            f"precondition unmet — arXiv:2605.23061v1 Lemma 3.1 is what lifts the "
-            f"bounded-diameter assumption of the SF-Spectral bound "
-            f"(`docs/research/2026-10-16-sf-muon.md:77-81`, S2). The decay is "
-            f"`Z <- (1 - lr*wd)*Z - eta_hat*P_hat` (Alg 1 line 17), so it is NOT the "
-            f"AdamW group's `wd`. Escape: muon_sf_wd>0 (the arm's 0.01), or "
-            f"muon_sf=false."
-        )
-    if tcfg.muon_sf_retract:
-        loud(
-            "muon_sf_retract=true: the per-step TSCT polar retraction cannot run "
-            "under the schedule-free average. The retraction is a closest-point "
-            "projection onto the (NON-CONVEX) Stiefel manifold, while the "
-            "SF-Spectral proof's projection/Lyapunov step "
-            "(arXiv:2605.23061v1 §3.1, Thm 2.1) needs a convex set, and "
-            "X=(1-c)U1+c*U2 of retracted factors has column norms <= 1 with "
-            "equality only when the two agree — so the averaged iterate is not on "
-            "the manifold the factor contract assumes "
-            "(`docs/research/2026-10-16-sf-muon.md:82-93`, S3). This port's loop "
-            "has no `retract_tsct` call site at all, so with muon_sf=false the flag "
-            "would be inert too. Escape: muon_sf_retract=false (the default, and "
-            "the legal arm)."
         )
     validate_train(tcfg)
     if model_overrides:

@@ -436,6 +436,9 @@ def rl_train(
         muon_sf_wd=cfg.muon_sf_wd,
         muon_chunk_elems=cfg.muon_chunk_elems,
         muon_lr_mult=cfg.muon_lr_mult,
+        # AdamW's denominator floor: a pure optimizer setting, forwarded so a
+        # non-default `train.adam_eps` is not silently dropped (the m5 class).
+        eps=cfg.adam_eps,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()

@@ -1015,6 +1015,21 @@ def refuse_unwired(cfg, loop: str) -> None:
             f"would silently run a different arm. Escape: muon_sf=false (the "
             f"default), or run `dormouse train` for the arm."
         )
+    if cfg.agc_clip > 0.0:
+        loud(
+            f"{loop}: train.agc_clip={cfg.agc_clip:g} is the adaptive gradient clip, "
+            f"which this loop does not call (its evidence lives in `train()`'s "
+            f"optimizer stage, `loop.py::opt_stage`). Accepting it would report a "
+            f"clip that never ran. Escape: agc_clip=0.0 (the default), or run "
+            f"`dormouse train` for the arm."
+        )
+    if cfg.ema_decay > 0.0:
+        loud(
+            f"{loop}: train.ema_decay={cfg.ema_decay:g} is `train()`'s EMA shadow "
+            f"(the `model_ema` checkpoint half and the eval copy); this loop keeps "
+            f"neither, so the flag would silently serve the raw weights. Escape: "
+            f"ema_decay=0.0 (the default), or run `dormouse train` for the arm."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1132,11 @@ def sft_train(
         muon_sf_wd=cfg.muon_sf_wd,
         muon_chunk_elems=cfg.muon_chunk_elems,
         muon_lr_mult=cfg.muon_lr_mult,
+        # AdamW's denominator floor is a pure optimizer setting whose mechanism
+        # (the logit scale ceiling ~ log(1/eps)) is loop-independent, so it is
+        # forwarded rather than refused: a non-default value used to be dropped
+        # here and silently ran torch's 1e-8.
+        eps=cfg.adam_eps,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
