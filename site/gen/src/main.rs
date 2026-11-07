@@ -211,12 +211,16 @@ fn main() {
         }));
     }
 
-    // --- the curve: the run that has seen the most bytes -----------------
+    // --- the curve: the BEST held-out number on record, not the longest run.
+    // A failed arm (E1's patch unit at 3.30 BPB) is longer than the good one and
+    // must never become the headline curve. Floor: 100 MB, so a 10-step smoke
+    // cannot win by luck.
     let longest = runs
         .iter()
-        .max_by(|a, b| {
-            let ka = a.last_eval().map(|e| e.0).unwrap_or(0.0);
-            let kb = b.last_eval().map(|e| e.0).unwrap_or(0.0);
+        .filter(|r| r.last_eval().map(|e| e.0).unwrap_or(0.0) >= 1e8)
+        .min_by(|a, b| {
+            let ka = a.last_eval().map(|e| e.1).unwrap_or(f64::INFINITY);
+            let kb = b.last_eval().map(|e| e.1).unwrap_or(f64::INFINITY);
             ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
         });
     let curve = longest
