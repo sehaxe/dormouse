@@ -137,7 +137,7 @@ def test_decay_frac_outside_the_unit_interval_is_refused(value: float) -> None:
     assert "Escape:" in str(e.value)
 
 
-@pytest.mark.parametrize("value", [0.0, -0.1, 1.5])
+@pytest.mark.parametrize("value", [-0.1, 1.5])
 def test_min_lr_frac_outside_its_range_is_refused(value: float) -> None:
     """The floor must be in (0,1]: 0 is a division by a zero-LR basin.
 
@@ -266,3 +266,21 @@ def test_progress_keys_are_a_closed_set() -> None:
         # matrices, so the per-slice NS chain is bit-identical across caps.
         "muon_chunk_elems",
     }
+
+
+def test_zero_min_lr_frac_is_a_full_cooldown() -> None:
+    """`min_lr_frac=0.0` is the full-cooldown arm, accepted at the config seam.
+
+    Added 2026-11-08 with the Ripple-65B ladder v1.5 change: a schedule that
+    ends at 0 is a different arm from one that ends at 0.1x peak, and `wsd_lr`
+    must land exactly on zero at the last step.
+    """
+    from dormouse.config import validate_train
+
+    validate_train(TrainConfig(min_lr_frac=0.0))
+    last = wsd_lr(999, total_steps=1000, peak_lr=1e-3, warmup_steps=0,
+                  decay_steps=100, final_frac=0.0)
+    assert last == pytest.approx(0.0, abs=1e-12)
+    mid = wsd_lr(949, total_steps=1000, peak_lr=1e-3, warmup_steps=0,
+                 decay_steps=100, final_frac=0.0)
+    assert 0.0 < mid < 1e-3, "only the LAST step is zero"
