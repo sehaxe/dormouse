@@ -145,12 +145,14 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut logs = PathBuf::from("../../logs");
     let mut quality_logs = PathBuf::from("../../logs/muonq");
+    let mut surprise = PathBuf::from("../assets/surprise.json");
     let mut template = PathBuf::from("../template.html");
     let mut out = PathBuf::from("../index.html");
     while let Some(a) = args.next() {
         match a.as_str() {
             "--logs" => logs = PathBuf::from(args.next().expect("--logs PATH")),
             "--quality-logs" => quality_logs = PathBuf::from(args.next().expect("--quality-logs PATH")),
+            "--surprise" => surprise = PathBuf::from(args.next().expect("--surprise PATH")),
             "--template" => template = PathBuf::from(args.next().expect("--template PATH")),
             "--out" => out = PathBuf::from(args.next().expect("--out PATH")),
             other => {
@@ -267,7 +269,14 @@ fn main() {
         std::process::exit(1);
     };
     let blob = serde_json::to_string(&data).expect("serialize");
-    let html = tpl.replace("/*__DATA__*/null", &blob);
+    // The hero image's data: 1024 bytes of held-out text with their surprise.
+    // Optional — without it the section renders empty rather than inventing one.
+    let surprise_blob = fs::read_to_string(&surprise).ok().filter(|t| !t.trim().is_empty());
+    let mut html = tpl.replace("/*__DATA__*/null", &blob);
+    html = html.replace(
+        "/*__SURPRISE__*/null",
+        surprise_blob.as_deref().unwrap_or("null"),
+    );
     if let Err(e) = fs::write(&out, html) {
         eprintln!("cannot write {}: {e}", out.display());
         std::process::exit(1);
