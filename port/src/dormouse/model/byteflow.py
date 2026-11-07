@@ -819,12 +819,14 @@ def compat_armed(cfg: ModelConfig) -> bool:
 
     The ONE list: `config.validate` refuses the arms it names and
     `DormouseModel` reads it, so a config that reaches a forward is a config
-    the validator already ruled on. `use_kda` is the one arm the channel
-    admits today — the others are not wired into it yet, and an unwired arm
-    must not start running because a byteflow flag moved.
+    the validator already ruled on. Two arms are admitted today: `byte_patch`
+    (the dense `block_form="transformer"` stack over the codec's patches) and
+    `use_kda` (the loop over K patch latents). The others are not wired into
+    the channel yet, and an unwired arm must not start running because a
+    byteflow flag moved.
     """
     return cfg.use_byteflow and (
-        cfg.use_kda or cfg.use_engram or cfg.use_attnres or cfg.moe_topk > 0
+        cfg.byte_patch or cfg.use_kda or cfg.use_engram or cfg.use_attnres or cfg.moe_topk > 0
     )
 
 

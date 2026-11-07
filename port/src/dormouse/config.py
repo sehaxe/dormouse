@@ -945,6 +945,17 @@ class ModelConfig:
     #: re-derive before any multi-loop default.
     loom: bool = False
     use_byteflow: bool = False
+    #: `block_form="transformer"` computes over PATCHES, not bytes: the conv
+    #: codec (`model/convcodec.py`) turns the T-byte window into P = T /
+    #: `byteflow_patch_bytes` latents, this model's `n_layers` UNIQUE blocks run
+    #: over `[b, P, d_model]`, and the codec's decoder lifts them back to T byte
+    #: logits. The loss is `_byte_ce` over all T byte positions, so BPB stays
+    #: comparable with every other arm. `byteflow_k_tokens` must equal the patch
+    #: count of the model's window (`max_seq_len // byteflow_patch_bytes`).
+    #: Requires `use_byteflow=true`, `block_form="transformer"` and
+    #: `byteflow_codec="conv"`; default false is the byte-position stack, bit
+    #: for bit.
+    byte_patch: bool = False
     #: ---- the prelude/coda topology (`arXiv 2610.23036`, `model/prelude.py`) ----
     #: A few UNIQUE layers that run once BEFORE the shared loop and a few that
     #: run once AFTER it: `embed → prelude(0..N) → LoopBlock ×T → coda(0..M) →
@@ -975,6 +986,10 @@ class ModelConfig:
     byteflow_d_local: int = 512
     byteflow_d_global: int = 1536
     #: Global sequence length K after chunking — the compression knob.
+    #: With `byte_patch=true` the stack runs over EVERY patch instead (K is
+    #: derived from the window as `seq_len // byteflow_patch_bytes`), and this
+    #: field is the max-window count it must agree with:
+    #: `max_seq_len // byteflow_patch_bytes`.
     byteflow_k_tokens: int = 3200
     #: Encoder depth E; reused by the decoder (paper §3.5).
     byteflow_e_layers: int = 6
@@ -3038,6 +3053,22 @@ def validate_block_form(model: ModelConfig) -> None:
         # `kda` branch below refuses `n_layers`, which IS the hybrid depth.
         _validate_hybrid(model)
         return
+    if model.byte_patch and not model.use_byteflow:
+        loud(
+            "byte_patch=true with use_byteflow=false: the patch compute unit IS "
+            "the byteflow codec (bytes -> patch latents before the stack, byte "
+            "logits after it), so with the codec off there is nothing to patch "
+            "and the flag would name an arm the forward never runs. Escape: "
+            "use_byteflow=true, or byte_patch=false."
+        )
+    if model.byte_patch and model.block_form != "transformer":
+        loud(
+            f"byte_patch=true with block_form={model.block_form!r}: the flag wires "
+            f"the DENSE stack (`n_layers` unique blocks) over patch positions; the "
+            f"KDA form already runs its loop over K patch latents through "
+            f"`use_byteflow` alone, so this flag would be inert. Escape: "
+            f"block_form='transformer', or byte_patch=false."
+        )
     if model.block_form == "kda":
         if model.n_layers:
             loud(
@@ -3121,13 +3152,70 @@ def validate_block_form(model: ModelConfig) -> None:
             f"wrappers (`model/prelude.py`), not part of the control decoder. "
             f"Escape: prelude_layers=0 and coda_layers=0, or block_form='kda'."
         )
-    if model.use_byteflow:
+    if model.use_byteflow and not model.byte_patch:
         loud(
             "block_form='transformer' with use_byteflow=true: both byteflow shapes "
             "return before the byte stack (Option A is a standalone net, Option B "
             "runs the loop over patch latents), so the transformer blocks would "
-            "never run. Escape: use_byteflow=false, or block_form='kda'."
+            "never run. Escape: use_byteflow=false, block_form='kda', or "
+            "byte_patch=true (the same dense stack, over the codec's patches)."
         )
+    if model.byte_patch:
+        # The dense stack over patches has one shape per call: `byte_patch`
+        # runs EVERY patch (K = P), because a K < P global top-k would make the
+        # selection depend on future bytes and break the strict
+        # `logits[:, :q]` invariance the codec's causality gate pins.
+        if model.byteflow_codec != "conv":
+            loud(
+                f"byte_patch=true with byteflow_codec={model.byteflow_codec!r}: "
+                f"the dense stack runs over the CONV codec's patch positions "
+                f"(`byteflow_patch_bytes` bytes each); the attention codec selects "
+                f"BYTE positions, so its latents are not patches and the shape "
+                f"contract would be a different compression scheme. Escape: "
+                f"byteflow_codec='conv', or byte_patch=false."
+            )
+        s = model.byteflow_patch_bytes
+        if s < 1:
+            loud(
+                f"byteflow_patch_bytes={s} with byte_patch=true: it is the number "
+                f"of bytes the stack's positions stand for, so it must be >= 1. "
+                f"Escape: 8 (the default), or a positive divisor of max_seq_len."
+            )
+        if model.max_seq_len % s:
+            loud(
+                f"max_seq_len={model.max_seq_len} is not a multiple of "
+                f"byteflow_patch_bytes={s}: the conv patchify covers "
+                f"floor(max_seq_len/s) patches and the remainder would be "
+                f"silently dropped. Escape: a patch_bytes that divides the "
+                f"window, or another max_seq_len."
+            )
+        want_k = model.max_seq_len // s
+        if model.byteflow_k_tokens != want_k:
+            loud(
+                f"byte_patch=true with byteflow_k_tokens={model.byteflow_k_tokens}: "
+                f"the stack runs over EVERY patch of the model's "
+                f"{model.max_seq_len}-byte window, which is {want_k} positions at "
+                f"{s} bytes/patch (K=P; a smaller K would make the global top-k "
+                f"depend on future bytes and break the prefix-causality gate). "
+                f"Escape: byteflow_k_tokens={want_k}."
+            )
+        if model.mod_capacity < 1.0 or model.mod_top_k:
+            loud(
+                f"byte_patch=true with mod_capacity={model.mod_capacity}/"
+                f"mod_top_k={model.mod_top_k}: the Mixture-of-Depths router runs "
+                f"inside the dense blocks, and the patch channel's forward has no "
+                f"`mod_aux` term wired into its byte CE — routing would shrink the "
+                f"stack's token count while the aux objective silently vanished. "
+                f"Escape: mod_capacity=1.0 and mod_top_k=0, or byte_patch=false."
+            )
+        if model.use_tsct:
+            loud(
+                "byte_patch=true with use_tsct=true: the dense blocks are plain "
+                "`nn.Linear` and the codec's own projections are `_MixedLinear`; "
+                "the patch channel builds no `lm_head`, so the TSCT factorization "
+                "would reach no module. Escape: use_tsct=false, or "
+                "byte_patch=false."
+            )
     if model.dense_qat != "none":
         loud(
             f"block_form='transformer' with dense_qat={model.dense_qat!r}: the "
@@ -5292,12 +5380,21 @@ def load_run(
             f"seq_len={tcfg.seq_len} exceeds max_seq_len={model.max_seq_len}: "
             f"the run would train on sequences the model refuses to serve"
         )
-    if model.use_byteflow and model.byteflow_k_tokens > tcfg.seq_len:
+    if model.use_byteflow and not model.byte_patch and model.byteflow_k_tokens > tcfg.seq_len:
         loud(
             f"byteflow_k_tokens={model.byteflow_k_tokens} > seq_len={tcfg.seq_len}: the "
             f"chunker promotes K boundaries inside the T-byte window, so K > T has no "
             f"positions to select. Escape: raise `seq_len`/`--batch`'s window or lower "
             f"byteflow_k_tokens."
+        )
+    if model.byte_patch and tcfg.seq_len % model.byteflow_patch_bytes:
+        loud(
+            f"seq_len={tcfg.seq_len} with byte_patch=true is not a multiple of "
+            f"byteflow_patch_bytes={model.byteflow_patch_bytes}: the conv patchify "
+            f"covers floor(seq_len/patch_bytes) patches and the last "
+            f"{tcfg.seq_len % model.byteflow_patch_bytes} bytes would have no "
+            f"position to read. Escape: a seq_len divisible by "
+            f"{model.byteflow_patch_bytes}."
         )
     if tcfg.engram_ram:
         # The host path is a MODEL-shape decision that spans both halves of the

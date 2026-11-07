@@ -1044,6 +1044,31 @@ testable and A/B-able (ADR-0017).
       **NOT run:** no GPU and no driver run; the paper's 0.60x is a 60M-3B
       result, not a prediction for 13.5M.
 
+- [x] P-BYTE-PATCH. port (Python): `byte_patch` — `block_form="transformer"`'s
+      `n_layers` unique blocks over the conv codec's PATCH positions.
+      `ModelConfig.byte_patch` (default false; the off path is bit-identical to
+      clean `550bc43` on both the transformer and KDA+conv pins, sha256).
+      `configs/arch_dense_byteflow8.toml` = flagship3_dense's 12 blocks
+      (94 608 384) + final norm (832) + codec and the two pairings (2 975 680)
+      = **97 584 896** params, asserted in the test and printed by `cli info`.
+      The codec is both ends, so `embed`/`lm_head` are NOT built (the 425 984
+      dead params the control has are absent). K MUST equal
+      `max_seq_len // byteflow_patch_bytes` — at K<P the codec's global top-k is
+      future-dependent and the strict prefix gate fails — and a `seq_len` that
+      does not tile is refused at `load_run`, not at the first step. The loss
+      is `_byte_ce` over BYTES, so BPB stays comparable with every other arm.
+      Gates `tests/test_byte_patch.py` (10): eight scratch mutations each red
+      (RNG draw off path, reversed patchify shift, pre-fix `prev = x`, one
+      block, one shared body, halved positions, dead embed/head, per-patch CE),
+      every file restored sha256; the four pins were independently recomputed
+      from `git archive 550bc43`. CPU FlopCounterMode: 73.68 vs 568.69
+      MFLOP/byte (7.72x) at seq 64/128/1024. Full CPU suite: one failure, the
+      known `test_train::test_torch_compile_flag_wraps_the_model_after_resume`
+      (inductor C++ compile; `/tmp` full); the other four known reds passed and
+      there is no new failure. ruff clean. **NOT run:** the GPU A/B (the
+      review's §6 is a recipe only); the wall-time and VRAM claims are
+      UNMEASURED here.
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)
