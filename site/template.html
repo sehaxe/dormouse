@@ -52,6 +52,13 @@
   .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
   section{padding:88px 0;border-top:1px solid var(--line)}
   section:first-of-type{border-top:0}
+  .hero{position:relative;overflow:hidden}
+  .hero > .content{position:relative;z-index:1}
+  #rain{position:absolute;inset:-40px 0 0;width:100%;height:calc(100% + 40px);
+        display:block;opacity:.7;pointer-events:none;
+        -webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 42%,#000 100%),linear-gradient(180deg,#000 0%,#000 62%,transparent 100%);
+        mask-image:linear-gradient(90deg,transparent 0%,#000 42%,#000 100%),linear-gradient(180deg,#000 0%,#000 62%,transparent 100%);
+        -webkit-mask-composite:source-in;mask-composite:intersect}
 
   /* hero */
   .kicker{font-family:var(--mono);font-size:13px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
@@ -112,7 +119,9 @@
 
 <div class="wrap">
 
-  <section>
+  <section class="hero">
+    <canvas id="rain" aria-hidden="true"></canvas>
+    <div class="content">
     <div class="kicker">one RTX 5070 Ti · 16 GB · sm_120</div>
     <h1>dormouse<span class="dot">.</span></h1>
     <p class="lede">
@@ -137,6 +146,7 @@
         <div class="k">runs on record, every one kept</div>
         <div class="s" id="runsub">including the retracted ones</div>
       </div>
+    </div>
     </div>
   </section>
 
@@ -217,6 +227,95 @@
 </div>
 
 <script id="data" type="application/json">/*__DATA__*/null</script>
+<script>
+(() => {
+  const cv = document.getElementById('rain');
+  if (!cv) return;
+  const gl = cv.getContext('webgl', { antialias: false, alpha: true, premultipliedAlpha: true });
+  if (!gl) { cv.remove(); return; }
+
+  const vs = `attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }`;
+  const fs = `precision highp float;
+uniform vec2 u_res;
+uniform float u_t;
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+void main(){
+  vec2 uv = gl_FragCoord.xy / u_res;
+  float cols = 64.0;
+  float cellW = u_res.x / cols;
+  float cellH = cellW * 1.7;                 // character aspect, not square
+  float rows = u_res.y / cellH;
+  float fx = fract(uv.x * cols);
+  float fy = fract(uv.y * rows);
+  float x = floor(uv.x * cols);
+  float y = uv.y * rows;
+  float cell = floor(y);
+  // the glyph body: a rounded 1x1 cell inset, so cells read as characters
+  float body = step(0.18, fx) * step(fx, 0.82) * step(0.14, fy) * step(fy, 0.86);
+
+  float speed = 0.035 + 0.11 * hash(vec2(x, 1.0));
+  float head = fract(u_t * speed + hash(vec2(x, 2.0)));
+  float d = uv.y - head;
+  float trail = d > 0.0 ? exp(-d * 7.0) : 0.0;
+
+  float rate = floor(u_t * (2.0 + 6.0 * hash(vec2(x, 3.0))) + hash(vec2(x, cell)));
+  float bits = hash(vec2(x, cell) + rate);
+  float glyph = step(0.52, bits) * step(0.06, hash(vec2(x + 7.0, cell)));
+
+  float a = trail * glyph * body;
+  float headGlow = smoothstep(0.02, 0.0, abs(d));
+  vec3 amber = vec3(0.85, 0.63, 0.36);
+  vec3 col = mix(amber, vec3(1.0, 0.96, 0.9), headGlow * 0.8);
+  gl_FragColor = vec4(col * a, a * 0.85);
+}`;
+
+  const sh = (t, src) => { const s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { cv.remove(); return; }
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  const uRes = gl.getUniformLocation(prog, 'u_res');
+  const uT = gl.getUniformLocation(prog, 'u_t');
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const resize = () => {
+    const dpr = Math.min(devicePixelRatio || 1, 1.5);
+    const w = Math.max(1, Math.floor(cv.clientWidth * dpr));
+    const h = Math.max(1, Math.floor(cv.clientHeight * dpr));
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    gl.viewport(0, 0, w, h);
+    gl.uniform2f(uRes, w, h);
+  };
+
+  const draw = (t) => { gl.uniform1f(uT, t); gl.drawArrays(gl.TRIANGLES, 0, 3); };
+
+  // One frame synchronously, so the hero is never empty before rAF starts
+  // (and the reduced-motion arm gets the same frame instead of nothing).
+  resize();
+  draw(5.0);
+  if (reduced) return;
+
+  let raf = 0, t0 = performance.now(), visible = true;
+  const loop = (now) => { if (!visible) return; raf = requestAnimationFrame(loop); resize(); draw((now - t0) / 1000); };
+  const io = new IntersectionObserver(([e]) => {
+    visible = e.isIntersecting;
+    if (visible) { cancelAnimationFrame(raf); raf = requestAnimationFrame(loop); }
+  }, { threshold: 0 });
+  io.observe(cv);
+  addEventListener('resize', resize);
+  raf = requestAnimationFrame(loop);
+})();
+</script>
 <script>
 (() => {
   const d = JSON.parse(document.getElementById('data').textContent);
