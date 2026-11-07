@@ -917,6 +917,87 @@ def distinct_scored_bytes(stream: ByteStream, batches: int) -> int:
     return sum(seen)
 
 
+def _file_id(path: Path) -> tuple[int, int] | None:
+    """`(st_dev, st_ino)` — the identity of the bytes, not of the filename."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _source_files(path: Path) -> list[tuple[Path, int, int]]:
+    """The `(file, lo, hi)` byte ranges ONE training source reads.
+
+    A `.bin` is its whole range; a shard directory is every `*.txt` shard, the
+    full file (the shuffle is an ORDER, not a subset).
+    """
+    if path.is_dir():
+        return [(p, 0, p.stat().st_size) for p in shard_files(path)]
+    return [(path, 0, path.stat().st_size)]
+
+
+def train_file_ranges(stream) -> list[tuple[Path, int, int]]:
+    """The `(file, lo, hi)` ranges the TRAIN stream reads — for the overlap gate.
+
+    An unknown stream (a caller's test double) answers `[]`: the gate cannot
+    invent a range for bytes it cannot name, and a custom stream is the
+    caller's own seam.
+    """
+    from .mixture import MixtureStream  # local: mixture imports this module
+
+    if isinstance(stream, MixtureStream):
+        out: list[tuple[Path, int, int]] = []
+        for path in stream.plan.sources.values():
+            out += _source_files(Path(path))
+        return out
+    if isinstance(stream, DocPackedStream):
+        return [(stream.source.path, stream.source.lo, stream.source.hi)]
+    if isinstance(stream, ByteStream):
+        return [(stream.path, stream.lo, stream.hi)]
+    if isinstance(stream, ShardStream):
+        return [(p, 0, s) for p, s in zip(stream.files, stream.sizes, strict=True)]
+    return []
+
+
+def eval_window_range(cfg: TrainConfig, ev) -> tuple[Path, int, int]:
+    """The `(file, lo, hi)` the EVAL reads: `batches × batch × (seq_len+1)` bytes.
+
+    The extra `+1` per row is the successor byte of the last scored position —
+    the eval READS it (it is context), so it is inside the held-out range.
+    """
+    stream = getattr(ev, "stream", ev)  # MaskedByteStream forwards its ByteStream
+    span = eval_batches_for(cfg) * cfg.batch * (cfg.seq_len + 1)
+    lo = stream.lo
+    return stream.path, lo, min(stream.hi, lo + span)
+
+
+def eval_train_overlap(cfg: TrainConfig, train_stream, eval_stream) -> tuple[int, str | None]:
+    """Bytes of the held-out window the TRAINING stream also reads — by IDENTITY.
+
+    The split in [`open_streams`][dormouse.train.data.open_streams] makes the
+    single-file mode disjoint by byte range. `eval_data` and `mix_plan` are
+    trusted to name a DIFFERENT file, and nothing checked it: a `--eval` that
+    points at `--data` (or at a mix source) trains on the bytes it then scores.
+    Same `(st_dev, st_ino)` is the only honest test — two paths can name one
+    file, and a copy cannot be detected from metadata (report it, do not guess).
+
+    Returns `(bytes, where)`; `(0, None)` is disjoint.
+    """
+    path, lo, hi = eval_window_range(cfg, eval_stream)
+    ident = _file_id(path)
+    total = 0
+    where: str | None = None
+    for train_path, tlo, thi in train_file_ranges(train_stream):
+        if ident is None or _file_id(train_path) != ident:
+            continue
+        n = max(0, min(hi, thi) - max(lo, tlo))
+        if n:
+            total += n
+            where = f"{train_path} [{max(lo, tlo)}, {min(hi, thi)})"
+    return total, where
+
+
 def split_points(size: int, eval_bytes: int) -> tuple[int, int]:
     """`(hi_train, hi_total)`: the eval tail is the LAST `eval_bytes` bytes."""
     if eval_bytes < 0:
@@ -1033,11 +1114,7 @@ def open_streams(
             f"eval_offset={tr.eval_offset} starts at byte {lo}, at/after the end of "
             f"{tr.data} ({size} B). Escape: a smaller offset."
         )
-    ev = (
-        ByteStream(tr.data, tr.batch, tr.seq_len, lo=lo, ring_bytes=1 << 20)
-        if tr.eval
-        else None
-    )
+    ev = ByteStream(tr.data, tr.batch, tr.seq_len, lo=lo, ring_bytes=1 << 20) if tr.eval else None
     if ev is not None and ev_bytes < requested:
         # COUNTED, never silent: the request is larger than the tail this
         # stream may read, so the stream wraps and the eval re-scores bytes it
