@@ -1942,6 +1942,15 @@ class TrainConfig:
     #: NS chain is per slice; `tests/test_opt_region.py` gates the bit-equality
     #: across caps), so the only thing a resume changes is the launch count.
     muon_chunk_elems: int = 1 << 25
+    #: The Muon half's LR as a MULTIPLE of `lr` (the AdamW half's). Measured
+    #: 2026-11-06 (`docs/reviews/2026-11-06-optimizer-audit.md`): at a shared LR
+    #: the Muon update is 8x-52x smaller in RMS than AdamW's on this model's
+    #: real shapes and delivers 0.7%-17% of its first-order loss decrease — an
+    #: effective LR of 3e-6..8e-5 instead of 5e-4. Muon's published default is
+    #: 0.02, 40x our `lr`. The memorisation gate (300 steps on one fixed string)
+    #: reads 0.513 BPB at 1.0, 0.198 for pure AdamW, 0.069 at 8x, diverges at
+    #: 8e-3 absolute. 1.0 = the historical behaviour, bit-identical.
+    muon_lr_mult: float = 1.0
     #: The Newton–Schulz CHAIN's dtype (`OPT_DTYPES`): `fp32` (the default) is
     #: every number on record; `bf16` runs the polynomial — BOTH arms, `classic`
     #: and `gram` — in bf16 with explicit fp32 in/out casts (nanogpt's practice;
