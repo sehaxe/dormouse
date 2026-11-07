@@ -26,12 +26,21 @@ OUT=/home/sehaxe/logs/e1v2
 mkdir -p "$OUT"
 
 BYTES=${BYTES:-250000000}   # 0.25 GB per arm per seed
+# FAST=1 runs BOTH arms on the Muon precision rung (bf16 NS, 3 steps, bf16
+# state). It must be the SAME on both arms or the A/B compares two optimizers:
+# the rung is a training-speed change, and the patch question is about the unit
+# of computation.
+FAST=${FAST:-0}
+FOPT=()
+if [ "$FAST" = 1 ]; then
+  FOPT=(--set ns_dtype=bf16 --set ns_steps=3 --set muon_state_dtype=bf16)
+fi
 
 run() { # tag config batch bytes_per_step seed
   local tag=$1 cfg=$2 batch=$3 bps=$4 seed=$5 steps eval_every
   steps=$(( BYTES / bps ))
   eval_every=$(( steps / 4 ))
-  echo "=== $tag seed=$seed steps=$steps batch=$batch $(date +%H:%M:%S)"
+  echo "=== $tag seed=$seed steps=$steps batch=$batch fast=$FAST $(date +%H:%M:%S)"
   $PY -u -m dormouse.cli train "$cfg" \
     --data ../data_local/best/fwedu.bin --eval ../data_local/mix4/web_eval.bin \
     --set steps=$steps --set batch=$batch --set seq_len=1024 --set seed=$seed \
@@ -39,7 +48,7 @@ run() { # tag config batch bytes_per_step seed
     --set eval=true --set eval_every=$eval_every \
     --set mix_plan=configs/mix_v7.toml --set doc_masking=false --set log_every=$eval_every \
     --set ckpt_every=1000000 --set ckpt_name="e1_${tag}_s${seed}" \
-    --set out_dir=/tmp/opencode/e1v2_${tag}_s${seed} \
+    --set out_dir=/tmp/opencode/e1v2_${tag}_s${seed} ${FOPT[@]+"${FOPT[@]}"} \
     --json-log "$OUT/${tag}_s${seed}.jsonl" > "$OUT/${tag}_s${seed}.log" 2>&1
   grep -oE "eval step=[0-9]+ off=[0-9]+ bpb_fin=[0-9.]+" "$OUT/${tag}_s${seed}.log" | tail -4
 }

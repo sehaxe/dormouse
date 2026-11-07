@@ -26,6 +26,12 @@ PY=.venv/bin/python
 OUT=/home/sehaxe/logs/ladder
 mkdir -p "$OUT"
 BYTES=${BYTES:-120000000}
+# FAST=1 runs every arm on the fast Muon rung (see e1_bytes_vs_patch.sh).
+FAST=${FAST:-0}
+FOPT=()
+if [ "$FAST" = 1 ]; then
+  FOPT=(--set ns_dtype=bf16 --set ns_steps=3 --set muon_state_dtype=bf16)
+fi
 STEPS=$(( BYTES / (8 * 1024) ))
 EVAL_EVERY=$(( STEPS / 4 ))
 
@@ -39,7 +45,7 @@ run() { # tag extra-set-args...
     --set mix_plan=configs/mix_v7.toml --set doc_masking=false \
     --set eval=true --set eval_every=$EVAL_EVERY --set log_every=$EVAL_EVERY \
     --set ckpt_every=1000000 --set out_dir=/tmp/opencode/ladder_$tag \
-    --json-log "$OUT/$tag.jsonl" "$@" > "$OUT/$tag.log" 2>&1
+    --json-log "$OUT/$tag.jsonl" ${FOPT[@]+"${FOPT[@]}"} "$@" > "$OUT/$tag.log" 2>&1
 }
 
 run control
