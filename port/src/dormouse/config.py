@@ -1478,10 +1478,12 @@ class ModelConfig:
     #: byte. ADDITIVE beside KDA behind a per-iteration gate and off by default:
     #: `use_csa=false` builds no module and no parameter. Chunk ∈ {4,8,16,32},
     #: width ∈ {64,128}. REFUSED loudly with `use_msa` (two sparse branches is
-    #: not measured), `segment_len>0` (the boundary rule for a half-full chunk
-    #: is undecided), `use_byteflow` (its loop runs over patch latents, so a
+    #: not measured), `use_byteflow` (its loop runs over patch latents, so a
     #: byte chunk would silently be a latent chunk), `use_kda=false` and
-    #: `attn_kind='full'` (this arm is specified beside KDA).
+    #: `attn_kind='full'` (this arm is specified beside KDA). With
+    #: `segment_len>0` the ring is carried across the cuts: a chunk a boundary
+    #: splits is completed by the next segment from its carried `sum`/`count`
+    #: (never dropped, never padded) — `tests/test_segment_csa.py` gates it.
     use_csa: bool = False
     csa_chunk: int = 8
     csa_kv_dim: int = 64
@@ -1495,8 +1497,9 @@ class ModelConfig:
     #: iteration slot. This is the level that makes 1M decode affordable: at
     #: 256 bytes an entry, 4096 dense entries per 1M bytes (0.52M MAC/byte at
     #: kv=64, 1.0 MiB of state) against the fine level's 131 072-entry scan
-    #: (8.4M MAC/byte). REFUSED loudly with `use_msa`, `segment_len>0`, a
-    #: non-multiple of `csa_chunk`, or without `use_csa`.
+    #: (8.4M MAC/byte). REFUSED loudly with `use_msa`, a non-multiple of
+    #: `csa_chunk`, or without `use_csa`. A `segment_len` cut carries this
+    #: ring exactly as it carries the fine one.
     csa_coarse_chunk: int = 0
     csa_coarse_kv_dim: int = 64
     #: The fine level's off switch. `false` runs the coarse level ALONE (the
@@ -2336,6 +2339,15 @@ class TrainConfig:
     #: one-shot forward to fp32 round-off (`tests/test_longctx.py`), the returned
     #: logits keep the `[b*seq_len, vocab]` shape, and the loss is the same
     #: `(Σ CE_i + CE_final)/(T+1)`, so nothing downstream changes.
+    #:
+    #: **With `use_csa` the CSA rings are carried too** (`csa._carried_state`):
+    #: a chunk a cut splits is completed by the next segment from its carried
+    #: `sum`/`count`, and the ring's `n·chunk + count` IS the byte position the
+    #: next segment starts at, so the pooled keys and the `key < pos` mask are
+    #: the one-shot ones. The pair is ALLOWED (any `segment_len` a multiple of,
+    #: or larger than, one chunk) and gated by
+    #: `tests/test_segment_csa.py` at 1e-5 on logits; the refusal that remains
+    #: is `segment_len < csa_chunk`, where a segment completes no chunk at all.
     #:
     #: **`0` = OFF, and that is the default**: the field must be set explicitly
     #: to enter the branch. The state carried is PER ITERATION SLOT (the loop
@@ -4715,20 +4727,41 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
         )
     if n == 0:
         return
-    if model.csa_coarse_chunk:
+    if model.use_csa and model.csa_hierarchical:
+        # PRE-EXISTING, measured 2026-11-08: on this arm `forward_state` (the
+        # prefill ring) and `forward` (the pooled window) already disagree by
+        # 1.7e-2 at topk=1000 / mid 512 / coarse 256 / chunk 8, because the ring
+        # holds no entry for the LAST PARTIAL coarse chunk and `_hier_fine`
+        # derives its fine candidate set from the survivors of the coarse level
+        # — so up to `coarse_chunk/chunk - 1` fine chunks are missing from the
+        # set. Segmented training would inherit that gap on every cut, and the
+        # parity gate cannot be made true before the hierarchical prefill is.
         loud(
-            f"segment_len={n} with csa_coarse_chunk={model.csa_coarse_chunk}: the "
-            f"coarse level is a dense ring carried across BYTES, and what a segment "
-            f"cut does to a half-full coarse chunk is undecided — carrying it is a "
-            f"model change, dropping it silently forgets the segment. Escape: "
-            f"csa_coarse_chunk=0 (fine level only), or segment_len=0."
+            f"segment_len={n} with csa_hierarchical=true: the hierarchical "
+            f"selection reads its fine candidates from the COARSEST level's "
+            f"survivors, and the prefill ring does not carry the last PARTIAL "
+            f"entry of that level (measured 2026-11-08: `forward_state` vs "
+            f"`forward` differ by 1.7e-2 at topk=1000, mid 512, coarse 256, "
+            f"chunk 8), so a segment cut would inherit a candidate set the "
+            f"one-shot forward does not have — the carry contract cannot be "
+            f"proved on this arm until the hierarchical prefill is repaired. "
+            f"Escape: csa_hierarchical=false (the flat fine scan, or the coarse "
+            f"dense level with csa_fine=false, both carry exactly), or "
+            f"segment_len=0."
         )
-    if model.use_csa:
+    if model.use_csa and n < model.csa_chunk:
+        # The boundary contract is "a chunk may span a cut and is completed by
+        # the next segment". Below one chunk a segment completes no fine entry
+        # at all: the first segment's queries have an empty candidate ring (and
+        # the hierarchical selection's gather has an empty candidate tensor),
+        # which is a shape the parity gates do not cover. The carry is still
+        # well defined, so this is a tested-contract refusal, not a formula one.
         loud(
-            f"segment_len={n} with use_csa: the CSA state is a chunk ring carried "
-            f"across BYTES, and what a segment cut should do to a half-full chunk is "
-            f"undecided — carrying it at the cut is a model change, and dropping it "
-            f"silently forgets the segment. Escape: use_csa=false, or segment_len=0."
+            f"segment_len={n} < csa_chunk={model.csa_chunk}: a segment shorter than "
+            f"one CSA chunk completes no fine entry at all, so the first segment's "
+            f"queries have an empty candidate ring (and the hierarchical gather would "
+            f"index an empty tensor) — a shape the carry contract has no gate for. "
+            f"Escape: a segment_len >= {model.csa_chunk}, or segment_len=0."
         )
     if model.attn_kind == "full":
         loud(

@@ -305,10 +305,17 @@ def test_gate_6_unsupported_combinations_are_loud():
         validate(tiny_cfg(use_csa=True, use_msa=True, csa_coarse_chunk=256))
     with pytest.raises(LoudError, match="csa_fine"):
         validate(tiny_cfg(use_csa=True, csa_fine=False, csa_coarse_chunk=0))
-    with pytest.raises(LoudError, match="csa_coarse_chunk"):
+    # The segment pair is LEGAL with the coarse level: the coarse ring carries
+    # its own partial chunk exactly as the fine ring does (`test_segment_csa.py`
+    # is the parity gate). The fine chunk is what the one-chunk floor names.
+    _validate_segment(
+        tiny_cfg(use_csa=True, csa_coarse_chunk=256, moe_topk=0, moe_capacity=0),
+        TrainConfig(segment_len=32, seq_len=SEQ),
+    )
+    with pytest.raises(LoudError, match="csa_chunk"):
         _validate_segment(
-            tiny_cfg(use_csa=True, csa_coarse_chunk=256),
-            TrainConfig(segment_len=32, seq_len=SEQ),
+            tiny_cfg(use_csa=True, csa_chunk=8, csa_coarse_chunk=256),
+            TrainConfig(segment_len=4, seq_len=SEQ),
         )
     # The runtime seam: a hand-built module never calls `validate`.
     with pytest.raises(AssertionError, match="multiple"):
@@ -318,7 +325,8 @@ def test_gate_6_unsupported_combinations_are_loud():
     validate(tiny_cfg(use_csa=True, csa_fine=False, csa_coarse_chunk=256))
     print(
         "loud: non-multiple, non-allowed chunk, coarse width, coarse without "
-        "use_csa, use_msa, csa_fine without coarse, segment_len>0, runtime multiple"
+        "use_csa, use_msa, csa_fine without coarse, segment_len<csa_chunk, "
+        "runtime multiple"
     )
 
 

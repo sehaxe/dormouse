@@ -100,17 +100,37 @@ selective. `decode_cost_table()` prints all three bills; the `--longctx` driver
 in `scripts/ab_csa.py` is the instrument that measures the long-window gain
 before anyone pays them.
 
+SEGMENTATION (`segment_len`, `loopblock._forward_segmented`). A segment cut is
+a MEMORY decision, so it must not move a chunk boundary. The state carries the
+partial chunk: `count` bytes of it are already pooled in `sum`, and the next
+window completes it as `(sum + the next bytes' sum) / chunk` — the same mean the
+one-shot `avg_pool1d` computes over those bytes to fp32 round-off. Nothing is
+dropped (which would silently forget the bytes before the cut) and nothing is
+padded (which would average in bytes that do not exist). The ring's
+`n·chunk + count` is the number of bytes the state has seen, so the byte
+position of a window's first token is reconstructed from the state alone and
+`pos = (count + arange(t)) // chunk + n` is the one-shot chunk index — the
+causal mask, the top-k set and the coarse/mid levels all stay exact. A
+`segment_len` that is NOT a multiple of the chunk is the hard case: it forces
+the partial-chunk carry, and `tests/test_segment_csa.py` gates a 2-segment pass
+against one continuous pass at 1e-5 on the logits (state 1e-6) with
+`segment_len=100`, chunk 8, coarse 256. `_carried_state` copies the ring
+instead of appending in place because `_forward_segmented` wraps the call in
+`checkpoint`, whose backward replays the body on the same input state. The
+state is fp32 on this path and bf16 on the decode path (`CSAState`'s `dtype`):
+a bf16 ring would round the pooled keys a second time and no 1e-5 gate could
+hold. Refused: `segment_len < csa_chunk` (a segment completes no chunk).
+
 REFUSALS (all in `config.validate` / `LoopBlock`): `use_msa` (two sparse branches
-is not measured), `segment_len>0` (what a segment cut does to a half-full chunk
-is undecided), `use_byteflow` (its loop runs over K patch latents, so a
+is not measured), `use_byteflow` (its loop runs over K patch latents, so a
 `csa_chunk` of bytes would silently be a constant chunk of latents — refused
 rather than repurposed), `use_kda=false`, `attn_kind='full'`, a chunk outside
 {4,8,16,32}, a width outside {64,128}, a coarse chunk outside {64,128,256,512},
 a coarse chunk that is not a multiple of `csa_chunk`, a coarse width outside
-{64,128}, coarse without `use_csa`, coarse with `use_msa`, coarse with
-`segment_len>0`, and `csa_fine=false` without a coarse level. `csa_topk > t` is
-legal at runtime: the selection is `min(topk, available chunks)`; `csa_topk=0`
-is legal only when the fine level is off.
+{64,128}, coarse without `use_csa`, coarse with `use_msa`, and
+`csa_fine=false` without a coarse level. `csa_topk > t` is legal at runtime:
+the selection is `min(topk, available chunks)`; `csa_topk=0` is legal only when
+the fine level is off.
 """
 
 from __future__ import annotations
@@ -121,6 +141,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .. import stepaudit
 from ..instrument import Counters, loud
 
 __all__ = [
@@ -341,16 +362,24 @@ def decode_cost_table(
 
 
 class CSAState:
-    """The chunk ring the decode path appends to — one per iteration slot.
+    """The chunk ring the decode and prefill paths append to — one per slot.
 
-    `k`/`v` are `[capacity, batch, csa_kv_dim]` bf16 (2 bytes each, so the
-    memory table is the true tensor size). `sum`/`count` are the current,
-    not-yet-full chunk's pool. `capacity` doubles from the smallest power of two
-    that holds the request (capped at 64), which makes the power-of-two contexts
-    in the memory table exact rather than upper bounds — including the coarse
-    level's 4 entries at 1k. A `reserve` past the cap (`DECODE_MAX_BYTES` of
-    context) raises LOUDLY: the one loss this branch cannot accept is silently
-    forgetting old chunks.
+    `k`/`v` are `[capacity, batch, csa_kv_dim]`; the dtype is the caller's:
+    `torch.bfloat16` (2 bytes each) on the DECODE path, where the memory table
+    is the true tensor size, and `torch.float32` (4 bytes) on the TRAINING
+    path, where a segmented forward must equal the one-shot forward to fp32
+    round-off and a bf16 ring would round every pooled key a second time.
+    `forward_state` builds fp32 (or keeps the incoming state's dtype);
+    `step_state` builds bf16.
+
+    `sum`/`count` are the current, not-yet-full chunk's pool, always fp32: they
+    are the CARRY across a segment cut, so `n·chunk + count` is the number of
+    bytes the state has seen — the byte position the next window starts at.
+    `capacity` doubles from the smallest power of two that holds the request
+    (capped at 64), which makes the power-of-two contexts in the memory table
+    exact rather than upper bounds — including the coarse level's 4 entries at
+    1k. A `reserve` past the cap (`DECODE_MAX_BYTES` of context) raises LOUDLY:
+    the one loss this branch cannot accept is silently forgetting old chunks.
     """
 
     def __init__(
@@ -362,13 +391,14 @@ class CSAState:
         batch: int = 1,
         device: torch.device | str = "cpu",
         max_chunks: int | None = None,
+        dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         self.kv_dim = csa_kv_dim
         self.chunk = csa_chunk
         self.batch = batch
         self.max_chunks = -(-DECODE_MAX_BYTES // csa_chunk) if max_chunks is None else max_chunks
         self.device = device
-        self.k = torch.empty(0, batch, csa_kv_dim, dtype=torch.bfloat16, device=device)
+        self.k = torch.empty(0, batch, csa_kv_dim, dtype=dtype, device=device)
         self.v = torch.empty_like(self.k)
         #: The number of FINALISED chunks (the ring's visible length).
         self.n = 0
@@ -861,22 +891,111 @@ class CompressedSelectiveAttention(nn.Module):
         assert out is not None, "CSA has no active level: fine off and no coarser level"
         return out
 
+    def _carried_state(
+        self,
+        state: CSAState | None,
+        x: torch.Tensor,
+        chunk: int,
+        W_k: nn.Linear,
+        W_v: nn.Linear,
+    ) -> CSAState:
+        """`state` + this window's COMPLETED chunks → the state the next one gets.
+
+        THE SEGMENT CONTRACT, for one level. A window may start inside a chunk:
+        `state.count` is how many bytes of the not-yet-full chunk are already
+        pooled and `state.n` is how many chunks are finalised, so the byte
+        position of `x[:, 0]` is `state.n·chunk + state.count` — reconstructed
+        from the state alone, no caller-supplied offset. The first
+        `chunk - count` bytes COMPLETE the carried chunk as
+        `(state.sum + their sum) / chunk`, the same mean the one-shot
+        `avg_pool1d` computes over those `chunk` bytes to fp32 round-off; the
+        rest are cut from that alignment. A trailing partial chunk is CARRIED in
+        `sum`/`count`, never dropped and never padded.
+
+        FUNCTIONAL in `state`: the old ring is copied into a fresh object, never
+        written. `_forward_segmented` wraps this call in `checkpoint`, whose
+        backward replays the body on the SAME input state object; an in-place
+        append would append every chunk a second time, and the forward parity
+        gate could not see it (the logits of the first pass are right).
+        """
+        b, t, d = x.shape
+        dtype = state.k.dtype if state is not None else torch.float32
+        n_old = 0 if state is None else state.n
+        count = 0 if state is None else state.count
+        total = (
+            torch.zeros(b, d, dtype=torch.float32, device=x.device) if state is None else state.sum
+        )
+        st = CSAState(d, W_k.out_features, chunk, batch=b, device=x.device, dtype=dtype)
+        if n_old:
+            st.reserve(n_old)
+            st.k[:n_old] = state.k[:n_old].to(dtype)
+            st.v[:n_old] = state.v[:n_old].to(dtype)
+            st.n = n_old
+        off, rem = 0, t
+        ks: list[torch.Tensor] = []
+        vs: list[torch.Tensor] = []
+        if count:
+            take = min(chunk - count, rem)
+            total = total + x[:, :take].sum(1)
+            count += take
+            off, rem = take, rem - take
+            if count == chunk:
+                mean = total / chunk
+                ks.append(W_k(mean).unsqueeze(0))  # [1, b, kv]
+                vs.append(W_v(mean).unsqueeze(0))
+                total = torch.zeros_like(total)
+                count = 0
+        full = rem // chunk
+        if full:
+            pooled = self._mean_pool(x[:, off : off + full * chunk], chunk)
+            ks.append(W_k(pooled).transpose(0, 1))  # [full, b, kv]
+            vs.append(W_v(pooled).transpose(0, 1))
+            off += full * chunk
+            rem -= full * chunk
+        if rem:
+            total = total + x[:, off:].sum(1)
+            count = rem
+        if ks:
+            k_new = ks[0] if len(ks) == 1 else torch.cat(ks, 0)
+            v_new = vs[0] if len(vs) == 1 else torch.cat(vs, 0)
+            if self.fused:
+                st.append_many(k_new, v_new)
+            else:
+                for j in stepaudit.iterations("csa.ring_append", range(k_new.shape[0])):
+                    st.append(k_new[j], v_new[j])
+        st.sum = total
+        st.count = count
+        seen = n_old * chunk + (0 if state is None else state.count) + t
+        assert st.n * chunk + st.count == seen, (
+            f"the carried state lost bytes: {st.n}·{chunk} + {st.count} != {seen}"
+        )
+        return st
+
     def forward_state(
         self,
         x: torch.Tensor,
         state: CSAState | tuple[CSAState | None, ...] | None,
         counters: Counters | None = None,
     ) -> tuple[torch.Tensor, CSAState | tuple[CSAState | None, ...]]:
-        """Prefill that also builds the decode ring (chunked prefill / prompt).
+        """Prefill that also builds the ring (chunked prefill / a segment).
 
-        A window may only start on a chunk boundary of the state's own timeline;
-        a half-full chunk is carried by `step_state`, never by a second prefill
-        window (its boundaries would move). The last partial chunk is carried in
-        `sum`/`count` so the decode continues it exactly. With a coarse level the
+        A window MAY start inside a chunk: the state carries the partial chunk's
+        `sum`/`count`, so the completed chunk at the next boundary is the mean of
+        the concatenated bytes and `pos = (count + arange(t)) // chunk + n` is
+        the one-shot chunk index. That is what lets the segmented trainer cut
+        anywhere and still be the same model (`_forward_segmented`) instead of
+        forgetting or padding the chunk a cut splits. With a coarse level the
         same rule holds for the coarse ring and the state is a
         `(fine_state, coarse_state)` pair; with a mid level it is
         `(fine_state, coarse_state, mid_state)` and the mid ring follows the
         same rule.
+
+        The ring this builds is fp32 (`CSAState`'s `dtype`), whatever the
+        caller: the pooled keys must match the one-shot `forward`'s to fp32
+        round-off, which is the segmented trainer's whole contract. The decode
+        arm's own ring (`step_state`) is bf16, which is what the memory table's
+        bytes describe; continuing a prefill from here keeps fp32 and therefore
+        costs twice the table's bytes.
         """
         counters = Counters() if counters is None else counters
         counters.count("csa_forward")
@@ -887,69 +1006,30 @@ class CompressedSelectiveAttention(nn.Module):
         levels: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, str]] = []
         cout = mout = None
         if self.coarse_chunk:
-            if cs is None:
-                cs = CSAState(d, self.coarse_kv_dim, self.coarse_chunk, batch=b, device=x.device)
-            assert (cs.batch, cs.kv_dim) == (b, self.coarse_kv_dim), (cs.batch, b)
-            if cs.count != 0:
-                loud(
-                    "CSA forward_state cannot start inside a half-full COARSE chunk: "
-                    "the pooled entry's byte boundaries would move. Escape: continue "
-                    "with step_state (decode), or start the prefill on a coarse-chunk "
-                    "boundary."
-                )
-            n_old_c = cs.n
-            n_full_c = t // self.coarse_chunk
-            ck, cv = self._pool_coarse(x)
-            if n_full_c:
-                if self.fused:
-                    cs.append_many(
-                        ck[:, :n_full_c].transpose(0, 1), cv[:, :n_full_c].transpose(0, 1)
-                    )
-                else:
-                    cs.reserve(cs.n + n_full_c)
-                    for i in range(n_full_c):
-                        cs.append(ck[:, i], cv[:, i])
-            if t % self.coarse_chunk:
-                cs.sum = cs.sum + x[:, n_full_c * self.coarse_chunk :].sum(1)
-                cs.count = t - n_full_c * self.coarse_chunk
+            if cs is not None:
+                assert (cs.batch, cs.kv_dim) == (b, self.coarse_kv_dim), (cs.batch, b)
+            r_c = 0 if cs is None else cs.count
+            n_old_c = 0 if cs is None else cs.n
+            cs = self._carried_state(cs, x, self.coarse_chunk, self.W_k_c, self.W_v_c)
             if self._coarse_on():
                 counters.count("csa_coarse_forward")
                 cq = self.W_q_c(x)
-                pos_coarse = torch.arange(t, device=x.device) // self.coarse_chunk + n_old_c
+                pos_coarse = (r_c + torch.arange(t, device=x.device)) // self.coarse_chunk
+                pos_coarse = pos_coarse + n_old_c
                 ckk = cs.k[: cs.n].to(cq.dtype).transpose(0, 1)
                 cvv = cs.v[: cs.n].to(cq.dtype).transpose(0, 1)
                 c_scores, c_allowed = self._level_scores(cq, ckk, pos_coarse, self.coarse_scale)
                 cout = self.W_o_c(self._dense_out(c_scores, cvv, c_allowed, self.coarse_kv_dim))
                 levels.append((c_scores, c_allowed, cvv, self.coarse_chunk, "csa_sel_coarse"))
         if self.mid_chunk:
-            if ms is None:
-                ms = CSAState(d, self.kv_dim, self.mid_chunk, batch=b, device=x.device)
-            assert (ms.batch, ms.kv_dim) == (b, self.kv_dim), (ms.batch, b)
-            if ms.count != 0:
-                loud(
-                    "CSA forward_state cannot start inside a half-full MID chunk: "
-                    "the pooled entry's byte boundaries would move. Escape: continue "
-                    "with step_state (decode), or start the prefill on a mid-chunk "
-                    "boundary."
-                )
-            n_old_m = ms.n
-            n_full_m = t // self.mid_chunk
-            mk, mv = self._pool_mid(x)
-            if n_full_m:
-                if self.fused:
-                    ms.append_many(
-                        mk[:, :n_full_m].transpose(0, 1), mv[:, :n_full_m].transpose(0, 1)
-                    )
-                else:
-                    ms.reserve(ms.n + n_full_m)
-                    for i in range(n_full_m):
-                        ms.append(mk[:, i], mv[:, i])
-            if t % self.mid_chunk:
-                ms.sum = ms.sum + x[:, n_full_m * self.mid_chunk :].sum(1)
-                ms.count = t - n_full_m * self.mid_chunk
+            if ms is not None:
+                assert (ms.batch, ms.kv_dim) == (b, self.kv_dim), (ms.batch, b)
+            r_m = 0 if ms is None else ms.count
+            n_old_m = 0 if ms is None else ms.n
+            ms = self._carried_state(ms, x, self.mid_chunk, self.W_k_m, self.W_v_m)
             counters.count("csa_mid_forward")
             mq = self.W_q_m(x)
-            pos_mid = torch.arange(t, device=x.device) // self.mid_chunk + n_old_m
+            pos_mid = (r_m + torch.arange(t, device=x.device)) // self.mid_chunk + n_old_m
             mkk = ms.k[: ms.n].to(mq.dtype).transpose(0, 1)
             mvv = ms.v[: ms.n].to(mq.dtype).transpose(0, 1)
             m_scores, m_allowed = self._level_scores(mq, mkk, pos_mid, self.scale)
@@ -957,36 +1037,16 @@ class CompressedSelectiveAttention(nn.Module):
             levels.append((m_scores, m_allowed, mvv, self.mid_chunk, "csa_sel_mid"))
         out = None
         if self.fine:
-            if fs is None:
-                fs = CSAState(d, self.kv_dim, self.chunk, batch=b, device=x.device)
-            assert (fs.batch, fs.kv_dim) == (b, self.kv_dim), (fs.batch, b)
-            if fs.count != 0:
-                loud(
-                    "CSA forward_state cannot start inside a half-full chunk: the "
-                    "prefill window's chunk boundaries would move, so the pooled key of "
-                    "the first chunk would differ from the byte-by-byte decode's. "
-                    "Escape: continue with step_state (decode), or start the prefill on "
-                    "a chunk boundary."
-                )
-            n_old = fs.n
-            n_full = t // self.chunk
-            k, v = self._pool(x)
-            # The last chunk is partial: it is a key for nothing in this window (no
-            # position after it exists), so it is carried, not appended.
-            if n_full:
-                if self.fused:
-                    fs.append_many(k[:, :n_full].transpose(0, 1), v[:, :n_full].transpose(0, 1))
-                else:
-                    fs.reserve(fs.n + n_full)
-                    for i in range(n_full):
-                        fs.append(k[:, i], v[:, i])
-            if t % self.chunk:
-                fs.sum = fs.sum + x[:, n_full * self.chunk :].sum(1)
-                fs.count = t - n_full * self.chunk
-            # Score against every FINALISED chunk (the final chunk index is never
-            # allowed for any position in this window, so including it is harmless).
+            if fs is not None:
+                assert (fs.batch, fs.kv_dim) == (b, self.kv_dim), (fs.batch, b)
+            r = 0 if fs is None else fs.count
+            n_old = 0 if fs is None else fs.n
+            fs = self._carried_state(fs, x, self.chunk, self.W_k, self.W_v)
+            # Score against every FINALISED chunk. The chunk a position sits in
+            # is never allowed for it (`key < pos`), so the carried tail — which
+            # is not appended yet — could not be read even if it were in the ring.
             q = self.W_q(x)
-            pos_chunk = torch.arange(t, device=x.device) // self.chunk + n_old
+            pos_chunk = (r + torch.arange(t, device=x.device)) // self.chunk + n_old
             kk = fs.k[: fs.n].to(q.dtype).transpose(0, 1)  # [b,n,kv]
             vv = fs.v[: fs.n].to(q.dtype).transpose(0, 1)
             if self.hierarchical:

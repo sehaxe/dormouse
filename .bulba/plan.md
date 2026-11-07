@@ -1069,6 +1069,31 @@ testable and A/B-able (ADR-0017).
       review's §6 is a recipe only); the wall-time and VRAM claims are
       UNMEASURED here.
 
+- [x] P-CSA-SEG. port (Python): the CSA boundary contract, so `use_csa=true`
+      with `segment_len>0` runs. At a cut the rings keep their entries, the
+      partial chunk is CARRIED in `sum`/`count` and completed by the next
+      segment as `(sum + new)/chunk` (never dropped, never padded), and the
+      ring's `n·chunk + count` IS the byte position, so `pos` continues and
+      a segment need not be a multiple of `csa_chunk`. `model/csa.py`
+      (`_carried_state`, fp32 training ring vs bf16 decode ring),
+      `model/loopblock.py` (the refusal is gone), `config.py` (replaced with
+      `segment_len >= csa_chunk` + a loud `csa_hierarchical` refusal),
+      `train/loop.py`/`model/model.py` comments, `stepaudit.py` counter. Parity
+      `tests/test_segment_csa.py` (10 functions / 13 cases): 1.3-1.9e-6 max
+      Δlogits at seg 64/128/100 with and without coarse 256 (gate 1e-5), state
+      2.4e-7 (gate 1e-6), gradient worst rel 8.4e-7; `segment_len=0` pinned to
+      clean `d1b2c2e` (`2bc9cf69…`/`4eb661ad…`, threads=1). Six named scratch
+      mutations each red (drop/pad partial, restart `n`, rotation offset 0,
+      ignore coarse ring, in-place carry → only the gradient gate sees it).
+      Report `docs/reviews/2026-11-08-segment-csa.md` (arithmetic, memory at
+      1M, exact GPU command). Full CPU suite: 43 failed vs main's 39, the 4
+      deltas are untracked data (`checkpoints/`, `sft_pairs/` sounds) missing
+      from a fresh worktree; no new code failure. ruff clean. **NOT run:** the
+      1M GPU command; all VRAM arithmetic is derived, not measured.
+      Follow-ups: the pre-existing hierarchical prefill gap (1.7e-2 vs
+      `forward`, hence the refusal), and chunked prefill now leaves an fp32
+      ring (2× the decode table's bytes).
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)

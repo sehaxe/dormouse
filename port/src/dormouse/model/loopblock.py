@@ -1571,6 +1571,15 @@ class LoopBlock(nn.Module):
           gradient propagation (arXiv:2608.06838), and it is the reason this is
           not truncated BPTT: nothing is detached and no window is a fresh
           sequence.
+        * **The CSA ring is carried inside the same per-slot state** (`_step`
+          holds `(kda_state, csa_state)` on that arm). A cut that lands inside a
+          `csa_chunk` carries the partial chunk's `sum`/`count` and completes it
+          in the next segment (`csa._carried_state`), and the ring's
+          `n·chunk + count` IS the byte position the next segment starts at — so
+          the pooled keys, the `key < pos` mask and every position-derived
+          quantity are the one-shot ones. The state is built functionally (the
+          old ring is copied, not appended in place) because `checkpoint`
+          replays this body on the same input objects in the backward.
         * **`h` is NOT carried and must not be**: it is a per-position residual
           stream, and iteration `i` of segment `s` reads iteration `i-1` of the
           SAME positions, which this window produced itself. Only the
@@ -1608,12 +1617,15 @@ class LoopBlock(nn.Module):
             "a model change wearing a memory flag. Escape: use_msa=false, or "
             "segment_len=0."
         )
-        assert self.csa is None, (
-            "segment_len with use_csa: the CSA state is a chunk ring carried across "
-            "BYTES, and the boundary rule for a half-full chunk at a segment cut is "
-            "undecided (carrying it is a model change, dropping it silently forgets "
-            "the segment). Escape: use_csa=false, or segment_len=0. The config layer "
-            "refuses this pair too."
+        assert self.csa is None or not self.csa.hierarchical, (
+            "segment_len with csa_hierarchical: the hierarchical selection's fine "
+            "candidate set comes from the coarsest level's survivors, and the "
+            "prefill ring has no entry for that level's last PARTIAL chunk — "
+            "measured 2026-11-08: `forward_state` and `forward` already differ by "
+            "1.7e-2 on this arm (topk=1000, mid 512, coarse 256, chunk 8), so a "
+            "segment cut inherits a candidate set the one-shot forward does not "
+            "have. Escape: csa_hierarchical=false (the flat scan or the coarse "
+            "dense level), or segment_len=0. The config layer refuses the pair."
         )
         assert self.moe.topk == 0 or self.moe.capacity == 0, (
             "segment_len with moe_topk>0 at moe_capacity>0: the capacity-padded sparse "
