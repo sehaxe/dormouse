@@ -32,6 +32,48 @@ from dormouse.train.loop import evaluate, load_model_half, load_model_state
 LN2 = 0.6931471805599453
 
 
+def training_paths(run) -> set[Path]:
+    """Every file the run TRAINS on: the flat data file plus each mix source.
+
+    Used by the overlap gate below: a window inside one of these is not held
+    out, whatever its offset.
+    """
+    out: set[Path] = set()
+    if run.train.data:
+        out.add(Path(run.train.data).resolve())
+    plan = run.train.mix_plan
+    if plan:
+        import tomllib
+
+        with open(plan, "rb") as fh:
+            table = tomllib.load(fh)
+        for value in (table.get("sources") or {}).values():
+            out.add(Path(value).resolve())
+    return out
+
+
+def refuse_training_overlap(run, eval_path: Path, allow: bool) -> None:
+    """LOUD when the eval window sits on the corpus: that number is not held out.
+
+    Found by the data/eval audit (2026-11-08): the `off=100,000,000` window on
+    `best/fwedu.bin` was scored while the run's own fwedu cursor had already
+    passed 108.9-110.0 MB, i.e. the "held-out" BPB was reading training bytes.
+    A path comparison is the cheapest honest detector; it cannot see a copy of
+    the same text under another name, and it says so.
+    """
+    if allow:
+        return
+    hits = training_paths(run)
+    if eval_path.resolve() in hits:
+        loud(
+            f"--eval {eval_path} is ALSO a training source of this run "
+            f"({', '.join(sorted(str(p) for p in hits if p == eval_path.resolve()))}). "
+            f"A window in it is not held out: the model may have read those bytes. "
+            f"Escape: point --eval at a file no source reads, or pass "
+            f"--allow-train-overlap and name the number accordingly."
+        )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints"))
@@ -46,9 +88,16 @@ def main() -> int:
     )
     ap.add_argument("--eval", default=None, help="score against THIS file")
     ap.add_argument("--device", default="auto")
+    ap.add_argument(
+        "--allow-train-overlap",
+        action="store_true",
+        help="score a window that lives in the training corpus (the number is then not held out)",
+    )
     a = ap.parse_args()
 
     run = _snapshot_run(a.ckpt_dir, a.ckpt_name, eval_file=a.eval, eval_batches=None)
+    if run.train.eval_data:
+        refuse_training_overlap(run, Path(run.train.eval_data), a.allow_train_overlap)
     over = {"eval": True, "eval_offset": a.eval_offset}
     if a.eval_batches is not None:
         over["eval_batches"] = a.eval_batches
