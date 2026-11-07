@@ -66,12 +66,30 @@
   h1 .dot{color:var(--accent)}
   .lede{max-width:68ch;font-size:20px;line-height:1.5;color:#cfccc6;margin:22px 0 0}
   .lede strong{color:var(--text);font-weight:600}
-  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:44px 0 0}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:44px 0 0;perspective:1000px}
+  .stats .card{transform-style:preserve-3d;transition:transform .35s cubic-bezier(.2,.7,.2,1),border-color .35s ease}
+  .stats .card:hover{border-color:#33373f}
+  .stats .card .n,.stats .card .k,.stats .card .s{transform:translateZ(22px)}
+  .stats .card{box-shadow:0 0 0 rgba(0,0,0,0)}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px}
   .card .n{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:34px;line-height:1.1;color:var(--accent)}
   .card .k{font-size:13px;color:var(--dim);margin-top:8px}
   .card .s{font-family:var(--mono);font-size:12px;color:var(--dim);margin-top:12px;opacity:.8}
 
+  /* Reveal is added by JS, and only to elements BELOW the fold: with no JS, or
+     a failed observer, every number is already visible. */
+  /* hidden state has NO transition: the class is added before first paint, and
+     a transition here would play the element out instead of leaving it hidden.
+     Only the reveal animates. */
+  .will-reveal{opacity:0;transform:translateY(16px)}
+  .will-reveal.is-in{
+    opacity:1;transform:none;
+    transition:opacity .55s ease,transform .55s cubic-bezier(.2,.7,.2,1);
+    transition-delay:calc(var(--i,0) * 60ms)}
+  @media (prefers-reduced-motion:reduce){
+    .will-reveal{opacity:1;transform:none;transition:none}
+    .stats .card{transition:none}
+  }
   h2{font-family:var(--mono);font-size:20px;font-weight:400;margin:0 0 6px;letter-spacing:-.02em}
   h2 .num{color:var(--dim);margin-right:12px}
   .sub{color:var(--dim);font-size:14px;margin:0 0 28px;max-width:68ch}
@@ -87,6 +105,9 @@
   .bar{height:4px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:8px;min-width:90px}
   .bar i{display:block;height:100%;background:var(--accent)}
   .best{color:var(--good)}
+  .rej{color:var(--bad);font-family:var(--mono);font-size:11px;display:inline-block}
+  .rej:hover{animation:glitch .28s steps(2) 2}
+  @keyframes glitch{0%{transform:translate(0)}50%{transform:translate(1.5px,-1px)}100%{transform:translate(0)}}
   .worst{color:var(--bad)}
 
   /* curve */
@@ -130,18 +151,18 @@
       <strong>refute</strong> it. Every number below is computed from the run logs
       at build time; if a log is missing, the number is missing.
     </p>
-    <div class="stats" id="stats">
-      <div class="card">
+    <div class="stats" id="stats" data-reveal>
+      <div class="card" data-tilt>
         <div class="n">1M</div>
         <div class="k">context length at constant memory</div>
         <div class="s">34 MB of state: KDA 393 KB + CSA 32 MB + HCA 1 MB</div>
       </div>
-      <div class="card">
+      <div class="card" data-tilt>
         <div class="n" id="speedup">—</div>
         <div class="k">training-step speed from one config rung</div>
         <div class="s">bf16 Newton–Schulz, 5 steps · inside the ±0.02 BPB noise floor</div>
       </div>
-      <div class="card">
+      <div class="card" data-tilt>
         <div class="n" id="runs">—</div>
         <div class="k">runs on record, every one kept</div>
         <div class="s" id="runsub">including the retracted ones</div>
@@ -158,7 +179,7 @@
       same shape. Moving the chain to bf16 puts it on the tensor cores. Same
       polynomial, same direction, different silicon.
     </p>
-    <table>
+    <table data-reveal>
       <thead><tr><th>rung</th><th>kB/s</th><th>ms / step</th><th>speed</th><th>Δ BPB</th></tr></thead>
       <tbody id="rungs"></tbody>
     </table>
@@ -171,14 +192,14 @@
       The last point is a real run, not an extrapolation — and the retractions
       below say which earlier points were not.
     </p>
-    <svg class="curve" id="curve" viewBox="0 0 640 220" role="img" aria-label="held-out BPB against bytes seen"></svg>
+    <svg class="curve" id="curve" data-reveal viewBox="0 0 640 220" role="img" aria-label="held-out BPB against bytes seen"></svg>
     <div class="meta" id="curvemeta" style="color:var(--dim);margin-top:8px"></div>
   </section>
 
   <section>
     <h2><span class="num">[3]</span>Runs with a held-out number</h2>
     <p class="sub">Longest first. A run appears here only if it produced an eval on the held-out window.</p>
-    <table>
+    <table data-reveal>
       <thead><tr><th>run</th><th>source</th><th>opt</th><th>batch × seq</th><th>MB</th><th>BPB</th></tr></thead>
       <tbody id="runs-table"></tbody>
     </table>
@@ -191,7 +212,7 @@
       measured wrong. Deleting them would be the one dishonest move available,
       so they stay next to what replaced them.
     </p>
-    <ul class="retractions">
+    <ul class="retractions" data-reveal>
       <li>
         <div class="was">“16× from the recipe ladder”</div>
         <div class="now">1.89× from the optimizer rung, measured</div>
@@ -263,6 +284,10 @@ void main(){
   float glyph = step(0.52, bits) * step(0.06, hash(vec2(x + 7.0, cell)));
 
   float a = trail * glyph * body;
+  // pixel look: a 4-level dither (interleaved gradient noise) instead of a
+  // smooth falloff, so the trail reads as discrete cells rather than a glow.
+  float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  a = floor(a * 4.0 + ign) / 4.0;
   float headGlow = smoothstep(0.02, 0.0, abs(d));
   vec3 amber = vec3(0.85, 0.63, 0.36);
   vec3 col = mix(amber, vec3(1.0, 0.96, 0.9), headGlow * 0.8);
@@ -320,6 +345,9 @@ void main(){
 (() => {
   const d = JSON.parse(document.getElementById('data').textContent);
   const fmt = (x, n = 1) => Number(x).toFixed(n);
+  // Declared before every block that reads it — it was declared at the bottom
+  // and the curve code hit the temporal dead zone (caught in the console).
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   // stats
   const rungs = d.rungs || [];
@@ -344,7 +372,7 @@ void main(){
     const d = r.dbpb;
     const q = d == null ? '<td>—</td>'
       : `<td class="${r.safe ? 'best' : 'worst'}">${d > 0 ? '+' : ''}${fmt(d, 2)}</td>`;
-    const note = r.safe ? '' : ' <span style="color:var(--bad);font-family:var(--mono);font-size:11px">rejected</span>';
+    const note = r.safe ? '' : ' <span class="rej">rejected</span>';
     return `<tr>
       <td class="label">${r.label}${note}<div class="bar"><i style="width:${(r.kbs / max * 100).toFixed(0)}%;${r.safe ? '' : 'background:var(--bad)'}"></i></div></td>
       <td>${fmt(r.kbs, 1)}</td>
@@ -377,6 +405,20 @@ void main(){
       `<text x="${L}" y="${H - 8}">${fmt(x0, 0)} MB</text>` +
       `<text x="${W - R}" y="${H - 8}" text-anchor="end">${fmt(x1, 0)} MB</text>` +
       `<text x="${X(last.mb).toFixed(1)}" y="${(Y(last.bpb) - 10).toFixed(1)}" text-anchor="end">${fmt(last.bpb, 3)} BPB</text>`;
+    if (!reduced) {
+      const line = svg.querySelector('.line');
+      const len = line.getTotalLength();
+      line.style.strokeDasharray = len;
+      line.style.strokeDashoffset = len;
+      const draw = new IntersectionObserver((es) => {
+        for (const e of es) if (e.isIntersecting) {
+          line.style.transition = 'stroke-dashoffset 1.3s cubic-bezier(.2,.7,.2,1)';
+          line.style.strokeDashoffset = '0';
+          draw.disconnect();
+        }
+      }, { rootMargin: '0px 0px -15% 0px' });
+      draw.observe(svg);
+    }
     document.getElementById('curvemeta').textContent =
       `${pts.length} held-out points · ${fmt(x1, 0)} MB seen · last ${fmt(last.bpb, 3)} BPB`;
   } else {
@@ -389,6 +431,39 @@ void main(){
     <td>${r.batch}×${r.seq}</td><td>${fmt(r.mb, 0)}</td><td>${fmt(r.bpb, 3)}</td></tr>`).join('');
 
   document.getElementById('built').textContent = 'built from ' + (d.stats.runs_on_record) + ' log files';
+
+  // Scroll reveal: one observer, no library. Everything starts hidden by CSS
+  // and becomes visible once — the observer disconnects itself when done.
+  if (!reduced && 'IntersectionObserver' in window) {
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) { e.target.classList.add('is-in'); io.unobserve(e.target); }
+      }
+    }, { rootMargin: '0px 0px -10% 0px' });
+    document.querySelectorAll('[data-reveal]').forEach((el) => {
+      // Anything already on screen stays visible: hiding it would make the
+      // first paint depend on a callback that might never run.
+      if (el.getBoundingClientRect().top > innerHeight * 0.92) el.classList.add('will-reveal');
+      io.observe(el);
+    });
+  } else {
+    document.querySelectorAll('[data-reveal]').forEach(el => el.classList.add('is-in'));
+  }
+
+  // 3D tilt on the stat cards: the pointer sets two angles, CSS does the rest.
+  if (!reduced && matchMedia('(hover: hover)').matches) {
+    for (const card of document.querySelectorAll('[data-tilt]')) {
+      const max = 7;
+      card.addEventListener('pointermove', (ev) => {
+        const r = card.getBoundingClientRect();
+        const px = (ev.clientX - r.left) / r.width - 0.5;
+        const py = (ev.clientY - r.top) / r.height - 0.5;
+        card.style.transform =
+          `rotateX(${(-py * max).toFixed(2)}deg) rotateY(${(px * max).toFixed(2)}deg) translateZ(10px)`;
+      });
+      card.addEventListener('pointerleave', () => { card.style.transform = ''; });
+    }
+  }
 })();
 </script>
 </body>
