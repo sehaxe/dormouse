@@ -2,6 +2,37 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!--
+
+  ██████╗  ██████╗ ██████╗ ███╗   ███╗ ██████╗ ██╗   ██╗███████╗███████╗
+  ██╔══██╗██╔═══██╗██╔══██╗████╗ ████║██╔═══██╗██║   ██║██╔════╝██╔════╝
+  ██║  ██║██║   ██║██████╔╝██╔████╔██║██║   ██║██║   ██║███████╗█████╗
+  ██║  ██║██║   ██║██╔══██╗██║╚██╔╝██║██║   ██║██║   ██║╚════██║██╔══╝
+  ██████╔╝╚██████╔╝██║  ██║██║ ╚═╝ ██║╚██████╔╝╚██████╔╝███████║███████╗
+  ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝╚══════╝
+
+  A byte-level language model that trains on one workstation.
+  Every number on this page is computed from the run logs at build time.
+
+  FOR HUMANS
+  ├── What it is        https://github.com/sehaxe/dormouse#readme
+  ├── The knowledge base https://github.com/sehaxe/dormouse/tree/main/docs-site
+  ├── The design        .ai-docs/DESIGN.md
+  └── The retractions   the section below, kept on purpose
+
+  FOR AGENTS
+  ├── This page         site/index.html (one file, data in <script id="data">)
+  ├── Generator         site/gen — Rust, std + serde_json, reads logs/**/*.jsonl
+  └── Full text         298 markdown files under docs/ and research/
+
+  WHAT IS MEASURED, AND WHERE
+  ├── throughput rungs  logs/thru/*.jsonl   (9 arms, 40 steps each)
+  ├── quality per rung  logs/muonq/*.jsonl  (5 arms, 2000 steps each)
+  ├── BPB curve         logs/flagship3.jsonl
+  └── the retractions   docs/research/2026-11-08-fp8-on-sm120.md, docs/reviews/
+
+-->
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>dormouse — measured, not asserted</title>
 <meta name="description" content="A byte-level language model trained on one 16 GB card. Every number computed from the run logs, every retraction kept.">
@@ -24,7 +55,7 @@
 
   /* hero */
   .kicker{font-family:var(--mono);font-size:13px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
-  h1{font-size:64px;line-height:1.05;font-weight:600;letter-spacing:-.02em;margin:18px 0 0}
+  h1{font-family:var(--mono);font-size:64px;line-height:1.05;font-weight:400;letter-spacing:-.03em;margin:18px 0 0}
   h1 .dot{color:var(--accent)}
   .lede{max-width:68ch;font-size:20px;line-height:1.5;color:#cfccc6;margin:22px 0 0}
   .lede strong{color:var(--text);font-weight:600}
@@ -34,7 +65,8 @@
   .card .k{font-size:13px;color:var(--dim);margin-top:8px}
   .card .s{font-family:var(--mono);font-size:12px;color:var(--dim);margin-top:12px;opacity:.8}
 
-  h2{font-size:20px;font-weight:600;margin:0 0 6px;letter-spacing:-.01em}
+  h2{font-family:var(--mono);font-size:20px;font-weight:400;margin:0 0 6px;letter-spacing:-.02em}
+  h2 .num{color:var(--dim);margin-right:12px}
   .sub{color:var(--dim);font-size:14px;margin:0 0 28px;max-width:68ch}
 
   /* tables */
@@ -109,7 +141,7 @@
   </section>
 
   <section>
-    <h2>The optimizer was 70% of the step</h2>
+    <h2><span class="num">[1]</span>The optimizer was 70% of the step</h2>
     <p class="sub">
       Muon's Newton–Schulz chain ran 579 GFLOP of fp32 matmuls per step on the
       CUDA-core lane — 223 ms of a 307 ms step, measured against AdamW at the
@@ -123,7 +155,7 @@
   </section>
 
   <section>
-    <h2>Bits per byte, on bytes actually seen</h2>
+    <h2><span class="num">[2]</span>Bits per byte, on bytes actually seen</h2>
     <p class="sub">
       Held-out BPB on a fixed English window, plotted against training bytes.
       The last point is a real run, not an extrapolation — and the retractions
@@ -134,7 +166,7 @@
   </section>
 
   <section>
-    <h2>Runs with a held-out number</h2>
+    <h2><span class="num">[3]</span>Runs with a held-out number</h2>
     <p class="sub">Longest first. A run appears here only if it produced an eval on the held-out window.</p>
     <table>
       <thead><tr><th>run</th><th>source</th><th>opt</th><th>batch × seq</th><th>MB</th><th>BPB</th></tr></thead>
@@ -143,7 +175,7 @@
   </section>
 
   <section>
-    <h2>What is not true</h2>
+    <h2><span class="num">[4]</span>What is not true</h2>
     <p class="sub">
       The distinguishing part. Every entry was published here first, then
       measured wrong. Deleting them would be the one dishonest move available,
