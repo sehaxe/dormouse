@@ -37,8 +37,10 @@ Two honest choices are spelled out rather than hidden:
    and therefore 137.42 at c=1.0 exactly.
 
 The transformer form (the MoD arm itself) is priced analytically, with no
-calibration: `24·L·d²` for the block's projections + MLP and `4·L·T·d` for the
-core, all FLOPs per byte (1 byte = 1 position in this byte-level model).
+calibration: `2·L·(4·d² + 2·d·d_ffn)` for the block's projections + MLP and
+`4·L·T·d` for the core, all FLOPs per byte (1 byte = 1 position in this
+byte-level model). The old `24·L·d²` block term assumed `d_ffn = 4·d`; it is
+kept only as the f=4d special case of the formula now used.
 """
 
 from __future__ import annotations
@@ -120,10 +122,17 @@ def ledger(cfg: ModelConfig, capacity: float, *, seq_len: int, name: str = "") -
         raise ValueError(f"capacity={capacity}: the paper's capacity is in (0, 1]")
     d, v = cfg.d_model, cfg.vocab
     t = min(seq_len, cfg.max_seq_len)
-    head = 2.0 * d * v / 1e6  # MFLOP/byte
+    if cfg.use_tsct:
+        r = min(cfg.rank, d, v)
+        head = 2.0 * (d * r + r * v) / 1e6
+    else:
+        head = 2.0 * d * v / 1e6  # dense head (tied or not: same FLOPs)
     if cfg.block_form == "transformer":
         layers = cfg.n_layers or cfg.loop_blocks * cfg.max_iter
-        block = 24.0 * layers * d * d / 1e6  # qkv 3d² + proj d² + MLP 8d², ×2 FLOPs/MAC
+        # qkv 3d² + proj d² + MLP 2·d·f, in MACs; ×2 FLOPs/MAC. `24·d²` is
+        # the f = 4d special case and overprices any other FFN width (the
+        # flagship3_dense arm has f = 3072, not 4·832 = 3328: +4.4%).
+        block = 2.0 * layers * (4.0 * d * d + 2.0 * d * cfg.d_ffn) / 1e6
         core = 4.0 * layers * t * d / 1e6
         fixed = core + head
         routed = block
@@ -185,8 +194,10 @@ def ledger(cfg: ModelConfig, capacity: float, *, seq_len: int, name: str = "") -
 def _print_formula() -> None:
     print(
         "formula: training MFLOP/byte(c) = 3 * [ fixed + c * routed ]\n"
-        "  fixed      = attention core (4*L*T*d) + head (2*d*V)   [priced FULL]\n"
-        "  routed     = QKV/proj/MLP work removed from skipped tokens\n"
+        "  fixed      = attention core (4*L*T*d) + head (2*d*V; for a TSCT head\n"
+        "               2*(d*r + r*V))                          [priced FULL]\n"
+        "  routed     = 2*L*(4*d^2 + 2*d*f): qkv/proj/MLP work removed from\n"
+        "               skipped tokens (the 24*L*d^2 form is f=4*d only)\n"
         "  3          = FlopCounterMode's forward->forward+backward factor\n"
         "  all-routed = the same split with the attention core scaled too (the\n"
         "               implementation's actual saving; the headline is its lower bound)\n"

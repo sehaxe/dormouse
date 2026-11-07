@@ -9,11 +9,14 @@
 #   * nothing beats a dense transformer at <=200M params in a compute-matched test
 #     (docs/research/2026-11-06-architecture-at-100m.md).
 #
-# Sizing: keep MFLOP/byte at or below the old flagship's 137.4 so the throughput
-# comparison is honest. With L=12, d=832 (13 heads x 64), f=3072: params ~94.6M, 6N/patch over a
-# 4.485 B/patch average = ~126.6 MFLOP/byte (-7.9% vs 137.4).
-# The 4.485 B/patch factor is the trainer's measured average patch length; the
-# exact number is printed by `scripts/flops_ledger.py` and asserted in tests.
+# Sizing: this is a BYTE-level dense arm (1 byte = 1 token), so the old
+# flagship's 4.485 B/patch factor does not apply. The full fwd+bwd bill at
+# b1 x s1024 is 691.37 MFLOP/byte (block 567.41 + attention core 122.68 +
+# head 1.28), ~5.03x the old flagship's measured 137.42. This arm is therefore
+# NOT compute-matched to the KDA flagship; any quality comparison must carry
+# the FLOPs ratio. Exact number printed by `port/scripts/mod_ledger.py` (the
+# comment used to name a `scripts/flops_ledger.py`, which is not on this
+# branch).
 
 d_model = 832
 n_heads = 13

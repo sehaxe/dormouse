@@ -959,16 +959,13 @@ def _eval_loss(
                 for i, v in enumerate(per):
                     per_iter_acc[i] += v * w
     assert weight_total > 0, "an eval over zero scored bytes is not a measurement"
-    if getattr(stream, "eval_tail_capped", None) is not None:
-        # The tail is capped below the requested window, so the stream wrapped
-        # and `scored` above counts duplicate rows. The printed figure is the
-        # DISTINCT bytes those windows scored (the cap's own COUNTED line
-        # names the requested/granted sizes).
-        scored = (
-            stream.distinct_scored_bytes(batches)
-            if masked
-            else distinct_scored_bytes(stream, batches)
-        )
+    # `scored` is the number of PREDICTIONS the means above divided by (the
+    # `weight_total` for a flat window, the selected positions for a masked
+    # one). A capped eval tail wraps and scores some bytes more than once; the
+    # numerator includes those reads, so the denominator must too. The distinct
+    # positions are metadata (`distinct=` on the line), not the BPB
+    # denominator. (Before 2026-11-07 this branch replaced `scored` with the
+    # distinct count while the mean still divided by the reads.)
     model.train(was_training)
     if counters is not None:
         counters.merge(ev_counters)
@@ -1061,7 +1058,15 @@ def _eval_line(
         line += f" eval_docmask={policy}"
     capped = getattr(stream, "eval_tail_capped", None)
     if capped is not None:
-        line += f" eval_tail_capped={capped[0]}/{capped[1]}"
+        # `over N B` is the prediction count the mean divided by; above the cap
+        # some positions were read more than once, so print the distinct count
+        # beside it rather than mistaking one for the other.
+        distinct = (
+            stream.distinct_scored_bytes(batches)
+            if hasattr(stream, "distinct_scored_bytes")
+            else distinct_scored_bytes(stream, batches)
+        )
+        line += f" eval_tail_capped={capped[0]}/{capped[1]} distinct={distinct}"
 
     if per_iter:
         line += " periter=" + ",".join(f"{v:.4f}" for v in per_iter)
