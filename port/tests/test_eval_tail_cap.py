@@ -1,11 +1,12 @@
-"""m2: the eval tail's 1 MiB cap is COUNTED, and `over N B` counts DISTINCT bytes.
+"""m2: the eval tail's 1 MiB cap is COUNTED, and the BPB denominator is predictions.
 
 `open_streams` clamps the tail carve to 1 MiB; above it the eval stream wraps
-and re-reads the same tail while `_eval_loss` kept adding `x.numel()`, so the
-printed figure counted duplicate rows (measured: 100 x 16 x 1024 = 1 638 400 B
-requested over a 1 048 576 B range). The fix keeps the cap, prints
-`eval_tail_capped=requested/granted` on the eval line, and scores each byte
-once. A window at or below the cap must keep its old number and line.
+and re-reads the same tail. The headline mean is over the predictions it summed,
+so `over N B` names that count and `distinct=` names the unique byte positions
+beside it. (Before 2026-11-07 the printed figure was the DISTINCT count while
+the numerator averaged duplicate reads, i.e. the denominator was not the set the
+numerator summed.) A window at or below the cap must keep its old number and
+line.
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ def brute_distinct(span: int, batch: int, seq: int, batches: int) -> int:
     return len(seen)
 
 
-def test_the_cap_logs_both_sizes_and_scores_distinct_bytes(tmp_path, capsys):
+def test_the_cap_logs_both_sizes_and_divides_by_the_predictions(tmp_path, capsys):
     run = big_run(tmp_path)
     assert eval_window_bytes(run.train) == 1_638_400
     _train, ev = open_streams(run)
@@ -83,9 +84,12 @@ def test_the_cap_logs_both_sizes_and_scores_distinct_bytes(tmp_path, capsys):
 
     _loss, scored, _fin, _per = _eval_loss(_ZeroLoss(), ev, 100, None, None)
     distinct = distinct_scored_bytes(ev, 100)
-    assert scored == distinct, "the printed figure must be the DISTINCT bytes scored"
-    assert scored < 1_638_400, "a wrapped eval must not count duplicate rows"
-    assert scored <= CAP
+    # The mean divides by the PREDICTIONS it summed (100 x 16 x 1024), so the
+    # denominator is that count. The distinct byte positions are metadata, not
+    # the BPB denominator: a wrapped window scores some bytes more than once.
+    assert scored == 100 * 16 * 1024
+    assert distinct < scored, "the fixture must wrap"
+    assert scored <= 100 * CAP
 
 
 def test_distinct_matches_a_brute_force_union(tmp_path):
