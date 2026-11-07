@@ -5,6 +5,24 @@
 **Method:** 20 arXiv queries, 40+ `get_abstract` resolutions, 28 full-text HTML fetches, every number read out of the paper's own table (table number named in each row). Repo facts from `AGENTS.md` §3.1 and `docs/protocols/AB-PROTOCOL.md`. Dates are arXiv first-submission dates.
 **Marks:** **[T]** table read · **[A]** abstract only · **[ours]** repo measurement · **[S1]** SPECULATION with a sourced mechanism · **[S2]** SPECULATION with no direct source.
 
+## Correction (2026-11-07, after the frontier teardown)
+
+Point 1 below — "not one sequence-mixer candidate has a published compute-matched
+win over a dense transformer at ≤200M" — is **wrong for linear attention** and is
+kept only as the record of what we believed for one day. `docs/research/2026-11-07-frontier-teardown.md`
+finds Olmo Hybrid (**2604.03444v4**, Table 5): at **60M params**, a 3:1 Gated
+DeltaNet/attention hybrid reaches **1.077 BPB against a transformer's 1.155** —
+a 0.078 BPB win, and the closest published scale to ours (95M). Kimi Linear
+(2510.26692v2, Table 1) shows the same sign at 653M active with equal FLOPs
+(PPL 5.65 vs 5.77).
+
+What survives unchanged: MoE, loops, MTP, BLT and sparse attention have no
+compute-matched win at our scale, and sparse attention is arithmetically worse at
+s=1024 (+5.7% because the indexer costs more than it saves). What changes: the
+linear-attention arm is not a dead end — it is the one mechanism with a
+published win close to our size, and our `configs/arch_hybrid_kda.toml` (12
+unique KDA blocks, 95.9M) is the arm that tests it.
+
 ## TL;DR
 
 1. **At ≤200M params, not one sequence-mixer candidate in this list has a published compute-matched win over a dense transformer on loss/BPB.** The only ≤200M wins I can verify are (a) **sparse memory layers on a 134M backbone** (iso-FLOPs, 7× total params; NQ 0.91 → 2.10) and (b) a **byte-patching rule at 50M** (computed-result accuracy 21% → 57%), neither of which is a BPB win against a dense control.
