@@ -21,3 +21,11 @@ vendor/cubecl-cuda/
 vendor/cubecl-runtime/
 vendor/cubecl-server/
 sft_pairs/v2/**/*.jsonl
+
+# Agent/scratch state: never source, never committed.
+.scratch/
+.pytest-tmp/
+.pytest_cache/
+.ruff_cache/
+*.orig
+*.rej
