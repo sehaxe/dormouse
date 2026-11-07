@@ -1211,11 +1211,7 @@ def sft_train(
             decay_steps=decay,
             final_frac=cfg.min_lr_frac,
         )
-        for group in opt.adamw.param_groups:
-            group["lr"] = lr
-        if opt.muon is not None:
-            for group in opt.muon.param_groups:
-                group["lr"] = lr
+        opt.set_lr(lr)
 
         opt.zero_grad(set_to_none=True)
         loss_finite = None

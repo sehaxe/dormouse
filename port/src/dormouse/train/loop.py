@@ -1754,14 +1754,21 @@ def train(
             # above is the only path an SF run takes.
             graph.set_lr(lr)
             if opt.muon is not None and cfg.muon_sf:
-                for group in opt.muon.param_groups:
-                    group["lr"] = muon_lr
+                # The SF arm's LR is CONSTANT after warmup, while `graph.set_lr`
+                # writes the WSD value into every group; the write-back keeps it
+                # the arm. A host float is right here: capture REFUSES `muon_sf`
+                # (`train/graph.py`), so the arm runs eager, and the group is a
+                # float again after the counted fallback.
+                for group in opt.muon.param_groups:  # stepaudit-excuse: <=8 groups, one scalar
+                    group["lr"] = muon_lr * cfg.muon_lr_mult
+            elif opt.muon is not None:
+                # `graph.set_lr` writes ONE value into every group, so the Muon
+                # half's own LR goes in after it — through the same seam, which
+                # fills a captured LR tensor IN PLACE (a float assignment would
+                # freeze the object the replay reads).
+                opt.set_lr(lr, muon_lr)
         else:
-            for group in opt.adamw.param_groups:
-                group["lr"] = lr
-            if opt.muon is not None:
-                for group in opt.muon.param_groups:
-                    group["lr"] = muon_lr
+            opt.set_lr(lr, muon_lr)
 
         # The ANNEALED factor_qat arm: burn-spectral's measured soft-to-hard
         # ramp (`ste_ternary_annealed`, "converges better than hard STE from

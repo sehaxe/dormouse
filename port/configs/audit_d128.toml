@@ -1,0 +1,25 @@
+# The audit's CPU control: a dense transformer at the flagship3_dense aspect
+# ratio, small enough that 3 arms x 1200 steps fit in a coffee break.
+d_model = 128
+n_heads = 4
+head_dim = 32
+d_ffn = 512
+vocab = 256
+max_seq_len = 256
+max_iter = 1
+loop_blocks = 1
+n_layers = 4
+
+block_form = "transformer"
+use_kda = false
+use_csa = false
+use_mhc = false
+use_attnres = false
+use_engram = false
+layerrope = false
+
+n_experts = 1
+moe_topk = 0
+use_tsct = false
+
+bf16 = false
