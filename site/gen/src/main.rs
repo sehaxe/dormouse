@@ -146,6 +146,7 @@ fn main() {
     let mut logs = PathBuf::from("../../logs");
     let mut quality_logs = PathBuf::from("../../logs/muonq");
     let mut surprise = PathBuf::from("../assets/surprise.json");
+    let mut script = PathBuf::from("../pixel.js");
     let mut template = PathBuf::from("../template.html");
     let mut out = PathBuf::from("../index.html");
     while let Some(a) = args.next() {
@@ -153,6 +154,7 @@ fn main() {
             "--logs" => logs = PathBuf::from(args.next().expect("--logs PATH")),
             "--quality-logs" => quality_logs = PathBuf::from(args.next().expect("--quality-logs PATH")),
             "--surprise" => surprise = PathBuf::from(args.next().expect("--surprise PATH")),
+            "--script" => script = PathBuf::from(args.next().expect("--script PATH")),
             "--template" => template = PathBuf::from(args.next().expect("--template PATH")),
             "--out" => out = PathBuf::from(args.next().expect("--out PATH")),
             other => {
@@ -277,6 +279,11 @@ fn main() {
         "/*__SURPRISE__*/null",
         surprise_blob.as_deref().unwrap_or("null"),
     );
+    let js = fs::read_to_string(&script).unwrap_or_else(|e| {
+        eprintln!("cannot read script {}: {e}", script.display());
+        std::process::exit(1);
+    });
+    html = html.replace("/*__SCRIPT__*/", &js);
     if let Err(e) = fs::write(&out, html) {
         eprintln!("cannot write {}: {e}", out.display());
         std::process::exit(1);

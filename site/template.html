@@ -4,650 +4,261 @@
 <meta charset="utf-8">
 <!--
 
-  ██████╗  ██████╗ ██████╗ ███╗   ███╗ ██████╗ ██╗   ██╗███████╗███████╗
-  ██╔══██╗██╔═══██╗██╔══██╗████╗ ████║██╔═══██╗██║   ██║██╔════╝██╔════╝
-  ██║  ██║██║   ██║██████╔╝██╔████╔██║██║   ██║██║   ██║███████╗█████╗
-  ██║  ██║██║   ██║██╔══██╗██║╚██╔╝██║██║   ██║██║   ██║╚════██║██╔══╝
-  ██████╔╝╚██████╔╝██║  ██║██║ ╚═╝ ██║╚██████╔╝╚██████╔╝███████║███████╗
-  ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝╚══════╝
-
-  A byte-level language model that trains on one workstation.
-  Every number on this page is computed from the run logs at build time.
+  01000100 01001111 01010010 01001101 01001111 01010101 01010011 01000101
+  --------------------------------------------------------------------------
+  dormouse — a byte-level language model on one workstation.
 
   FOR HUMANS
-  ├── What it is        https://github.com/sehaxe/dormouse#readme
-  ├── The knowledge base https://github.com/sehaxe/dormouse/tree/main/docs-site
-  ├── The design        .ai-docs/DESIGN.md
-  └── The retractions   the section below, kept on purpose
+  ├── read      this page, top to bottom; every number is a measured run
+  ├── source    https://github.com/sehaxe/dormouse
+  └── agents    298 markdown files under docs/ and research/
 
   FOR AGENTS
-  ├── This page         site/index.html (one file, data in <script id="data">)
-  ├── Generator         site/gen — Rust, std + serde_json, reads logs/**/*.jsonl
-  └── Full text         298 markdown files under docs/ and research/
-
-  WHAT IS MEASURED, AND WHERE
-  ├── throughput rungs  logs/thru/*.jsonl   (9 arms, 40 steps each)
-  ├── quality per rung  logs/muonq/*.jsonl  (5 arms, 2000 steps each)
-  ├── BPB curve         logs/flagship3.jsonl
-  └── the retractions   docs/research/2026-11-08-fp8-on-sm120.md, docs/reviews/
+  ├── data      <script id="data"> at the bottom: runs, rungs, curve
+  ├── image     <script id="surprise">: 1024 bytes + per-byte -log2 p
+  └── build     site/gen (Rust, std + serde_json) reads logs/**/*.jsonl
 
 -->
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>dormouse — measured, not asserted</title>
 <meta name="description" content="A byte-level language model trained on one 16 GB card. Every number computed from the run logs, every retraction kept.">
 <style>
   :root{
-    --bg:#0b0c0e; --panel:#121418; --line:#23262c; --text:#e8e6e1;
-    --dim:#8a8f98; --accent:#d9a05b; --good:#7fb069; --bad:#c46a5a;
-    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
-    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --bg:#05070a; --panel:#0a0e12; --panel2:#0d1319;
+    --line:#1b2530; --line2:#26333f;
+    --ink:#cfdae2; --dim:#5d7180;
+    --green:#00e08a; --green-dim:#0a6b46;
+    --hot:#ff3b5c;
+    --mono:"DejaVu Sans Mono","Liberation Mono",ui-monospace,monospace;
   }
   *{box-sizing:border-box}
-  html{-webkit-text-size-adjust:100%}
-  body{
-    margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
-    font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased;
-  }
-  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
-  section{padding:76px 0;border-top:1px solid var(--line)}
-  section:first-of-type{border-top:0}
-  /* A full-viewport poster that PINS, so the next section slides over it —
-     one transition, no scroll-jacking, no library. */
-  .hero{position:sticky;top:0;z-index:0;min-height:100svh;display:flex;
-        align-items:center;padding:0}
-  .hero .content{width:100%}
-  section.over{position:relative;z-index:1;background:var(--bg)}
-
-  /* hero */
-  .kicker{font-family:var(--mono);font-size:13px;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
-  h1{font-family:var(--mono);font-size:64px;line-height:1.05;font-weight:400;letter-spacing:-.03em;margin:18px 0 0}
-  h1 .dot{color:var(--accent)}
-  .lede{max-width:68ch;font-size:20px;line-height:1.5;color:#cfccc6;margin:22px 0 0}
-  .lede strong{color:var(--text);font-weight:600}
-  .surprise{position:relative;z-index:1;background:var(--bg)}
-  .shead{display:flex;align-items:baseline;gap:14px;font-family:var(--mono);
-    font-size:13px;color:var(--dim);letter-spacing:.04em;text-transform:uppercase;
-    padding-bottom:14px;border-bottom:1px solid var(--line)}
-  .shead .num{color:var(--accent)}
-  .smeta{margin-left:auto;text-transform:none;letter-spacing:0}
-  .heat{display:block;width:100%;height:44px;margin:26px 0 0;
-    image-rendering:pixelated;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
-    opacity:.95}
-  .bytes{margin:16px 0 0;font-family:var(--mono);
-    font-size:clamp(11px,1.05vw,17px);line-height:1.42;letter-spacing:0;
-    white-space:pre;overflow-x:auto;color:#4a4e56;
-    font-variant-numeric:tabular-nums;font-weight:400}
-  .bytes b{font-weight:400}
-  .sfoot{display:flex;justify-content:space-between;align-items:center;gap:18px;
-    margin-top:18px;padding-top:14px;border-top:1px solid var(--line);
-    font-family:var(--mono);font-size:12px;color:var(--dim)}
-  .legend{display:flex;align-items:center;gap:8px}
-  .legend i{display:inline-block;width:10px;height:10px;background:#3a3e46}
-  .legend i.hot{background:var(--accent)}
-  .legend .sp{width:18px}
-
-  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:56px 0 0}
-  .stats .card{transition:border-color .35s ease}
-  .stats .card:hover{border-color:#33373f}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px}
-  .card .n{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:34px;line-height:1.1;color:var(--accent)}
-  .card .k{font-size:13px;color:var(--dim);margin-top:8px}
-  .card .s{font-family:var(--mono);font-size:12px;color:var(--dim);margin-top:12px;opacity:.8}
-
-  /* Reveal is added by JS, and only to elements BELOW the fold: with no JS, or
-     a failed observer, every number is already visible. */
-  /* hidden state has NO transition: the class is added before first paint, and
-     a transition here would play the element out instead of leaving it hidden.
-     Only the reveal animates. */
-  .will-reveal{opacity:0;transform:translateY(16px)}
-  .will-reveal.is-in{
-    opacity:1;transform:none;
-    transition:opacity .55s ease,transform .55s cubic-bezier(.2,.7,.2,1);
-    transition-delay:calc(var(--i,0) * 60ms)}
-  @media (prefers-reduced-motion:reduce){
-    .will-reveal{opacity:1;transform:none;transition:none}
-    .stats .card{transition:none}
-  }
-  h2{font-family:var(--mono);font-size:20px;font-weight:400;margin:0 0 6px;letter-spacing:-.02em}
-  h2 .num{color:var(--dim);margin-right:12px}
-  .sub{color:var(--dim);font-size:14px;margin:0 0 28px;max-width:68ch}
-
-  /* tables */
-  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
-  th{font-family:var(--mono);font-size:12px;font-weight:400;color:var(--dim);text-align:right;
-     padding:0 12px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
-  th:first-child,td:first-child{text-align:left;padding-left:0}
-  td{font-family:var(--mono);font-size:14px;text-align:right;padding:12px;border-bottom:1px solid var(--line);white-space:nowrap}
-  tr:last-child td{border-bottom:0}
-  td.label{font-family:var(--sans);color:#cfccc6}
-  .bar{height:4px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:8px;min-width:90px}
-  .bar i{display:block;height:100%;background:var(--accent)}
-  .best{color:var(--good)}
-  .rej{color:var(--bad);font-family:var(--mono);font-size:11px;display:inline-block}
-  .rej:hover{animation:glitch .28s steps(2) 2}
-  @keyframes glitch{0%{transform:translate(0)}50%{transform:translate(1.5px,-1px)}100%{transform:translate(0)}}
-  .worst{color:var(--bad)}
-
-  /* curve */
-  .curve{margin:8px 0 0;width:100%;height:auto;display:block}
-  .curve .grid{stroke:var(--line);stroke-width:1}
-  .curve .line{fill:none;stroke:var(--accent);stroke-width:2}
-  .curve .pt{fill:var(--accent)}
-  .curve text{fill:var(--dim);font-family:var(--mono);font-size:11px}
-
-  /* retractions */
-  ul.retractions{list-style:none;margin:0;padding:0}
-  ul.retractions li{border-bottom:1px solid var(--line);padding:18px 0;display:grid;grid-template-columns:1fr 1fr;gap:24px}
-  ul.retractions li:last-child{border-bottom:0}
-  ul.retractions .was{font-family:var(--mono);font-size:14px;color:var(--bad)}
-  ul.retractions .now{font-family:var(--mono);font-size:14px;color:var(--good)}
-  ul.retractions .why{grid-column:1/-1;color:var(--dim);font-size:14px}
-
-  footer{padding:56px 0 80px;border-top:1px solid var(--line);color:var(--dim);font-size:13px}
-  footer a{color:var(--text);text-decoration:none;border-bottom:1px solid var(--line)}
-  footer .row{display:flex;gap:24px;flex-wrap:wrap}
-  .meta{font-family:var(--mono);font-size:12px}
-  @media (max-width:860px){
-    .poster{grid-template-columns:1fr;gap:36px}
-  }
-  @media (max-width:720px){
-    h1{font-size:40px}.stats{grid-template-columns:1fr}
-    ul.retractions li{grid-template-columns:1fr;gap:6px}
-    td,th{padding:10px 8px}
-  }
-
-  /* ---- the poster (v3): binary rain behind, type in front ---- */
-  .hero{position:sticky;top:0;z-index:0;min-height:100svh;display:flex;
-        align-items:center;overflow:hidden}
-  .hero .content{position:relative;z-index:2;width:100%}
-  .hero h1{font-size:clamp(56px,9vw,132px);letter-spacing:-.04em;margin:14px 0 0}
-  .hero .lede{margin-top:26px;max-width:62ch}
-  .hero-stats{display:flex;flex-wrap:wrap;gap:34px;margin-top:38px;
-    font-family:var(--mono);font-size:13px;color:var(--dim);letter-spacing:.02em}
-  .hero-stats b{color:var(--text);font-weight:400;font-size:15px;margin-right:4px}
-  .hero-stats .hint{margin-left:auto;color:#5b6069;animation:blink 2.6s steps(2) infinite;
-    display:flex;align-items:center;gap:8px}
-  .hero-stats .hint::after{content:"";width:1px;height:22px;
-    background:linear-gradient(180deg,var(--accent),transparent)}
-  @keyframes blink{0%,60%{opacity:.45}61%,100%{opacity:1}}
-  #rain{position:absolute;inset:0;z-index:0;width:100%;height:100%;
-        opacity:.75;pointer-events:none;display:block}
-  /* the scrim: the rain fades out where the type lives, so the text is never
-     competing with a digit for the same pixel. */
-  .hero::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;
+  html{background:var(--bg);-webkit-text-size-adjust:100%}
+  body{margin:0;color:var(--ink);font-family:var(--mono);font-size:13.5px;line-height:1.6;
     background:
-      linear-gradient(90deg,rgba(11,12,14,.98) 0%,rgba(11,12,14,.95) 34%,rgba(11,12,14,.55) 56%,rgba(11,12,14,0) 78%),
-      linear-gradient(180deg,rgba(11,12,14,.9) 0%,rgba(11,12,14,0) 22%,rgba(11,12,14,0) 74%,rgba(11,12,14,.95) 100%)}
-  @media (prefers-reduced-motion:reduce){#rain{display:none}}
-  .tape{position:absolute;left:0;right:0;bottom:0;z-index:2;overflow:hidden;
-    border-top:1px solid var(--line);background:rgba(9,10,12,.96);
-    -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
-  .tape-in{display:inline-block;white-space:nowrap;padding:9px 0;
-    font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:#6f747d;
-    animation:tape 44s linear infinite}
-  .tape-in b{color:var(--accent);font-weight:400}
-  .tape{-webkit-mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent);
-        mask-image:linear-gradient(90deg,transparent,#000 6%,#000 94%,transparent)}
+      repeating-linear-gradient(0deg,rgba(255,255,255,.022) 0 1px,transparent 1px 4px),
+      repeating-linear-gradient(90deg,rgba(255,255,255,.022) 0 1px,transparent 1px 4px),
+      var(--bg);
+    -webkit-font-smoothing:none;font-smooth:never}
+  a{color:var(--green);text-decoration:none;border-bottom:1px solid var(--green-dim)}
+  a:hover{border-bottom-color:var(--green)}
+  .wrap{max-width:1120px;margin:0 auto;padding:0 20px}
+
+  /* ---- top bar ---- */
+  .bar{position:fixed;top:0;left:0;right:0;z-index:40;height:34px;display:flex;
+    align-items:center;gap:16px;padding:0 14px;font-size:11px;letter-spacing:.08em;
+    text-transform:uppercase;color:var(--dim);
+    background:rgba(5,7,10,.92);border-bottom:1px solid var(--line)}
+  .bar b{color:var(--green);font-weight:400}
+  .bar .sp{margin-left:auto}
+  .bar a{color:var(--dim);border:0}
+  .bar a:hover{color:var(--ink)}
+
+  /* ---- hero ---- */
+  .hero{position:relative;min-height:100svh;display:flex;align-items:center;
+    padding:120px 0 90px;overflow:hidden;border-bottom:1px solid var(--line)}
+  #rain{position:absolute;inset:0;width:100%;height:100%;z-index:0;opacity:.5;
+    -webkit-mask-image:linear-gradient(90deg,transparent 0%,transparent 40%,#000 58%);
+    mask-image:linear-gradient(90deg,transparent 0%,transparent 40%,#000 58%)}
+  .hero-in{position:relative;z-index:2;width:100%}
+  .tag{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+  .tag b{color:var(--green);font-weight:400}
+  #pixTitle{display:block;margin:22px 0 0;image-rendering:pixelated;
+    width:100%;max-width:760px;height:auto}
+  .lede{margin:26px 0 0;max-width:60ch;font-size:14px;line-height:1.7;color:#a9b8c4}
+  .lede b{color:var(--ink);font-weight:400}
+  .hstats{display:flex;flex-wrap:wrap;gap:0;margin:34px 0 0;border:1px solid var(--line);
+    background:var(--panel);width:fit-content}
+  .hstats span{padding:10px 16px;border-right:1px solid var(--line);font-size:11px;
+    letter-spacing:.06em;color:var(--dim);text-transform:uppercase}
+  .hstats span:last-child{border-right:0}
+  .hstats b{display:block;font-size:18px;letter-spacing:0;color:var(--green);
+    font-weight:400;text-transform:none;margin-bottom:2px}
+
+  /* ---- the tape ---- */
+  .tape{position:absolute;left:0;right:0;bottom:0;z-index:3;overflow:hidden;
+    border-top:1px solid var(--line);background:rgba(5,7,10,.95)}
+  .tape-in{display:inline-block;white-space:nowrap;padding:8px 0;font-size:10.5px;
+    letter-spacing:.08em;color:#4e6270;animation:tape 52s linear infinite}
+  .tape-in b{color:var(--green);font-weight:400}
   @keyframes tape{from{transform:translateX(0)}to{transform:translateX(-50%)}}
-  .hero:hover .tape-in{animation-play-state:paused}
-  @media (prefers-reduced-motion:reduce){.tape-in{animation:none}}
-  /* the title glitches for 220 ms every 7 s — a CRT artefact, not a loop */
-  .hero h1{animation:glitchy 7s steps(1) infinite}
-  @keyframes glitchy{
-    0%,96%{text-shadow:none;transform:none}
-    96.5%{text-shadow:-2px 0 rgba(217,160,91,.55),2px 0 rgba(120,170,255,.45);transform:translateX(1px)}
-    97.5%{text-shadow:2px 0 rgba(217,160,91,.55),-2px 0 rgba(120,170,255,.45);transform:translateX(-1px)}
-    98.5%{text-shadow:none;transform:none}
-    100%{text-shadow:none;transform:none}}
+
+  /* ---- sections ---- */
+  section.blk{padding:64px 0;border-top:1px solid var(--line)}
+  section.blk:first-of-type{border-top:0}
+  h2{font-size:12px;font-weight:400;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--ink);margin:0 0 6px}
+  h2 .n{color:var(--green);margin-right:10px}
+  .sub{color:var(--dim);font-size:12px;margin:0 0 26px;max-width:86ch;line-height:1.7}
+
+  /* ---- tables ---- */
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);
+    font-weight:400;text-align:right;padding:8px 10px;border-bottom:1px solid var(--line2)}
+  th:first-child{text-align:left;padding-left:0}
+  td{text-align:right;padding:9px 10px;border-bottom:1px solid var(--line)}
+  td:first-child{text-align:left;padding-left:0}
+  tr:hover td{background:var(--panel)}
+  .ok{color:var(--green)}
+  .bad{color:var(--hot)}
+  .dim{color:var(--dim)}
+
+  /* ---- the portrait ---- */
+  .heat{display:block;width:100%;height:52px;image-rendering:pixelated;
+    border:1px solid var(--line);background:var(--panel)}
+  .bytes{margin:0;padding:14px;border:1px solid var(--line);border-top:0;
+    background:var(--panel);font-size:11.5px;line-height:1.5;white-space:pre;
+    overflow-x:auto;color:#3d4d59;letter-spacing:0}
+  .bytes b{font-weight:400}
+
+  /* ---- cards ---- */
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .card{border:1px solid var(--line2);background:var(--panel);padding:16px;
+    box-shadow:4px 4px 0 rgba(0,224,138,.07)}
+  .card .k{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
+  .card .v{font-size:26px;color:var(--green);margin:6px 0 8px;line-height:1}
+  .card .d{font-size:11px;color:var(--dim);line-height:1.6}
+
+  /* ---- curve ---- */
+  .curve{width:100%;height:auto;display:block;border:1px solid var(--line);background:var(--panel)}
+  .curve .grid{stroke:#16202a;stroke-width:1}
+  .curve .line{fill:none;stroke:var(--green);stroke-width:1.5}
+  .curve .pt{fill:var(--green)}
+  .curve text{fill:var(--dim);font-family:var(--mono);font-size:10px}
+
+  /* ---- retractions ---- */
+  ol.retr{list-style:none;margin:0;padding:0;counter-reset:r}
+  ol.retr li{border:1px solid var(--line);border-left:2px solid var(--hot);
+    padding:14px 16px;margin-bottom:10px;background:var(--panel)}
+  ol.retr .was{color:var(--hot);font-size:12px}
+  ol.retr .now{color:var(--green);font-size:12px}
+  ol.retr .why{color:var(--dim);font-size:11.5px;margin-top:6px;line-height:1.65}
+
+  footer{padding:40px 0 70px;border-top:1px solid var(--line);color:var(--dim);font-size:11px}
+  footer .row{display:flex;gap:20px;flex-wrap:wrap;align-items:center}
+
+  @media (max-width:820px){
+    .cards{grid-template-columns:1fr}
+    .hstats span{padding:8px 12px}
+    section.blk{padding:48px 0}
+  }
+  @media (prefers-reduced-motion:reduce){
+    #rain{display:none}.tape-in{animation:none}
+  }
 </style>
 </head>
 <body>
 
-<div class="wrap">
-
-  <section class="hero">
-    <canvas id="rain" aria-hidden="true"></canvas>
-    <div class="content">
-      <div class="kicker">one RTX 5070 Ti · 16 GB · sm_120</div>
-      <h1><span id="scramble">dormouse</span><span class="dot">.</span></h1>
-      <p class="lede">
-        A byte-level language model that lives on <strong>one workstation</strong>.
-        Published with the measurements that justify it — and the ones that
-        <strong>refute</strong> it.
-      </p>
-      <div class="hero-stats">
-        <span><b id="hBpb">—</b> bits / byte</span>
-        <span><b id="hMb">—</b> MB seen</span>
-        <span><b id="hSpeed">—</b> step</span>
-        <span class="hint">scroll</span>
-      </div>
-    </div>
-    <div class="tape" aria-hidden="true"><div class="tape-in" id="tape"></div></div>
-  </section>
-
-  <!-- The hero image is not an illustration: 1024 held-out bytes, each tinted
-       by how much it surprised THIS checkpoint. Rendered from
-       site/assets/surprise.json, written by port/scripts/surprise_map.py. -->
-  <section class="surprise" id="s0">
-    <div class="shead">
-      <span class="num">[0]</span>
-      <span>what the model sees</span>
-      <span class="smeta" id="sMeta">held-out english · 1 024 bytes</span>
-    </div>
-    <canvas class="heat" id="heat" width="1024" height="44" aria-hidden="true"></canvas>
-    <pre class="bytes" id="bytes" aria-label="held-out text tinted by the model's surprise"></pre>
-    <div class="sfoot">
-      <span id="sMean">—</span>
-      <span class="legend"><i></i>calm<span class="sp"></span><i class="hot"></i>surprised</span>
-    </div>
-  </section>
-
-  <section class="over">
-    <div class="stats" id="stats" data-reveal>
-      <div class="card">
-        <div class="n">1M</div>
-        <div class="k">context length at constant memory</div>
-        <div class="s">34 MB of state: KDA 393 KB + CSA 32 MB + HCA 1 MB</div>
-      </div>
-      <div class="card">
-        <div class="n" id="speedup">—</div>
-        <div class="k">training-step speed from one config rung</div>
-        <div class="s">bf16 Newton–Schulz, 5 steps · inside the ±0.02 BPB noise floor</div>
-      </div>
-      <div class="card">
-        <div class="n" id="runs">—</div>
-        <div class="k">runs on record, every one kept</div>
-        <div class="s" id="runsub">including the retracted ones</div>
-      </div>
-    </div>
-  </section>
-
-  <section class="over">
-    <h2><span class="num">[1]</span>The optimizer was 70% of the step</h2>
-    <p class="sub">
-      Muon's Newton–Schulz chain ran 579 GFLOP of fp32 matmuls per step on the
-      CUDA-core lane — 223 ms of a 307 ms step, measured against AdamW at the
-      same shape. Moving the chain to bf16 puts it on the tensor cores. Same
-      polynomial, same direction, different silicon.
-    </p>
-    <table data-reveal>
-      <thead><tr><th>rung</th><th>kB/s</th><th>ms / step</th><th>speed</th><th>Δ BPB</th></tr></thead>
-      <tbody id="rungs"></tbody>
-    </table>
-  </section>
-
-  <section class="over">
-    <h2><span class="num">[2]</span>Bits per byte, on bytes actually seen</h2>
-    <p class="sub">
-      Held-out BPB on a fixed English window, plotted against training bytes.
-      The last point is a real run, not an extrapolation — and the retractions
-      below say which earlier points were not.
-    </p>
-    <svg class="curve" id="curve" data-reveal viewBox="0 0 640 220" role="img" aria-label="held-out BPB against bytes seen"></svg>
-    <div class="meta" id="curvemeta" style="color:var(--dim);margin-top:8px"></div>
-  </section>
-
-  <section class="over">
-    <h2><span class="num">[3]</span>Runs with a held-out number</h2>
-    <p class="sub">Longest first. A run appears here only if it produced an eval on the held-out window.</p>
-    <table data-reveal>
-      <thead><tr><th>run</th><th>source</th><th>opt</th><th>batch × seq</th><th>MB</th><th>BPB</th></tr></thead>
-      <tbody id="runs-table"></tbody>
-    </table>
-  </section>
-
-  <section class="over">
-    <h2><span class="num">[4]</span>What is not true</h2>
-    <p class="sub">
-      The distinguishing part. Every entry was published here first, then
-      measured wrong. Deleting them would be the one dishonest move available,
-      so they stay next to what replaced them.
-    </p>
-    <ul class="retractions" data-reveal>
-      <li>
-        <div class="was">“16× from the recipe ladder”</div>
-        <div class="now">1.89× from the optimizer rung, measured</div>
-        <div class="why">The 16× was Ripple-65B's result at 4B parameters, not ours. Our own recipe knobs are still unmeasured; the step-speed win that is measured belongs to bf16 Newton–Schulz.</div>
-      </li>
-      <li>
-        <div class="was">“3 Newton–Schulz steps are a tie”</div>
-        <div class="now">+0.27 BPB at [832, 3072]</div>
-        <div class="why">The published non-monotone result, and this repo's own “1.17e-15 from the manifold”, were both measured on rank-64 factors. On the dense stack's shapes the 3-step chain does not converge, and a non-orthogonal Muon update is a badly scaled momentum step. Two arms, two precisions, both red.</div>
-      </li>
-      <li>
-        <div class="was">“209× less compute than GPT-2”</div>
-        <div class="now">53×, and only per byte</div>
-        <div class="why">The first figure counted GPT-2's 40 GB of text as 40 G positions; at ~4 bytes per BPE token it is 10 G positions. The corrected ratio is still large, but it is a ratio of compute per byte, not of capability.</div>
-      </li>
-      <li>
-        <div class="was">“1.927 BPB at 98 MB”</div>
-        <div class="now">1.660 BPB at the same bytes</div>
-        <div class="why">The first curve was captured before the Muon learning-rate fix (a scheduler overwrote the group's LR every step). The corrected curve is 1.660 → 1.519 BPB, a slope of −0.107 per doubling.</div>
-      </li>
-    </ul>
-  </section>
-
-  <footer>
-    <div class="row">
-      <a href="https://github.com/sehaxe/dormouse">github.com/sehaxe/dormouse</a>
-      <span class="meta">MIT · Python lane live, Rust lane frozen</span>
-      <span class="meta">no web fonts · no analytics</span>
-      <span class="meta" id="built"></span>
-    </div>
-  </footer>
-
+<div class="bar">
+  <b>dormouse</b><span>v0 · measured</span>
+  <span class="sp"></span>
+  <a href="https://github.com/sehaxe/dormouse">source</a>
+  <span id="clock">--:--:--</span>
 </div>
 
-<script>
-(() => {
-  const cv = document.getElementById('rain');
-  if (!cv || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-  const gl = cv.getContext('webgl', { antialias: false, alpha: true, premultipliedAlpha: true });
-  if (!gl) { cv.remove(); return; }
+<section class="hero">
+  <canvas id="rain" aria-hidden="true"></canvas>
+  <div class="wrap hero-in">
+    <div class="tag">one RTX 5070 Ti · 16 GB · <b>sm_120</b></div>
+    <canvas id="pixTitle" aria-label="dormouse"></canvas>
+    <p class="lede">
+      A byte-level language model that lives on <b>one workstation</b>.
+      Published with the measurements that justify it — and the ones that <b>refute</b> it.
+    </p>
+    <div class="hstats">
+      <span><b id="hBpb">—</b>bits / byte</span>
+      <span><b id="hMb">—</b>MB seen</span>
+      <span><b id="hSpeed">—</b>step speed</span>
+    </div>
+  </div>
+  <div class="tape" aria-hidden="true"><div class="tape-in" id="tape"></div></div>
+</section>
 
-  // A 2-glyph atlas drawn by the 2D canvas: '0' and '1'. One texture, sampled
-  // per cell, so the rain is characters rather than blocks.
-  const at = document.createElement('canvas');
-  at.width = 64; at.height = 64;
-  const c2 = at.getContext('2d');
-  c2.fillStyle = '#000'; c2.fillRect(0, 0, 64, 64);
-  c2.fillStyle = '#fff';
-  c2.font = 'bold 54px ui-monospace, "DejaVu Sans Mono", monospace';
-  c2.textAlign = 'center'; c2.textBaseline = 'middle';
-  c2.fillText('0', 16, 34); c2.fillText('1', 48, 34);
+<section class="blk wrap" id="s0">
+  <h2><span class="n">[0]</span>what the model sees</h2>
+  <p class="sub">1024 held-out bytes of English, one forward of the flagship3 checkpoint.
+    Height is surprise, colour is the same four bands as the text below.</p>
+  <canvas class="heat" id="heat" width="1024" height="52" aria-hidden="true"></canvas>
+  <pre class="bytes" id="bytes" aria-label="held-out text tinted by the model's surprise"></pre>
+  <p class="sub" style="margin:14px 0 0"><span id="sMean">—</span> · <span id="sMeta">—</span></p>
+</section>
 
-  const vs = 'attribute vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }';
-  const fs = `precision highp float;
-uniform vec2 u_res; uniform float u_t; uniform sampler2D u_atlas;
-float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
-void main(){
-  float cellW = 15.0;
-  float cellH = 19.0;
-  vec2 g = gl_FragCoord.xy / vec2(cellW, cellH);
-  float col = floor(g.x);
-  float rowAll = g.y;
-  float fx = fract(g.x);
-  float fy = 1.0 - fract(g.y);
+<section class="blk wrap">
+  <h2><span class="n">[1]</span>three numbers the page proves</h2>
+  <p class="sub">Each one is computed from the logs at build time.</p>
+  <div class="cards">
+    <div class="card"><div class="k">context</div><div class="v">1M</div>
+      <div class="d">34 MB of state: KDA 393 KB + CSA 32 MB + HCA 1 MB</div></div>
+    <div class="card"><div class="k">step speed</div><div class="v" id="cSpeed">—</div>
+      <div class="d">bf16 Newton–Schulz at 5 steps · inside the ±0.02 BPB noise floor</div></div>
+    <div class="card"><div class="k">runs on record</div><div class="v" id="cRuns">—</div>
+      <div class="d"><span id="cRunsSub">—</span>, including the retracted ones</div></div>
+  </div>
+</section>
 
-  float speed = 0.9 + 2.4 * hash(vec2(col, 11.0));
-  float phase = hash(vec2(col, 23.0));
-  float rows = u_res.y / cellH;
-  float headRow = mod(u_t * speed + phase * rows, rows + 26.0) - 13.0;
-  float d = headRow - rowAll;
-  float trail = d >= 0.0 ? exp(-d * 0.16) : 0.0;
+<section class="blk wrap">
+  <h2><span class="n">[2]</span>the optimizer was 70% of the step</h2>
+  <p class="sub">Muon's Newton–Schulz chain ran 579 GFLOP of fp32 matmuls per step on the
+    CUDA-core lane — 223 ms of a 307 ms step. bf16 puts the same chain on the tensor cores.
+    A faster rung that costs BPB is marked rejected and never drives a headline.</p>
+  <table>
+    <thead><tr><th>rung</th><th>kB/s</th><th>ms/step</th><th>speed</th><th>Δ BPB</th></tr></thead>
+    <tbody id="rungs"></tbody>
+  </table>
+</section>
 
-  float cell = floor(rowAll);
-  float rate = floor(u_t * (2.0 + 5.0 * hash(vec2(col, 7.0))));
-  float pick = hash(vec2(col, cell) + rate);
-  float glyph = texture2D(u_atlas, vec2(step(0.5, pick) * 0.5 + fx * 0.5, fy)).r;
+<section class="blk wrap">
+  <h2><span class="n">[3]</span>bits per byte, on bytes actually seen</h2>
+  <p class="sub">Held-out BPB on a fixed English window against training bytes.
+    The last point is a real run, not an extrapolation.</p>
+  <svg class="curve" id="curve" viewBox="0 0 720 240" role="img" aria-label="held-out BPB against bytes seen"></svg>
+  <p class="sub" style="margin:14px 0 0" id="curveMeta">—</p>
+</section>
 
-  float a = trail * glyph;
-  float head = smoothstep(1.6, 0.0, abs(d));
-  vec3 amber = vec3(0.85, 0.63, 0.36);
-  vec3 col3 = mix(amber * 0.5, vec3(1.0, 0.97, 0.92), head);
-  a = step(0.16, a) * clamp(a * 1.7, 0.0, 1.0);
-  gl_FragColor = vec4(col3 * a, a);
-}`;
-  const sh = (t, src) => { const o = gl.createShader(t); gl.shaderSource(o, src); gl.compileShader(o); return o; };
-  const prog = gl.createProgram();
-  gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs));
-  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
-  gl.linkProgram(prog);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { cv.remove(); return; }
-  gl.useProgram(prog);
+<section class="blk wrap">
+  <h2><span class="n">[4]</span>runs with a held-out number</h2>
+  <p class="sub">Longest first. A run appears only if it produced an eval on the held-out window.</p>
+  <table>
+    <thead><tr><th>run</th><th>source</th><th>opt</th><th>batch × seq</th><th>MB</th><th>BPB</th></tr></thead>
+    <tbody id="runs"></tbody>
+  </table>
+</section>
 
-  const buf = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-  const loc = gl.getAttribLocation(prog, 'p');
-  gl.enableVertexAttribArray(loc);
-  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+<section class="blk wrap">
+  <h2><span class="n">[5]</span>what is not true</h2>
+  <p class="sub">Every entry was published here first, then measured wrong. Deleting them
+    would be the one dishonest move available, so they stay next to what replaced them.</p>
+  <ol class="retr">
+    <li><div class="was">“16× from the recipe ladder”</div>
+      <div class="now">1.92× from the optimizer rung, measured</div>
+      <div class="why">The 16× was Ripple-65B's result at 4B parameters, not ours.</div></li>
+    <li><div class="was">“3 Newton–Schulz steps are a tie”</div>
+      <div class="now">+0.27 BPB at [832, 3072]</div>
+      <div class="why">The published non-monotone result and this repo's own “1.17e-15 from
+        the manifold” were both measured on rank-64 factors. On the dense stack the 3-step
+        chain does not converge.</div></li>
+    <li><div class="was">“209× less compute than GPT-2”</div>
+      <div class="now">53×, and only per byte</div>
+      <div class="why">The first figure counted GPT-2's 40 GB as 40 G positions; at ~4 bytes
+        per BPE token it is 10 G.</div></li>
+    <li><div class="was">“1.927 BPB at 98 MB”</div>
+      <div class="now">1.660 BPB at the same bytes</div>
+      <div class="why">Captured before the Muon learning-rate fix (a scheduler overwrote the
+        group's LR every step).</div></li>
+  </ol>
+</section>
 
-  const tex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, at);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.uniform1i(gl.getUniformLocation(prog, 'u_atlas'), 0);
+<footer class="wrap">
+  <div class="row">
+    <a href="https://github.com/sehaxe/dormouse">github.com/sehaxe/dormouse</a>
+    <span>MIT</span><span>python lane live · rust lane frozen</span>
+    <span id="built">—</span>
+  </div>
+</footer>
 
-  const uRes = gl.getUniformLocation(prog, 'u_res');
-  const uT = gl.getUniformLocation(prog, 'u_t');
-  const resize = () => {
-    const dpr = Math.min(devicePixelRatio || 1, 1.5);
-    const w = Math.max(1, Math.floor(cv.clientWidth * dpr));
-    const h = Math.max(1, Math.floor(cv.clientHeight * dpr));
-    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
-    gl.viewport(0, 0, w, h);
-    gl.uniform2f(uRes, w, h);
-  };
-  const draw = (t) => { gl.uniform1f(uT, t); gl.drawArrays(gl.TRIANGLES, 0, 3); };
-  resize();
-  draw(6.0);
-
-  let raf = 0, t0 = performance.now(), visible = true;
-  const loop = (now) => { if (!visible) return; raf = requestAnimationFrame(loop); resize(); draw((now - t0) / 1000); };
-  new IntersectionObserver(([e]) => {
-    visible = e.isIntersecting;
-    if (visible) { cancelAnimationFrame(raf); raf = requestAnimationFrame(loop); }
-  }, { threshold: 0 }).observe(cv);
-  addEventListener('resize', resize);
-  raf = requestAnimationFrame(loop);
-})();
-
-</script>
 <script id="data" type="application/json">/*__DATA__*/null</script>
 <script id="surprise" type="application/json">/*__SURPRISE__*/null</script>
 <script>
-(() => {
-  const d = JSON.parse(document.getElementById('data').textContent);
-  const fmt = (x, n = 1) => Number(x).toFixed(n);
-  // Declared before every block that reads it — it was declared at the bottom
-  // and the curve code hit the temporal dead zone (caught in the console).
-  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-  // The byte field: one <b> per held-out byte, tinted by -log2 p. Four bands
-  // rather than a gradient — a smooth ramp reads as a heatmap from another
-  // product, and this page is a pixel thing.
-  const sj = JSON.parse(document.getElementById('surprise').textContent || 'null');
-  if (sj && sj.bits && sj.text) {
-    const cols = sj.cols || 64;
-    const bits = sj.bits;
-    const band = (b) => b < 0.6 ? 0 : b < 1.6 ? 1 : b < 2.6 ? 2 : b < 4.2 ? 3 : 4;
-    const col = ['#3d414a', '#5a5449', '#8a7350', '#c09455', '#d9a05b'];
-    const esc = (c) => c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c;
-    let out = '';
-    for (let i = 0; i < bits.length; i++) {
-      const bd = band(bits[i]);
-      const bg = bd >= 3 ? ';background:rgba(217,160,91,.10)' : '';
-      out += `<b style="color:${col[bd]}${bg}">${esc(sj.text[i])}</b>`;
-      if ((i + 1) % cols === 0) out += '\n';
-    }
-    document.getElementById('bytes').innerHTML = out.trimEnd();
-    const mean = bits.reduce((a, b) => a + b, 0) / bits.length;
-    // the strip: one column per byte, height = surprise, colour = the same bands
-    const hc = document.getElementById('heat');
-    if (hc) {
-      hc.width = bits.length;
-      const ctx = hc.getContext('2d');
-      const maxB = Math.max(...bits, 1);
-      for (let i = 0; i < bits.length; i++) {
-        const v = bits[i] / maxB;
-        ctx.fillStyle = col[band(bits[i])];
-        ctx.globalAlpha = 0.15 + 0.85 * v;
-        ctx.fillRect(i, 44 - Math.max(2, Math.round(v * 44)), 1, Math.max(2, Math.round(v * 44)));
-      }
-      ctx.globalAlpha = 1;
-    }
-    document.getElementById('sMean').textContent =
-      `mean ${mean.toFixed(3)} bits / byte over ${bits.length} held-out bytes`;
-    document.getElementById('sMeta').textContent =
-      `${sj.ckpt} · off=${sj.offset} · ${bits.length} bytes`;
-  }
-
-  // stats
-  const rungs = d.rungs || [];
-  const control = rungs.find(r => r.tag === 'muon_fp32');
-  // The headline speedup is the best rung that ALSO passed the quality gate.
-  // A faster row that costs 0.27 BPB is not a win and must never drive the card.
-  const safeRungs = rungs.filter(r => r.safe && r.tag !== 'muon_fp32');
-  const bestSafe = safeRungs.reduce((a, b) => (!a || b.kbs > a.kbs ? b : a), null);
-  const bestAny = rungs.reduce((a, b) => (!a || b.kbs > a.kbs ? b : a), null);
-  if (control && bestSafe) {
-    document.getElementById('speedup').textContent = fmt(bestSafe.kbs / control.kbs, 2) + '×';
-  }
-  document.getElementById('runs').textContent = d.stats.runs_on_record;
-  document.getElementById('runsub').textContent =
-    d.stats.runs_with_bpb + ' with a held-out BPB · including the retracted ones';
-
-  // ladder
-  const max = Math.max(...rungs.map(r => r.kbs), 1);
-  document.getElementById('rungs').innerHTML = rungs.map(r => {
-    const rel = control ? r.kbs / control.kbs : 1;
-    const speedCls = r.tag === 'muon_fp32' ? '' : (r.safe ? 'best' : '');
-    const d = r.dbpb;
-    const q = d == null ? '<td>—</td>'
-      : `<td class="${r.safe ? 'best' : 'worst'}">${d > 0 ? '+' : ''}${fmt(d, 2)}</td>`;
-    const note = r.safe ? '' : ' <span class="rej">rejected</span>';
-    return `<tr>
-      <td class="label">${r.label}${note}<div class="bar"><i style="width:${(r.kbs / max * 100).toFixed(0)}%;${r.safe ? '' : 'background:var(--bad)'}"></i></div></td>
-      <td>${fmt(r.kbs, 1)}</td>
-      <td>${fmt(r.ms_per_step, 0)}</td>
-      <td class="${speedCls}">${r.tag === 'muon_fp32' ? 'baseline' : fmt(rel, 2) + '×'}</td>
-      ${q}
-    </tr>`;
-  }).join('');
-
-  // curve
-  const pts = (d.curve || []);
-  const svg = document.getElementById('curve');
-  if (pts.length > 1) {
-    const W = 640, H = 220, L = 44, R = 12, T = 12, B = 28;
-    const xs = pts.map(p => p.mb), ys = pts.map(p => p.bpb);
-    const x0 = Math.min(...xs), x1 = Math.max(...xs);
-    const y0 = Math.min(...ys) - 0.05, y1 = Math.max(...ys) + 0.05;
-    const X = v => L + (v - x0) / Math.max(x1 - x0, 1e-9) * (W - L - R);
-    const Y = v => T + (1 - (v - y0) / Math.max(y1 - y0, 1e-9)) * (H - T - B);
-    const path = pts.map((p, i) => `${i ? 'L' : 'M'}${X(p.mb).toFixed(1)},${Y(p.bpb).toFixed(1)}`).join(' ');
-    const grid = [0, .5, 1].map(f => {
-      const y = T + f * (H - T - B);
-      return `<line class="grid" x1="${L}" y1="${y}" x2="${W - R}" y2="${y}"/>` +
-        `<text x="0" y="${y + 4}">${fmt(y1 - f * (y1 - y0), 2)}</text>`;
-    }).join('');
-    const dots = pts.map(p => `<circle class="pt" cx="${X(p.mb).toFixed(1)}" cy="${Y(p.bpb).toFixed(1)}" r="3"/>`).join('');
-    const last = pts[pts.length - 1];
-    svg.innerHTML = grid +
-      `<path class="line" d="${path}"/>${dots}` +
-      `<text x="${L}" y="${H - 8}">${fmt(x0, 0)} MB</text>` +
-      `<text x="${W - R}" y="${H - 8}" text-anchor="end">${fmt(x1, 0)} MB</text>` +
-      `<text x="${X(last.mb).toFixed(1)}" y="${(Y(last.bpb) - 10).toFixed(1)}" text-anchor="end">${fmt(last.bpb, 3)} BPB</text>`;
-    if (!reduced) {
-      const line = svg.querySelector('.line');
-      const len = line.getTotalLength();
-      line.style.strokeDasharray = len;
-      line.style.strokeDashoffset = len;
-      const draw = new IntersectionObserver((es) => {
-        for (const e of es) if (e.isIntersecting) {
-          line.style.transition = 'stroke-dashoffset 1.3s cubic-bezier(.2,.7,.2,1)';
-          line.style.strokeDashoffset = '0';
-          draw.disconnect();
-        }
-      }, { rootMargin: '0px 0px -15% 0px' });
-      draw.observe(svg);
-    }
-    document.getElementById('curvemeta').textContent =
-      `${pts.length} held-out points · ${fmt(x1, 0)} MB seen · last ${fmt(last.bpb, 3)} BPB`;
-  } else {
-    svg.remove();
-  }
-
-  // runs
-  document.getElementById('runs-table').innerHTML = (d.runs || []).map(r => `<tr>
-    <td class="label">${r.run}</td><td>${r.source || '—'}</td><td>${r.opt || '—'}</td>
-    <td>${r.batch}×${r.seq}</td><td>${fmt(r.mb, 0)}</td><td>${fmt(r.bpb, 3)}</td></tr>`).join('');
-
-  const scramble = document.getElementById('scramble');
-  const word = 'dormouse';
-  if (scramble && !reduced) {
-    let start = 0;
-    const total = 780;
-    const tick = (now) => {
-      if (!start) start = now;
-      const t = now - start;
-      let out = '';
-      for (let i = 0; i < word.length; i++) {
-        out += t >= (i / word.length) * total ? word[i] : (Math.random() < 0.5 ? '0' : '1');
-      }
-      scramble.textContent = out;
-      if (t < total) requestAnimationFrame(tick);
-      else scramble.textContent = word;
-    };
-    requestAnimationFrame(tick);
-  }
-  // A camera push: as the hero leaves, it scales up and fades, so the pinned
-  // section reads as a scene change rather than a stuck block.
-  const heroEl = document.querySelector('.hero .content');
-  if (heroEl && !reduced) {
-    let raf2 = 0;
-    addEventListener('scroll', () => {
-      if (raf2) return;
-      raf2 = requestAnimationFrame(() => {
-        raf2 = 0;
-        const y = window.scrollY;
-        const h = window.innerHeight || 1;
-        const k = Math.min(y / h, 1);
-        heroEl.style.transform = `translate3d(0, ${(k * -30).toFixed(1)}px, 0) scale(${(1 + k * 0.04).toFixed(3)})`;
-        heroEl.style.opacity = String(1 - k * 0.55);
-      });
-    }, { passive: true });
-  }
-
-  const tapeFacts = [
-    'flagship3 · 1.520 bits per byte at 246 MB',
-    '95,035,200 parameters · 12 unique layers · d_model 832',
-    '1M context · 34 MB of state',
-    'Muon bf16 Newton–Schulz · 1.92× the step for +0.01 BPB',
-    '3-step Newton–Schulz rejected: +0.27 BPB at [832, 3072]',
-    'one RTX 5070 Ti · 16 GB · sm_120',
-    'every number on this page is computed from the run logs'
-  ];
-  const tapeEl = document.getElementById('tape');
-  if (tapeEl) {
-    const line = tapeFacts.map(t => `<b>·</b> ${t} `).join('');
-    tapeEl.innerHTML = line + line;   // duplicated for a seamless -50% loop
-  }
-
-  if (pts.length) {
-    document.getElementById('hBpb').textContent = fmt(pts[pts.length - 1].bpb, 3);
-    document.getElementById('hMb').textContent = fmt(pts[pts.length - 1].mb, 0);
-  }
-  if (control && bestSafe) {
-    document.getElementById('hSpeed').textContent = fmt(bestSafe.kbs / control.kbs, 2) + '×';
-  }
-
-  document.getElementById('built').textContent = 'built from ' + (d.stats.runs_on_record) + ' log files';
-
-  // Scroll reveal: one observer, no library. Everything starts hidden by CSS
-  // and becomes visible once — the observer disconnects itself when done.
-  if (!reduced && 'IntersectionObserver' in window) {
-    const io = new IntersectionObserver((entries) => {
-      for (const e of entries) {
-        if (e.isIntersecting) { e.target.classList.add('is-in'); io.unobserve(e.target); }
-      }
-    }, { rootMargin: '0px 0px -10% 0px' });
-    document.querySelectorAll('[data-reveal]').forEach((el) => {
-      // Anything already on screen stays visible: hiding it would make the
-      // first paint depend on a callback that might never run.
-      if (el.getBoundingClientRect().top > innerHeight * 0.92) el.classList.add('will-reveal');
-      io.observe(el);
-    });
-  } else {
-    document.querySelectorAll('[data-reveal]').forEach(el => el.classList.add('is-in'));
-  }
-
-})();
+/*__SCRIPT__*/
 </script>
 </body>
 </html>
