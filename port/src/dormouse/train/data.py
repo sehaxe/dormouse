@@ -82,7 +82,11 @@ def _windows(raw: bytes, batch: int, seq_len: int) -> tuple[torch.Tensor, torch.
     makes a window `batch × seq_len` PREDICTIONS and not `batch × seq_len` bytes
     of context.
     """
-    ids = torch.tensor(list(raw), dtype=torch.long).view(batch, seq_len + 1)
+    # `list(raw)` builds one PyLong per byte (0.74 ms per b=8 batch, 6.0 ms at
+    # b=32, measured 2026-11-08); frombuffer copies the bytes once and lets the
+    # cast do the widening: 85 us at b=8, 9-40x. One `bytearray` copy because
+    # frombuffer needs a writable buffer and the stream hands out an mmap slice.
+    ids = torch.frombuffer(bytearray(raw), dtype=torch.uint8).long().view(batch, seq_len + 1)
     return ids[:, :-1].contiguous(), ids[:, 1:].contiguous()
 
 

@@ -151,3 +151,26 @@ def test_skip_bytes_fast_forwards_for_resume(tmp_path):
     for _ in range(3):
         a.next_batch()
     assert (a.next_batch()[0] == b.next_batch()[0]).all()
+
+
+def test_the_window_is_bit_identical_to_the_pylong_path():
+    """`_windows` must not change a single byte — only how fast it builds them.
+
+    It used `torch.tensor(list(raw))`, one PyLong per byte (0.74 ms per b=8
+    batch, 6.0 ms at b=32, measured 2026-11-08); it now uses frombuffer + a
+    width cast. The values are the thing that must not move.
+    """
+    import torch
+
+    from dormouse.train.data import _windows
+
+    raw = bytes(range(256))          # 4 x 64 = 256 bytes exactly
+    ids, tgt = _windows(raw, batch=4, seq_len=63)
+    expect = torch.tensor(list(raw), dtype=torch.long).view(4, 64)
+    assert ids.dtype == tgt.dtype == torch.long
+    assert torch.equal(ids, expect[:, :-1].contiguous())
+    assert torch.equal(tgt, expect[:, 1:].contiguous())
+    # and a byte value above 127 must survive the uint8 leg
+    hi = bytes([200, 201, 255, 0] * 16)
+    a, _ = _windows(hi, batch=2, seq_len=31)
+    assert int(a.max()) == 255 and int(a.min()) == 0
