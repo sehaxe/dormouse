@@ -239,6 +239,31 @@ class DormouseModel(nn.Module):
                 self.bf_net = ByteFlowNet(byteflow_config(cfg), device=device)
             return
         d = cfg.d_model
+        if cfg.block_form == "transformer" and cfg.byte_patch:
+            # THE PATCH FORM: the same UNIQUE block stack as the control, run
+            # over the conv codec's patch positions. The codec is BOTH ends
+            # (bytes -> latents before, byte logits after), so `embed` and
+            # `lm_head` are not built — they would be a parameter tree with no
+            # reader and no gradient (the dead-capacity defect this port's
+            # audits exist for). The final `norm` stays: the control applies
+            # it before its head, and the channel applies it before `out_proj`.
+            n_layers = cfg.n_layers or cfg.loop_blocks * cfg.max_iter
+            self.transformer_blocks = nn.ModuleList(
+                [TransformerBlock(cfg, n_layers=n_layers, device=device) for _ in range(n_layers)]
+            )
+            self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
+            # `byte_patch` is the dense-stack arm of `compat_armed`; this is
+            # the only channel shape that keeps `transformer_blocks`.
+            self.bf = bf_for_model(cfg, device=device)
+            self._qat_caches = attach_qat_caches(self, dense=False)
+            # The attributes `DormouseModel.forward` reads before it dispatches,
+            # and the ones the trainer's eval/checkpoint readers expect.
+            self._act_offload = None
+            self.halt = None
+            self.dspark = None
+            self.last_halt = None
+            self.last_breakdown = {}
+            return
         self.embed = nn.Embedding(cfg.vocab, d, device=device)
         if cfg.block_form == "transformer":
             # THE VANILLA FORM (`block_form`, `model/transformer.py`): the same
@@ -250,10 +275,7 @@ class DormouseModel(nn.Module):
             # dormant copy beside it.
             n_layers = cfg.n_layers or cfg.loop_blocks * cfg.max_iter
             self.transformer_blocks = nn.ModuleList(
-                [
-                    TransformerBlock(cfg, n_layers=n_layers, device=device)
-                    for _ in range(n_layers)
-                ]
+                [TransformerBlock(cfg, n_layers=n_layers, device=device) for _ in range(n_layers)]
             )
             self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
             if cfg.tie_embeddings:
@@ -801,7 +823,7 @@ class DormouseModel(nn.Module):
         depth: int | None = None,
         ce_fixed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Option B: front stage → this model's loop on K latents → back stage.
+        """Option B: front stage → this model's loop OR dense stack → back stage.
 
         The objective is the byte CE from the DECODER, over all T positions —
         not the loop's in-loop `L_Rec`. Two reasons, both load-bearing: the
@@ -811,6 +833,27 @@ class DormouseModel(nn.Module):
         anything else would be a train CE that is not the quantity on the eval
         line. `sel` is a discrete argtopk product: the SELECTION has no
         gradient, the gathered rows and everything after `z` train normally.
+
+        TWO STACKS, ONE CODE. With `byte_patch=false` (the default and every
+        number on record) the shared `self.loop` runs over K latents. With
+        `byte_patch=true` the SAME channel runs `self.transformer_blocks`
+        over EVERY patch of this window. Exact shapes for that form, with
+        `s = byteflow_patch_bytes` and `P = t // s` (`t = 1024, s = 8` →
+        `P = 128`):
+
+        * `input_ids [b, t]` — bytes;
+        * `encode_chunks(input_ids, P)` → `h [b, t, width]` (the per-byte
+          stream the decoder's skip reads; `width` is the codec's own),
+          `z [b, P, d_global]`, `sel [b, P]` (every patch start);
+        * `in_proj: d_global → d_model` → `x [b, P, d_model]`;
+        * `n_layers` unique blocks: `[b, P, d_model] → [b, P, d_model]`,
+          causal over patch positions (`TransformerBlock`'s SDPA);
+        * final RMSNorm: `[b, P, d_model] → [b, P, d_model]` (the control's
+          own terminal norm);
+        * `out_proj: d_model → d_global` → `[b, P, d_global]`;
+        * `decode_chunks` → byte logits `[b, t, 256]`, fp32;
+        * `[b·t, 256]` + targets → `_byte_ce`, the mean over BYTES — so BPB is
+          the same quantity every other arm reports, not a per-patch mean.
         """
         assert self.bf is not None
         # The aux heads are refused with `use_byteflow` by `validate`, and the
@@ -833,11 +876,33 @@ class DormouseModel(nn.Module):
             "loop's per-iteration CE - set halt_weight to 0"
         )
         bf = self.bf
-        h, z, sel = bf.net.encode_chunks(input_ids, bf.k)
+        # `byte_patch` runs EVERY patch of THIS window (K = P): with K < P the
+        # codec's global top-k could let a future byte change the SELECTION and
+        # move a past logit, so the strict prefix-causality gate only holds at
+        # K = P. The byte-level channel keeps its configured K.
+        k = input_ids.shape[1] // self.cfg.byteflow_patch_bytes if self.cfg.byte_patch else bf.k
+        h, z, sel = bf.net.encode_chunks(input_ids, k)
         x = bf.in_proj(z)  # [b, k, d_model]
-        # The loop, unchanged, on K patch latents. No byte ids: the memory arm
-        # is refused with use_byteflow (validate), so nothing here needs them.
-        out_acc, _, _ = self.loop(x, None, None, None, counters=counters, depth=depth)
+        assert x.shape[1] == k, (x.shape, k)
+        if self.cfg.byte_patch:
+            # The dense stack, unchanged, over PATCH positions. No byte ids
+            # (the blocks read none) and no loop: this is `block_form`'s own
+            # stack with the codec's sequence around it.
+            assert self.cfg.block_form == "transformer"
+            for block in stepaudit.iterations(
+                "forward.transformer_blocks", self.transformer_blocks
+            ):
+                x = block(x, counters)
+                counters.count("transformer_block")
+            # The dense control's final RMSNorm, before the codec's `out_proj`
+            # (its `lm_head` analogue). Without it the patch stream would enter
+            # the projection at the raw residual scale.
+            out_acc = self.norm(x)
+        else:
+            # The loop, unchanged, on K patch latents. No byte ids: the memory
+            # arm is refused with use_byteflow (validate), so nothing here
+            # needs them.
+            out_acc, _, _ = self.loop(x, None, None, None, counters=counters, depth=depth)
         logits = bf.net.decode_chunks(bf.out_proj(out_acc), h, sel)  # [b, t, vocab]
         flat = logits.reshape(-1, self.cfg.vocab)
         return flat, _byte_ce(flat, targets, fixed=ce_fixed, counters=counters)
