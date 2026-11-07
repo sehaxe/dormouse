@@ -2189,13 +2189,16 @@ class TrainConfig:
     #:
     #: The cost, named: a corpus of short documents pays tail padding (a
     #: 200-byte document leaves ~80 % of a 1024-byte row empty), so the flag is
-    #: a quality lever for short-document corpora and a near-no-op for the
-    #: 6 MB `web` shards. It needs a `<data>.docs.json` sidecar
+    #: a quality lever for short-document corpora and a near-no-op for corpora
+    #: whose documents exceed `seq_len`. It needs a `<data>.docs.json` sidecar
     #: (`scripts/build_doc_sidecar.py`): a `.bin` alone cannot say where a
     #: document ends, and a missing sidecar is a LOUD refusal, never a flat
-    #: fallback. Refused with `segment_len>0` (the carried state has no
-    #: boundary notion), `use_byteflow=true` (patch boundaries are not document
-    #: boundaries), and the target-bearing aux terms.
+    #: fallback. The eval stream keeps its fixed `eval_bytes` window; it masks
+    #: the SAME cross-document targets when a sidecar exists beside the eval
+    #: file, and prints `eval_docmask=flat (no sidecar)` when it does not.
+    #: Refused with `segment_len>0` (the carried state has no boundary notion),
+    #: `use_byteflow=true` (patch boundaries are not document boundaries), and
+    #: the target-bearing aux terms.
     #:
     #: Non-progress: flipping it changes what the run trains on, so the
     #: snapshot drift check refuses a flip on a resume.

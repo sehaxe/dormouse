@@ -206,7 +206,7 @@ def test_windows_never_straddle_a_document(tmp_path):
 
 
 def test_open_streams_wraps_the_train_side_only(tmp_path):
-    """`doc_masking=true` → the train stream is packed, the eval stream is flat."""
+    """`doc_masking=true` → the train stream is packed; eval keeps its flat window."""
     corpus = _corpus(tmp_path / "corpus.bin")
     # Three documents over the 4096-byte fixture, then the run asks for eval.
     starts = [0, 1000, 3000]
@@ -216,12 +216,17 @@ def test_open_streams_wraps_the_train_side_only(tmp_path):
     run = _run(tmp_path, corpus, doc_masking=True, eval=True, eval_batches=3)
     tr, ev = open_streams(run)
     assert isinstance(tr, DocPackedStream)
-    assert isinstance(ev, ByteStream)
+    # The eval window keeps the fixed byte geometry; it is a masked wrapper
+    # only because the sidecar exists (the same boundary source train reads).
+    from dormouse.train.data import MaskedByteStream
+
+    assert isinstance(ev, MaskedByteStream)
     x, y, mask = tr.next_batch_masked()
     assert x.shape == (BATCH, SEQ) == y.shape == mask.shape
     assert mask.sum() > 0
-    ids, _ = ev.next_batch()
-    assert ids.shape == (BATCH, SEQ)
+    ex, ey, emask = ev.next_batch_masked()
+    assert ex.shape == (BATCH, SEQ) == ey.shape == emask.shape
+    assert bool(emask.any())  # the fixed window still scores bytes
 
 
 # --- gate 3: the loss ignores positions outside documents -------------------
@@ -331,7 +336,7 @@ def test_a_directory_source_is_refused_with_doc_masking(tmp_path):
 # --- gate 5: the long-context smoke on a real mix4 shard --------------------
 
 
-REAL = Path("/home/sehaxe/dormouse/data_local/mix4/reasoning.bin")
+REAL = Path("/home/sehaxe/dormouse/data_local/mix4/code.bin")
 
 
 def test_long_context_window_on_a_real_mix4_shard():

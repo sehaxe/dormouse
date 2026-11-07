@@ -906,21 +906,30 @@ def _eval_loss(
         # (`TrainConfig.ce_fixed`), not a second, easier one.
         kw["ce_fixed"] = True
     ev_counters = Counters()
+    masked = hasattr(stream, "next_batch_masked")
     with torch.no_grad():
         for _ in range(batches):
-            x, y = stream.next_batch()
-            if device is not None:
-                x, y = x.to(device), y.to(device)
+            if masked:
+                x, y, mask = stream.next_batch_masked()
+                if device is not None:
+                    x, y, mask = x.to(device), y.to(device), mask.to(device)
+            else:
+                x, y = stream.next_batch()
+                mask = None
+                if device is not None:
+                    x, y = x.to(device), y.to(device)
             # `pure=True`: the held-out number is the PREDICTIVE CE alone.
             # The aux terms (DSpark/SIGReg) are training signals; without this
             # an aux arm reads ~w*aux_term worse by construction and the A/B
             # compares two different quantities (measured on the first aux A/B
             # run: control 3.045 vs fb 3.469 while the arm was fine). Counters
             # are not bumped on this path.
-            _, loss, _ = model(x, y, pure=True, breakdown=True, counters=ev_counters, **kw)
+            _, loss, _ = model(
+                x, y, loss_mask=mask, pure=True, breakdown=True, counters=ev_counters, **kw
+            )
             assert loss is not None, "an eval batch must carry targets"
             total += float(loss)
-            scored += int(x.numel())
+            scored += int(mask.sum()) if mask is not None else int(x.numel())
             bd = getattr(model, "last_breakdown", None)
             if bd is not None:
                 fin_total += bd["fin"]
@@ -935,7 +944,11 @@ def _eval_loss(
         # and `scored` above counts duplicate rows. The printed figure is the
         # DISTINCT bytes those windows scored (the cap's own COUNTED line
         # names the requested/granted sizes).
-        scored = distinct_scored_bytes(stream, batches)
+        scored = (
+            stream.distinct_scored_bytes(batches)
+            if masked
+            else distinct_scored_bytes(stream, batches)
+        )
     model.train(was_training)
     if counters is not None:
         counters.merge(ev_counters)
@@ -1023,6 +1036,9 @@ def _eval_line(
         f"({batches} x {cfg.batch} x {cfg.seq_len}) "
         f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)}"
     )
+    policy = getattr(stream, "doc_boundary_policy", None)
+    if policy is not None:
+        line += f" eval_docmask={policy}"
     capped = getattr(stream, "eval_tail_capped", None)
     if capped is not None:
         line += f" eval_tail_capped={capped[0]}/{capped[1]}"
@@ -1158,7 +1174,9 @@ def train(
             "doc_masking=true: one document per training row (whole document, or a "
             "contiguous chunk of one when it is longer than seq_len), tail-padded; "
             "padding and cross-document targets are excluded from the loss. The eval "
-            "stream stays flat (the held-out window is the comparable number)."
+            "window keeps its fixed byte geometry; when a sidecar exists beside the "
+            "eval file the SAME cross-document targets are excluded there too, and "
+            "`eval_docmask=` on the eval line names the policy."
         )
     model.train()
     recompute = cfg.activation_recompute
