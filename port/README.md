@@ -37,8 +37,11 @@ skip, every behavior pin stays assertable.
 | optimizer | Muon (Jordan NS coefficients, factor-space) on 2-D maps + AdamW elsewhere, WSD schedule |
 | precision | bf16 factors + fp32 masters; storage ladder `bf16 → fp8 → NVFP4 → LittleBit` (gates pre-registered) |
 
-The b1 preset is **1,066,354,113 params (57M active)** — `tests/test_param_count.py`
-recomputes it against the module tree, so no preset comment can rot.
+The b1 preset is **1,066,358,209 params** (the plan's ~57M active; the port's
+touched set is ~37.9M/iteration — `configs/b1.toml:151-156`) —
+`tests/test_param_count.py:26` recomputes it against the module tree, so no preset
+comment can rot. The old **1,066,354,113** was the `max_iter 2` count; `af8b0c9`
+(2026-10-16) moved b1 to `max_iter 4` (+4,096) and the test now pins the new total.
 
 ## Invariants (what makes it trustworthy)
 
@@ -65,14 +68,16 @@ src/dormouse/
   model/           tsct · experts(MoE) · kda · engram · loopblock · model · byteflow · decode
   train/           data (mmap byte streams) · optim (Muon/AdamW) · lr (WSD) · loop
   cli.py           info | train | eval | decode | plot
-tests/             117 tests, CPU-true by default, CUDA gates opt-in
+tests/             167 files, 2,194 collected tests, CPU-true by default, CUDA gates opt-in
 scripts/           bench_moe · smoke_gpu · smoke_byteflow
-configs/           small (9,476,993) · b1 (1,066,354,113)
+configs/           small (9,476,993) · b1 (1,066,358,209)
 ```
 
 **Rust stays where it is already the best code** (data pipeline, Engram host
-tables, ByteFlow patcher) — as a PyO3 extension (`ffi/`), wired when a
-profile says a hot loop is CPU-bound. GPU-side Rust buys nothing here.
+tables, ByteFlow patcher) — **not wired today**: there is no `ffi/` crate, no
+`pyo3` dependency, and no Rust binary the Python package calls. The PyO3 seam is
+a plan, wired when a profile says a hot loop is CPU-bound. GPU-side Rust buys
+nothing here.
 
 ## What lives in `docs/`
 
