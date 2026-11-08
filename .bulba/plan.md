@@ -73,8 +73,14 @@ result". **Queued: 2-3 seed control-vs-all replication**
 Compression anchor on the same 196 608 B: bzip2 2.5878, xz 2.7134, zstd 2.7703
 bits/byte — the control is 1.10 b/B below the best of them.
 
-**The CSA artifact is TRAINING since 08:50** (`scripts/train_csa8k.sh`, 8K,
-102.7M, 8 000 steps, ~3 h 50 m) — gate A of the 1M protocol.
+**CSA artifact 1 (legacy `sign`) trained in 1 h 59 m, and the protocol REFUSED
+it at gate C** — see `docs/reviews/2026-11-08-night.md` §5b. Gate A passes, gate
+B passes under a scale-free rule, gate C fails: the selector ranks the needle
+~119/128 (chance) when the needle sits in the first ~50 bytes, while the same
+976-byte distance ranks 17.5/256 and 7/10 in top-32 mid-document. **No 1M number
+is claimed.** The artifact's LFB controller also DIVERGED (bias ±95, routing
+collapsed — the known 2026-11-04 `sign` failure), so `train_csa8k.sh` now pins
+`moe_lb_mode=prop`, and **a corrected run is on the card since 11:20**.
 
 **The ladder was running** on it: `FAST=1 MIX=configs/mix_refetch.toml
 RUN_TAG=_refetch`, 7 arms x 14648 steps x 8192 B = 120 MB each. First arm
