@@ -193,8 +193,9 @@
     state arithmetic — exact, and not yet a pass.</p>
   <div class="stats">
     <div class="stat"><div class="v">1M</div><div class="k">context · designed</div>
-      <div class="d">34 MB of state: KDA 393 KB + CSA 32 MB + HCA 1 MB. A 1M forward has not been run;
-        the protocol that would make it a number is being written.</div></div>
+      <div class="d">33 MiB per CSA slot + 1 MiB HCA, at <span class="mono">d=1024</span>; the loop form
+        carries one per iteration (3 → 99 MiB, a 12-layer stack → 396 MiB). A 1M forward has not been
+        run; the protocol that would make it a number is being written.</div></div>
     <div class="stat"><div class="v" id="sSpeed">—</div><div class="k">step speed</div>
       <div class="d">bf16 Newton–Schulz at 5 steps, inside the ±0.02 BPB noise floor</div></div>
     <div class="stat"><div class="v" id="sRuns">—</div><div class="k">runs on record</div>
