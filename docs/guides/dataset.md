@@ -10,9 +10,13 @@
 > |---|---:|---|
 > | `data_local/best/fwedu_train.bin` | 933 743 230 | FineWeb-Edu shard 0, head |
 > | `data_local/best/fwedu_eval.bin` | 8 386 155 | the shard's tail from a document separator — **a file no source reads**, so the overlap gate holds |
-> | `data_local/best/cosmo.bin` | 302 198 823 | Cosmopedia `auto_math_text` shard 0 |
-> | `data_local/best/finemath.bin` | 948 125 886 | FineMath `finemath-3plus` shard 0 |
-> | `data_local/mix/{code,math,ru}.bin` | 209 7xx xxx each | `scripts/fetch_mix_sources.py --cap-mb 200` |
+> | `data_local/best/cosmo.bin` | 293 808 222 | Cosmopedia `auto_math_text` shard 0 (8 MiB carved as `cosmo_eval.bin`) |
+> | `data_local/best/finemath.bin` | 939 699 672 | FineMath `finemath-3plus` shard 0 (8 MiB carved as `finemath_eval.bin`) |
+> | `data_local/mix/{code,math,ru}.bin` | 201.3 MB each | `scripts/fetch_mix_sources.py --cap-mb 200`, minus an 8 MiB tail each (`*_eval.bin`, carved 2026-11-08 by `scripts/carve_eval_tails.py`) |
+>
+> Six held-out windows now exist — one per source — each the last 8 MiB carved
+> at a document separator when one exists, else a line-aligned offset, with the
+> offset and SHA-256 printed. `scripts/eval_by_domain.py` scores them.
 > | `data_local/parquet/*.parquet` | 3.0 GB | one shard each, `curl -L` (the hub's parquet reader burns the anonymous quota — HTTP 429) |
 >
 > **Health check, 2026-11-08 (the refetch was never inspected before this):** all
