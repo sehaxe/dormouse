@@ -81,7 +81,9 @@ Until the owner picks, pushes go to `backup/main-local-2026-11-08`.
 
 ## Known-red at 2026-11-08 02:30 (pre-existing, not from tonight)
 
-Seven tests, all in the fused/CUDA-graph cluster, all written before tonight
+**The suite is at 7 red, down from 22** (2026-11-08 04:00 run). Fifteen were
+stale test stubs or my own regression; these seven remain, all in the
+fused/CUDA-graph cluster, all written before tonight
 (`acb013f`, `0f118b2`, `b342390`), and several are ORDER-dependent: the same
 test passes when its file runs alone and fails in a mixed run, which points at
 process-global counters rather than at the kernel.
