@@ -22,11 +22,14 @@ DATA=${DATA:-../data_local/best/fwedu_train.bin}
 ONLY=${ONLY:-}
 mkdir -p "$OUT"
 
-# (batch, grad_accum, lr): 8 KB/step keeps the ladder's shape; 32 KB/step is the
-# smallest batch that a 2 GB run would plausibly want.
+# (batch, grad_accum, lr): 8 KB/step keeps the ladder's shape; 32 and 64 KB/step
+# test the throughput hypothesis — at 95M params the card is DISPATCH-bound, so a
+# step that does 4x the work should cost far less than 4x the time, and the run
+# clock is what a 2 GB budget buys. accum, not batch, so peak memory stays at b8.
 ARMS=(
   "8 1 2e-4" "8 1 4e-4" "8 1 8e-4"
   "8 4 2e-4" "8 4 4e-4" "8 4 8e-4"
+  "8 8 4e-4" "8 8 8e-4"
 )
 
 for arm in "${ARMS[@]}"; do
