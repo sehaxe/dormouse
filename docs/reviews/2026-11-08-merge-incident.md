@@ -37,7 +37,20 @@ directory is gone and nothing in git can restore it.
 
 `/tmp` is a tmpfs: **copy `flagship3.pt` somewhere persistent before reboot.**
 
-## Recovery
+## Recovery status (2026-11-08 04:20)
+
+| step | status |
+|---|---|
+| `flagship3.pt` out of /tmp | **done** — `checkpoints/flagship3/` |
+| code / math / RU slices (200 MB each) | **done** — `data_local/mix/*.bin`, 600 MB |
+| fwedu / cosmo / finemath (1.2 GB each) | **BLOCKED**: Hugging Face answered HTTP 429 — "we had to rate limit your IP… pass a HF_TOKEN". The three small slices used the anonymous quota (500 requests / 300 s) and the parquet reader issues many range requests per shard. |
+| eval window | gone; must be carved fresh from the refetched fwedu, and every number on it is new |
+
+To resume: put a token in `HF_TOKEN` (or `~/.cache/huggingface/token`) and run
+`uv run port/scripts/refetch_pretrain.py --cap-mb 1200`; without a token, wait
+out the window and lower the cap.
+
+## Recovery (the plan)
 
 1. **Immediate (5 min):** copy `/tmp/opencode/ck/` to `dormouse/checkpoints/flagship3/`.
 2. **Small slices (network, ~30 min):** `uv run port/scripts/fetch_mix_sources.py`
