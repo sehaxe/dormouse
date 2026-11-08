@@ -347,6 +347,15 @@ class KDAAttention(nn.Module):
         transposed on the way into the kernel. `g` is log-space and fp32, which
         is what both the kernel and the recurrence reference read.
 
+        **No `g_min` floor, deliberately.** K3 Eq. 5 clamps `g` at `g_min=-5`
+        (`alpha >= e^-5 = 6.7e-3`); this port clamps nowhere (math audit
+        2026-11-08, item K3): a raw `g_proj=-100` gives `exp(-100)=3.7e-44`, so a
+        channel can forget everything in one step. The omission is not fixed
+        here alone because the FLA kernel the live arm runs has no
+        `A_log`/`dt_bias` parameters to express the paper's floor — a clamp on
+        THIS tail only would make the two paths two different decay laws. The
+        semantics are pinned by `test_the_kda_decay_has_no_g_min_floor`.
+
         `attn_latent_rank` computes `c` ONCE and reads the four projections off
         it; `n_kv_heads` leaves k/v at the KV width and expands them here, so
         every consumer — this arm's kernel, the SDPA fallback, the decode step —

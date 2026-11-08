@@ -826,3 +826,27 @@ def test_the_chunked_prefill_is_the_byte_prefill():
     assert rel <= 5e-2, f"the chunked prefill's logits drifted: {rel}"
     assert dmax <= 5e-2, f"the chunked prefill's state drifted: {dmax}"
     assert chunked == byte, "the greedy argmax did not survive the prefill divergence"
+
+
+def test_the_kda_decay_has_no_g_min_floor(monkeypatch):
+    """K3 Eq. 5 floors `g` at -5; this port does not, and the omission is pinned.
+
+    Math audit 2026-11-08 item K3: `logsigmoid(-100) = -100`, so `alpha =
+    exp(-100) = 3.7e-44` — a channel can forget everything in one step. The
+    paper's floor would be 6.7e-3. A clamp cannot be added on this tail alone
+    without splitting the reference path from the FLA kernel (which has no
+    `A_log`/`dt_bias` to carry it), so the deviation is recorded and gated here:
+    if the decay law changes, this test fails and the change becomes a decision.
+    """
+    attn = KDAAttention(tiny_cfg(use_kda=True), device="cpu")
+    d, h = attn.n_heads * attn.head_dim, attn.n_heads
+    b, t = 1, 2
+
+    def raw(_x):
+        z = torch.zeros(b, t, d)
+        return z, z, z, torch.full((b, t, d), -100.0), torch.zeros(b, t, h)
+
+    monkeypatch.setattr(attn, "projections_raw", raw)
+    _q, _k, _v, g, _beta = attn.projections(torch.zeros(b, t, d))
+    assert torch.all(g == -100.0), g
+    assert float(g.exp().max()) < 1e-40, float(g.exp().max())
