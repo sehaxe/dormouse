@@ -105,14 +105,17 @@ cd port && PYTHONPATH=src .venv/bin/python -m pytest -q
 
 ## The audits (2026-11-08)
 
-Five read-only audits and two research reports, all committed with their
-evidence: [math](docs/reviews/2026-11-08-math-audit.md) ·
+Five read-only audits, two research reports and three follow-ups, all committed
+with their evidence: [math](docs/reviews/2026-11-08-math-audit.md) ·
 [numerics](docs/reviews/2026-11-08-numerics-audit.md) ·
 [data/eval integrity](docs/reviews/2026-11-08-data-eval-integrity.md) ·
 [CPU perf](docs/reviews/2026-11-08-cpu-perf-audit.md) ·
 [deletion](docs/reviews/2026-11-08-deletion-audit.md) ·
 [1B on one card](docs/research/2026-11-08-1b-on-one-card.md) ·
-[post-training at 1B](docs/research/2026-11-08-post-training-at-1b.md).
+[post-training at 1B](docs/research/2026-11-08-post-training-at-1b.md) ·
+[the fused-cluster reds](docs/reviews/2026-11-08-fused-cluster.md) ·
+[claims repair](docs/reviews/2026-11-08-claims-repair.md) ·
+[what 1M context can prove](docs/research/2026-11-08-long-context-eval.md).
 
 They found, among other things: a hierarchical-CSA parent mask that was never
 checked (a live crash at 16 KB), two loss firewalls blind to the failure they
