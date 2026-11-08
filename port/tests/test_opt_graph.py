@@ -621,3 +621,28 @@ def test_a_replay_after_a_resume_matches_the_unbroken_run(quiet_card, tmp_path):
     assert _maxdiff(unbroken, resumed) == 0.0, (
         f"the resumed graph run diverged by {_maxdiff(unbroken, resumed):.3e}"
     )
+
+
+def test_a_fallback_hands_the_muon_group_its_own_lr_back():
+    """The Muon half's LR is `lr * muon_lr_mult`, written through the same tensor.
+
+    `_fall_back` used to restore the WSD float (`_lr_value`) into EVERY group,
+    so the first eager step after a capture refusal ran Muon at `1/mult` of its
+    learning rate — invisible in the log, one step, and exactly the class of
+    silent non-arm the multiplier audit exists for
+    (docs/reviews/2026-11-08-fused-cluster.md §1b).
+    """
+    model, opt = _mix()
+    opt.muon_lr_mult = 12.0
+    graph = _wrap(opt)
+    graph.set_lr(0.1)
+    opt.set_lr(0.1, 0.1)
+    graph._fall_back("simulated refusal")
+    got = {
+        "adamw": opt.adamw.param_groups[0]["lr"],
+        "muon": opt.muon.param_groups[0]["lr"],
+    }
+    assert not any(torch.is_tensor(v) for v in got.values()), got
+    # fp32: the host values come back as the tensor's rounding (~1e-7 relative)
+    assert got["adamw"] == pytest.approx(0.1, rel=1e-6), got
+    assert got["muon"] == pytest.approx(1.2, rel=1e-6), got

@@ -520,7 +520,16 @@ class OptimizerGraph:
         self.reason = reason
         for group, tensor in self._lr:
             if group.get("lr") is tensor:
-                group["lr"] = self._lr_value
+                # NOT `self._lr_value`: that is the value the LAST `graph.set_lr`
+                # call was handed, and the trainer writes the Muon half's own LR
+                # (`lr * muon_lr_mult`) through the SAME tensor afterwards
+                # (`opt.set_lr(lr, muon_lr)`). Restoring the WSD float there made
+                # the first eager step after a refusal run Muon at 1/mult of its
+                # LR — a silent arm, for one step (fused-cluster review §1b).
+                # The tensor holds what that group's captured step would have
+                # read, so hand its value back. The fp32 rounding versus the
+                # scheduler's float is ~1e-11 relative, one step.
+                group["lr"] = float(tensor)
         for group, was_present, old in self._capturable_restore:
             if was_present:
                 group["capturable"] = old
