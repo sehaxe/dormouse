@@ -26,6 +26,13 @@ PY=.venv/bin/python
 OUT=/home/sehaxe/logs/ladder
 mkdir -p "$OUT"
 BYTES=${BYTES:-120000000}
+# The corpus was deleted 2026-11-08 (docs/reviews/2026-11-08-merge-incident.md).
+# MIX/EVAL let the ladder run on the refetched sources; a run on those is a NEW
+# number and the caller must tag it (RUN_TAG).
+MIX=${MIX:-configs/mix_v7.toml}
+EVAL=${EVAL:-../data_local/mix4/web_eval.bin}
+DATA=${DATA:-../data_local/best/fwedu.bin}
+TAG=${RUN_TAG:-}
 # FAST=1 runs every arm on the SAFE Muon rung (see e1_bytes_vs_patch.sh):
 # ns_dtype=bf16 + state bf16, ns_steps stays 5.
 FAST=${FAST:-0}
@@ -40,13 +47,13 @@ run() { # tag extra-set-args...
   local tag=$1; shift
   echo "=== $tag steps=$STEPS $* $(date +%H:%M:%S)"
   $PY -u -m dormouse.cli train configs/flagship3_dense.toml \
-    --data ../data_local/best/fwedu.bin --eval ../data_local/mix4/web_eval.bin \
+    --data "$DATA" --eval "$EVAL" \
     --set steps=$STEPS --set batch=8 --set seq_len=1024 --set seed=1 \
     --set lr=3e-4 --set opt=mix --set muon_lr_mult=12 \
-    --set mix_plan=configs/mix_v7.toml --set doc_masking=false \
+    --set mix_plan="$MIX" --set doc_masking=false \
     --set eval=true --set eval_every=$EVAL_EVERY --set log_every=$EVAL_EVERY \
     --set ckpt_every=1000000 --set out_dir=/tmp/opencode/ladder_$tag \
-    --json-log "$OUT/$tag.jsonl" ${FOPT[@]+"${FOPT[@]}"} "$@" > "$OUT/$tag.log" 2>&1
+    --json-log "$OUT/${tag}${TAG}.jsonl" ${FOPT[@]+"${FOPT[@]}"} "$@" > "$OUT/$tag.log" 2>&1
 }
 
 run control
