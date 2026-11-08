@@ -45,6 +45,12 @@ stays published as retracted.
 Held-out BPB on **one fixed English window** (`mix4/web_eval.bin`, `off=0`,
 196 608 bytes scored). A BPB is only comparable within its window.
 
+> **That window file died with the corpus on 2026-11-08**
+> ([incident](docs/reviews/2026-11-08-merge-incident.md)). These BPB are the
+> record of that window; a run on the refetched corpus
+> (`configs/mix_refetch.toml`, `best/fwedu_eval.bin`) is a **new** number and
+> must be labelled as one.
+
 | run | BPB | bytes seen | note |
 |---|---:|---:|---|
 | `flagship3` | 1.5185 | 245.8 MB | `doc_masking=true`, Muon fp32 NS |
@@ -79,11 +85,16 @@ The compute target: **275M @ 22 GB** is the Chinchilla point for that budget;
 cd port
 uv sync
 PYTHONPATH=src .venv/bin/python -m dormouse.cli train configs/flagship3_dense.toml \
-  --data ../data_local/best/fwedu.bin --eval ../data_local/mix4/web_eval.bin \
+  --data ../data_local/best/fwedu_train.bin \
+  --eval ../data_local/best/fwedu_eval.bin \
+  --set mix_plan=configs/mix_refetch.toml \
   --set steps=30517 --set batch=8 --set seq_len=1024 \
   --set opt=mix --set muon_lr_mult=12 --set lr=3e-4 \
   --set ns_dtype=bf16 --set muon_state_dtype=bf16
 ```
+
+That command runs on the **refetched** corpus, so it reproduces the recipe, not
+the BPB in the table above.
 
 Gates before a commit:
 
