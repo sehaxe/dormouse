@@ -23,9 +23,14 @@ BATCH=${BATCH:-8}
 ACCUM=${ACCUM:-1}
 LR=${LR:-3e-4}
 COMPILE=${COMPILE:-0}
-# EMA horizon = 1/(1-decay) steps. The ladder's 0.999 is a 1 000-step horizon —
-# 0.4 % of this run, too short to buy anything; 0.9999 is ~10 000 steps (~4 %).
-EMA=${EMA:-0.9999}
+# EMA OFF for the curve: the ladder's 1.4906 was measured without it, and the LR
+# research (docs/research/2026-11-08-lr-schedule.md) argues one variable at a
+# time. An EMA/SWA pass is a POST-RUN fork from the checkpoint (~30 min), not a
+# knob that makes this run incomparable. EMA=0.9999 turns it on.
+EMA=${EMA:-0.0}
+# 1% warmup (19 MB of 1.9 GB): the repo has NEVER run warmup at the live shape,
+# and the one no-warmup LR arm lost 0.25 BPB (LR research, [M]). 0 would repeat it.
+WARMUP=${WARMUP:-19000000}
 TAG=${TAG:-budget}
 OUT=${OUT:-/home/sehaxe/dormouse/checkpoints/$TAG}
 MIX=${MIX:-configs/mix_refetch.toml}
@@ -42,18 +47,20 @@ export PYTHONUNBUFFERED=1
 ARGS=(
   --set "steps=$STEPS" --set "batch=$BATCH" --set "grad_accum=$ACCUM" --set "lr=$LR"
   --set seq_len=1024 --set seed=1 --set opt=mix --set muon_lr_mult=12
+  --set "warmup_tokens=$WARMUP"
   --set "mix_plan=$MIX" --set doc_masking=false
   --set "data=$DATA" --set "eval_data=$EVAL"
   --set eval=true --set "eval_every=$EVAL_EVERY" --set eval_bytes=196608
   --set log_every="$EVAL_EVERY" --set ckpt_every=1000
   --set ns_dtype=bf16 --set muon_state_dtype=bf16
-  # EMA is scored by the eval (loop.py wraps `_eval_line` in `_shadow_params`),
-  # so this is a free change to the REPORTED number, not just the weights.
-  --set "ema_decay=$EMA"
   --set "ckpt_name=$TAG" --set "out_dir=$OUT"
   --json-log "/home/sehaxe/logs/${TAG}.jsonl"
 )
+# EMA is OFF by default: the ladder's numbers and this run's curve must be the
+# same function. `EMA=0.9999` turns it on (the eval then scores the shadow, so
+# the reported number changes with it — say which arm a number came from).
+if [ "$EMA" != "0" ] && [ "$EMA" != "0.0" ]; then ARGS+=(--set "ema_decay=$EMA"); fi
 [ "$COMPILE" = 1 ] && ARGS+=(--set torch_compile=true)
 
-echo "=== $TAG steps=$STEPS bytes=$(( STEPS * BATCH * ACCUM * 1024 )) b=$BATCH a=$ACCUM lr=$LR compile=$COMPILE ema=$EMA $(date +%H:%M:%S)"
+echo "=== $TAG steps=$STEPS bytes=$(( STEPS * BATCH * ACCUM * 1024 )) b=$BATCH a=$ACCUM lr=$LR compile=$COMPILE ema=$EMA warmup=$WARMUP $(date +%H:%M:%S)"
 exec .venv/bin/dormouse train configs/flagship3_dense.toml "${ARGS[@]}"
