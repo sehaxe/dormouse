@@ -82,6 +82,11 @@ KNOWN_DEAD = {
 # `path` / `path:line` / `path:12` / `path:12-34`, or a glob, or `a/{b,c}`.
 TOKEN = re.compile(r"[A-Za-z0-9_./-]*[A-Za-z0-9_]")
 LINE_SUFFIX = re.compile(r":\d+(-\d+)?$")
+#: `sha:path` in prose is a COMMIT-ANCHORED reference: the file was deleted from
+#: the tree but the document is citing the revision it was true at. That is the
+#: honest way to keep a deleted document's provenance, so the gate proves the
+#: blob existed at that commit instead of calling the path missing.
+COMMIT_REF = re.compile(r"\b([0-9a-f]{7,40}):([A-Za-z0-9_./-]*[A-Za-z0-9_])")
 MD_LINK = re.compile(r"\]\(([^)\s]+)")
 
 
@@ -128,6 +133,24 @@ def plausible(token: str) -> bool:
 PATH_ALIASES = (("port/", "python/"),)
 
 
+_AT_COMMIT: dict[tuple[str, str], bool] = {}
+
+
+def exists_at(commit: str, repo_rel: str) -> bool:
+	"""The blob `repo_rel` existed at `commit` (cached; one git call per pair)."""
+	key = (commit, repo_rel)
+	if key not in _AT_COMMIT:
+		_AT_COMMIT[key] = (
+			subprocess.run(
+				["git", "cat-file", "-e", f"{commit}:{repo_rel}"],
+				cwd=ROOT,
+				capture_output=True,
+			).returncode
+			== 0
+		)
+	return _AT_COMMIT[key]
+
+
 def exists(repo_rel: str) -> bool:
 	if (ROOT / repo_rel).exists():
 		return True
@@ -161,6 +184,12 @@ def main() -> int:
 				if not plausible(token):
 					continue
 				path = LINE_SUFFIX.sub("", token)
+				if any(
+					path == LINE_SUFFIX.sub("", ref_path) and exists_at(sha, ref_path)
+					for sha, ref_path in COMMIT_REF.findall(line)
+				):
+					checked += 1
+					continue
 				if exists(path):
 					checked += 1
 					continue

@@ -384,7 +384,7 @@ S_B = k / (1 + k·c/B)                        (равные позиции на 
 - **Proxy:** `2602.04289v2`, 2026-02-04; §3 (gzip fails; tokenizer/neural proxies transfer; gains grow with scale; 0.5B–14B).
 - **Lossy Horizon:** `2510.22207v1`, 2025-10-25; Table 1 (EPC 1.1–1.3 BPC at 0.98 CharFid; PM 2.3–2.8 BPC), VQ+RE dominated.
 - **Our corpus measurement:** 8 × 32 MiB, H₁–H₁₆, coverage, xz 1.940 b/B; offsets and estimator in §3.1; reproducible with `xz -9` and numpy.
-- **Repo audit:** `~/logs/ab_bf400/{bf8_s1,full_s1}.log` (4.135 vs 2.684; 150.8M vs 199.3M); `~/logs/night2/ab_byteflow.log:133` (3.6152 vs 3.2427 at 1.9M); `docs/reviews/2026-11-03` §3 (47.6→32.6 ms, 5.4%, 0.4992 leak).
+- **Repo audit:** `~/logs/ab_bf400/{bf8_s1,full_s1}.log` (4.135 vs 2.684; 150.8M vs 199.3M); `~/logs/night2/ab_byteflow.log:133` (3.6152 vs 3.2427 at 1.9M); `docs/reviews/2026-11-03-three-verdicts-and-a-leak.md` §3 (47.6→32.6 ms, 5.4%, 0.4992 leak).
 
 ### SPECULATION (my inference, no direct benchmark)
 
