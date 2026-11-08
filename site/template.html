@@ -271,6 +271,7 @@
   <b>dormouse</b>
   <a href="#bytes">bytes</a>
   <a href="#model">model</a>
+  <a href="#experts">experts</a>
   <a href="#muon">muon</a>
   <a href="#card">one card</a>
   <a href="#curve">curve</a>
@@ -337,9 +338,29 @@
   </div>
 </div></div></section>
 
-<section id="muon"><div class="wrap"><div class="chapter">
+<section id="experts"><div class="wrap"><div class="chapter">
   <div class="txt">
-    <div class="num">03 · the optimizer</div>
+    <div class="num">03 · the experts</div>
+    <h2>TSCT: a bank of small experts</h2>
+    <p>A wide feed-forward layer is where most of a transformer's parameters live. TSCT replaces that one
+      big layer with a <b>bank of small low-rank experts</b>.</p>
+    <p>Each expert squeezes the input into a narrow latent, applies the gate and the up projection there,
+      and writes back through one projection shared by every expert. A router sends each byte to
+      <b>two of 256</b>.</p>
+    <p>Parameters become cheap: the bank costs a fraction of 256 full-width layers, and only the few experts
+      a byte picked do any work.</p>
+    <p class="dim">Our own construction, built on spectral compact training. It is an experimental arm: at
+      equal bytes a dense layer still wins, so the live model is dense and the bank stays in the queue.</p>
+  </div>
+  <div class="visual">
+    <video src="media/tsct.webm" poster="media/tsct.jpg" preload="none" autoplay muted loop playsinline aria-label="a byte routed to two low-rank experts"></video>
+    <div class="cap">top-2 of 256 · gate and up share one write back to width</div>
+  </div>
+</div></div></section>
+
+<section id="muon"><div class="wrap"><div class="chapter flip">
+  <div class="txt">
+    <div class="num">04 · the optimizer</div>
     <h2>Muon thinks in matrices</h2>
     <p>Networks learn by nudging millions of numbers downhill. The usual tool is <b>Adam</b>, which treats
       every number on its own. <b>Muon</b> treats a weight matrix as a matrix.</p>
@@ -359,7 +380,7 @@
 
 <section id="card"><div class="wrap"><div class="chapter solo">
   <div class="txt">
-    <div class="num">04 · the machine</div>
+    <div class="num">05 · the machine</div>
     <h2>One graphics card, on purpose</h2>
     <p>Everything trains on a single RTX 5070 Ti with 16 GB of memory. That is the constraint the project is
       built around: a result that needs a cluster is hard to check, and a result you cannot check is hard to
@@ -381,7 +402,7 @@
 </div></section>
 
 <section id="dataset"><div class="wrap">
-  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">05 · the data</div>
+  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">06 · the data</div>
   <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">What it reads</h2>
   <p class="lead" style="max-width:62ch">Six open datasets, mixed by weight. Web text for the language, code and
     maths for the structure, Russian so the byte alphabet is not only English. Every source is filtered,
@@ -398,7 +419,7 @@
 </div></section>
 
 <section id="step"><div class="wrap">
-  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">06 · one step</div>
+  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">07 · one step</div>
   <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">Eight kilobytes at a time</h2>
   <p class="lead" style="max-width:64ch">Training is a loop of tiny, boring steps. Eight kilobytes of text go in;
     a prediction and a loss come out; the loss is pushed backwards through the same twelve blocks; the
@@ -416,7 +437,7 @@
 </div></section>
 
 <section id="curve"><div class="wrap">
-  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">07 · the result</div>
+  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">08 · the result</div>
   <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">What learning looks like</h2>
   <p class="lead" style="max-width:62ch">Bits per byte, measured on text the model never trained on. Lower is
     better: 1.74 at the start, 1.48 after 120 MB — about 20% less surprise. A strong general compressor needs
@@ -437,7 +458,7 @@
 
 <section id="neural"><div class="wrap"><div class="chapter">
   <div class="txt">
-    <div class="num">08 · the inside</div>
+    <div class="num">09 · the inside</div>
     <h2>What the model sees</h2>
     <p>Every byte is a small bet. Before it reads a character the model has a distribution over all 256
       possibilities; after it sees the character, the surprise is <span class="mono">−log2 p</span>.</p>
@@ -453,7 +474,7 @@
 </div></div></section>
 
 <section id="next"><div class="wrap">
-  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">09 · next</div>
+  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">10 · next</div>
   <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">A million bytes of context</h2>
   <p class="lead" style="max-width:64ch">The next step is memory. The design keeps a compressed summary of
     everything the model has read, so a single pass can reach a million bytes without its state growing.

@@ -166,9 +166,72 @@ def render_heat(tmp: Path) -> None:
         img.save(tmp / f"{i:04d}.png")
 
 
+
+# ---------------------------------------------------------------- 4. TSCT
+def render_tsct(tmp: Path) -> None:
+    """The expert bank: one byte falls into a router, two of sixteen drawn cards light.
+
+    Sixteen cards stand for 256 experts; the label says so. Inside a chosen card
+    a wide bar (d) squeezes to a thin latent (r) and writes back wide (f) — the
+    low-rank shape that makes a bank cheap.
+    """
+    cards = []
+    for i in range(16):
+        row, col = divmod(i, 8)
+        cards.append((38 + col * 92, 186 + row * 78, 80, 56))
+    rx, ry, rw, rh = 340, 66, 120, 40
+    picks = ((2, 11), (5, 14), (0, 9))
+    f_small = font(11, bold=False)
+    f_mid = font(12)
+    for i in range(FRAMES):
+        t = i / FRAMES
+        cycle = min(2, int(t * 3))
+        local = (t * 3) - cycle
+        img = Image.new("RGB", (W, H), BG)
+        d = ImageDraw.Draw(img)
+        grid(d)
+        d.text((40, 22), "TSCT · a bank of 256 low-rank experts", font=f_small, fill=DIM)
+        d.text((W - 158, 22), "top-2 per byte", font=f_small, fill=DIM)
+
+        # the cards, unlit
+        for x, y, w, h in cards:
+            d.rounded_rectangle([x, y, x + w, y + h], radius=8, outline=(38, 38, 42), fill=(14, 14, 16))
+
+        # router
+        d.rounded_rectangle([rx, ry, rx + rw, ry + rh], radius=10, outline=(72, 72, 78), fill=(18, 18, 20))
+        d.text((rx + rw / 2 - 20, ry + 12), "router", font=f_mid, fill=INK)
+
+        # the byte falls in
+        fall = min(1.0, local / 0.18)
+        dy = 26 + (ry - 44) * fall
+        d.ellipse([396, dy, 404, dy + 8], fill=ACCENT)
+
+        if local > 0.2:
+            k = min(1.0, (local - 0.2) / 0.18)
+            fade = 1.0 if local < 0.85 else max(0.0, 1 - (local - 0.85) / 0.15)
+            for idx in picks[cycle]:
+                x, y, w, h = cards[idx]
+                ex = x + w / 2
+                col = tuple(int(c * k * fade) for c in (60, 96, 160))
+                d.line([(400, ry + rh), (ex, y)], fill=col, width=1)
+                g = int(26 * k * fade)
+                d.rounded_rectangle([x, y, x + w, y + h], radius=8, outline=(70, 120, 200),
+                                    fill=(10 + g, 16 + g, 26 + g))
+                bx, by = x + 10, y + 18
+                d.rectangle([bx, by + 4, bx + 20, by + 10], fill=(116, 132, 160))       # d
+                d.rectangle([bx + 26, by, bx + 32, by + 14], fill=ACCENT)               # r
+                d.rectangle([bx + 38, by + 4, bx + 58, by + 10], fill=(116, 132, 160))  # f
+                d.text((x + 6, y + h - 17), f"e{idx}", font=f_small, fill=(120, 130, 150))
+
+        # a slow sweep so the dark grid is not static
+        sx = int(-60 + (W + 120) * t)
+        d.line([(sx, 120), (sx - 40, H)], fill=(22, 24, 30), width=2)
+        img.save(tmp / f"{i:04d}.png")
+
+
 def main() -> None:
     MEDIA.mkdir(parents=True, exist_ok=True)
-    for name, fn in (("rain", render_rain), ("curve", render_curve), ("heat", render_heat)):
+    for name, fn in (("rain", render_rain), ("curve", render_curve), ("heat", render_heat), ("tsct", render_tsct)):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             fn(tmp)
