@@ -1,4 +1,4 @@
-"""The dormouse CLI: `dormouse info|train|sft|rl|eval|bench|decode|serve`.
+"""The dormouse CLI: `dormouse info|train|sft|rl|eval|bench|decode|serve|runs`.
 
 A thin, pretty front over `config.load_run`, `train.loop`, and `model.decode`
 — config strictness, resume refusal and counter discipline are already
@@ -9,7 +9,9 @@ library rules, and the CLI adds none of its own. The log line stays plain
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -19,7 +21,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from . import width
+from . import __version__, width
+from . import runs as run_registry
 from .config import PROGRESS_KEYS, ModelConfig, RunConfig, TrainConfig, load_run
 from .instrument import LoudError
 from .model import DormouseModel, param_count
@@ -32,16 +35,99 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
     help="dormouse — the byte-level LM trainer (PyTorch port).",
 )
+runs_app = typer.Typer(
+    no_args_is_help=True,
+    help="The run registry: one run.json per training invocation (JSON only).",
+)
+app.add_typer(runs_app, name="runs")
 console = Console()
 _LN2 = torch.log(torch.tensor(2.0)).item()
 
 
+def _print_version() -> None:
+    console.print(f"dormouse {__version__}")
+
+
 def main() -> None:
+    # `--version` is answered before Click parses. A group callback would add the
+    # flag to `--help`, but it also turns bare `dormouse` (help today, exit 0)
+    # into Click's missing-command usage error (exit 2), which nobody asked for.
+    if "--version" in sys.argv[1:]:
+        _print_version()
+        return
     try:
         app()
     except LoudError as e:
         console.print(f"[bold red]loud:[/] {e}")
         raise typer.Exit(1) from None
+
+
+@app.command()
+def version() -> None:
+    """Print the version and exit."""
+    _print_version()
+
+
+# ---------------------------------------------------------------------------
+# runs — the registry is JSON only (`dormouse.runs`), never the trainer
+# ---------------------------------------------------------------------------
+
+
+@runs_app.command("list")
+def runs_list(
+    runs_dir: Annotated[
+        Path,
+        typer.Option(
+            "--runs-dir",
+            help=f"registry root, one dir per run (default {run_registry.DEFAULT_RUNS_DIR})",
+        ),
+    ] = Path(run_registry.DEFAULT_RUNS_DIR),
+) -> None:
+    """Every run in the registry, newest first: params, bytes, held-out BPB, status."""
+    records = run_registry.read_runs(runs_dir)
+    if not records:
+        console.print(f"[yellow]no runs[/] under {runs_dir}")
+        return
+    table = Table(title=f"runs · {runs_dir}", title_style="bold")
+    table.add_column("id", style="cyan", no_wrap=True)
+    table.add_column("date")
+    table.add_column("params", justify="right")
+    table.add_column("bytes", justify="right")
+    table.add_column("bpb", justify="right")
+    table.add_column("status")
+    table.add_column("duration", justify="right")
+    style = {"running": "yellow", "done": "green", "failed": "red"}
+    for row in run_registry.table_rows(records):
+        params = row["params"]
+        bpb = row["bpb"]
+        table.add_row(
+            str(row["id"]),
+            str(row["date"]),
+            f"{params:,}" if isinstance(params, int) else "-",
+            run_registry.fmt_bytes(row["bytes"]),
+            f"{bpb:.3f}" if isinstance(bpb, (int, float)) else "-",
+            f"[{style.get(row['status'], '')}]{row['status']}[/]"
+            if row["status"] in style
+            else str(row["status"]),
+            run_registry.fmt_duration(row["duration"]),
+        )
+    console.print(table)
+
+
+@runs_app.command("show")
+def runs_show(
+    run_id: Annotated[str, typer.Argument(help="the run id printed by `runs list`")],
+    runs_dir: Annotated[
+        Path,
+        typer.Option(
+            "--runs-dir",
+            help=f"registry root, one dir per run (default {run_registry.DEFAULT_RUNS_DIR})",
+        ),
+    ] = Path(run_registry.DEFAULT_RUNS_DIR),
+) -> None:
+    """Print one run's `run.json` verbatim (the config, data, host and eval line)."""
+    record = run_registry.read_run(runs_dir, run_id)
+    typer.echo(json.dumps(record, indent=2, sort_keys=True, default=str))
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +360,421 @@ def _train_table(run) -> Table:
     return t
 
 
+# ---------------------------------------------------------------------------
+# doctor — the pre-flight a long run cannot pay for later
+# ---------------------------------------------------------------------------
+
+OK, WARN, FAIL = "pass", "warn", "fail"
+
+
+@dataclasses.dataclass(frozen=True)
+class Check:
+    """One doctor row: the check's name, its verdict, and the evidence."""
+
+    name: str
+    status: str
+    detail: str
+
+
+@dataclasses.dataclass(frozen=True)
+class Gpu:
+    """One reading of `nvidia-smi --query-gpu`, nothing initialized."""
+
+    name: str
+    driver: str
+    total_mib: int
+    free_mib: int
+    used_mib: int
+    util: int
+    cap: str
+
+
+def _hbytes(n: float) -> str:
+    for unit, div in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if n >= div:
+            return f"{n / div:.2f} {unit}"
+    return f"{int(n)} B"
+
+
+def _gpu_probe() -> tuple[Gpu | None, str]:
+    """ONE `nvidia-smi --query`: the card is busy with a real run.
+
+    `torch.cuda.mem_get_info` would create a CUDA context, i.e. allocate on the
+    card the doctor is supposed to leave alone. The query fields are the
+    driver's own numbers, and `compute_cap` names the arch the kernels need.
+    """
+    import subprocess
+
+    query = "name,driver_version,memory.total,memory.free,memory.used,utilization.gpu,compute_cap"
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, str(e)
+    if out.returncode != 0:
+        return None, out.stderr.strip() or f"nvidia-smi exited {out.returncode}"
+    line = out.stdout.strip().splitlines()
+    if not line:
+        return None, "nvidia-smi printed no GPU"
+    try:
+        name, driver, total, free, used, util, cap = [x.strip() for x in line[0].split(",")]
+        busy = int(util) if util.isdigit() else 0
+        return Gpu(name, driver, int(total), int(free), int(used), busy, cap), ""
+    except (IndexError, ValueError) as e:
+        return None, f"cannot parse nvidia-smi output {line[0]!r}: {e}"
+
+
+def _price(run: RunConfig) -> tuple[object, object, object]:
+    """The VRAM ledger's own arithmetic for THIS run: `(module, ledger, peak)`."""
+    import sys
+
+    scripts = Path(__file__).resolve().parents[3] / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import vram_ledger
+
+    ledger = vram_ledger.param_ledger(run.model)
+    # `iter_checkpoint` is the historical alias for `activation_recompute=full`
+    # (`TrainConfig`'s docstring); pricing it as "none" would overstate VRAM.
+    recompute = run.train.activation_recompute
+    if recompute == "none" and run.train.iter_checkpoint:
+        recompute = "full"
+    lever = vram_ledger.Levers(
+        recompute=recompute,
+        muon_dtype=run.train.muon_state_dtype,
+    )
+    peak = vram_ledger.peak_bytes(
+        run.model,
+        ledger,
+        run.train.batch,
+        run.train.seq_len,
+        lever,
+        run.train.muon_chunk_elems,
+    )
+    return vram_ledger, ledger, peak
+
+
+def _device_checks(run, price, device: str) -> list[Check]:
+    """torch, the card and the VRAM arithmetic — reads only, never allocates."""
+    checks = [Check("torch", OK, f"{torch.__version__} · CUDA {torch.version.cuda or 'none'}")]
+    if device == "cpu":
+        return checks + [
+            Check("gpu", OK, "not required (--device cpu)"),
+            Check("vram", OK, "not required (--device cpu)"),
+        ]
+    gpu, err = _gpu_probe()
+    if gpu is None:
+        return checks + [
+            Check("gpu", FAIL, f"nvidia-smi: {err}"),
+            Check("vram", WARN, "unmeasured: no nvidia-smi reading"),
+        ]
+    cap = "sm_" + gpu.cap.replace(".", "")
+    arch = torch.cuda.get_arch_list()
+    if not torch.cuda.is_available():
+        gpu_check = Check(
+            "gpu",
+            FAIL,
+            f"{gpu.name} · driver {gpu.driver} · {cap} — torch.cuda.is_available() is "
+            f"False: a CPU-only torch. Escape: --device cpu, or sync the gpu extra.",
+        )
+    elif arch and cap not in arch:
+        gpu_check = Check(
+            "gpu",
+            FAIL,
+            f"{gpu.name} is {cap}; this torch has kernels for {', '.join(arch)} only. "
+            f"Escape: the gpu extra's torch pin.",
+        )
+    else:
+        gpu_check = Check(
+            "gpu", OK, f"{gpu.name} · driver {gpu.driver} · {cap} · {gpu.total_mib / 1024:.1f} GiB"
+        )
+    return checks + [gpu_check, _vram_check(run, price, gpu)]
+
+
+def _vram_check(run, price, gpu: Gpu) -> Check:
+    """Estimated peak against the card's TOTAL first, then its FREE memory.
+
+    Total decides whether the config can ever fit (FAIL). A card another
+    process holds is the repo's one-heavy-thing rule, so it is a WARN: the
+    arithmetic says the run fits, waiting says when.
+    """
+    if run is None:
+        return Check("vram", WARN, "unmeasured: the config refused to load")
+    if price is None:
+        return Check("vram", WARN, "unmeasured: the VRAM ledger failed")
+    _, _, peak = price
+    need = peak.peak / (1 << 30)
+    total = gpu.total_mib / 1024
+    free = gpu.free_mib / 1024
+    label = (
+        f"peak {need:.2f} GiB at b{run.train.batch} s{run.train.seq_len} · "
+        f"{free:.2f} / {total:.2f} GiB free"
+    )
+    if need > total:
+        return Check(
+            "vram",
+            FAIL,
+            f"{label}: the config does not fit this card. Escape: a smaller batch/seq, "
+            f"activation_recompute, or muon_state_dtype=bf16.",
+        )
+    if gpu.used_mib >= 1024 or gpu.util >= 10:
+        return Check(
+            "vram",
+            WARN,
+            f"{label}: another process holds {gpu.used_mib} MiB ({gpu.util} % util) — "
+            f"one heavy thing at a time; wait for the card.",
+        )
+    if need > free:
+        return Check("vram", FAIL, f"{label}: not enough free VRAM on an idle card.")
+    return Check("vram", OK, label)
+
+
+def _file_check(name: str, raw: str, step: int, *, allow_dir: bool = False) -> Check:
+    """A named file: exists, readable, and at least one training read long."""
+    import os
+
+    p = Path(raw)
+    try:
+        if not p.exists():
+            return Check(name, FAIL, f"{p} does not exist")
+        if p.is_dir():
+            if allow_dir:
+                return Check(name, OK, f"{p} · directory (shard stream)")
+            return Check(name, FAIL, f"{p} is a directory, not a .bin file")
+        size = p.stat().st_size
+        if not os.access(p, os.R_OK):
+            return Check(name, FAIL, f"{p} ({_hbytes(size)}) is not readable")
+    except OSError as e:
+        return Check(name, FAIL, f"{p}: {e}")
+    if size < step:
+        return Check(
+            name,
+            FAIL,
+            f"{p} is {_hbytes(size)}, smaller than one read of {_hbytes(step)}",
+        )
+    return Check(name, OK, f"{p} · {_hbytes(size)}")
+
+
+def _data_checks(run) -> list[Check]:
+    """Every file the run names, plus the plan that names the mix sources."""
+    checks: list[Check] = []
+    step = run.train.batch * (run.train.seq_len + 1)
+    plan = None
+    if run.train.mix_plan:
+        from .train.mixture import load_mix_plan
+
+        try:
+            plan = load_mix_plan(run.train.mix_plan)
+        except (LoudError, OSError) as e:
+            checks.append(Check("mix", FAIL, str(e)))
+        else:
+            stages = f"{len(plan.stages)} stage" + ("" if len(plan.stages) == 1 else "s")
+            checks.append(
+                Check(
+                    "mix",
+                    OK,
+                    f"{run.train.mix_plan} · {len(plan.sources)} sources · {stages}",
+                )
+            )
+    else:
+        checks.append(Check("mix", OK, "none (the single `data` file)"))
+    if run.train.data:
+        checks.append(_file_check("data", run.train.data, step))
+    elif plan is None and not run.train.mix_plan:
+        checks.append(
+            Check("data", FAIL, "`data` is empty and no `mix_plan` is set: nothing to read")
+        )
+    if plan is not None:
+        for name, path in sorted(plan.sources.items()):
+            checks.append(_file_check(f"mix:{name}", str(path), step, allow_dir=True))
+    return checks
+
+
+def _eval_checks(run) -> list[Check]:
+    """The eval window: its file, its size, and that the window fits inside it."""
+    tr = run.train
+    if not tr.eval_data:
+        if tr.data:
+            return [Check("eval", OK, "no `eval_data`: the no-leak tail of `data`")]
+        return [Check("eval", FAIL, "no `eval_data` and no `data` to carve a tail from")]
+    check = _file_check("eval", tr.eval_data, 1)
+    if check.status == FAIL:
+        return [check]
+    from .train.data import eval_batches_for
+
+    try:
+        span = eval_batches_for(tr) * tr.batch * (tr.seq_len + 1)
+        size = Path(tr.eval_data).stat().st_size
+    except (LoudError, OSError) as e:
+        return [Check("eval", FAIL, str(e))]
+    off = tr.eval_offset
+    if off + span > size:
+        return [
+            Check(
+                "eval",
+                FAIL,
+                f"{tr.eval_data} ({_hbytes(size)}): offset {off} + window "
+                f"{_hbytes(span)} runs off the end. Escape: eval_offset <= "
+                f"{max(0, size - span)}, or a larger eval file.",
+            )
+        ]
+    return [
+        Check(
+            "eval",
+            OK,
+            f"{tr.eval_data} · {_hbytes(size)} · window {_hbytes(span)} at +{off}",
+        )
+    ]
+
+
+def _overlap_check(run) -> Check:
+    """A window inside a training source is not held out, whatever its offset."""
+    if not run.train.eval_data:
+        return Check("overlap", OK, "the eval tail is the carve the train stream never reaches")
+    from .eval_window import training_overlap
+
+    try:
+        hit = training_overlap(run.train.data, run.train.mix_plan, Path(run.train.eval_data))
+    except (OSError, ValueError) as e:  # an unreadable plan is the `mix` row's FAIL
+        return Check("overlap", WARN, f"unmeasured: {e}")
+    if hit is not None:
+        return Check(
+            "overlap",
+            FAIL,
+            f"--eval {run.train.eval_data} is ALSO a training source ({hit}). The "
+            f"window is not held out: the model may have read those bytes. Escape: "
+            f"point --eval at a file no source reads, and name the number as a new one.",
+        )
+    return Check("overlap", OK, f"{run.train.eval_data} is read by no source")
+
+
+def _snapshot_check(run) -> Check:
+    """The resume gate: a snapshot with an unknown key is a LOUD refusal."""
+    p = Path(run.train.out_dir) / f"{run.train.ckpt_name}.config.toml"
+    if not p.is_file():
+        return Check("snapshot", OK, f"fresh run (no {p.name} in {p.parent})")
+    try:
+        snap = RunConfig.from_snapshot(p.read_text())
+    except (LoudError, OSError) as e:
+        return Check(
+            "snapshot",
+            FAIL,
+            f"{p} is refused: {e} — a --resume cannot start. A fresh run overwrites "
+            f"the pair; name a new `ckpt_name` to keep both.",
+        )
+    drift = run.diff_keys(snap)
+    if drift:
+        return Check(
+            "snapshot",
+            WARN,
+            f"{p}: a --resume would refuse on {drift} (a fresh run overwrites it)",
+        )
+    return Check("snapshot", OK, f"{p} · resume-compatible")
+
+
+def _disk_check(run, price) -> Check:
+    """Free space on the run dir against one atomic checkpoint write."""
+    import shutil
+
+    vram_ledger, ledger, _peak = price
+    out = Path(run.train.out_dir)
+    base = out
+    while not base.exists() and base.parent != base:
+        base = base.parent
+    try:
+        free = shutil.disk_usage(base).free
+    except OSError as e:
+        return Check("disk", FAIL, f"{base}: {e}")
+    muon, adamw = vram_ledger.optimizer_bytes(ledger, muon_dtype=run.train.muon_state_dtype)
+    copies = 2 if run.train.ema_decay > 0 else 1
+    one = ledger.total * 4 * copies + muon + adamw
+    label = f"{_hbytes(free)} free on {base} · one checkpoint ~{_hbytes(one)}"
+    if free < one:
+        return Check(
+            "disk",
+            FAIL,
+            f"{label}: not enough for the write. Escape: free space, or drop the EMA.",
+        )
+    if free < 2 * one:
+        return Check(
+            "disk",
+            WARN,
+            f"{label}: less than two checkpoints — the atomic overwrite needs the "
+            f"old and the new file at once.",
+        )
+    return Check("disk", OK, label)
+
+
+def _cache_check(run) -> Check:
+    """`torch_compile`'s inductor cache: a warmup cost, not a run failure."""
+    if not run.train.torch_compile:
+        return Check("cache", OK, "off (`torch_compile=false`)")
+    cache = Path.home() / ".cache" / "torch" / "inductor"
+    try:
+        warm = cache.is_dir() and any(cache.iterdir())
+    except OSError:
+        warm = False
+    if warm:
+        return Check("cache", OK, f"{cache} present")
+    return Check(
+        "cache",
+        WARN,
+        f"{cache} is missing or empty: the first compile warmup costs minutes. "
+        f"Escape: one `torch_compile=true` run pays it once, or leave the flag off.",
+    )
+
+
+def _git_check(root: Path) -> tuple[Check, dict | None]:
+    """The run's code: the SHA, and whether the tree can name it honestly."""
+    import subprocess
+
+    def git(*args: str):
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    try:
+        head = git("rev-parse", "HEAD")
+        if head.returncode != 0:
+            return (
+                Check(
+                    "git",
+                    FAIL,
+                    f"{root} is not a git checkout, so the run cannot name its code. "
+                    f"Escape: run from the repo, or pass --root.",
+                ),
+                None,
+            )
+        status = git("status", "--porcelain")
+    except (OSError, subprocess.SubprocessError) as e:
+        return Check("git", FAIL, f"git: {e}"), None
+    sha = head.stdout.strip()
+    dirty = [ln for ln in status.stdout.splitlines() if ln.strip()]
+    meta = {"sha": sha, "dirty": bool(dirty)}
+    if status.returncode != 0:
+        return Check("git", FAIL, f"git status failed: {status.stderr.strip()}"), meta
+    if dirty:
+        return (
+            Check(
+                "git",
+                WARN,
+                f"{sha[:12]} · dirty: {len(dirty)} path(s) differ from HEAD "
+                f"(the SHA does not describe the code that runs)",
+            ),
+            meta,
+        )
+    return Check("git", OK, f"{sha[:12]} · clean"), meta
+
+
 def _run(preset: str, sets: list[str]):
     model_over, train_over = _split_sets(sets)
     return load_run(preset, model_overrides=model_over, train_overrides=train_over)
@@ -369,6 +870,114 @@ def info(
     console.print(_train_table(run))
 
 
+@app.command()
+def doctor(
+    preset: Annotated[
+        str, typer.Argument(help="preset NAME or a .toml PATH the run will use")
+    ] = "small",
+    data: Annotated[Path | None, typer.Option(help="the flat .bin the run reads")] = None,
+    eval_file: Annotated[
+        Path | None,
+        typer.Option("--eval", help="the held-out .bin the run scores"),
+    ] = None,
+    out_dir: Annotated[
+        Path | None, typer.Option(help="checkpoint directory (the free-disk row)")
+    ] = None,
+    mix_plan: Annotated[
+        Path | None, typer.Option("--mix-plan", help="the staged mixture plan TOML")
+    ] = None,
+    device: Annotated[str, typer.Option(help="auto|cuda|cpu — what the run will use")] = "auto",
+    root: Annotated[Path, typer.Option(help="git checkout that names the run's code")] = Path("."),
+    json_out: Annotated[bool, typer.Option("--json", help="machine-readable rows for CI")] = False,
+    # typer constructs a fresh list per call (its contract) — B006 is a
+    # plain-function footgun, and the option annotation IS the fixture.
+    sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006
+) -> None:
+    """The pre-flight for a long run: pass / warn / fail, BEFORE the card is booked.
+
+    Every row is a check that would otherwise fail minutes or hours into a run:
+    the config's refusals, the card and its free VRAM against the ledger's own
+    estimate, every file the run names, the eval window's separation from the
+    corpus, the checkpoint snapshot's resume gate, free disk, the compile cache,
+    and the commit the run would be attributable to.
+
+    Exit 0 when nothing FAILs (a WARN does not fail), 1 otherwise. The card is
+    read with ONE `nvidia-smi --query`; no CUDA context is created and nothing
+    is allocated.
+    """
+    if device not in ("auto", "cuda", "cpu"):
+        raise LoudError(f"--device {device}: use auto|cuda|cpu")
+    model_over, train_over = _split_sets(sets)
+    for key, value in (
+        ("data", data),
+        ("eval_data", eval_file),
+        ("out_dir", out_dir),
+        ("mix_plan", mix_plan),
+    ):
+        if value is not None:
+            train_over[key] = str(value)
+
+    checks: list[Check] = []
+    run: RunConfig | None = None
+    try:
+        run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    except LoudError as e:
+        checks.append(Check("config", FAIL, f"load_run refused: {e}"))
+    else:
+        checks.append(Check("config", OK, run.source))
+
+    price = None
+    if run is not None:
+        try:
+            price = _price(run)
+        except Exception as e:  # a doctor row, never a traceback
+            checks.append(Check("ledger", WARN, f"VRAM estimate unavailable: {e}"))
+
+    checks += _device_checks(run, price, device)
+
+    if run is not None:
+        checks += _data_checks(run)
+        checks += _eval_checks(run)
+        checks.append(_overlap_check(run))
+        checks.append(_snapshot_check(run))
+        checks.append(
+            _disk_check(run, price)
+            if price
+            else Check("disk", WARN, "unmeasured: no parameter count")
+        )
+        checks.append(_cache_check(run))
+
+    git_check, git_meta = _git_check(root)
+    checks.append(git_check)
+
+    counts = {s: sum(c.status == s for c in checks) for s in (OK, WARN, FAIL)}
+    ok = counts[FAIL] == 0
+    if json_out:
+        payload = {
+            "ok": ok,
+            "preset": preset,
+            "counts": counts,
+            "git": git_meta,
+            "checks": [dataclasses.asdict(c) for c in checks],
+        }
+        import json
+
+        print(json.dumps(payload, indent=2))
+    else:
+        from rich.text import Text
+
+        table = Table(title=f"doctor · {preset}", title_style="bold")
+        table.add_column("check", style="cyan", no_wrap=True)
+        table.add_column("status", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        style = {OK: "green", WARN: "yellow", FAIL: "bold red"}
+        for c in checks:
+            table.add_row(Text(c.name), Text(c.status, style=style[c.status]), Text(c.detail))
+        console.print(table)
+        console.print(f"[dim]{counts[OK]} pass · {counts[WARN]} warn · {counts[FAIL]} fail[/]")
+    raise typer.Exit(0 if ok else 1)
+
+
 @app.command("train")
 def train_cmd(
     preset: Annotated[str, typer.Argument(help="preset NAME or a .toml PATH")] = "small",
@@ -396,6 +1005,13 @@ def train_cmd(
     json_log: Annotated[
         Path | None, typer.Option("--json-log", help="telemetry sink for `dormouse plot`")
     ] = None,
+    runs_dir: Annotated[
+        Path,
+        typer.Option(
+            "--runs-dir",
+            help=f"registry root, one dir per run (default {run_registry.DEFAULT_RUNS_DIR})",
+        ),
+    ] = Path(run_registry.DEFAULT_RUNS_DIR),
     # typer constructs a fresh list per call (its contract) — B006 is a
     # plain-function footgun, and the option annotation IS the fixture.
     sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006
@@ -430,6 +1046,7 @@ def train_cmd(
         resume=resume,
         init_from=init_from or None,
         device=None if dev.type == "cpu" else dev,
+        runs_dir=runs_dir,
     )
     console.print(f"[green]done[/] steps={report['steps']} loss={report['loss']:.4f}")
 
@@ -452,6 +1069,13 @@ def run(
     post_steps: Annotated[int, typer.Option(help="stage-2 groups per task")] = 2,
     post_budget: Annotated[int, typer.Option(help="stage-2 byte budget per rollout")] = 256,
     out_dir: Annotated[Path | None, typer.Option] = None,
+    runs_dir: Annotated[
+        Path,
+        typer.Option(
+            "--runs-dir",
+            help=f"registry root, one dir per run (default {run_registry.DEFAULT_RUNS_DIR})",
+        ),
+    ] = Path(run_registry.DEFAULT_RUNS_DIR),
     sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006
 ) -> None:
     """One button: stage-1 pretrain → checkpoint family → stage-2 post-train.
@@ -492,7 +1116,7 @@ def run(
             f" lr={run.train.lr} opt={run.train.opt}",
         )
     )
-    report = _train(model, run, device=None if dev.type == "cpu" else dev)
+    report = _train(model, run, device=None if dev.type == "cpu" else dev, runs_dir=runs_dir)
     console.print(f"[green]stage 1 done[/] steps={report['steps']} loss={report['loss']:.4f}")
 
     # The stage gate: a post lane needs a task class, or the run ends here
@@ -780,6 +1404,14 @@ def eval_cmd(
     eval_offset: Annotated[
         int | None, typer.Option("--eval-offset", help="pinned byte offset (default 0)")
     ] = None,
+    weights_only: Annotated[
+        bool,
+        typer.Option(
+            "--weights-only",
+            help="read the .pt with torch.load(weights_only=True): refuse a file whose "
+            "pickle names a class (the FOREIGN-file path; a plain tensor record loads)",
+        ),
+    ] = False,
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
 ) -> None:
     """Held-out BPB of a checkpoint. It resolves from the checkpoint's own snapshot."""
@@ -805,7 +1437,12 @@ def eval_cmd(
     # unpacked from its storage rung, and an `engram_ram` checkpoint switches
     # the model to host tables and restores its `.ngram` sibling — a raw
     # `load_state_dict` died on both (`Missing key(s): "loop.engram.tables"`).
-    load_model_state(model, run.train, load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
+    # `--weights-only` turns the read into a refusal of unsafe pickles.
+    load_model_state(
+        model,
+        run.train,
+        load_model_half(Path(out_dir) / f"{ckpt_name}.pt", weights_only=weights_only),
+    )
     _train_stream, eval_stream = open_streams(run)
     if eval_stream is None:
         raise LoudError("no eval stream (the snapshot carries eval_data or eval=true)")
@@ -1243,6 +1880,46 @@ def serve_cmd(
         )
     )
     serve_forever(httpd)
+
+
+@app.command("diagnose")
+def diagnose_cmd(
+    log: Annotated[
+        Path,
+        typer.Argument(help="a run's stdout log, or its --json-log .jsonl telemetry"),
+    ],
+    snapshot: Annotated[
+        Path | None,
+        typer.Option(
+            "--snapshot",
+            help="the run's <ckpt>.config.toml — unlocks expert count, WSD schedule, "
+            "eval paths and the checkpoint cadence",
+        ),
+    ] = None,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="machine-readable rows instead of the table")
+    ] = False,
+) -> None:
+    """Diagnose a run from its log: the known pathologies, one row each.
+
+    Parsing only — no checkpoint is loaded and no model is built. Each row
+    names the log line or counter it read, so the verdict is checkable. Exit
+    status is 1 iff a row is FAIL; WARN (recovered/counted) and SKIP (this log
+    carries no evidence) are not failures.
+
+    The eight rows: loss NaN/inf, LFB divergence, dead experts, LR frozen/zero,
+    dataloader stall, eval-window overlap, checkpoint written, log readable.
+    `--snapshot` is what lets the bank size, the schedule windows, the eval
+    file's identity and the checkpoint cadence be checked out of the run's own
+    config instead of guessed.
+    """
+    if not log.is_file():
+        raise LoudError(f"diagnose: {log} is not a file. Escape: a run's stdout log or .jsonl")
+    if snapshot is not None and not snapshot.is_file():
+        raise LoudError(f"diagnose: --snapshot {snapshot} is not a file")
+    from .diagnose import run as _diagnose
+
+    raise typer.Exit(_diagnose(log, snapshot, as_json=as_json))
 
 
 if __name__ == "__main__":

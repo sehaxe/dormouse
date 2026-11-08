@@ -44,6 +44,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dormouse"]
+# The presets are runtime data, not source: `load_preset("small")` must work
+# from a wheel with no checkout around it. They land beside `config.py`, which
+# is where `config.PACKAGE_PRESET_DIR` looks (the loader's last fallback).
+force-include = { "configs" = "dormouse/configs" }
 
 [tool.ruff]
 line-length = 100

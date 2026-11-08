@@ -18,13 +18,18 @@ cost the burn side real runs are LOUD:
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import math
+import os
+import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 
+from .. import runs as run_registry
 from .. import stepaudit
 from ..config import (
     PROGRESS_KEYS,
@@ -57,7 +62,7 @@ from .data import (
 )
 from .graph import FullGraph, OptimizerGraph, full_graph_refusal
 from .lr import anneal_alpha, wsd_lr
-from .mixture import MixtureStream, open_mixture
+from .mixture import MixtureStream, load_mix_plan, open_mixture, source_size
 from .optim import MixOptimizer, agc_clip, clip_grads, grad_norm
 
 
@@ -414,6 +419,176 @@ def _restore_lfb(model: torch.nn.Module, moe: dict[str, torch.Tensor], *, where:
     return len(live)
 
 
+#: The checkpoint FILE format's version, written as `format_version`.
+#:
+#: v1 (every file before 2026-11-08): `model`, `opt`, `step`,
+#: `model_quant_rung`, `moe`, optional `model_ema`. A loader cannot tell a v1
+#: file from a truncated one, and cannot say which code or corpus wrote it.
+#: v2 adds `format_version`, `git_sha` and `corpus`; every v1 key keeps its
+#: meaning, so a v2 reader loads v1 and a v1 reader ignores the new keys.
+CHECKPOINT_FORMAT_VERSION = 2
+
+
+def git_sha() -> str | None:
+    """HEAD's commit SHA at save time, or None off a git checkout.
+
+    Recorded so a checkpoint can name the code that wrote it (§1.4: a number
+    needs its commit). It is metadata only — the loader never refuses on it,
+    because a dirty tree or a wheel install legitimately has no SHA.
+    """
+    root = Path(__file__).resolve().parents[3]
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = out.stdout.strip()
+    return sha if out.returncode == 0 and sha else None
+
+
+def corpus_manifest(cfg: TrainConfig) -> dict:
+    """What the run READ: the mixture plan, its sources and their sizes.
+
+    The hash covers the plan file's TEXT (`plan_sha256`, so an edited weight or
+    stage changes it) and each source's NAME + SIZE — not its bytes. Hashing
+    80 GB of corpus per checkpoint is not worth it, and this is a manifest of
+    the mixture's SHAPE: swapping a source for a different file of the same
+    size is invisible. That ceiling is the price of a cheap stat-only record,
+    and it is stated here rather than discovered from a collision.
+
+    A missing plan or source records `sha256 = null` plus the name in
+    `missing`, so a checkpoint written after the 2026-11-08 artifact loss says
+    so in the file instead of claiming a corpus it cannot prove.
+
+    ponytail: the hash is plan-text + name/size, never the corpus bytes; hash
+    the bytes only if a same-size source swap must be detectable.
+    """
+    plan_path = cfg.mix_plan
+    sources: dict[str, int | None] = {}
+    missing: list[str] = []
+    plan_sha: str | None = None
+    if plan_path:
+        try:
+            plan = load_mix_plan(plan_path)
+        except LoudError:
+            return {
+                "mix_plan": plan_path,
+                "plan_sha256": None,
+                "sources": {},
+                "sha256": None,
+                "missing": ["<plan>"],
+            }
+        plan_sha = hashlib.sha256(Path(plan_path).read_bytes()).hexdigest()
+        for name, path in sorted(plan.sources.items()):
+            try:
+                sources[name] = source_size(name, path)
+            except LoudError:
+                sources[name] = None
+                missing.append(name)
+    elif cfg.data:
+        path = Path(cfg.data)
+        try:
+            sources[path.name] = source_size(path.name, path)
+        except LoudError:
+            sources[path.name] = None
+            missing.append(path.name)
+    else:
+        missing.append("<data>")
+    digest = hashlib.sha256(
+        json.dumps(
+            {"plan_sha256": plan_sha, "sources": sorted(sources.items())}, sort_keys=True
+        ).encode()
+    ).hexdigest()
+    return {
+        "mix_plan": plan_path or None,
+        "plan_sha256": plan_sha,
+        "sources": sources,
+        "sha256": None if missing else digest,
+        "missing": missing,
+    }
+
+
+def _fsync_dir(path: Path) -> None:
+    """Make the directory ENTRY durable — fsync on the dir fd, not the file."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_save(dest: Path, write) -> None:
+    """Write `dest` through `<dest>.tmp`, fsync, `os.replace`, fsync the dir.
+
+    A power loss at any point leaves the OLD complete file or the NEW complete
+    file; a half-written `.tmp` is never named `dest`. The rename is atomic on
+    a POSIX filesystem and the two fsyncs are what make it survive a reboot —
+    `os.replace` alone orders the name, not the bytes behind it.
+    """
+    tmp = dest.with_name(dest.name + ".tmp")
+    try:
+        with open(tmp, "wb") as f:
+            write(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dest)
+        _fsync_dir(dest.parent)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def load_weights_only(path: Path) -> dict:
+    """A FOREIGN file's payload, read under `torch.load(..., weights_only=True)`.
+
+    `weights_only=True` refuses any pickle that names a class or global outside
+    torch's safe allow-list, which is the whole point: a `.pt` handed over from
+    another machine must not be able to run code on this one. The payload
+    accepted here is plain tensors, ints, floats, strings, lists and dicts —
+    which is exactly what a v1/v2 dormouse `model` half is.
+
+    Where it CANNOT be used: `load_ckpt` (a resume) must keep the trusted-file
+    path. A resume reads the optimizer and controller sections (and whatever a
+    future version adds) from a file the config-snapshot gate already ties to
+    this run — refusing a legitimate new section as "unsafe pickle" would break
+    a resume for no trust gain. Use this for `--init-from`-style foreign files
+    and for any `.pt` whose provenance is not this run's snapshot.
+    """
+    import pickle
+
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except (pickle.UnpicklingError, RuntimeError) as e:
+        loud(
+            f"{path}: refused under weights_only=True ({e}). The file either asks "
+            f"the unpickler for a class outside torch's allow-list, or it is not a "
+            f"readable plain tensor record — loading it as a trusted pickle would "
+            f"execute whatever it names. Escape: load it with the writer's own "
+            f"code, or re-save its weights as plain tensors "
+            f"(`torch.save({{'model': state_dict}}, path)`)."
+        )
+
+
+def _check_format_version(ck: dict, where: Path) -> int:
+    """The file's format version; a FUTURE one is LOUD. Absent = v1."""
+    version = int(ck.get("format_version", 1))
+    if version > CHECKPOINT_FORMAT_VERSION:
+        loud(
+            f"{where}: format_version={version}, but this build reads <="
+            f"{CHECKPOINT_FORMAT_VERSION}. A newer writer added fields this build "
+            f"would silently ignore, which is what the version exists to prevent "
+            f"(written by git_sha={ck.get('git_sha') or 'not recorded'}). Escape: load "
+            f"it on the commit that wrote it, or re-save it on this build."
+        )
+    return version
+
+
 def save_ckpt(
     run: RunConfig,
     model: torch.nn.Module,
@@ -437,6 +612,13 @@ def save_ckpt(
     moments belong to those weights). An EMA checkpoint therefore carries two
     weight copies; that is the cost of a legal resume, stated here rather than
     discovered from a 2x file size.
+
+    The file is self-describing (`format_version`, `git_sha`, `corpus`) and
+    ATOMIC (`_atomic_save`: tmp + fsync + replace + dir fsync), as is the
+    `.config.toml` beside it and the `.ngram` sidecar. The weights land before
+    the snapshot, so a crash between the two leaves the OLD config with the NEW
+    weights — a resume whose snapshot gate still passes (the pair's only
+    cross-file requirement) and whose step is read from the file itself.
     """
     weights, snapshot = ckpt_paths(run.train)
     weights.parent.mkdir(parents=True, exist_ok=True)
@@ -448,6 +630,9 @@ def save_ckpt(
     # un-evaluable. The prefix is a wrapper artifact, never part of the file
     # format.
     payload = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "git_sha": git_sha(),
+        "corpus": corpus_manifest(run.train),
         "model": _checkpoint_half(model.state_dict(), rung),
         "opt": opt.state_dict(),
         "step": step,
@@ -461,19 +646,17 @@ def save_ckpt(
     }
     if ema is not None:
         payload["model_ema"] = _checkpoint_half(ema, rung)
-    tmp = weights.with_suffix(".pt.tmp")
-    torch.save(payload, tmp)
-    tmp.replace(weights)  # atomic: a crash never leaves a half-written ckpt
+    _atomic_save(weights, lambda f: torch.save(payload, f))
     if run.train.engram_ram:
         # The host tables are not parameters, so they are not in `sd`: they are
         # the sibling file, written atomically like the weights. A checkpoint
         # that restored the model without its memory would be a different
         # network at the same step count (AGENTS §3.3).
         ng = ngram_path(run.train)
-        tmp_ng = ng.with_suffix(".ngram.tmp")
-        torch.save(host_state(model), tmp_ng)
-        tmp_ng.replace(ng)
-    snapshot.write_text(run.snapshot_toml())
+        host = host_state(model)
+        _atomic_save(ng, lambda f: torch.save(host, f))
+    text = run.snapshot_toml()
+    _atomic_save(snapshot, lambda f: f.write(text.encode()))
     return weights, snapshot
 
 
@@ -501,7 +684,7 @@ def unpack_state_dict(sd: dict, rung: str | None) -> dict:
     return out
 
 
-def load_model_half(weights: Path) -> dict:
+def load_model_half(weights: Path, *, weights_only: bool = False) -> dict:
     """A checkpoint FILE's model half → fp32 masters, storage rung unpacked.
 
     The loader `eval`, `decode` and `serve` share with `load_ckpt` (audit MAJOR
@@ -520,8 +703,17 @@ def load_model_half(weights: Path) -> dict:
     served with the router it trained (the bias is not derivable), so that is
     COUNTED here rather than silent; a training load of the same file REFUSES
     (`_refuse_missing_lfb`).
+
+    `weights_only=True` is the FOREIGN-file path (`--weights-only` on `eval`):
+    the read goes through `load_weights_only`, which refuses a pickle that
+    names a class. A v1/v2 dormouse file is plain tensors and passes it.
     """
-    ck = torch.load(weights, map_location="cpu", weights_only=False)
+    ck = (
+        load_weights_only(weights)
+        if weights_only
+        else torch.load(weights, map_location="cpu", weights_only=False)
+    )
+    _check_format_version(ck, weights)
     half = ck.get("model_ema")
     if half is None:
         half = ck["model"]
@@ -741,7 +933,24 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
             f"so continuing under one step count would be a different experiment. "
             f"Escape: resolve the run with the stored values, or use a new ckpt_name."
         )
-    ck = dict(torch.load(weights, map_location="cpu", weights_only=False))
+    # `weights_only=True`: a resume file is dicts, lists and tensors. Anything
+    # that needs a CLASS to unpickle is not a checkpoint this repo wrote, and
+    # executing it before the shape checks is the pickle-RCE the 2026-11-08
+    # security review found. Measured then: every file on this box passes.
+    ck = dict(load_weights_only(weights))
+    version = _check_format_version(ck, weights)
+    if version == 1:
+        # COUNTED, not refused: every file on disk predates v2, and none of them
+        # needs the provenance to resume correctly. A v1 file is loaded with the
+        # v1 semantics and the reader is told which fields are missing.
+        ck["format_version"] = 1
+    elif ck.get("corpus") is not None and ck["corpus"].get("sha256") is None:
+        print(
+            f"ckpt: {weights} records no corpus manifest ({ck['corpus'].get('missing')}): "
+            f"the mixture plan or a source was missing when it was written. Resuming is "
+            f"legal — the config snapshot gates what the model computes — but this file "
+            f"cannot prove which corpus produced its step count."
+        )
     # Storage rungs: the model half unpacks to fp32 masters (eval/decode/
     # resume all ride the same path) — and the `_orig_mod.` prefix of a
     # pre-strip torch.compile file is dropped there too, so ONE function is the
@@ -777,15 +986,52 @@ def _sample_depth(seed: int, step: int, max_iter: int) -> int:
     return 1 + ((step * 2654435761 + seed) % max_iter)
 
 
+def seed_router_jitter(seed: int, step: int) -> None:
+    """Seed the GLOBAL torch RNG at the top of step `step` (the `moe_router_jitter` arm).
+
+    `SparseMoE.forward` draws its tie-breaking noise with `torch.randn_like` on
+    the process-global generator (`model/experts.py`), and that stream is in NO
+    checkpoint. Without this, a resume starts the noise from wherever the new
+    process happens to be: measured 2026-11-08, 6 steps vs 3 + resume diverged
+    at `embed.weight` by 1.5e-4 relative (the router's noise moved the loss,
+    then everything downstream — `tests/test_resume_exact.py`). Seeding from
+    `(seed, step)` makes the draw a pure function of the step, the ADR-0021
+    rule `_sample_depth`, the mixture draw and the LR schedule already follow.
+    The caller gates on the arm, so the OFF path's RNG stream is untouched —
+    an existing bit-exact pin cannot move because this function is not called.
+    """
+    assert step >= 0, f"step must be >= 0, got {step}"
+    torch.manual_seed((int(seed) << 32) ^ int(step))
+
+
+def _param_key(name: str) -> str:
+    """A live parameter name → its CHECKPOINT name (`_orig_mod.` stripped).
+
+    ONE spelling rule for the EMA arm: the shadow is checkpoint-keyed
+    ([`_shadow_state`]), while `model.named_parameters()` on a
+    `torch.compile` wrapper carries `_orig_mod.`. Every lookup goes through
+    here, so the wrapper prefix cannot leak into a checkpoint, a report, or a
+    resume across the compile boundary.
+    """
+    return name.removeprefix("_orig_mod.")
+
+
 def _shadow_state(model: torch.nn.Module, initial: dict | None = None) -> dict:
-    """The EMA shadow: one tensor per PARAMETER, keyed by the live name.
+    """The EMA shadow: one tensor per PARAMETER, keyed by the CHECKPOINT name.
+
+    The key space is `state_dict()`'s, i.e. the `_orig_mod.` prefix a
+    `torch.compile` wrapper adds is stripped: the shadow is written to the file
+    as `model_ema` and returned in `train()`'s report, and both must name the
+    tree the UNWRAPPED readers load (audit CRITICAL 2). Internal callers
+    (`_shadow_params`, `_ema_update`) look a live parameter up through
+    [`_param_key`], so the two spellings cannot disagree.
 
     `initial` is a checkpoint's `model_ema` half (already unpacked, CPU, keys
-    WITHOUT the `_orig_mod.` prefix `torch.compile` adds). Keys are matched
-    after stripping that prefix on both sides, and a set or shape mismatch is
-    LOUD: a shadow that names a different tree would make every eval score a
-    network the run never trained. `None` starts the shadow AT the current
-    weights (a fresh run, or a resume of a file written with `ema_decay=0`).
+    WITHOUT the prefix). Keys are matched after stripping that prefix on both
+    sides, and a set or shape mismatch is LOUD: a shadow that names a different
+    tree would make every eval score a network the run never trained. `None`
+    starts the shadow AT the current weights (a fresh run, or a resume of a
+    file written with `ema_decay=0`).
 
     The shadow covers `named_parameters()` and nothing else — buffers and the
     host Engram tables are not weights of the checkpoint's model half, and
@@ -807,14 +1053,15 @@ def _shadow_state(model: torch.nn.Module, initial: dict | None = None) -> dict:
             )
     out: dict[str, torch.Tensor] = {}
     for name, p in live:
-        src = None if initial is None else initial[name.removeprefix("_orig_mod.")]
+        key = _param_key(name)
+        src = None if initial is None else initial[key]
         if src is not None and tuple(src.shape) != tuple(p.shape):
             loud(
-                f"ema: `model_ema` {name} has shape {tuple(src.shape)}, the model "
+                f"ema: `model_ema` {key} has shape {tuple(src.shape)}, the model "
                 f"expects {tuple(p.shape)}. Escape: the checkpoint's config, or a "
                 f"fresh ckpt_name."
             )
-        out[name] = (
+        out[key] = (
             p.detach().clone()
             if src is None
             else src.detach().to(device=p.device, dtype=p.dtype).clone()
@@ -832,6 +1079,12 @@ def _shadow_params(model: torch.nn.Module, shadow: dict | None):
     does not disturb the optimizer's parameter objects (the objects, their
     `.grad` and their identity are untouched), which is why the switch back is
     exact and the next step's graph sees the RAW weights it built.
+
+    The shadow is CHECKPOINT-keyed (`_shadow_state`) and the live names here are
+    the wrapper's, so the lookup strips `_orig_mod.` through [`_param_key`].
+    A `torch.compile` graph reads parameters by object at call time, so the
+    swap reaches the compiled forward too (pinned by
+    `tests/test_torch_compile.py`).
     """
     if shadow is None:
         yield
@@ -839,7 +1092,7 @@ def _shadow_params(model: torch.nn.Module, shadow: dict | None):
     live = list(model.named_parameters())
     saved = {name: p.data for name, p in live}
     for name, p in live:
-        p.data = shadow[name]
+        p.data = shadow[_param_key(name)]
     try:
         yield
     finally:
@@ -863,7 +1116,7 @@ def _ema_update(model: torch.nn.Module, shadow: dict, decay: float, flag_dev: to
     # `t1 + w*(t2-t1)` — and `_foreach_lerp_` dispatches it unchanged.
     groups: dict[torch.dtype, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
     for name, p in stepaudit.iterations("ema.params", model.named_parameters()):
-        s = shadow[name]
+        s = shadow[_param_key(name)]
         dst, src = groups.setdefault(s.dtype, ([], []))
         dst.append(s)
         src.append(p.detach())
@@ -1111,6 +1364,53 @@ def eval_row(
 
 
 def train(
+    model: torch.nn.Module,
+    run: RunConfig,
+    *,
+    stream: ByteStream | None = None,
+    eval_stream: ByteStream | None = None,
+    resume: bool = False,
+    init_from: str | None = None,
+    log=print,
+    device: torch.device | str | None = None,
+    runs_dir: str | Path | None = None,
+) -> dict:
+    """`_train_impl` + the run registry: one write before, one after.
+
+    The registry is a bystander, never a step: `runs.start` writes `run.json`
+    once before the first forward (`status="running"`), and the `finally`-shaped
+    tail rewrites it once as `done` (with the last eval line) or `failed` (with
+    the exception string). A crash therefore leaves a record that names the run
+    instead of a directory a reader has to guess at.
+
+    `runs_dir=None` puts the registry under `out_dir/runs`, so a moved
+    checkpoint directory keeps its provenance; the CLI passes `--runs-dir`
+    (default `logs/runs`) to collect many runs in one index.
+    """
+    record = run_registry.start(run, model=model, runs_dir=runs_dir, device=device)
+    try:
+        report = _train_impl(
+            model,
+            run,
+            stream=stream,
+            eval_stream=eval_stream,
+            resume=resume,
+            init_from=init_from,
+            log=log,
+            device=device,
+        )
+    except BaseException as e:
+        record.finish("failed", error=f"{type(e).__name__}: {e}")
+        raise
+    record.finish(
+        "done",
+        eval_line=report.get("eval_line"),
+        final_bpb=report.get("final_bpb"),
+    )
+    return report
+
+
+def _train_impl(
     model: torch.nn.Module,
     run: RunConfig,
     *,
@@ -1384,7 +1684,7 @@ def train(
         path = Path(init_from)
         if not path.is_file():
             loud(f"train --init-from: {path} does not exist. Escape: the .pt of the run you mean.")
-        foreign = torch.load(path, map_location="cpu", weights_only=False)
+        foreign = load_weights_only(path)
         # An EMA checkpoint's SERVED half is `model_ema` (the same preference
         # `load_model_half` makes): a fine-tune starts from the averaged model a
         # reader would serve, not from the raw iterate.
@@ -1466,7 +1766,8 @@ def train(
                 "the host dispatch). Escape: torch_compile=false, or opt_graph=false."
             )
         # torch.compile(dynamic=True) — the spike's measured winner at the b1
-        # shape (273.5 vs 357.3 ms/step, 1.20x). Wrapped AFTER the resume
+        # shape (273.5 vs 357.3 ms/step, 1.31x; its dynamic=False arm read
+        # 298.0, 1.20x). Wrapped AFTER the resume
         # load: an OptimizedModule's state_dict carries a `_orig_mod.` prefix,
         # so loading into the wrapped model would rename every key. The
         # inductor cache persists in ~/.cache/torch — the warmup is once per
@@ -1507,6 +1808,10 @@ def train(
     window_steps = 0
     timer = StepTimer()
     last_loss = float("nan")
+    #: The last eval LINE this run printed, with its `bpb_fin`. The registry
+    #: reports one number per run and this is it; the JSONL sink still carries
+    #: every eval for a curve. `None` = the run never evaluated.
+    last_eval: tuple[str, float] | None = None
     #: The DEVICE firewall's state (ADR-0018 rule 2). `flag_dev` is the 1/0
     #: integer the step's writes are multiplied by; `last_loss_dev` is the last
     #: FINITE loss, carried on the device so the log cadence is the only host
@@ -1766,7 +2071,17 @@ def train(
             f"and every ragged MoE dispatch) are LOUD before the first step; paper "
             f"LayerRoPE is allowed because its depth indices are fixed."
         )
+    # The LIVE model, not `run.model`: a hand-built caller can pass a model
+    # whose config disagrees, and this switch decides whether the forward's
+    # global-RNG draw is deterministic at all.
+    jitter_rng = any(getattr(m, "router_jitter", 0.0) > 0.0 for m in model.modules())
     for step in range(start, cfg.steps):
+        # The router-jitter arm draws from the global RNG inside the forward;
+        # seeding it per step is what makes that draw a pure function of
+        # `(seed, step)` — otherwise a resume restarts the stream and the run
+        # is not the one that never stopped (`seed_router_jitter`).
+        if jitter_rng:
+            seed_router_jitter(cfg.seed, step)
         # The step audit's bracket (`dormouse.stepaudit`, disarmed unless a
         # script installs it): every host read, allocation and instrumented
         # loop a step takes lands on THIS record, which is what makes "zero
@@ -2091,6 +2406,7 @@ def train(
                 )
             sf("train")
             log(line)
+            last_eval = (line, bpb(fin))
             if sink is not None:
                 _row(
                     **eval_row(
@@ -2126,11 +2442,12 @@ def train(
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
         sf("eval")
         with _shadow_params(model, ema):
-            line, _ev, _scored, _fin = _eval_line(
+            line, _ev, _scored, fin = _eval_line(
                 model, eval_stream, cfg, run.model.max_iter, device, cfg.steps
             )
         sf("train")
         log(line)
+        last_eval = (line, bpb(fin))
     return {
         "steps": cfg.steps,
         # `None`, not `nan`: a resume at the finished step runs ZERO iterations,
@@ -2147,4 +2464,7 @@ def train(
         "ema": ema,
         "eval_window_bytes": eval_window_bytes(cfg),
         "doc_counts": doc_counts,
+        # The registry's one-number summary, and the printed line behind it.
+        "eval_line": None if last_eval is None else last_eval[0],
+        "final_bpb": None if last_eval is None else last_eval[1],
     }

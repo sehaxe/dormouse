@@ -34,13 +34,25 @@ if TYPE_CHECKING:  # the RL config lives in the post lane; importing it here
     from .post.rl import RLConfig  # would be a cycle at module load
 
 #: `port/configs/`, reached from this file (`port/src/dormouse/config.py`).
+#: A checkout only: in an installed wheel this path is `<prefix>/lib/pythonX.Y/configs`.
 PRESET_DIR = Path(__file__).resolve().parents[2] / "configs"
+
+#: `dormouse/configs/` — the same preset files, force-included into the wheel
+#: by `[tool.hatch.build.targets.wheel.force-include]` in `pyproject.toml`.
+#: Absent in a source checkout, present once installed; the fallback that keeps
+#: `dormouse info` working without the repo.
+PACKAGE_PRESET_DIR = Path(__file__).resolve().parent / "configs"
 
 #: Train keys a resume is allowed to change: they decide WHEN we look, never
 #: what the model computes. The burn list (cfg.rs `PROGRESS_KEYS`) plus
 #: `json_log` — the telemetry sink is WHERE the measurement goes and it reaches
 #: no forward (audit MINOR 23, 2026-10-17: the field's own docstring promised
 #: this exemption while `diff_keys` refused the flip).
+#: Two members are IMPLEMENTATION keys rather than schedule keys — `moe_kernel`
+#: (arms proven equal to 1e-6) and `torch_compile` (the executor of the same
+#: forward, parity pinned at fp32 round-off by `tests/test_torch_compile.py`) —
+#: and `ns_steps` is an arm on the remaining budget. The exemption is a resume
+#: on the same trajectory, not a licence to change the objective.
 #: Keys a resume may change. `seq_len` joined on 2026-11-04: the window is not a
 #: parameter, and the KDA/CSA arms carry no positional table, so widening it is a
 #: curriculum step in the same class as extending `steps`. `max_seq_len` is the
@@ -53,6 +65,16 @@ PROGRESS_KEYS = (
     # cuBLAS thread counts are. Switching it on a resume is a kernel change on
     # the same math — and on 2026-11-04 it was worth 8.6x on the step.
     "moe_kernel",
+    # `torch_compile` picks the EXECUTOR of the same forward, the same class as
+    # `moe_kernel`: the checkpoint file never carries the wrapper's
+    # `_orig_mod.` prefix (`save_ckpt` strips it, `load_ckpt` tolerates it), so
+    # both directions of the boundary load the SAME weights and optimizer
+    # state. The CPU parity gate (`tests/test_torch_compile.py`) pins the
+    # compiled loss and gradients to the eager ones at fp32 round-off, which is
+    # what makes the flip a resume rather than a new experiment: an existing
+    # run buys the measured 1.20x without restarting its step count, and a
+    # compiled arm whose live-shape measurement does not pay can be reverted.
+    "torch_compile",
     "steps",
     "log_every",
     "ckpt_every",
@@ -1957,11 +1979,15 @@ class TrainConfig:
     ns_steps: int = 5
     #: torch.compile(dynamic=True) around the model's forward — the one large
     #: speed lever left (the spike measured 273.5 vs 357.3 ms/step at the b1
-    #: shape, 1.20x; dynamic=True because eval/resume lengths vary). The first
+    #: shape, 1.31x; its dynamic=False arm read 298.0 = 1.20x, and this trainer
+    #: wraps dynamic=True because eval/resume lengths vary). The first
     #: warmup costs minutes and lands in ~/.cache/torch, so it is paid once
     #: per machine, not per run. OFF by default until a b1-shape run confirms
     #: the win end to end; the wrapper goes on AFTER resume (an
-    #: OptimizedModule's state_dict carries a `_orig_mod.` prefix).
+    #: OptimizedModule's state_dict carries a `_orig_mod.` prefix, which the
+    #: checkpoint strips). It is a PROGRESS KEY: a resume may flip it, because
+    #: the file is the same unwrapped tree either way and the compiled forward
+    #: matches the eager one at fp32 round-off (`tests/test_torch_compile.py`).
     torch_compile: bool = False
     #: The ANNEALED factor_qat ramp (burn-spectral's measured soft-to-hard
     #: recipe, `ste_ternary_annealed`: "converges better than hard STE from
@@ -4968,8 +4994,12 @@ def _validate_jepa(model: ModelConfig, tcfg: TrainConfig) -> None:
 
 
 def _candidates(name: str) -> list[Path]:
-    """Search order, burn's: cwd `configs/`, then the port's own `configs/`."""
-    return [Path(f"configs/{name}.toml"), PRESET_DIR / f"{name}.toml"]
+    """Search order: cwd `configs/`, the checkout's, then the wheel's own copy."""
+    return [
+        Path(f"configs/{name}.toml"),
+        PRESET_DIR / f"{name}.toml",
+        PACKAGE_PRESET_DIR / f"{name}.toml",
+    ]
 
 
 def load_preset(name_or_path: str) -> ModelConfig:
