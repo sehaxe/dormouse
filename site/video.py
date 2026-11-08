@@ -129,7 +129,10 @@ def render_curve(tmp: Path) -> None:
                fill=INK, width=2)
         hx, hy = X(dense_x[head]), Y(smooth[head])
         d.ellipse([hx - 4, hy - 4, hx + 4, hy + 4], fill=ACCENT)
-        d.text((right - 120, H - 46), f"{smooth[head]:.3f} BPB", font=f_big, fill=INK)
+        # The final number is NOT baked into the video: the page computes it
+        # from the same logs at build time, and two numbers a reader can see
+        # at once must not disagree (they did: 1.621 in the frame, 1.480 in
+        # the card). The frame carries the shape; the card carries the value.
         d.text((left, H - 46), f"{dense_x[head]:.0f} MB seen", font=f_small, fill=DIM)
         img.save(tmp / f"{i:04d}.png")
 

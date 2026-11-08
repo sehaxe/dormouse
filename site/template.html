@@ -4,7 +4,23 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>dormouse — a byte-level model on one workstation</title>
-<meta name="description" content="A byte-level language model trained on one 16 GB card. Every number computed from the run logs, every retraction kept.">
+<meta name="description" content="A byte-level language model trained on one 16 GB graphics card. Every number comes from the run logs — including the ones that turned out wrong.">
+<link rel="canonical" href="https://sehaxe.github.io/dormouse/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="dormouse">
+<meta property="og:title" content="dormouse — a byte-level model on one workstation">
+<meta property="og:description" content="No tokenizer, no cluster, no teacher: a 95M byte-level language model trained on one 16 GB card, with every claim tied to a measurement and every failure kept.">
+<meta property="og:url" content="https://sehaxe.github.io/dormouse/">
+<meta property="og:image" content="https://sehaxe.github.io/dormouse/media/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="dormouse — the landing page hero, a photograph printed as a halftone">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="dormouse — a byte-level model on one workstation">
+<meta name="twitter:description" content="A 95M byte-level language model trained on one 16 GB card. Every claim names its measurement; every retraction stays published.">
+<meta name="twitter:image" content="https://sehaxe.github.io/dormouse/media/og.png">
+<meta name="theme-color" content="#f6f3ec" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a0b0d" media="(prefers-color-scheme: dark)">
 <style>
   :root{
     --bg:#f6f3ec; --panel:#fffdf8; --panel2:#fffefb;
@@ -15,14 +31,19 @@
     --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
     --glass:rgba(252,250,245,.74); --glass-line:rgba(255,255,255,.75);
     --nav:rgba(246,243,236,.75); --hero-ink:#141b26; --hero-dim:#3c4555;
+    --btn:rgba(255,255,255,.55); --btn-hover:#ffffff;
+    /* the surprise ramp: low surprise is faint, high is ink. Dark theme flips it. */
+    --heat0:#dcd6c8; --heat1:#b3aa99; --heat2:#837b6d; --heat3:#4a453d; --heat4:#141210;
   }
   html[data-theme="dark"]{
     --bg:#0a0b0d; --panel:#101216; --panel2:#14171c;
     --line:#1e2128; --line2:#2a2e37;
-    --ink:#e8e6e1; --dim:#8b8f98; --dimmer:#5c6068;
+    --ink:#e8e6e1; --dim:#9aa0a9; --dimmer:#7c818b;
     --accent:#7aa2e8; --hot:#ff6b7a; --good:#5fbf7f;
     --glass:rgba(16,18,22,.55); --glass-line:rgba(255,255,255,.08);
     --nav:rgba(10,11,13,.72); --hero-ink:#f2f0ea; --hero-dim:#b9bcc4;
+    --btn:rgba(255,255,255,.06); --btn-hover:rgba(255,255,255,.12);
+    --heat0:#3a3f47; --heat1:#5f656f; --heat2:#9199a4; --heat3:#c8ced8; --heat4:#ffffff;
   }
   html{color-scheme:light}
   html[data-theme="dark"]{color-scheme:dark}
@@ -73,9 +94,9 @@
   .sub b{color:var(--hero-ink);font-weight:600}
   .cta{display:flex;gap:10px;margin:26px 0 0;flex-wrap:wrap}
   .btn{font-family:var(--mono);font-size:12.5px;padding:10px 16px;border-radius:8px;
-    border:1px solid var(--line2);color:var(--hero-ink);background:rgba(255,255,255,.55);
+    border:1px solid var(--line2);color:var(--hero-ink);background:var(--btn);
     display:inline-flex;align-items:center;gap:8px}
-  .btn:hover{background:#fff}
+  .btn:hover{background:var(--btn-hover)}
   .btn.p{background:var(--hero-ink);color:var(--bg);border-color:var(--hero-ink)}
   .btn.p:hover{opacity:.9}
 
@@ -99,6 +120,7 @@
 
   /* cards */
   .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+  .grid.three{grid-template-columns:repeat(3,1fr)}
   .card{border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--panel)}
   .card video{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#0a0a0b}
   .card .b{padding:16px 18px 18px}
@@ -110,7 +132,7 @@
   /* stats */
   .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
   .stat{border:1px solid var(--line);border-radius:14px;padding:22px;background:var(--panel)}
-  .stat .v{font-family:var(--mono);font-size:36px;line-height:1;letter-spacing:-.03em;color:#141b26}
+  .stat .v{font-family:var(--mono);font-size:36px;line-height:1;letter-spacing:-.03em;color:var(--ink)}
   .stat .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
     color:var(--dimmer);margin-top:10px}
   .stat .d{font-size:12.5px;color:var(--dim);margin-top:8px;line-height:1.6}
@@ -135,15 +157,17 @@
   ul.ret .why{color:var(--dim);font-size:13px;margin-top:8px;line-height:1.65}
 
   pre.bytes{margin:0;padding:14px 16px;border-top:1px solid var(--line);background:var(--panel2);
-    font-family:var(--mono);font-size:11.5px;line-height:1.5;white-space:pre;overflow-x:auto;color:#b6ac9a}
+    font-family:var(--mono);font-size:11.5px;line-height:1.5;white-space:pre;overflow-x:auto;color:var(--heat2)}
   pre.bytes b{font-weight:400}
+  pre.bytes .b0{color:var(--heat0)} pre.bytes .b1{color:var(--heat1)} pre.bytes .b2{color:var(--heat2)}
+  pre.bytes .b3{color:var(--heat3)} pre.bytes .b4{color:var(--heat4)}
 
   footer{border-top:1px solid var(--line);padding:40px 0 70px;color:var(--dimmer);
     font-family:var(--mono);font-size:11.5px}
   footer .row{display:flex;gap:22px;flex-wrap:wrap;align-items:center}
 
   @media (max-width:860px){
-    .grid,.stats{grid-template-columns:1fr}
+    .grid,.grid.three,.stats{grid-template-columns:1fr}
     section{padding:60px 0;margin-top:60px}
     header{padding:104px 0 72px}
     .glass{padding:24px}
@@ -157,12 +181,13 @@
 
 <nav><div class="wrap">
   <b>dormouse</b>
-  <a href="docs/">docs</a>
-  <a href="#measure">measurements</a>
-  <a href="#runs">runs</a>
-  <a href="#retracted">retractions</a>
+  <a href="#what">what</a>
+  <a href="#why">why</a>
+  <a href="#numbers">numbers</a>
+  <a href="#record">record</a>
   <span class="sp"></span>
   <button class="theme" id="themeBtn" type="button" aria-label="theme">auto</button>
+  <a href="docs/">docs</a>
   <a href="https://github.com/sehaxe/dormouse"><span class="dot"></span>source</a>
 </div></nav>
 
@@ -170,42 +195,86 @@
   <canvas id="heroCanvas" aria-hidden="true"></canvas>
   <div class="wrap">
     <div class="glass">
-      <div class="kicker">one RTX 5070 Ti · 16 GB · sm_120</div>
-      <h1>A byte-level model that lives on <em>one workstation.</em></h1>
-      <p class="sub">Published with the measurements that justify it — and the ones that <b>refute</b> it.
-        Every number on this page is computed from the run logs at build time.</p>
+      <div class="kicker">one RTX 5070 Ti · 16 GB · no tokenizer</div>
+      <h1>A language model that reads raw bytes, trained on <em>one graphics card.</em></h1>
+      <p class="sub">No tokenizer, no cluster, no teacher. dormouse learns to predict text one byte at a
+        time — and every number it publishes comes from the run logs, in the open, including the ones that
+        turned out <b>wrong</b>.</p>
       <div class="cta">
-        <a class="btn p" href="#measure">Read the measurements</a>
-        <a class="btn" href="https://github.com/sehaxe/dormouse">Source ↗</a>
+        <a class="btn p" href="#numbers">See the numbers</a>
+        <a class="btn" href="#why">Why this exists</a>
       </div>
     </div>
   </div>
 </header>
 
-<section id="measure"><div class="wrap">
+<section id="what"><div class="wrap">
   <div class="stage">
     <video src="media/rain.webm" poster="media/rain.jpg" preload="auto" autoplay muted loop playsinline aria-label="binary rain, 0 and 1"></video>
     <div class="cap"><b>flagship3</b><span>12 unique layers · 95,035,200 parameters</span>
       <span class="sp">the alphabet is 256 bytes; the rain is its binary shadow</span></div>
   </div>
-  <h2><span>01</span>what the runs say</h2>
-  <h3>Two numbers measured, one designed</h3>
-  <p class="lead">Step speed and the size of the record are runs you can point at. The 1M context is the
-    state arithmetic — exact, and not yet a pass.</p>
+  <h2><span>01</span>what it is</h2>
+  <h3>A small model you can check</h3>
+  <p class="lead">dormouse is a <b>byte-level</b> language model: it reads text as 256 possible bytes instead
+    of tokens. That makes the whole thing inspectable — the input is the file itself, and every number on
+    this page can be recomputed from the logs in the repository.</p>
   <div class="stats">
-    <div class="stat"><div class="v">1M</div><div class="k">context · designed</div>
-      <div class="d">33 MiB per CSA slot + 1 MiB HCA, at <span class="mono">d=1024</span>; the loop form
-        carries one per iteration (3 → 99 MiB, a 12-layer stack → 396 MiB). A 1M forward has not been
-        run; the protocol that would make it a number is being written.</div></div>
-    <div class="stat"><div class="v" id="sSpeed">—</div><div class="k">step speed</div>
-      <div class="d">bf16 Newton–Schulz at 5 steps, inside the ±0.02 BPB noise floor</div></div>
-    <div class="stat"><div class="v" id="sRuns">—</div><div class="k">runs on record</div>
-      <div class="d"><span id="sRunsSub">—</span>, including the ones later retracted</div></div>
+    <div class="stat"><div class="v">256</div><div class="k">input symbols</div>
+      <div class="d">No tokenizer and no vocabulary to train. The model sees the text as it is, down to
+        the byte.</div></div>
+    <div class="stat"><div class="v">95M</div><div class="k">parameters</div>
+      <div class="d">Twelve transformer layers — small enough for one 16 GB card, large enough to say
+        something.</div></div>
+    <div class="stat"><div class="v">1</div><div class="k">GPU, the whole stack</div>
+      <div class="d">No cluster and no rented hours. One workstation, one card, and a public log for every
+        run.</div></div>
   </div>
 </div></section>
 
+<section id="why"><div class="wrap">
+  <h2><span>02</span>why it exists</h2>
+  <h3>A number you cannot check is a rumour</h3>
+  <p class="lead">Most claims about models are unverifiable from the outside. This project is built the
+    other way around: every claim names its measurement, every failed idea stays published, and a claim
+    that cannot be reproduced is retracted in public.</p>
+  <div class="grid three">
+    <div class="card"><div class="b">
+      <div class="k">rule 01</div><div class="t">Measure, then claim</div>
+      <div class="d">A mechanism ships only if it beats its own removal on held-out data. A faster one that
+        costs quality is marked rejected and never drives a headline.</div></div></div>
+    <div class="card"><div class="b">
+      <div class="k">rule 02</div><div class="t">Keep the failures</div>
+      <div class="d">A retraction is published next to what replaced it. Deleting it would be the one
+        dishonest move available.</div></div></div>
+    <div class="card"><div class="b">
+      <div class="k">rule 03</div><div class="t">One machine</div>
+      <div class="d">If a result needs a cluster to reproduce, it is not evidence. Everything here is meant
+        to run on a workstation like yours.</div></div></div>
+  </div>
+</div></section>
+
+<section id="numbers"><div class="wrap">
+  <h2><span>03</span>the numbers</h2>
+  <h3>What the runs actually say</h3>
+  <p class="lead">Each figure is tied to a log. The one exception is the 1M context: that is arithmetic on
+    the design, not a measurement, and it is labelled that way.</p>
+  <div class="stats">
+    <div class="stat"><div class="v" id="sBpb">—</div><div class="k">bits per byte</div>
+      <div class="d">Held-out English text; lower is better. On the same 196 KB, xz needs 2.71 bits
+        per byte and bzip2 2.59.</div></div>
+    <div class="stat"><div class="v" id="sSpeed">—</div><div class="k">faster step</div>
+      <div class="d">The optimizer's matrix chain moved to bf16, for +0.01 BPB — inside the measurement
+        noise.</div></div>
+    <div class="stat"><div class="v" id="sRuns">—</div><div class="k">runs on record</div>
+      <div class="d"><span id="sRunsSub">—</span>, including the ones later retracted.</div></div>
+  </div>
+  <p class="note" style="margin-top:14px">1M context · designed, not measured: 33 MiB of state per slot, and
+    no 1M pass has been run yet.</p>
+</div></section>
+
 <section><div class="wrap">
-  <h2><span>02</span>what the model sees</h2>
+  <h2><span>04</span>what the model sees</h2>
   <h3>1024 held-out bytes, one forward</h3>
   <p class="lead">Height is the model's surprise at that byte (<span class="mono">−log2 p</span>), measured
     on a pinned English window. The text below the strip is the same 1024 bytes, tinted by the same value.</p>
@@ -214,13 +283,13 @@
     <div class="b">
       <div class="k">flagship3 · <span id="sMeta">—</span></div>
       <div class="t"><span id="sMean">—</span></div>
-      <pre class="mono" id="bytes" style="margin:14px 0 0;font-size:11.5px;line-height:1.5;white-space:pre;overflow-x:auto;color:#3f3f45"></pre>
+      <pre class="mono bytes" id="bytes"></pre>
     </div>
   </div>
 </div></section>
 
 <section><div class="wrap">
-  <h2><span>03</span>the curve</h2>
+  <h2><span>05</span>the curve</h2>
   <h3>Bits per byte, on bytes actually seen</h3>
   <p class="lead" id="curveMeta">—</p>
   <div class="card">
@@ -232,20 +301,20 @@
 </div></section>
 
 <section><div class="wrap">
-  <h2><span>04</span>the optimizer</h2>
-  <h3>70% of every step was one chain of matmuls</h3>
-  <p class="lead">Muon's Newton–Schulz iteration ran 579 GFLOP of fp32 per step on the CUDA-core lane —
-    223 ms of a 307 ms step. bf16 puts the same chain on the tensor cores. A faster rung that costs BPB
-    is marked rejected and never drives a headline.</p>
+  <h2><span>06</span>the engine</h2>
+  <h3>The same answer, 1.92× sooner</h3>
+  <p class="lead">Most of a training step was one chain of matrix multiplies inside the optimizer. Moving
+    it onto the tensor cores made the step almost twice as fast and cost 0.01 BPB — inside the noise. Rungs
+    that buy speed with quality are marked rejected and never drive a headline.</p>
   <table>
-    <thead><tr><th>rung</th><th>kB/s</th><th>ms/step</th><th>speed</th><th>Δ BPB</th></tr></thead>
+    <thead><tr><th>optimizer rung</th><th>bytes/s</th><th>ms/step</th><th>speed</th><th>cost</th></tr></thead>
     <tbody id="rungs"></tbody>
   </table>
   <p class="note" style="margin-top:14px">9 arms · 40 steps each · same shape · 2026-11-08</p>
 </div></section>
 
-<section id="runs"><div class="wrap">
-  <h2><span>05</span>runs</h2>
+<section id="record"><div class="wrap">
+  <h2><span>07</span>the record</h2>
   <h3>Every run with a held-out number</h3>
   <p class="lead">Longest first. A run appears here only if it produced an eval on the held-out window.</p>
   <table>
@@ -255,8 +324,8 @@
 </div></section>
 
 <section id="retracted"><div class="wrap">
-  <h2><span>06</span>retractions</h2>
-  <h3>What is not true</h3>
+  <h2><span>08</span>retractions</h2>
+  <h3>What we got wrong</h3>
   <p class="lead">Every entry was published here first, then measured wrong. Deleting them would be the one
     dishonest move available, so they stay next to what replaced them.</p>
   <ul class="ret">
@@ -290,8 +359,8 @@
 <footer><div class="wrap row">
   <span>dormouse</span>
   <a href="https://github.com/sehaxe/dormouse">github.com/sehaxe/dormouse</a>
+  <a href="docs/">knowledge base</a>
   <span>MIT</span>
-  <span>python lane live · rust lane frozen</span>
   <span id="built" class="sp" style="margin-left:auto"></span>
 </div></footer>
 

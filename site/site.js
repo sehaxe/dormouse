@@ -182,6 +182,8 @@ void main(){
     const last = pts[pts.length - 1];
     document.getElementById('curveMeta').textContent =
       `${pts.length} held-out points over ${fmt(last.mb, 0)} MB of training bytes.`;
+    const sBpb = document.getElementById('sBpb');
+    if (sBpb) sBpb.innerHTML = fmt(last.bpb, 2);
     document.getElementById('curveFinal').innerHTML =
       `<span class="mono">${fmt(last.bpb, 3)}</span> bits per byte at ${fmt(last.mb, 0)} MB`;
   }
@@ -198,11 +200,13 @@ void main(){
     const cols = sj.cols || 64;
     const bits = sj.bits;
     const band = (b) => b < 0.6 ? 0 : b < 1.6 ? 1 : b < 2.6 ? 2 : b < 4.2 ? 3 : 4;
-    const col = ['#3a3a40', '#565660', '#8a8a96', '#c9c9d2', '#ffffff'];
+    // classes, not inline colours: the ramp is a CSS variable per theme,
+    // so a theme switch repaints the strip without a re-render.
+    const cls = ['b0', 'b1', 'b2', 'b3', 'b4'];
     const esc = (c) => c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c;
     let out = '';
     for (let i = 0; i < bits.length; i++) {
-      out += `<b style="color:${col[band(bits[i])]};font-weight:400">${esc(sj.text[i])}</b>`;
+      out += `<b class="${cls[band(bits[i])]}">${esc(sj.text[i])}</b>`;
       if ((i + 1) % cols === 0) out += '\n';
     }
     document.getElementById('bytes').innerHTML = out.trimEnd();
