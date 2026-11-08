@@ -274,6 +274,15 @@
       <div class="now">1.660 BPB at the same bytes</div>
       <div class="why">Captured before the Muon learning-rate fix (a scheduler overwrote the group's LR
         every step).</div></li>
+    <li><div class="was">“34 MB of state at 1M”</div>
+      <div class="now">33 MiB per CSA slot — 99 MiB for the 3-slot loop</div>
+      <div class="why">The figure was ONE CSA ring read as the total. The loop carries
+        <span class="mono">(kda_state, csa_state)</span> per iteration slot, and a 12-layer stack would be
+        396 MiB. A 1M forward has still not been run.</div></li>
+    <li><div class="was">“1M context, in the measurements row”</div>
+      <div class="now">designed, not measured</div>
+      <div class="why">The stat card sat under “each one a measurement”. The state arithmetic is exact;
+        the capability is untested, and the training that would test it (a CSA model at 8K) is queued, not run.</div></li>
   </ul>
 </div></section>
 
