@@ -21,6 +21,28 @@ jobs:
       - name: cli
         run: cargo check -p dormouse-cli
 
+  # ── the claims ledger ──────────────────────────────────────────────────────
+  # Report-only ON PURPOSE, and the debt is named: 1 901 legacy claims predate
+  # the rule, 9 mismatch, and the gate cannot pass until they are converted
+  # (`.bulba/plan.md`). A blocking job here would freeze every push on a
+  # backlog; a silent one would hide it. So: run it, publish the count, fail
+  # only if the SCRIPT crashes.
+  claims-ledger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: install (frozen)
+        run: cd port && uv sync --frozen || uv sync
+      - name: ledger (report)
+        run: |
+          cd port && PYTHONPATH=src uv run python scripts/claims_ledger.py \
+            --docs ../docs --repo .. --no-params --today "$(date -u +%F)" \
+            --out /tmp/ledger.md | tail -2
+          tail -20 /tmp/ledger.md
+
   # ── python lane ────────────────────────────────────────────────────────────
   # The training port had NO CI until 2026-11-07: the Rust lane was covered and
   # every training run, every architecture A/B and every post-training path went

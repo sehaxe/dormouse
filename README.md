@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="site/media/readme-banner.png" alt="dormouse — the landing page hero: a photograph printed as a halftone" width="1200">
+
 # 🐹 dormouse
 
 **A byte-level language model that trains on one workstation — with every
