@@ -35,6 +35,28 @@ the lane — see `docs/PLAN-minimal-core.md`.
 - 1B-on-one-card research (`docs/research/2026-11-08-1b-on-one-card.md`).
 - Post-training research (`docs/research/2026-11-08-post-training-at-1b.md`).
 
+## The GitHub divergence (found 2026-11-08 while pushing)
+
+`origin/main` is NOT this lane. Its tree is the Rust-era layout (`src/`,
+`tests/` at the root, a 5060 Ti MoE README with `assets/banner.svg`), and its
+HEAD is a data commit from that lineage. Local `main` is the Python lane under
+`port/`, 357 commits ahead and 78 behind; an automatic merge produced **319
+conflicts** (a directory flatten plus two overlapping trees) and was aborted.
+
+What exists now: `origin/backup/main-local-2026-11-08` carries all 357 local
+commits, so nothing is only-on-one-disk. `origin/main` is untouched.
+
+Three ways forward, for the owner:
+1. **Make the local lane canonical**: push local main to a new `origin/python`
+   branch and merge it into `origin/main` as a rewrite (the Rust tree moves to
+   `rust/` or `archive/`). One decision, one big commit.
+2. **Flatten locally** to the remote's layout (`port/*` → root) and merge; the
+   conflict count drops but the two `src/` and `docs/` trees still overlap.
+3. **Keep two branches** (`main` = Rust lineage, `python` = this lane) and stop
+   pretending they are one project.
+
+Until the owner picks, pushes go to `backup/main-local-2026-11-08`.
+
 ## Waiting on the owner
 
 - `port/` → `python/` rename: scripted (`scripts/split_lanes.sh`), never run.
