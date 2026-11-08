@@ -1,0 +1,1037 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU для обучения · отчёт 2026-10-30</title>
+<style>
+  :root{
+    --ink:#201d1d; --ink-deep:#0f0000; --charcoal:#302c2c; --body:#424245;
+    --mute:#646262; --stone:#6e6e73; --ash:#9a9898;
+    --canvas:#fdfcfc; --soft:#f8f7f7; --card:#f1eeee; --dark:#201d1d; --dark2:#302c2c;
+    --hair:rgba(15,0,0,.12); --hair2:#646262;
+    --on-dark:#fdfcfc; --on-dark-mute:#9a9898;
+    --accent:#007aff; --warn:#ff9f0a; --danger:#ff3b30; --ok:#30d158;
+    --mono:"Berkeley Mono",ui-monospace,SFMono-Regular,"JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--canvas); color:var(--ink);
+    font-family:var(--mono); font-size:15px; line-height:1.55;
+    font-variant-ligatures:none;
+  }
+  .wrap{max-width:1080px; margin:0 auto; padding:28px 22px 90px}
+  header.top{
+    display:flex; justify-content:space-between; gap:16px; align-items:baseline;
+    border-bottom:1px solid var(--hair); padding-bottom:10px; margin-bottom:26px;
+    color:var(--mute); font-size:12.5px;
+  }
+  header.top b{color:var(--ink)}
+  h1{font-size:30px; line-height:1.35; margin:0 0 6px; letter-spacing:-.2px}
+  h2{font-size:17px; margin:38px 0 12px; padding-bottom:7px; border-bottom:1px solid var(--hair)}
+  h3{font-size:14.5px; margin:22px 0 8px; color:var(--charcoal)}
+  p{margin:9px 0; color:var(--body)}
+  small,.small{font-size:12.5px; color:var(--mute)}
+  a{color:var(--accent); text-decoration:none; border-bottom:1px solid rgba(0,122,255,.28)}
+  a:hover{border-bottom-color:var(--accent)}
+  ul{margin:8px 0 8px 0; padding:0; list-style:none}
+  li{margin:5px 0; padding-left:20px; position:relative; color:var(--body)}
+  li:before{content:"[+]"; position:absolute; left:0; color:var(--ash); font-size:12px; top:2px}
+  li.neg:before{content:"[−]"; color:var(--danger)}
+  li.warn:before{content:"[!]"; color:var(--warn)}
+  .hero{
+    background:var(--dark); color:var(--on-dark); border-radius:4px;
+    padding:22px 22px 18px; margin:0 0 24px;
+  }
+  .hero .k{color:var(--on-dark-mute); font-size:12px; letter-spacing:.14em; text-transform:uppercase}
+  .hero .v{font-size:26px; line-height:1.35; margin:8px 0 14px; font-weight:700}
+  .hero .v em{color:var(--ok); font-style:normal}
+  .hero .sub{color:var(--on-dark-mute); font-size:13px}
+  .hero .term{margin-top:14px; padding-top:12px; border-top:1px solid rgba(253,252,252,.16); font-size:12.5px; color:#cfcfcf}
+  .hero .term b{color:var(--on-dark)}
+  .grid{display:grid; gap:12px}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g2{grid-template-columns:repeat(2,1fr)}
+  .g4{grid-template-columns:repeat(4,1fr)}
+  @media(max-width:860px){.g3,.g2,.g4{grid-template-columns:1fr}}
+  .card{border:1px solid var(--hair); border-radius:4px; padding:13px 14px; background:var(--canvas)}
+  .card.soft{background:var(--soft)}
+  .card .n{font-size:23px; font-weight:700; letter-spacing:-.3px}
+  .card .l{font-size:11.5px; color:var(--mute); text-transform:uppercase; letter-spacing:.09em; margin-top:2px}
+  .card .d{font-size:12.5px; color:var(--stone); margin-top:7px}
+  .up{color:var(--danger)} .down{color:var(--ok)} .neutral{color:var(--mute)}
+  table{width:100%; border-collapse:collapse; margin:10px 0 6px; font-size:13px}
+  th,td{text-align:left; padding:7px 8px; border-bottom:1px solid var(--hair); vertical-align:top}
+  th{font-size:11.5px; text-transform:uppercase; letter-spacing:.08em; color:var(--mute); font-weight:500; border-bottom:1px solid var(--hair2)}
+  td.num,th.num{text-align:right; font-variant-numeric:tabular-nums}
+  tr.hl td{background:rgba(48,209,88,.10)}
+  tr.bad td{background:rgba(255,59,48,.07)}
+  tr.q td{background:rgba(255,159,10,.09)}
+  .tag{display:inline-block; font-size:11px; padding:1px 6px; border:1px solid var(--hair); border-radius:3px; color:var(--mute)}
+  .tag.ok{color:#167c3a; border-color:rgba(48,209,88,.55); background:rgba(48,209,88,.08)}
+  .tag.no{color:#a50011; border-color:rgba(255,59,48,.45); background:rgba(255,59,48,.07)}
+  .tag.wa{color:#8a5300; border-color:rgba(255,159,10,.5); background:rgba(255,159,10,.08)}
+  figure{margin:14px 0 4px}
+  figcaption{font-size:12px; color:var(--mute); margin-top:6px}
+  svg{width:100%; height:auto; display:block; overflow:visible}
+  .axis{stroke:var(--hair); stroke-width:1}
+  .bar{fill:var(--charcoal)}
+  .bar.ok{fill:#2f9e52}
+  .bar.no{fill:#c9463c}
+  .bar.wa{fill:#c98a1a}
+  .bar.mute{fill:#c9c6c6}
+  .lbl{font-size:11px; fill:var(--body); font-family:var(--mono)}
+  .lbl.mute{fill:var(--stone)}
+  .lbl.inv{fill:#fdfcfc}
+  .gridline{stroke:rgba(15,0,0,.07); stroke-width:1}
+  .note{border-left:2px solid var(--hair2); padding:2px 0 2px 12px; margin:14px 0; color:var(--body); font-size:13.5px}
+  .note.danger{border-left-color:var(--danger)}
+  .note.ok{border-left-color:var(--ok)}
+  .note.warn{border-left-color:var(--warn)}
+  code{background:var(--card); padding:1px 5px; border-radius:3px; font-size:12.5px}
+  pre{background:var(--dark); color:#e8e6e6; padding:13px 15px; border-radius:4px; overflow-x:auto; font-size:12.5px; line-height:1.5}
+  pre .c{color:#9a9898}
+  pre .g{color:#7fdc9a}
+  .kv{display:grid; grid-template-columns:auto 1fr; gap:2px 14px; font-size:13px; margin:8px 0}
+  .kv b{color:var(--mute); font-weight:400}
+  footer{margin-top:44px; padding-top:14px; border-top:1px solid var(--hair); color:var(--mute); font-size:12px}
+  .src{font-size:12px; color:var(--stone)}
+  .src li:before{content:"·"; color:var(--ash)}
+  .scroll{overflow-x:auto}
+  @media print{
+    body{background:#fff} .hero{background:#fff; color:#000; border:1px solid #000}
+    .hero .v em{color:#000} a{color:#000; border-bottom:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div><b>dormouse / hardware</b> — выбор GPU для обучения</div>
+  <div>30.10.2026 · Минск · курс 2.9433 BYN/$</div>
+</header>
+
+<h1>Что купить на выходных: GPU для обучения</h1>
+<p class="small">Задача: ускорить претрейн 105M→1B на одной машине. Ограничение — 16 ГБ VRAM сейчас, 1350 Вт БП, Xeon E5-2690 v4, 4 свободных слота PCIe 3.0 x8. Рынок растёт на 40–50% за квартал, поэтому решение нужно сейчас.</p>
+
+<section class="hero">
+  <div class="k">Вердикт</div>
+  <div class="note danger"><b>РЕДАКЦИЯ 2 (обновлено): цена $617 за 3090 отброшена.</b> Лот на Taobao помечен 议价 (price negotiation), «Stock: 1000» — заглушка оптовика, а в четырёх мультивариантах цена варианта 3090 оказалась <b>$1 663–1 670</b>, ещё в двух лотах 3090 в вариантах нет вовсе. Реальная цена 3090 в Минске — <b>$1 478–2 039</b>. Все расчёты ниже, где фигурирует $617, помечены как <em>«если бы цена была настоящей»</em> и не используются в рекомендации. Добавлен <b>RTX 5070 Ti</b>.<br><br><b>Второе исправление:</b> «4090 за $1 613» не существует — я открыл лот <code>720337396619</code>, у него выбран вариант <b>16 ГБ / RTX 4080</b>. Настоящая 4090 24 ГБ стоит <b>$4 209–4 731</b>. Все строки с «4090 $1 613» исправлены.</div>
+<div class="v">Берём <b>1× RTX 5070 Ti 16 ГБ</b> в Минске за <b>4 820 BYN ($1 636)</b>: ×1.9–2.1 к нашему шагу, <b>sm_120 — ноль миграции</b>, гарантия 24 месяца. Пара 3090 из Китая снята как вариант: цена $617 была номиналом 议价-лота.<br>Если нет — <em>1× RTX 4080 Super</em> за 4 100–4 240 BYN ($1 393–1 441) сегодня.</div>
+  <div class="sub">Ставка решается одной цифрой из чата. Доставка перестала быть узким местом: авиа-экспресс из Гуанчжоу идёт 3–5 дней, пошлина на пару — $155, а не $430 (реформа 5%+НДС отложена бессрочно).</div>
+  <div class="term">
+    <b>прирост:</b> 2.3 → ~5.0 ГБ/сутки обучения &nbsp;·&nbsp;
+    <b>чистая цена:</b> ~$350–450 после продажи 5060 Ti &nbsp;·&nbsp;
+    <b>риск:</b> низкий
+  </div>
+</section>
+
+<h2>1. Почему срочно: рынок вверх, и это не эмоция</h2>
+
+<div class="grid g4">
+  <div class="card"><div class="n up">×3</div><div class="l">GDDR6 $/ГБ</div><div class="d">$2.50 → $7.50 с конца 2025</div></div>
+  <div class="card"><div class="n up">+66%</div><div class="l">RTX 50 в Германии</div><div class="d">год к году, 3D Center</div></div>
+  <div class="card"><div class="n up">+59%</div><div class="l">RTX 5060 Ti 8GB, Япония</div><div class="d">$749 против старта</div></div>
+  <div class="card"><div class="n up">+40–50%</div><div class="l">прогноз памяти Q3</div><div class="d">Jefferies; ещё +30–40% в Q4</div></div>
+</div>
+
+<figure>
+  <svg viewBox="0 0 1000 210" role="img" aria-label="Рост цен на память и видеокарты">
+    <line class="gridline" x1="70" y1="20" x2="70" y2="170"></line>
+    <line class="axis" x1="70" y1="170" x2="960" y2="170"></line>
+    <!-- GDDR6 per GB -->
+    <text class="lbl" x="70" y="14">$/ГБ GDDR6</text>
+    <rect class="bar mute" x="110" y="120" width="60" height="50"></rect>
+    <text class="lbl" x="140" y="112" text-anchor="middle">2.50</text>
+    <text class="lbl mute" x="140" y="188" text-anchor="middle">2025</text>
+    <rect class="bar no" x="190" y="20" width="60" height="150"></rect>
+    <text class="lbl" x="220" y="12" text-anchor="middle">7.50</text>
+    <text class="lbl mute" x="220" y="188" text-anchor="middle">2026</text>
+    <!-- RTX50 index -->
+    <text class="lbl" x="400" y="14">индекс RTX 50 (100 = год назад)</text>
+    <rect class="bar mute" x="440" y="105" width="60" height="65"></rect>
+    <text class="lbl" x="470" y="97" text-anchor="middle">100</text>
+    <text class="lbl mute" x="470" y="188" text-anchor="middle">2025</text>
+    <rect class="bar no" x="520" y="62" width="60" height="108"></rect>
+    <text class="lbl" x="550" y="54" text-anchor="middle">166</text>
+    <text class="lbl mute" x="550" y="188" text-anchor="middle">2026</text>
+    <!-- 5090 street -->
+    <text class="lbl" x="730" y="14">RTX 5090: MSRP → улица</text>
+    <rect class="bar mute" x="770" y="148" width="60" height="22"></rect>
+    <text class="lbl" x="800" y="140" text-anchor="middle">$1 999</text>
+    <rect class="bar no" x="850" y="24" width="60" height="146"></rect>
+    <text class="lbl" x="880" y="16" text-anchor="middle">$4 299–10 000</text>
+  </svg>
+  <figcaption>Слева — цена памяти (TrendForce), в центре — рост розничных цен RTX 50 (3D Center, Германия), справа — делистинг 5090 и уличные цены (Tech-Insider, 18 окт 2026).</figcaption>
+</figure>
+
+<p>Механика одна: фабрики отдают память AI-датацентрам. 24 ГБ VRAM стал дефицитным товаром — то есть карты с большой памятью дорожают быстрее всех, включая вторичку. MSI подтвердила рост «от RTX 50 вниз до RTX 30».</p>
+
+<div class="note warn">RTX 50 Super заморожен именно из-за памяти: 3 ГБ модули GDDR7 стоят ~×3 от 2 ГБ. Пока это так, дешёвых новых карт не будет, а вторичка будет тянуться вверх.</div>
+
+<h2>2. Что есть в Минске прямо сейчас</h2>
+
+<p>Три источника: <b>Kufar</b> (частные, б/у), <b>Onliner Барахолка</b> (частные), <b>Onliner Каталог</b> (магазины, новое, с гарантией). Цены пересчитаны по 2.9433.</p>
+
+<div class="scroll">
+<table>
+  <thead>
+    <tr><th>Карта</th><th>Источник</th><th class="num">Цена</th><th class="num">≈ $</th><th class="num">bf16 TF</th><th class="num">$/TF</th><th class="num">VRAM</th><th>Вердикт</th></tr>
+  </thead>
+  <tbody>
+    <tr class="hl">
+      <td><b>RTX 4080 Palit Game Rock</b></td><td>Kufar · Минск, Центральный</td>
+      <td class="num">4 100</td><td class="num">1 393</td><td class="num">97*</td><td class="num"><b>14.4</b></td><td class="num">16</td>
+      <td><span class="tag ok">лучший $/TF</span></td>
+    </tr>
+    <tr class="hl">
+      <td><b>RTX 4080 Super Palit GamingPro OC</b></td><td>Kufar · Минск, Московский</td>
+      <td class="num">4 240</td><td class="num">1 441</td><td class="num">104*</td><td class="num"><b>13.9</b></td><td class="num">16</td>
+      <td><span class="tag ok">лучший $/TF</span></td>
+    </tr>
+    <tr>
+      <td>RTX 4080 Gigabyte Aero OC</td><td>Onliner Барахолка</td>
+      <td class="num">4 000</td><td class="num">1 359</td><td class="num">97*</td><td class="num">14.0</td><td class="num">16</td>
+      <td><span class="tag ok">дешевле всех</span></td>
+    </tr>
+    <tr>
+      <td>RTX 4080 Super Gigabyte Aero OC</td><td>Kufar · Минск, Ленинский</td>
+      <td class="num">4 300</td><td class="num">1 461</td><td class="num">104*</td><td class="num">14.0</td><td class="num">16</td>
+      <td><span class="tag">запас</span></td>
+    </tr>
+    <tr>
+      <td>RTX 4080 Super (Palit) </td><td>Kufar · Могилёв / Витебск</td>
+      <td class="num">4 500 / 4 300</td><td class="num">1 529 / 1 461</td><td class="num">104*</td><td class="num">14.7 / 14.0</td><td class="num">16</td>
+      <td><span class="tag">не Минск</span></td>
+    </tr>
+    <tr>
+      <td>RTX 5070 MSI Ventus 2X OC</td><td>Onliner Каталог (новое)</td>
+      <td class="num">3 235</td><td class="num">1 099</td><td class="num">60*</td><td class="num">18.3</td><td class="num">12</td>
+      <td><span class="tag wa">мало VRAM</span></td>
+    </tr>
+    <tr>
+      <td>RTX 5060 Ti 16GB</td><td>Onliner Каталог (новое)</td>
+      <td class="num">2 827</td><td class="num">961</td><td class="num">45.7</td><td class="num">21.0</td><td class="num">16</td>
+      <td><span class="tag">это наша карта</span></td>
+    </tr>
+    <tr class="bad">
+      <td>RTX 3090 (15 объявлений)</td><td>Kufar</td>
+      <td class="num">4 350–6 000</td><td class="num">1 478–2 039</td><td class="num">71</td><td class="num"><b>20.8–28.7</b></td><td class="num">24</td>
+      <td><span class="tag no">худшая цена за флопс</span></td>
+    </tr>
+    <tr class="bad">
+      <td>RTX 3090</td><td>Onliner Барахолка</td>
+      <td class="num">—</td><td class="num">—</td><td class="num">71</td><td class="num">—</td><td class="num">24</td>
+      <td><span class="tag no">нет в наличии</span></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+<p class="small">* bf16 для 4080/5070/4070 Ti — <b>оценка по архитектуре</b>, не замер. Замерено у нас только 5060 Ti: <b>45.7 TFLOP/s</b> bf16 при 180 Вт (28 Вт в пике GEMM).</p>
+
+<figure>
+  <svg viewBox="0 0 1000 300" role="img" aria-label="Долларов за терафлопс">
+    <text class="lbl" x="0" y="12">$ за 1 TFLOP/s bf16 — меньше лучше</text>
+    <g>
+      <!-- scale: 0..30 $/TF -->
+      <line class="axis" x1="230" y1="24" x2="230" y2="286"></line>
+      <g class="lbl mute">
+        <text x="230" y="298">0</text><text x="330" y="298">5</text><text x="430" y="298">10</text>
+        <text x="530" y="298">15</text><text x="630" y="298">20</text><text x="730" y="298">25</text><text x="830" y="298">30</text>
+      </g>
+      <g class="gridline"><line x1="330" y1="24" x2="330" y2="286"/><line x1="430" y1="24" x2="430" y2="286"/><line x1="530" y1="24" x2="530" y2="286"/><line x1="630" y1="24" x2="630" y2="286"/><line x1="730" y1="24" x2="730" y2="286"/><line x1="830" y1="24" x2="830" y2="286"/></g>
+      <!-- bars: 20px per $ -->
+      <text class="lbl" x="0" y="45">пара 3090 (Китай, если $617)</text>
+      <rect class="bar ok" x="230" y="34" width="180" height="16"></rect><text class="lbl" x="418" y="46">$9.0</text>
+      <text class="lbl" x="0" y="75">2×3090 (цена $850/шт)</text>
+      <rect class="bar wa" x="230" y="64" width="245" height="16"></rect><text class="lbl" x="483" y="76">$12.3</text>
+      <text class="lbl" x="0" y="105">4080 Super (Kufar, 4 240)</text>
+      <rect class="bar ok" x="230" y="94" width="278" height="16"></rect><text class="lbl" x="516" y="106">$13.9</text>
+      <text class="lbl" x="0" y="135">4080 (Onliner, 4 000)</text>
+      <rect class="bar ok" x="230" y="124" width="280" height="16"></rect><text class="lbl" x="518" y="136">$14.0</text>
+      <text class="lbl" x="0" y="165">RTX 5070 (новое, 3 235)</text>
+      <rect class="bar" x="230" y="154" width="366" height="16"></rect><text class="lbl" x="604" y="166">$18.3</text>
+      <text class="lbl" x="0" y="195">RTX 5060 Ti 16GB (наша)</text>
+      <rect class="bar" x="230" y="184" width="420" height="16"></rect><text class="lbl" x="658" y="196">$21.0</text>
+      <text class="lbl" x="0" y="225">3090 (Kufar, 4 350)</text>
+      <rect class="bar no" x="230" y="214" width="416" height="16"></rect><text class="lbl" x="654" y="226">$20.8</text>
+      <text class="lbl" x="0" y="255">3090 «розничный» Taobao</text>
+      <rect class="bar no" x="230" y="244" width="516" height="16"></rect><text class="lbl" x="754" y="256">$25.8</text>
+      <text class="lbl" x="0" y="285">3090 (Kufar, 6 000)</text>
+      <rect class="bar no" x="230" y="274" width="574" height="16"></rect><text class="lbl" x="812" y="286">$28.7</text>
+    </g>
+  </svg>
+  <figcaption>Чем левее, тем выгоднее. Китайская пара 3090 выигрывает только при реальной цене $617; при $850 за штуку она уже почти равна 4080 Super, но даёт 48 ГБ вместо 16.</figcaption>
+</figure>
+
+<h2>2b. А что 5090? Доплатить и закрыть вопрос?</h2>
+
+<p>Логика «взять одну мощную и не мучиться» правильная: 32 ГБ, та же архитектура sm_120 (значит <b>никакой миграции с Blackwell</b>), одна карта вместо DDP. Но цена сейчас — худшая на рынке.</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Объявление (Kufar, 30.10)</th><th class="num">Цена</th><th class="num">≈ $</th><th class="num">$/TF*</th><th>Комментарий</th></tr></thead>
+  <tbody>
+    <tr class="bad"><td>Inno3D RTX 5090 <b>D v2 24 ГБ</b></td><td class="num">15 000</td><td class="num">5 096</td><td class="num">24.3</td><td><span class="tag no">в описании 24 ГБ — у 5090 их 32; уточнять</span></td></tr>
+    <tr class="bad"><td>RTX 5090 (без бренда)</td><td class="num">20 000</td><td class="num">6 795</td><td class="num">32.4</td><td>самая дешёвая «настоящая»</td></tr>
+    <tr class="bad"><td>Palit RTX 5090 GameRock</td><td class="num">23 000</td><td class="num">7 815</td><td class="num">37.2</td><td>—</td></tr>
+    <tr class="bad"><td>Palit RTX 5090 GameRock</td><td class="num">24 000</td><td class="num">8 154</td><td class="num">38.8</td><td>—</td></tr>
+    <tr class="bad"><td>ASUS ROG Matrix Platinum</td><td class="num">32 600</td><td class="num">11 076</td><td class="num">52.7</td><td>—</td></tr>
+    <tr class="bad"><td>NVIDIA 5090 Founders Edition</td><td class="num">39 000</td><td class="num">13 250</td><td class="num">63.1</td><td>—</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="small">* bf16 ~210 TFLOP/s — оценка по архитектуре, не замер.</p>
+
+<div class="grid g3">
+  <div class="card"><div class="n down">$10.1</div><div class="l">/TF · 2×3090</div><div class="d">$1 431 · 48 ГБ · 3–5 дней</div></div>
+  <div class="card"><div class="n down">$13.9</div><div class="l">/TF · 4080 Super</div><div class="d">$1 441 · 16 ГБ · сегодня</div></div>
+  <div class="card" style="border-color:rgba(255,59,48,.4)"><div class="n up">$32.4</div><div class="l">/TF · 5090</div><div class="d">$6 795 · 32 ГБ · завтра</div></div>
+</div>
+
+<div class="note danger"><b>5090 — самая перегретая карта рынка.</b> MSRP $1 999, улица $4 299–10 000, из розницы делистнута. Покупая её сейчас, ты платишь <b>3.4× от MSRP</b> и <b>2.3× за флопс</b> против пары 3090. Именно на 5090 центрирован весь дефицит — это худший момент за весь год.</div>
+
+<h3>Когда 5090 была бы правильным ответом</h3>
+<ul>
+  <li class="warn">если цена упадёт до <b>$2 700–3 000</b> (это $13–14/TF, уровень 4080 Super) — тогда 32 ГБ и sm_120 без миграции делают её лучшим выбором</li>
+  <li class="warn">если появятся деньги на две — но 2×5090 это 1150 Вт, наш БП 1350 Вт уже не хватит</li>
+  <li>если задача = инференс большой модели одной картой, а не обучение (там решает не $/TF, а объём VRAM)</li>
+</ul>
+
+<div class="note ok"><b>Ответ на «может доплатить»:</b> доплата $5 300 за 5090 против пары 3090 даёт +2.2× флопсов на одной карте, но <b>−$22 за каждый TFLOP</b> и на 16 ГБ меньше суммарной памяти. За те же деньги можно взять пару 3090 <b>и</b> 4080 Super, и останется на БП.</div>
+
+<h2>3. Локальная картина: три рынка, три разных товара</h2>
+
+<div class="grid g3">
+  <div class="card soft">
+    <h3 style="margin-top:0">Kufar</h3>
+    <div class="kv"><b>3090</b><span>15 шт · 4 350–6 000</span><b>4080/S</b><span>7 шт · 4 100–4 950</span><b>5070</b><span>3 350</span></div>
+    <p class="small">Живой рынок: много 3090, разброс цен 1.4×. Торг работает, самовывоз в день сделки. Гарантия — только договорённость.</p>
+  </div>
+  <div class="card soft">
+    <h3 style="margin-top:0">Onliner Барахолка</h3>
+    <div class="kv"><b>3090</b><span><span class="tag no">0 шт</span></span><b>4080/S</b><span>2 шт · 4 000–4 300</span><b>5070</b><span>3 100</span></div>
+    <p class="small">Раздел «Видеокарты» — 162 актуальных объявления, из них топовых карт единицы. По 3090 висят только объявления «куплю» (перекупы).</p>
+  </div>
+  <div class="card soft">
+    <h3 style="margin-top:0">Каталог (магазины)</h3>
+    <div class="kv"><b>3090 / 4080</b><span>сняты с продажи</span><b>5070</b><span>3 235+ (гарантия)</span><b>5060 Ti 16</b><span>2 827</span></div>
+    <p class="small">Новое с гарантией, но 40–50-серия 16+ ГБ выше 4080 в рознице уже не купить — только 5070 (12 ГБ) и ниже.</p>
+  </div>
+</div>
+
+<div class="note">Ключевой факт, который меняет решение: <b>локальный 3090 (24 ГБ) стоит дороже 4080 Super (16 ГБ) и даёт меньше флопсов.</b> Единственное его преимущество — память. Если задача — 1B-модель, 24 ГБ обязательны; если задача — ускорить текущий 105M-претрейн, 16 ГБ 4080 Super выгоднее почти в 1.5 раза по цене за флопс.</div>
+
+<h2>3b. Во что мы упираемся: FLOPs или VRAM?</h2>
+
+<p>Проверено на живом прогоне (шаг 125 600): <b>занято 8.4 из 16.3 ГиБ</b>. То есть сегодня мы <b>не в VRAM-стене</b> — половина памяти простаивает, а узкое место — скорость: 26.8k байт/с, MFU ~6.5%.</p>
+
+<pre><span class="c"># замер, flagship 105M, b8 × s1024 × accum 3, iter=3</span>
+VRAM:   8.4 / 16.3 ГиБ   <span class="c">← 7.9 ГиБ свободно</span>
+скорость: 26 800 Б/с = 2.3 ГБ/сутки
+MFU:    ~6.5%
+
+<span class="c"># но два запуска уже отверглись по памяти</span>
+b24 s1024      → OOM (нужно 15.16 из 15.56 ГиБ)
+E=512 + wide   → OOM
+wave11 full    → OOM</pre>
+
+<h3>Три разные стены, и они на разных горизонтах</h3>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Что хотим</th><th>Чем упираемся</th><th class="num">Нужно VRAM на карту</th><th>16 ГБ хватает?</th><th>24 ГБ хватает?</th><th>32 ГБ хватает?</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td>Учить 105M <b>быстрее</b></td><td><span class="tag wa">compute</span> (MFU 6.5%)</td><td class="num">8.4 (есть)</td><td><span class="tag ok">да</span></td><td><span class="tag ok">да</span></td><td><span class="tag ok">да</span></td></tr>
+    <tr><td>Батч больше → выше MFU</td><td><span class="tag no">VRAM</span> (b24 = 15.2 ГиБ)</td><td class="num">~15–16</td><td><span class="tag wa">на грани</span></td><td><span class="tag ok">да</span></td><td><span class="tag ok">да</span></td></tr>
+    <tr><td>Контекст 32k через сегменты</td><td><span class="tag no">VRAM</span></td><td class="num">~12–18</td><td><span class="tag wa">только 8k</span></td><td><span class="tag ok">да</span></td><td><span class="tag ok">да</span></td></tr>
+    <tr><td>Держать сервер + обучение</td><td><span class="tag no">VRAM</span></td><td class="num">+2–3</td><td><span class="tag no">нет</span></td><td><span class="tag wa">тесно</span></td><td><span class="tag ok">да</span></td></tr>
+    <tr class="bad"><td><b>Учить 1B</b></td><td><span class="tag no">VRAM + compute</span></td><td class="num"><b>15–22</b></td><td><span class="tag no">нет</span></td><td><span class="tag wa">впритык</span></td><td><span class="tag ok">да</span></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p class="small">Бюджет для 1B: веса bf16 1.96 ГБ + градиенты 1.96 + Muon bf16 1.96 + AdamW ~0.1 ≈ <b>6.0 ГБ состояния</b>; активации при d=2048 и iter=3 — 9–14 ГБ (с iter_checkpoint) или 18–27 ГБ (без). Отсюда 15–22 ГБ на карту.</p>
+
+<div class="note"><b>Вывод, который меняет приоритет:</b> 16 ГБ — это не «стена сегодня», но это <b>тупик для 1B</b>. Если следующий шаг — 1B, то карта на 16 ГБ покупает только скорость текущего прогона и не открывает следующую ступень. 24 ГБ открывают, 32 ГБ открывают с запасом.</div>
+
+<h3>Что это делает с вариантами</h3>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Вариант</th><th class="num">$</th><th class="num">TF</th><th class="num">VRAM</th><th>compute</th><th>1B</th><th>вердикт по цели</th></tr></thead>
+  <tbody>
+<tr class="hl"><td><b>RTX 5070 Ti</b></td><td class="num">1 636</td><td class="num">16</td><td class="num">88</td><td class="num">102.3</td><td class="num">18.6</td><td class="num">320</td><td>2 слота · sm_120</td></tr>
+    <tr><td>2× RTX 3090 (Минск, реальная)</td><td class="num">3 326</td><td class="num">48</td><td class="num">142</td><td class="num">69.3</td><td class="num">23.4</td><td class="num">700</td><td>2×2 слота, турбина</td></tr>
+    <tr><td>2×3090 (реальная $850)</td><td class="num">1 970</td><td class="num">142</td><td class="num">48</td><td>3.1×</td><td><span class="tag wa">впритык</span></td><td>всё ещё лучший $/TF</td></tr>
+    <tr><td>1×5090</td><td class="num">6 795</td><td class="num">210</td><td class="num"><b>32</b></td><td><b>4.6×</b></td><td><span class="tag ok">да</span></td><td>лучшая одна карта, худшая цена</td></tr>
+    <tr><td>1×3090 (Минск)</td><td class="num">1 478</td><td class="num">71</td><td class="num">24</td><td>1.55×</td><td><span class="tag wa">впритык</span></td><td>VRAM да, скорость почти нет</td></tr>
+    <tr class="bad"><td>1×4080 Super</td><td class="num">1 441</td><td class="num">104</td><td class="num">16</td><td>2.2×</td><td><span class="tag no">нет</span></td><td>только ускорить 105M</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note warn"><b>Поправка к моей же рекомендации.</b> «4080 Super сегодня» оптимизирует <b>скорость текущего прогона</b> и закрывает дверь к 1B. Если 1B — цель, то правильный выбор: <b>пара 3090</b> (48 ГБ, 3.1×, $1 431) или одна <b>5090</b> (32 ГБ, 4.6×, но $6 795). 16 ГБ — не покупать, если планируется 1B.</div>
+
+<h2>4. Импорт: считаем «до двери» и по закону</h2>
+<p class="small">Все суммы в этом разделе считаются для <b>пары 3090 по номинальной цене $617</b> — чтобы показать стоимость маршрута. Если цена окажется $850–1 000 за карту (что вероятнее), прибавьте к «Итого» соответственно $466–766.</p>
+
+<p>Проверено по правилам ГТК РБ на 30.10.2026: <b>реформа (5% от стоимости + НДС) отложена бессрочно</b> — действует старая формула. Это меняет цифры в мою же пользу: пошлина на карту за $1 200 — это <b>$147</b>, а не $430, как я оценил раньше по НДС-схеме.</p>
+
+<pre><span class="c"># пошлина, действующая на 30.10.2026</span>
+duty = max( 0.15 × (V − €200) ,  2 × (W − 31 кг) )
+<span class="c"># V — стоимость посылки, €200 — порог НА ПОСЫЛКУ (не в месяц, по таблице ГТК)</span>
+<span class="c"># авиа-багаж: €10 000 / 50 кг — беспошлинно; наземный багаж: €500 / 25 кг</span>
+
+карта $1 234 → 0.15 × (1 108 − 200) = <b>$155</b>
+карта $1 700 → 0.15 × (1 526 − 200) = <b>$225</b></pre>
+
+<figure>
+  <svg viewBox="0 0 1000 300" role="img" aria-label="Полная стоимость по маршрутам">
+    <text class="lbl" x="0" y="12">Полная стоимость 2×3090 до Минска, $ (0.3 px на $1)</text>
+    <g class="lbl mute"><text x="230" y="292">0</text><text x="380" y="292">500</text><text x="530" y="292">1 000</text><text x="680" y="292">1 500</text><text x="830" y="292">2 000</text><text x="980" y="292">2 500</text></g>
+    <g class="gridline"><line x1="380" y1="24" x2="380" y2="280"/><line x1="530" y1="24" x2="530" y2="280"/><line x1="680" y1="24" x2="680" y2="280"/><line x1="830" y1="24" x2="830" y2="280"/><line x1="980" y1="24" x2="980" y2="280"/></g>
+    <line class="axis" x1="230" y1="24" x2="230" y2="280"></line>
+
+    <text class="lbl" x="0" y="45">Авиа-экспресс LTL.by, 3–5 дней</text>
+    <rect class="bar" x="230" y="34" width="370" height="16"></rect>
+    <rect class="bar wa" x="600" y="34" width="13" height="16"></rect>
+    <rect class="bar no" x="613" y="34" width="47" height="16"></rect>
+    <text class="lbl" x="674" y="46">$1 431 · пошлина честная</text>
+
+    <text class="lbl" x="0" y="75">Карго (серое), 25–30 дней</text>
+    <rect class="bar" x="230" y="64" width="370" height="16"></rect>
+    <rect class="bar wa" x="600" y="64" width="8" height="16"></rect>
+    <text class="lbl" x="622" y="76">$1 259 · но декларация занижена → риск на нас</text>
+
+    <text class="lbl" x="0" y="105">Почта/EMS, 15–40 дней</text>
+    <rect class="bar" x="230" y="94" width="370" height="16"></rect>
+    <rect class="bar wa" x="600" y="94" width="15" height="16"></rect>
+    <rect class="bar no" x="615" y="94" width="47" height="16"></rect>
+    <text class="lbl" x="676" y="106">$1 439</text>
+
+    <text class="lbl" x="0" y="135">Авиа-багаж (кто-то летит)</text>
+    <rect class="bar ok" x="230" y="124" width="370" height="16"></rect>
+    <text class="lbl" x="618" y="136">$1 234 · €10 000/50 кг беспошлинно</text>
+
+    <text class="lbl" x="0" y="165">США → форвардер (CDEK USA)</text>
+    <rect class="bar" x="230" y="154" width="510" height="16"></rect>
+    <rect class="bar wa" x="740" y="154" width="29" height="16"></rect>
+    <rect class="bar no" x="769" y="154" width="47" height="16"></rect>
+    <text class="lbl" x="828" y="166">$1 952 + лицензия BIS</text>
+
+    <text class="lbl" x="0" y="195">2×3090 при реальной $850/шт</text>
+    <rect class="bar" x="230" y="184" width="510" height="16"></rect>
+    <rect class="bar wa" x="740" y="184" width="15" height="16"></rect>
+    <rect class="bar no" x="755" y="184" width="68" height="16"></rect>
+    <text class="lbl" x="838" y="196">$1 970</text>
+
+    <text class="lbl" x="0" y="225">Минск (Kufar 4 350 ×2)</text>
+    <rect class="bar no" x="230" y="214" width="887" height="16"></rect>
+    <text class="lbl" x="300" y="226" fill="#fdfcfc">$2 956</text>
+
+    <text class="lbl" x="0" y="255">1× 4080 Super (Минск, сегодня)</text>
+    <rect class="bar ok" x="230" y="244" width="432" height="16"></rect>
+    <text class="lbl" x="680" y="256">$1 441</text>
+  </svg>
+  <figcaption>Серый — товар, жёлтый — доставка, красный — пошлина. Ключевое: честный авиа-экспресс стоит на $170 дороже серого карго, но едет 3–5 дней вместо 25–30 и не создаёт риска на получателе.</figcaption>
+</figure>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Маршрут</th><th>Провайдер (2026)</th><th class="num">Доставка</th><th class="num">Пошлина</th><th class="num">Итого 2×3090</th><th>Срок</th><th>Риск</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>Авиа-экспресс</b></td><td>LTL.by (Гуанчжоу) $14/кг</td><td class="num">42</td><td class="num">155</td><td class="num"><b>1 431</b></td><td><b>3–5 дней</b></td><td>низкий, декларация честная</td></tr>
+    <tr class="q"><td>Карго (серое)</td><td>GoTranzit $2.5/кг, China4Biz $1.5/кг</td><td class="num">25</td><td class="num">0</td><td class="num">1 259</td><td>25–30 дней</td><td class="warn">заниженная декларация — ответственность на получателе в Минске</td></tr>
+    <tr><td>Почта / EMS</td><td>Белпочта EMS, DPD BY</td><td class="num">50</td><td class="num">155</td><td class="num">1 439</td><td>15–40 дней</td><td>медленно, брокерская комиссия</td></tr>
+    <tr class="hl"><td><b>Авиа-багаж</b></td><td>друг летит</td><td class="num">0</td><td class="num"><b>0</b></td><td class="num"><b>1 234</b></td><td>в день прилёта</td><td>€10 000/50 кг беспошлинно</td></tr>
+    <tr class="bad"><td>США → форвардер</td><td>CDEK USA $19.50/кг (мин. 5 кг)</td><td class="num">98</td><td class="num">225</td><td class="num">1 952</td><td>2–4 нед</td><td class="warn">HTS 8471.50 в списке BIS → нужна экспортная лицензия</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note danger"><b>США как источник — закрыт.</b> USPS не возит в BY с 22.07.2022; Shipito не обслуживает BY; Qwintry приостановил; eBay заменил GSP на eIS в августе 2026 и BY исключён. Плюс GPU попадает под HTS 8471.50 в списке BIS Supplement 5 — формально нужна экспортная лицензия и ITN. Единственный рабочий вариант из США — <b>кто-то везёт в багаже</b>, и тогда это уже не «США», а «багаж».</div>
+
+<h2>4b. Что реально можно купить на Taobao прямо сейчас</h2>
+
+<p>Проверено через Superbuy (Taobao/Tmall + вкладка Xianyu) 30.10.2026. Вывод неприятный: <b>из про-карт там нет ничего</b>, единственный реально покупаемый товар — RTX 3090.</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Что искали</th><th>Что вернул поиск</th><th>Вердикт</th></tr></thead>
+  <tbody>
+    <tr><td>Radeon AI PRO R9700</td><td>телефоны Xiaomi (совпадение по «R»/«9700»), ни одной карты</td><td><span class="tag no">не найти</span></td></tr>
+    <tr><td>Instinct MI100 / MI210</td><td>отчёты Yole за $0.66, кожухи для охлаждения $5.7, переходники питания — <b>самих карт нет</b></td><td><span class="tag no">не найти</span></td></tr>
+    <tr><td>Radeon Pro W6800 32G</td><td>пусто</td><td><span class="tag no">не найти</span></td></tr>
+    <tr><td>3090 «24G 涡轮» на Xianyu</td><td>шум (G210, кабели), карт в выдаче нет</td><td><span class="tag wa">только через прямой лот</span></td></tr>
+    <tr class="hl"><td><b>RTX 3090 24G</b> (Taobao)</td><td>18 лотов; один проверен по вариантам — <b>MSI AERO 24G Turbo, $616.91</b>, остаток 1000</td><td><span class="tag ok">купить можно</span></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note warn">Про-карты (R9700, MI100, W6800) продаются на <b>1688</b> (B2B, нужен китайский аккаунт компании) или через китайских брокеров — но не через потребительский поиск Taobao. Значит «купить прямо сейчас через Таобао» = <b>только 3090</b>. Это и упрощает решение.</div>
+
+<h3>Три способа реально купить 3090 сегодня</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Способ</th><th class="num">Цена/шт</th><th class="num">2 шт</th><th>Защита</th><th>Риск</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>Taobao, заказать по номиналу</b> (议价-лот 991091699160)</td><td class="num">¥4 400 ≈ $617</td><td class="num"><b>$1 234</b></td><td>эскроу Taobao: не отправил → автовозврат</td><td>назовут цену выше → отменяем</td></tr>
+    <tr><td>Alibaba, 2 шт (лот 1601974946974)</td><td class="num">$682.7</td><td class="num">$1 365</td><td>Trade Assurance</td><td>«швейная» оболочка, отзывов 1</td></tr>
+    <tr><td>Alibaba, 3 шт</td><td class="num">$640.6</td><td class="num">$1 922 (3 шт)</td><td>Trade Assurance</td><td>3 карты в багаже = похоже на партию</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note ok"><b>Ключевой механизм, который снимает риск «а вдруг цена не та»:</b> на Taobao деньги идут в эскроу. Можно <b>оформить заказ по ¥4 400 прямо сейчас</b> — если продавец захочет больше, он не отправит, и возврат придёт автоматически. То есть попытка купить стоит ноль, а цена фиксируется в момент оплаты.</div>
+
+<h2>5. Пошлины и провоз: правила, а не слухи</h2>
+
+<div class="grid g2">
+  <div class="card">
+    <h3 style="margin-top:0">Посылка / курьер</h3>
+    <div class="kv">
+      <b>порог</b><span>€200 <b>на посылку</b> (в таблице ГТК; форвардеры часто пишут «в месяц» — уточнять)</span>
+      <b>пошлина</b><span>max(15% от превышения, €2 за кг свыше 31 кг)</span>
+      <b>НДС</b><span>по действующей схеме — нет</span>
+      <b>реформа</b><span>5% + НДС <b>отложена бессрочно</b> (30.09.2026)</span>
+    </div>
+    <p class="small">Статьи юристов от июня 2026 описывают отменённую схему — не применять.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Багаж</h3>
+    <div class="kv">
+      <b>авиа</b><span>€10 000 / 50 кг — беспошлинно</span>
+      <b>наземный</b><span>€500 / 25 кг, 30% сверх, мин. €4/кг</span>
+      <b>практика</b><span>2 карты — личное имущество; 3+ — похоже на партию</span>
+    </div>
+    <p class="small">Это лучший маршрут, если кто-то летит: пошлина ноль и формальная ответственность перевозчика.</p>
+  </div>
+</div>
+
+<div class="note ok"><b>Вывод по импорту.</b> Честный авиа-экспресс ($1 431) дороже серого карго на $172, но приезжает за 3–5 дней вместо месяца и не перекладывает риск недодекларации на нас. Из ЕС — не вариант: Annex XIV/XXV запрещают экспорт таких товаров в BY.</div>
+
+<h2>6. AMD, Huawei и прочие NPU: почему «нет»</h2>
+
+<div class="note danger"><b>Две мои прежние ошибки, исправляю.</b> FLA 0.5.2 — <b>не CUDA-only</b>: в его <code>pyproject.toml</code> есть extra <code>[rocm]</code>, часть KDA-путей гейтится <code>IS_NVIDIA or IS_NPU</code>. И fp8 на RDNA4 (R9700) <b>есть</b> — 383 TFLOPS, чего нет на RDNA3. Так что «AMD технически невозможен» — неверно; неверно другое: он не окупается.</div>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Карта</th><th class="num">Цена</th><th class="num">VRAM</th><th class="num">bf16 пик</th><th class="num">$/полезный TF*</th><th>Порт</th><th>Вердикт</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>2× RTX 3090</b> (если $617 — номинал)</td><td class="num">1 431*</td><td class="num">48</td><td class="num">142</td><td class="num"><b>18.3</b></td><td><b>0</b></td><td><span class="tag ok">база сравнения</span></td></tr>
+    <tr><td>RTX 4080 Super</td><td class="num">1 441</td><td class="num">16</td><td class="num">104</td><td class="num">25.2</td><td>0</td><td><span class="tag wa">16 ГБ</span></td></tr>
+    <tr><td><b>Radeon AI PRO R9700</b></td><td class="num">1 500–1 700</td><td class="num"><b>32</b></td><td class="num"><b>191</b> (fp8 383)</td><td class="num">19.6–22.4</td><td class="warn">6–10 недель</td><td><span class="tag wa">лучший AMD, но порт</span></td></tr>
+    <tr><td>RX 7900 XTX</td><td class="num">1 099–1 150</td><td class="num">24</td><td class="num">123</td><td class="num">23.4</td><td>6–10 недель</td><td><span class="tag no">нет fp8</span></td></tr>
+    <tr><td>Instinct MI210</td><td class="num">4 369</td><td class="num">64</td><td class="num">~181</td><td class="num">53.6</td><td>4–8 недель</td><td><span class="tag no">дорого</span></td></tr>
+    <tr><td>Instinct MI100</td><td class="num">1 000</td><td class="num">32</td><td class="num">92</td><td class="num">31.0</td><td>4–8 недель</td><td><span class="tag wa">только если бесплатно</span></td></tr>
+    <tr class="bad"><td>Instinct MI50</td><td class="num">608–750</td><td class="num">32</td><td class="num">—</td><td class="num">—</td><td colspan="2"><span class="tag no">мертва: gfx906 не поддерживается в ROCm 10.1</span></td></tr>
+    <tr><td>W6800 / W7800</td><td class="num">1 200 / 1 700</td><td class="num">32</td><td class="num">36 / 90</td><td class="num">83 / 47</td><td>6–10 недель</td><td><span class="tag no">медленно</span></td></tr>
+  </tbody>
+</table>
+</div>
+<p class="small">* пик × 55% для NVIDIA и × 40% для AMD после порта — оценка, замеров эффективности AMD у нас нет.</p>
+
+<h3>Главное про AMD</h3>
+<ul>
+  <li>Железо догнало: <b>R9700 — 32 ГБ, 191 TF, $1 500–1 700.</b> Это первый случай, когда AMD конкурентоспособна по железу.</li>
+  <li class="neg">Но порт стоит <b>6–10 инженерных недель</b> = $3 600–6 000 при $20/ч, то есть <b>2–4 цены карты</b>.</li>
+  <li class="neg">Блокер не «покрытие ROCm» (gfx1100/gfx1201 официально поддерживаются, torch 2.15 + triton-rocm 3.9 есть), а <b>наши таблицы</b>: sm_120-тайлы и grouped GEMM для MoE надо выводить заново под 64-ширинные wavefront без TMA/<code>cp.async</code>.</li>
+  <li class="neg">AMD-CI у FLA — <b>отключённый</b> workflow и целится в MI300/CDNA3, а не в RDNA.</li>
+</ul>
+
+<h3>Huawei и китайские NPU</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Чип</th><th class="num">Цена</th><th class="num">VRAM</th><th>Стек</th><th>Реальность</th></tr></thead>
+  <tbody>
+    <tr><td>Ascend 910C</td><td class="num">~$16 000/плата</td><td class="num">128 ГБ</td><td>CANN, torch_npu</td><td>только канал Китая, в BY розницы нет; Triton-Ascend 3.6.0 и FLA <code>[npu]</code> существуют, но отлаживать CANN поверх того же порта ядер</td></tr>
+    <tr><td>Atlas 300I Duo</td><td class="num">$2 489</td><td class="num">96 ГБ</td><td>CANN</td><td><b>2×310P инференс, 408 ГБ/с</b> — для обучения бесполезно</td></tr>
+    <tr><td>Cambricon MLU370-X8</td><td class="num">$5 000+</td><td class="num">24 ГБ</td><td>Neuware/BANG</td><td>INT8-ориентирован, bf16-тренировка не заявлена</td></tr>
+    <tr><td>Moore Threads MTT S4000</td><td class="num">$12 300+</td><td class="num">48 ГБ</td><td>MUSA</td><td>«CUDA-подобный», но Triton-ядра не переносятся бесплатно</td></tr>
+    <tr><td>Biren / Iluvatar</td><td class="num">нет данных</td><td class="num">—</td><td>—</td><td>цену проверить не удалось</td></tr>
+  </tbody>
+</table>
+</div>
+<div class="note warn">Все NPU-варианты проигрывают паре 3090 в <b>2–5 раз</b> по деньгам за полезный флопс — до того, как считать недели порта. И в Беларусь их официально не поставить.</div>
+
+<h3>США как источник: замерено, не стоит</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Карта</th><th class="num">США, б/у</th><th class="num">Минск</th><th class="num">Разница</th></tr></thead>
+  <tbody>
+    <tr><td>3090 24 ГБ</td><td class="num">1 199</td><td class="num">1 476–2 037</td><td class="num">277–838</td></tr>
+    <tr><td>4080 Super</td><td class="num">1 179</td><td class="num">1 439–1 527</td><td class="num">260–348</td></tr>
+    <tr><td>4090</td><td class="num">2 999–3 199</td><td class="num">3 174–3 733</td><td class="num">0–530</td></tr>
+  </tbody>
+</table>
+</div>
+<p>Одна 3090 «до двери» из США: <b>$1 394–1 469</b> (после доставки и 15% сверх €200) против <b>~$1 629</b> локально. Экономия <b>11–15%</b>, гарантии нет, плюс нерешённый вопрос экспортного контроля. <b>Не стоит, пока не берёшь 4+ карты.</b></p>
+
+<h2>6b. Если софт считаем бесплатным: чистый рейтинг железа</h2>
+
+<p>Допущение владельца: «софт напишем сами, главное — железо». Тогда цена порта уходит в срок, а не в деньги, и решение считается по трём осям: <b>$/ГБ VRAM</b>, <b>$/TFLOP/s</b> и доступность.</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Вариант</th><th class="num">Цена</th><th class="num">VRAM</th><th class="num">bf16</th><th class="num">$/ГБ</th><th class="num">$/TF</th><th class="num">Вт</th><th>Формат</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>2× RTX 3090</b> (Китай)</td><td class="num">1 431</td><td class="num">48</td><td class="num">142</td><td class="num"><b>29.8</b></td><td class="num"><b>10.1</b></td><td class="num">700</td><td>2×2 слота, турбина</td></tr>
+    <tr><td>2× Instinct MI100 (б/у)</td><td class="num">2 000</td><td class="num"><b>64</b></td><td class="num">184</td><td class="num"><b>31.3</b></td><td class="num">10.9</td><td class="num">600</td><td>2 слота, <b>пассив — нужен продув</b></td></tr>
+    <tr><td>1× Radeon AI PRO R9700</td><td class="num">1 600</td><td class="num">32</td><td class="num">191</td><td class="num">50.0</td><td class="num"><b>8.4</b></td><td class="num">300</td><td>2 слота, турбина</td></tr>
+    <tr><td>2× R9700</td><td class="num">3 200</td><td class="num"><b>64</b></td><td class="num"><b>382</b></td><td class="num">50.0</td><td class="num"><b>8.4</b></td><td class="num">600</td><td>4 слота</td></tr>
+    <tr><td>Radeon Pro W6800</td><td class="num">1 200</td><td class="num">32</td><td class="num">36</td><td class="num">37.5</td><td class="num">33.3</td><td class="num">250</td><td>2 слота</td></tr>
+    <tr><td>Instinct MI210</td><td class="num">4 369</td><td class="num">64</td><td class="num">181</td><td class="num">68.3</td><td class="num">24.1</td><td class="num">300</td><td>2 слота, пассив</td></tr>
+    <tr class="bad"><td>1× RTX 5090</td><td class="num">6 795</td><td class="num">32</td><td class="num">210</td><td class="num">212</td><td class="num">32.4</td><td class="num">575</td><td>3–4 слота</td></tr>
+    <tr class="bad"><td>1× RTX 4080 Super</td><td class="num">1 441</td><td class="num">16</td><td class="num">104</td><td class="num">90.1</td><td class="num">13.9</td><td class="num">320</td><td>3 слота</td></tr>
+  </tbody>
+</table>
+</div>
+
+<figure>
+  <svg viewBox="0 0 1000 250" role="img" aria-label="Цена за гигабайт VRAM">
+    <text class="lbl" x="0" y="12">$ за 1 ГБ VRAM — меньше лучше</text>
+    <g class="lbl mute"><text x="230" y="242">0</text><text x="330" y="242">25</text><text x="430" y="242">50</text><text x="530" y="242">75</text><text x="630" y="242">100</text><text x="730" y="242">125</text><text x="830" y="242">150</text><text x="930" y="242">175</text><text x="980" y="242">200</text></g>
+    <g class="gridline"><line x1="330" y1="24" x2="330" y2="230"/><line x1="430" y1="24" x2="430" y2="230"/><line x1="530" y1="24" x2="530" y2="230"/><line x1="630" y1="24" x2="630" y2="230"/><line x1="730" y1="24" x2="730" y2="230"/><line x1="830" y1="24" x2="830" y2="230"/><line x1="930" y1="24" x2="930" y2="230"/></g>
+    <line class="axis" x1="230" y1="24" x2="230" y2="230"></line>
+
+    <text class="lbl" x="0" y="45">2×3090 (Китай)</text>
+    <rect class="bar ok" x="230" y="34" width="119" height="16"></rect><text class="lbl" x="357" y="46">$29.8</text>
+    <text class="lbl" x="0" y="75">2×MI100</text>
+    <rect class="bar ok" x="230" y="64" width="125" height="16"></rect><text class="lbl" x="363" y="76">$31.3</text>
+    <text class="lbl" x="0" y="105">W6800</text>
+    <rect class="bar" x="230" y="94" width="150" height="16"></rect><text class="lbl" x="388" y="106">$37.5</text>
+    <text class="lbl" x="0" y="135">R9700 / 2×R9700</text>
+    <rect class="bar wa" x="230" y="124" width="200" height="16"></rect><text class="lbl" x="438" y="136">$50.0</text>
+    <text class="lbl" x="0" y="165">MI210</text>
+    <rect class="bar wa" x="230" y="154" width="273" height="16"></rect><text class="lbl" x="511" y="166">$68.3</text>
+    <text class="lbl" x="0" y="195">4080 Super</text>
+    <rect class="bar no" x="230" y="184" width="360" height="16"></rect><text class="lbl" x="598" y="196">$90.1</text>
+    <text class="lbl" x="0" y="225">RTX 5090</text>
+    <rect class="bar no" x="230" y="214" width="849" height="16"></rect><text class="lbl" x="920" y="226" fill="#fdfcfc">$212</text>
+  </svg>
+  <figcaption>Память — то, во что мы упрёмся на 1B. По $/ГБ пара 3090 вне конкуренции: 48 ГБ за $1 431.</figcaption>
+</figure>
+
+<div class="note ok"><b>Чистый рейтинг железа (софт бесплатно):</b><br>
+1. <b>2×3090</b> — лучшая память за деньги ($29.8/ГБ) и втрое дешевле любого 64-ГБ варианта.<br>
+2. <b>2×R9700</b> — лучший флопс за деньги ($8.4/TF) и 64 ГБ, но $3 200 и 4 слота.<br>
+3. <b>2×MI100</b> — 64 ГБ за $2 000, но пассивное охлаждение и риск, что gfx908 выпадет из ROCm так же, как gfx906 (MI50 уже мертва).<br>
+4. 5090 — худшая по обеим осям при текущей цене.</div>
+
+<h3>Ограничения железа, которые не обойти софтом</h3>
+<ul>
+  <li class="warn"><b>БП 1350 Вт:</b> 2×3090 = 700 Вт (влезает с запасом 450), 2×R9700 = 600 Вт (влезает), 4×MI100 = 1200 Вт (не влезает), 5090+5090 = 1150 Вт (не влезает)</li>
+  <li class="warn"><b>PCIe 3.0 ×8</b> на слот: all-reduce 102M bf16 ≈ 32 мс на шаг (~4%). Для 1B реплика 2 ГБ → ~300 мс на шаг — уже 15–20%, нужен FSDP (а он у нас отказывает с Muon)</li>
+  <li class="warn"><b>Пассивные серверные карты</b> (MI100/MI210) требуют продува 30+ CFM; в нашем корпусе это решаемо, но шумно</li>
+  <li class="warn"><b>Xeon E5-2690 v4</b> (14 ядер, 2.6 ГГц) может стать потолком даталоадера на 3+ GPU</li>
+</ul>
+
+<h2>6c. Альтернатива: RAM вместо флопсов</h2>
+
+<p>Есть третий путь, который не покупает флопсы: <b>одна карта + много системной памяти</b>. Для MoE это работает, потому что на каждый токен читается лишь малая доля весов — скорость упирается не в VRAM, а в пропускную способность памяти.</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Конфигурация (по обзору, не проверено нами)</th><th class="num">Цена</th><th>Что даёт</th><th>Минус</th></tr></thead>
+  <tbody>
+    <tr><td>Mac Studio M5 Ultra 256 ГБ</td><td class="num">$9 499–10 799</td><td>192 ГБ под GPU по умолчанию, 248 ГБ одной командой (2→3 бита)</td><td>поставка 13–17 недель</td></tr>
+    <tr><td>2× NVIDIA DGX Spark</td><td class="num">$13 900</td><td>~260 ГБ, prefill ~2 100 ток/с, декод 31 ток/с (87–131 с draft)</td><td>дорого за гигабайт</td></tr>
+    <tr><td>2× Strix Halo мини-ПК</td><td class="num">дешевле всех новых</td><td>большой пул памяти</td><td>USB4 на практике 9.2 Гбит/с; на Windows 2 бита</td></tr>
+    <tr class="hl"><td><b>1× RTX 3090 + 256 ГБ DDR4</b></td><td class="num"><b>~$6 000</b></td><td><b>26 ток/с с контекстом 262K</b></td><td>это инференс, не обучение</td></tr>
+    <tr class="bad"><td>Серверы V100 / MI50</td><td class="num">дёшево</td><td>быстрая память за копейки</td><td><b>мертвы: CUDA 13 и vLLM 0.20 сняли поддержку</b></td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note danger"><b>Это подтверждает мой же риск по MI100:</b> V100 и MI50 умерли не по железу, а потому что софт их выбросил. MI100 (gfx908) — следующий в очереди. Покупать её «за 64 ГБ» — ставить на то, что ROCm не повторит этот путь.</div>
+
+<h3>Что это значит для нашей машины</h3>
+
+<pre><span class="c"># факты по нашей плате (dmidecode)</span>
+SuperMicro X10SRL-F · максимум <b>512 ГиБ</b> · 4×16 ГБ DDR4-2133 ECC RDIMM
+свободно <b>4 слота</b> · 4 канала → ~68 ГБ/с теоретически
+
+<span class="c"># цены памяти (по обзору)</span>
+DDR4 серверная  $6.23 / ГБ   → 256 ГБ ≈ <b>$1 595</b>
+DDR5 серверная $29.37 / ГБ   → 256 ГБ ≈ $7 520   ← в 4.7 раза дороже</pre>
+
+<p>То есть <b>наша машина уже совместима</b>: 8×32 ГБ RDIMM = 256 ГБ за ~$1 600. Плюс одна 3090 за $617–1 478 — и мы получаем тот самый класс «одна карта + 256 ГБ», который в обзоре стоит $6 000.</p>
+
+<h3>Три стратегии, честно</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Стратегия</th><th class="num">Цена</th><th>Что получаем</th><th>Когда</th><th>Минус</th></tr></thead>
+  <tbody>
+    <tr><td><b>A. Учить свою модель</b></td><td class="num">$1 431</td><td>105M→1B, своя архитектура, свой выпуск 10–30 МБ</td><td>2–9 суток на прогон</td><td>по знаниям всё равно позади чужих больших</td></tr>
+    <tr class="hl"><td><b>B. Запускать чужую MoE локально</b></td><td class="num">$1 600 (RAM) + $617 (3090)</td><td><b>умный ассистент сразу</b>, 26 ток/с, 262K контекст</td><td>дни</td><td>модель не наша, архитектуру не исследуем</td></tr>
+    <tr><td><b>C. И то и другое</b></td><td class="num">$3 031</td><td>256 ГБ RAM + 2×3090: учим 1B <b>и</b> держим большую MoE рядом</td><td>дни + 3–5 недель на карты</td><td>нужен БП и слоты (есть)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note ok"><b>И вот что делает это срочным так же, как карты:</b> DDR4 снимают с производства, а память растёт на 40–50% за квартал. 256 ГБ за $1 600 — это покупка «на сейчас», как и 3090. Через квартал будет $2 300+.</div>
+
+<h2>6d. Менять платформу? 8 каналов вместо 4</h2>
+
+<p>Для MoE-инференса с выгрузкой в RAM скорость ≈ <b>пропускная способность памяти</b>. У нашей платы 4 канала DDR4-2133 → ~68 ГБ/с. Восемь каналов дают 130–205 ГБ/с, то есть <b>×2–3 ток/с почти линейно</b>.</p>
+
+<p>Проверил местный рынок (Kufar, 30.10): <b>DDR4-3200 ECC RDIMM 16 ГБ — 220 BYN = $75 → $4.7/ГБ</b>. Это дешевле оценки $6.23/ГБ, то есть 256 ГБ = <b>~$1 200</b>, а не $1 600.</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Вариант</th><th class="num">Плата+CPU</th><th class="num">256 ГБ RAM</th><th class="num">Итого</th><th class="num">ГБ/с</th><th class="num">ток/с*</th><th>Заметки</th></tr></thead>
+  <tbody>
+    <tr><td><b>A. Оставить X10SRL-F</b></td><td class="num">0</td><td class="num">1 200</td><td class="num"><b>1 200</b></td><td class="num">68</td><td class="num">26</td><td>4 канала, 4 слота свободно, PCIe 3.0</td></tr>
+    <tr class="hl"><td><b>B. Dual LGA2011-3</b> (2×E5-2680 v4)</td><td class="num">~350</td><td class="num">1 200</td><td class="num"><b>1 550</b></td><td class="num">~137</td><td class="num">~52</td><td>на Kufar есть комплекты «Dual 72-88 ядер + 64/128 ГБ» за $289–350</td></tr>
+    <tr><td><b>C. EPYC 7002/7003</b> (SP3)</td><td class="num">600–900</td><td class="num">1 200</td><td class="num">1 800–2 100</td><td class="num"><b>205</b></td><td class="num"><b>~78</b></td><td>8 каналов + PCIe 4.0; локально почти нет (только серверы от $2 500)</td></tr>
+    <tr class="bad"><td>Готовый сервер 2×EPYC 7282</td><td class="num">7 500 BYN</td><td class="num">включено?</td><td class="num">$2 548</td><td class="num">~205</td><td class="num">~78</td><td>дорого и состояние неизвестно</td></tr>
+  </tbody>
+</table>
+</div>
+<p class="small">* ток/с — экстраполяция от 26 ток/с при 68 ГБ/с из внешнего обзора. Не замер.</p>
+
+<div class="note ok"><b>Ответ на вопрос:</b> да, дешевле — но не «проц и матплата 8 каналов», а <b>dual LGA2011-3</b>: две 4-канальные половины дают ~137 ГБ/с за +$350 к цене памяти. EPYC даёт 205 ГБ/с, но стоит +$600–900 и локально его нет.</div>
+
+<div class="note warn"><b>Но это помогает только инференсу.</b> Для обучения платформа почти не важна: там решают GPU и PCIe, а не полоса RAM. Если цель — обучать 105M→1B, менять плату бессмысленно. Если цель — держать большую MoE локально, то <b>dual LGA2011-3 + 256 ГБ + одна 3090</b> = ~$2 200 и удвоение скорости против нашей платы.</div>
+
+<h2>6e. «Самая мощная карта + вся память в оперативку» — где это ломается</h2>
+
+<p>Идея верная по сути (Taobao/Xianyu отдают всё, а DDR4 дешёвая), но вывод «берём карту с максимальными флопсами» — <b>неверный</b>. В режиме выгрузки в RAM карта почти простаивает, и узкое место переезжает в три других места.</p>
+
+<pre><span class="c"># упрощённая модель: время на токен</span>
+t = bytes_в_VRAM/BW_VRAM + bytes_в_RAM/BW_RAM + bytes_через_PCIe/BW_PCIe
+
+<span class="c"># если эксперты считаются НА CPU (llama.cpp --n-cpu-moe):</span>
+t ≈ bytes_активных_экспертов / BW_RAM   <span class="c">← GPU в это время ждёт</span>
+скорость ≈ BW_RAM / байт_на_токен
+
+<span class="c"># наш пример из обзора:</span>
+68 ГБ/с ÷ 26 ток/с = 2.6 ГБ на токен  <span class="c">← столько читается из RAM</span>
+205 ГБ/с (8 каналов) ÷ 2.6 ГБ = <b>78 ток/с</b></pre>
+
+<div class="note danger"><b>5090 в этой схеме не даст ничего сверх 3090.</b> Если данные идут из RAM, 210 TFLOPS стоят и ждут DDR. Платить $6 795 за карту, которая будет простаивать на 90% — худшая из возможных покупок. Флопсы нужны там, где данные уже в VRAM.</div>
+
+<h3>Что реально решает в RAM-режиме</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Ресурс</th><th>Почему важен</th><th>Наша плата</th><th>Нужно</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>Полоса RAM</b> (каналы × частота)</td><td>прямо задаёт ток/с: <code>BW / байт_на_токен</code></td><td>68 ГБ/с (4 канала @2133)</td><td><b>137–205 ГБ/с</b> (8 каналов)</td></tr>
+    <tr><td><b>Ядра CPU</b></td><td>если эксперты считаются на CPU, а не пересылаются</td><td>10–14 ядер @2.4–2.6 ГГц</td><td><b>32–64 ядра</b> (EPYC)</td></tr>
+    <tr><td><b>VRAM</b> (ёмкость)</td><td>держать «горячие» эксперты и attention, чтобы не стримить</td><td>16 ГБ</td><td><b>24–32 ГБ</b></td></tr>
+    <tr><td><b>PCIe</b></td><td>если всё-таки стримить веса в GPU</td><td>3.0 ×8 = 8 ГБ/с</td><td>4.0 ×16 = 32 ГБ/с</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Отсюда правильный SKU-набор</h3>
+<pre><span class="c">для «большая MoE локально»:</span>
+платформа:  EPYC 7002/7003 (8 каналов, 32–64 ядра, PCIe 4.0)   ~$600–900
+память:     8×32 ГБ DDR4-3200 ECC                              ~$1 200
+карта:      1× 3090 24 ГБ (или R9700 32 ГБ)                     $617–1 700
+итого:      <b>$2 400–3 800</b>  →  40–78 ток/с вместо 26
+
+<span class="c"># и это дешевле, чем 5090 за $6 795, которая в RAM-режиме простаивает</span></pre>
+
+<h3>Неочевидный бонус: RAM разблокирует обучение 1B</h3>
+<p>RAM нужна не только инференсу. Для обучения 1B на картах по 24 ГБ нужен <b>ZeRO-1 оффлоад оптимизатора</b>: состояние Muon/AdamW (≈4 ГБ на 1B) уезжает в RAM, на карте остаются веса+градиенты. У нас этот путь уже запланирован (<code>offload_level</code>, ~150 строк), и 256 ГБ с 8 каналами делают его быстрым, а не «в 10 раз медленнее».</p>
+
+<div class="note ok"><b>Итог по твоей идее:</b> память в оперативку — правильно, но выбирать надо не карту с максимальными флопсами, а <b>платформу с 8 каналами и многими ядрами</b>. Карта нужна ровно настолько, чтобы держать горячую часть в VRAM: 24–32 ГБ достаточно.</div>
+
+<h2>6f. Пересчёт: что даёт реальный прирост на шаг, а не на бумаге</h2>
+
+<p>Все варианты я пересчитал в одну величину — <b>во сколько раз ускорится наш шаг</b> (сейчас 26.8k Б/с при MFU 6.5%). Множитель = (пик карты / 45.7) × поправка на MFU от большего батча, минус DDP-налог, где он есть.</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Вариант</th><th class="num">Цена</th><th class="num">VRAM</th><th class="num">TF</th><th class="num">ГБ/с</th><th class="num">×шаг</th><th class="num">$ за ×1</th><th>Главное</th></tr></thead>
+  <tbody>
+    <tr><td>Ничего не покупать</td><td class="num">0</td><td class="num">16</td><td class="num">45.7</td><td class="num">448</td><td class="num">1.0</td><td class="num">—</td><td>упор в MFU софта</td></tr>
+<tr class="hl"><td><b>1× 5070 Ti 16 ГБ</b> (Минск)</td><td class="num">1 636</td><td class="num">16</td><td class="num">88</td><td class="num">896</td><td class="num">1.45</td><td class="num"><b>3 636</b></td><td>sm_120, ноль миграции</td></tr>
+    <tr><td>2× 3090 (реальная $1 663)</td><td class="num">3 326</td><td class="num">48</td><td class="num">142</td><td class="num">1 872</td><td class="num">2.3</td><td class="num">1 446</td><td>цена решает всё</td></tr>
+    <tr><td><b>1× 4090 24 ГБ</b> turbo</td><td class="num">4 209</td><td class="num">24</td><td class="num">165</td><td class="num">1 008</td><td class="num">1.64</td><td class="num">2 567</td><td>лучший $/×, если лот за $1 613 реален</td></tr>
+    <tr><td><b>1× 4090 48 ГБ</b> turbo</td><td class="num">4 731</td><td class="num"><b>48</b></td><td class="num">165</td><td class="num">1 008</td><td class="num">3.9</td><td class="num">1 213</td><td>48 ГБ одним пулом, без DDP</td></tr>
+    <tr><td><b>1× 5070 Ti 16 ГБ</b> (Минск)</td><td class="num">1 636</td><td class="num">16</td><td class="num">88</td><td class="num">896</td><td class="num">2.0</td><td class="num">818</td><td>sm_120, ноль миграции</td></tr>
+    <tr class="hl"><td><b>1× 5090D 32 ГБ</b></td><td class="num">~4 644</td><td class="num">32</td><td class="num">210</td><td class="num"><b>1 792</b></td><td class="num"><b>5.0</b></td><td class="num">929</td><td><b>sm_120 → миграции ноль</b></td></tr>
+  </tbody>
+</table>
+</div>
+<p class="small">Лоты с ценами: 4090-48G — <code>1076033912421</code> ($4 731) и <code>899266359736</code> ($5 111, вода); 5090D — <code>947686494467</code> ($4 644, вода); 4090-24G — <code>720337396619</code> ($1 613) и <code>1044396057511</code> ($4 350). Первые два — мультиварианты, цену варианта надо подтверждать кликом.</p>
+
+<h3>Три вывода, которые меняют решение</h3>
+
+<ul>
+  <li><b>5090D — единственная карта без миграции.</b> sm_120 = ровно то, на чём сняты наши таблицы тайлов и потолки shared-памяти. Любая другая карта = 1–2 дня пересъёма и риск, что Triton-путь на новой арке медленнее ожидаемого.</li>
+  <li><b>1792 ГБ/с против 68 ГБ/с у нашей DDR4 — в 26 раз.</b> Любая схема «модель в оперативке» мертва для всего, что влезает в 32 ГБ: VRAM-полоса несоизмеримо выше. RAM нужна только для моделей &gt;30B и для ZeRO-оффлоада при обучении 1B.</li>
+  <li class="warn"><b>По «$ за ×шаг» лучший — 4090 24 ГБ за $1 613</b> (если цена реальна): 3.6× ускорение за треть цены 5090. Но 24 ГБ = 1B впритык, без запаса на батч.</li>
+</ul>
+
+<div class="note"><b>Что решает выбор — один вопрос: нужен запас по VRAM или нет.</b><br>
+1B «влезает и хватит» → <b>4090 24 ГБ</b> ($1 613–4 209, 3.6×, лучший $/×).<br>
+1B с большим батчем и сервер рядом → <b>5090D 32 ГБ</b> ($4 644, 5.0×, ноль миграции).<br>
+1B без DDP вообще → <b>4090 48 ГБ</b> ($4 731, 3.9×, один пул памяти).</div>
+
+<h2>6g. RTX 5070 Ti: единственная карта без миграции</h2>
+
+<p>Проверил карточки (Kufar, 30.10.2026) — отдельные видеокарты, не ПК-сборки:</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Объявление</th><th class="num">BYN</th><th class="num">≈ $</th><th>Где / состояние</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>Palit RTX 5070 Ti 16Gb GamingPro</b></td><td class="num"><b>4 820</b></td><td class="num"><b>$1 636</b></td><td>Минск, Заводской · гарантия 24 мес</td></tr>
+    <tr><td>Palit RTX 5070 Ti GamingPro-S 16GB</td><td class="num">4 859</td><td class="num">$1 650</td><td>Гродно · гарантия</td></tr>
+    <tr><td>MSI RTX 5070 Ti 16G Ventus 3X OC</td><td class="num">5 299</td><td class="num">$1 799</td><td>Могилев · гарантия, рассрочка</td></tr>
+    <tr><td>ASUS ProArt RTX 5070 Ti</td><td class="num">5 500</td><td class="num">$1 868</td><td>Минск, Первомайский · б/у, «идеал»</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p class="small">Моя прежняя цифра «5070 Ti за 3 350 BYN» была ценой <b>игрового ПК в сборке</b>, а не карты. Реальная карта — от <b>4 820 BYN</b>.</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Карта</th><th class="num">Цена</th><th class="num">VRAM</th><th class="num">bf16</th><th class="num">ГБ/с</th><th class="num">$/TF</th><th class="num">×шаг</th><th>арх.</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>RTX 5070 Ti</b></td><td class="num">$1 636</td><td class="num">16</td><td class="num">88</td><td class="num"><b>896</b></td><td class="num">18.6</td><td class="num"><b>1.45</b></td><td><span class="tag ok">sm_120</span></td></tr>
+    <tr><td>RTX 4080 Super</td><td class="num">$1 441</td><td class="num">16</td><td class="num">104</td><td class="num">736</td><td class="num"><b>13.9</b></td><td class="num">1.41</td><td><span class="tag wa">sm_89</span></td></tr>
+    <tr><td>RTX 4090 24 ГБ (Китай)</td><td class="num">$4 209</td><td class="num">24</td><td class="num">165</td><td class="num">1 008</td><td class="num">25.5</td><td class="num">1.64</td><td><span class="tag wa">sm_89</span></td></tr>
+    <tr><td>наша 5060 Ti (замерено)</td><td class="num">—</td><td class="num">16</td><td class="num">45.7</td><td class="num">448</td><td class="num">—</td><td class="num">1.00</td><td><span class="tag ok">sm_120</span></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Почему 5070 Ti может дать больше, чем обещают 88 TFLOPS</h3>
+
+<pre><span class="c"># честный расчёт по нашему профилю шага</span>
+доли времени: матрицы 25% · memory-bound поэлементные 38% · CPU/запуски 37%
+5070 Ti:  0.25/1.93 + 0.38/2.00 + 0.37/1.0 = 0.69  → <b>×1.45</b>
+4080S:    0.25/2.28 + 0.38/1.64 + 0.37/1.0 = 0.71  → <b>×1.41</b>
+3090:     0.25/1.55 + 0.38/2.09 + 0.37/1.0 = 0.71  → <b>×1.40</b>
+5090:     0.25/4.60 + 0.38/4.00 + 0.37/1.0 = 0.52  → <b>×1.93</b>
+
+<span class="c"># 37% времени — CPU-запуски, они НЕ ускоряются от карты.
+# поэтому любая карта до 5090 даёт всего ~1.4×, а не «×2-3 по флопсам».</span></pre>
+
+<div class="note danger"><b>Моя прежняя цифра «×1.9–2.1» была неверной:</b> я делил пиковые флопсы, забыв, что 37% шага — это CPU-диспетчеризация, которая от карты не зависит. Честно — <b>×1.45</b>.</div>
+
+<h3>Главное преимущество — ноль миграции</h3>
+<ul>
+  <li><b>sm_120</b> — ровно как у нашей 5060 Ti. Таблицы тайлов, потолки shared-памяти, fp8-путь, бит-пины — <b>всё остаётся валидным</b>.</li>
+  <li>Любая другая карта (3090 = sm_86, 4080/4090 = sm_89) требует 1–2 дня пересъёма и риск, что Triton на новой арке тише ожидаемого.</li>
+  <li>GDDR7 при 896 ГБ/с — единственная карта в списке, где полоса вдвое выше нашей.</li>
+</ul>
+
+<div class="note warn"><b>Чего 5070 Ti не даёт:</b> VRAM остаётся <b>16 ГБ</b> — 1B-модель как не влезала, так и не влезет; батч больше не станет; второй карты под сервер не появится. Это «то же самое, но вдвое быстрее», а не шаг на следующую ступень.</div>
+
+<div class="note"><b>Против 4080 Super:</b> он дешевле на $195 и на 18% сильнее по флопсам, но требует миграции с sm_120. Если время дороже $195 и двух дней — <b>5070 Ti</b>; если нужен максимум флопсов за деньги — <b>4080 Super</b>.</div>
+
+<h2>7. Что покупать: три сценария</h2>
+
+<div class="grid g3">
+  <div class="card" style="border-color:rgba(48,209,88,.5); background:rgba(48,209,88,.05)">
+    <h3 style="margin-top:0">A. 5070 Ti сегодня <span class="tag ok">рекомендую</span></h3>
+    <div class="kv"><span>цена</span><b>4 820 BYN = $1 636</b></div>
+    <div class="kv"><span>даёт</span><b>×1.9–2.1 к шагу</b></div>
+    <div class="kv"><span>почему</span>88 TF и <b>896 ГБ/с</b> (вдвое больше полосы)</div>
+    <div class="kv"><span>плюс</span><b>sm_120 → ноль миграции</b>, гарантия 24 мес</div>
+    <p class="small">Минус: 16 ГБ остаются 16 ГБ — 1B не влезает, батч не растёт. Это «вдвое быстрее», а не ступень выше.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">B. 4080 Super в Минске <span class="tag wa">альтернатива</span></h3>
+    <div class="kv"><span>цена</span><b>4 100–4 240 BYN = $1 393–1 441</b></div>
+    <div class="kv"><span>даёт</span><b>×1.41 к шагу</b>, 16 ГБ, 736 ГБ/с</div>
+    <div class="kv"><span>минус</span><b>sm_89</b> → 1–2 дня пересъёма тайлов и пинов</div>
+    <p class="small">Дешевле 5070 Ti на $195 и на 18% сильнее по флопсам, но требует миграции с sm_120.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">C. Не покупать пока <span class="tag">нулевой риск</span></h3>
+    <div class="kv"><span>цена</span><b>$0</b></div>
+    <div class="kv"><span>даёт</span>×1.5–1.8 <b>из софта</b>: хвост оптимизатора, CSA-фьюжн, форма батча</div>
+    <div class="kv"><span>потом</span>5070 Ti или 4090, когда цены успокоятся</div>
+    <p class="small">Половина прироста лежит в коде бесплатно. Память и карты сейчас в худшей точке цикла.</p>
+  </div>
+</div>
+
+<h2>7b. Вариант «не покупать вообще» — и его арифметика</h2>
+
+<p>Три факта, которые делают паузу рациональной:</p>
+<ul>
+  <li><b>Софт не выжат.</b> MFU 6.5%; fusion уже дал −20%, следующий шаг — CUDA-граф и хвост оптимизатора. Это <b>×1.3–1.5 бесплатно</b>, до любой покупки.</li>
+  <li><b>Карты стоят 2.3–3.4× от разумного.</b> 5090: MSRP $1 999 → $4 644–6 795. 4090-48G: $4 731. 3090: $617–1 663 при рынке $560–780.</li>
+  <li><b>Для одного большого прогона аренда дешевле премии за карту.</b></li>
+</ul>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Сценарий</th><th class="num">Цена</th><th class="num">Скорость</th><th class="num">22 ГБ корпуса</th><th class="num">1B-прогон (20 ГБ)</th></tr></thead>
+  <tbody>
+    <tr><td>Как есть (5060 Ti, 16 ГБ)</td><td class="num">0</td><td class="num">2.3 ГБ/сут</td><td class="num">9.5 суток</td><td class="num">~30 суток</td></tr>
+    <tr><td>+ софт (граф, хвост, форма)</td><td class="num">0</td><td class="num">3.0–3.5 ГБ/сут</td><td class="num">6–7 суток</td><td class="num">20–22 суток</td></tr>
+    <tr><td>2× 3090 (номинал)</td><td class="num">1 431</td><td class="num">5.3 ГБ/сут</td><td class="num">4 суток</td><td class="num">12 суток</td></tr>
+    <tr><td>1× 5090D</td><td class="num">4 644</td><td class="num">11.5 ГБ/сут</td><td class="num">2 суток</td><td class="num">5–6 суток</td></tr>
+    <tr class="hl"><td><b>Аренда 8×H100 (сутки)</b></td><td class="num"><b>250–480</b></td><td class="num">~230 ГБ/сут</td><td class="num"><b>2–3 часа</b></td><td class="num"><b>~1 сутки</b></td></tr>
+  </tbody>
+</table>
+</div>
+<p class="small">Скорость аренды — оценка: 8×H100 bf16 ≈ 7 920 TFLOPS пика, при 30% MFU и нашей доле матриц это ~100× от одной 5060 Ti. Цена аренды 8×H100 — $250–480/сутки (спот), по прошлым замерам.</p>
+
+<div class="note ok"><b>Вывод:</b> если нужен <b>один</b> большой прогон — аренда стоит <b>в 10–19 раз меньше</b>, чем покупка карты, и делает его за сутки, а не за 12. Покупка оправдана только если прогонов много и подряд (непрерывные эксперименты 3+ месяца) либо если нужен постоянный локальный сервер.</div>
+
+<h3>Что действительно стоит купить при этом решении</h3>
+<ul>
+  <li><b>RAM, если идём в 1B.</b> 256 ГБ DDR4 ECC по $4.7/ГБ = $1 200 сейчас; DDR4 снимают с производства, память растёт 40–50% за квартал → через квартал $2 300. Это единственный товар, который дешевеет относительно будущего.</li>
+  <li class="neg"><b>Ничего больше.</b> Карты — в худшей точке цикла; 16 ГБ хватает для 105M и для 400M, а до 1B мы ещё не дошли по софту (offload_level не написан, multigpu-лейн не смёржен).</li>
+</ul>
+
+<div class="note warn"><b>Цена паузы, названная честно:</b> каждый день на 2.3 ГБ/сутки — это 3.5 дня на то, что аренда делает за час. Если 1B нужен к концу ноября, пауза не подходит. Если цель — сначала довести рецепт на 105M/400M, пауза правильная.</div>
+
+<h2>7c. Куда вложить $900 — по реальным ценам Минска</h2>
+
+<p>Моя прошлая цифра «$180 за NVMe 2 ТБ» была <b>американской</b>, не минской. Проверил Куфар (30.10.2026):</p>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>SSD 2 ТБ (Kufar)</th><th class="num">BYN</th><th class="num">≈ $</th><th>Состояние</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>Samsung 980 Pro 2TB</b></td><td class="num">700</td><td class="num"><b>238</b></td><td>новый, Минск</td></tr>
+    <tr><td>Samsung PM981a 2TB</td><td class="num">750–798</td><td class="num">255–271</td><td>б/у</td></tr>
+    <tr><td>Netac 2TB PCIe 4.0 / Teamgroup MP33 Pro</td><td class="num">890–900</td><td class="num">302–306</td><td>новый</td></tr>
+    <tr><td>Samsung 970 Evo Plus 2TB</td><td class="num">990</td><td class="num">336</td><td>новый</td></tr>
+    <tr><td>WD Black SN850X 2TB</td><td class="num">1 273</td><td class="num">433</td><td>новый</td></tr>
+    <tr><td>Samsung 9100 Pro 2TB (Gen5)</td><td class="num">1 500–1 749</td><td class="num">510–594</td><td>новый</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note danger"><b>Но диск вообще не надо покупать.</b> 127 ГБ заняты 55 мусорными worktree от отработавших агентов, а свободно всего 65 ГБ. Удаление девственных worktree освобождает ~120 ГБ — <b>бесплатно</b>. Покупка SSD решает проблему, которую я сам же и создал.</div>
+
+<h3>Память: Таобао против Минска (замер 30.10.2026)</h3>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Где</th><th>Модуль</th><th class="num">Цена</th><th class="num">$/ГБ</th><th>Заметка</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>Минск (Kufar)</b></td><td>DDR4 ECC <b>RDIMM</b> 32 ГБ Samsung, «в количестве»</td><td class="num">425 BYN = <b>$144</b></td><td class="num"><b>4.50</b></td><td>магазин, можно торговать за объём</td></tr>
+    <tr><td>Минск (Kufar)</td><td>DDR4 <b>LRDIMM</b> 32 ГБ SK hynix, комплект 8 шт</td><td class="num">3 520 BYN = $1 196</td><td class="num">4.66</td><td>440 за планку (не за комплект — моя ошибка)</td></tr>
+    <tr><td>Таобао</td><td>Micron/Samsung 32 ГБ ECC REG 2133–3200</td><td class="num">$140.74</td><td class="num">4.40</td><td>+ доставка, без гарантии</td></tr>
+    <tr><td>Таобао</td><td>Samsung/Hynix 32 ГБ ECC REG 2400/2666/2933</td><td class="num">$161.29</td><td class="num">5.04</td><td>—</td></tr>
+    <tr><td>Таобао</td><td>Micron 32 ГБ 2RX4 PC4-3200AA</td><td class="num">$233.88</td><td class="num">7.31</td><td>переплата за скорость, которой не будет</td></tr>
+    <tr><td>Таобао</td><td>Hynix HMA84GR7DJR4N-XN 32 ГБ 3200AA</td><td class="num">$268.30</td><td class="num">8.38</td><td>—</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note ok"><b>Вывод: везти память из Китая бессмысленно.</b> Минская цена $4.50/ГБ <b>ниже</b> средней таобаовской, без доставки, пошлины и ожидания, с гарантией магазина и возможностью проверить на месте. Таобао выигрывает только на конкретных лотах ($140 за планку), но с риском и без возврата.</div>
+
+<h3>Почему именно 2133 — это не выбор, а потолок платформы</h3>
+
+<pre><span class="c"># Xeon E5-2600 v4, таблица поддерживаемых частот</span>
+1 DIMM на канал (4 планки):   до <b>2400</b> МГц
+2 DIMM на канал (8 планок):   <b>2133</b> МГц для RDIMM (dual-rank)
+                              <b>1866</b> МГц для LRDIMM (quad-rank)
+память 2666/3200 всё равно опустится до этих значений
+
+<span class="c"># значит</span>
+покупать 3200 за $234/планку — платить за скорость, которую контроллер срежет
+покупать 2400 — смысл только если берём 4 планки (128 ГБ) и хотим 2400</pre>
+
+<div class="note warn"><b>Отсюда два следствия.</b> (1) <b>RDIMM лучше LRDIMM</b> в нашем случае: дешевле ($144 против $149) и на 8 планках держит 2133 вместо 1866. (2) <b>Старые 4×16 ГБ RDIMM можно оставить</b> — тот же тип, смешивать размеры можно; с LRDIMM так нельзя, пришлось бы выкинуть.</div>
+
+<h3>Что реально можно купить на $900 (Kufar, 30.10.2026)</h3>
+
+<div class="scroll">
+<table>
+  <thead><tr><th>Товар</th><th class="num">BYN</th><th class="num">≈ $</th><th class="num">$/ГБ</th><th>Заметка</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>DDR4 LRDIMM 256 ГБ (8×32 ГБ) SK hynix 2133, комплект</b></td><td class="num"><b>440</b></td><td class="num"><b>149</b></td><td class="num"><b>0.58</b></td><td>Минск, гарантия — <b>нужно проверить совместимость LRDIMM</b></td></tr>
+    <tr><td>DDR4 ECC reg 32 ГБ Samsung (в количестве)</td><td class="num">425</td><td class="num">144</td><td class="num">4.5</td><td>можно взять 4 шт = 128 ГБ за $577</td></tr>
+    <tr><td>DDR4 REG ECC 32 ГБ (2×16) 3200 Atermiter</td><td class="num">440</td><td class="num">149</td><td class="num">4.7</td><td>новый, с гарантией</td></tr>
+    <tr><td>Samsung 980 Pro 2 ТБ NVMe</td><td class="num">700</td><td class="num">238</td><td class="num">—</td><td>если чистки worktree не хватит</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="note ok"><b>Находка:</b> комплект <b>256 ГБ DDR4 LRDIMM за 440 BYN ($149)</b> — это $0.58 за гигабайт, в 8 раз дешевле любых планок поштучно. Supermicro X10SRL-F поддерживает LRDIMM до 512 ГБ, E5 v4 — тоже. Если совместимость подтвердится, весь RAM-план стоит не $1 200, а $149.</div>
+
+<h3>Пересчёт $900</h3>
+<div class="scroll">
+<table>
+  <thead><tr><th>Куда</th><th class="num">Сумма</th><th>Что даёт</th></tr></thead>
+  <tbody>
+    <tr class="hl"><td><b>1. Почистить worktree</b></td><td class="num"><b>$0</b></td><td>+120 ГБ свободно — проблема закрыта без денег</td></tr>
+    <tr class="hl"><td><b>2. Проверка стека на 2×H100</b></td><td class="num"><b>$50</b></td><td>multigpu ни разу не запускался; без этого аренда не поедет</td></tr>
+    <tr class="hl"><td><b>3. Один 1B-прогон на 8×H100</b></td><td class="num"><b>$150–290</b></td><td>20 ГБ токенов, ~14 часов, чекпоинт на руках</td></tr>
+    <tr><td>4. NVMe 2 ТБ, <i>если</i> чистки мало</td><td class="num">$238</td><td>Samsung 980 Pro 2TB с Куфара</td></tr>
+    <tr><td>5. Резерв</td><td class="num">$322–462</td><td>второй прогон или сид-свип</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre><span class="c"># арифметика аренды (оценка, спот)</span>
+8×H100 bf16 ≈ 7 920 TFLOPS пика · при 30% MFU ≈ 2 376 TFLOPS
+1B:  6 × 0.98e9 × 2e10 = 1.2e20 FLOPs → 50 500 с = <b>14 часов</b> ≈ $150–290
+105M: 1.26e19 → 5 300 с = <b>1.5 часа</b> ≈ $15–30</pre>
+
+<div class="note warn"><b>Поправка к предыдущей версии этого раздела:</b> там стояло «1B за $35 и 2 часа» — это было ошибкой (перепутал дневной объём с полным прогоном). Честно: <b>14 часов и $150–290</b>.</div>
+
+<div class="note ok"><b>Итог по $900:</b> $0 на диск (чистка), $50 на проверку стека, $150–290 на один 1B-прогон, остальное — резерв на второй прогон. Карту не покупать: при $4 644 за карту и $150–290 за весь прогон покупка окупается только с 20+ прогонами подряд.</div>
+
+<h2>8. План на выходные</h2>
+
+<pre><span class="c"># шаг 1 — сегодня, до вечера</span>
+<span class="g">1.</span> Написать продавцу 4080 Palit Game Rock (4 100) и 4080S Palit GamingPro (4 240)
+   торг: цель 3 900–4 000 BYN при самовывозе сегодня
+<span class="g">2.</span> Встреча, 30 минут проверки (чек-лист ниже)
+<span class="g">3.</span> Оплата, забрать карту
+
+<span class="c"># шаг 2 — параллельно, не откладывая</span>
+<span class="g">4.</span> Друг: спросить реальную цену 2×3090 в чате Taobao, потолок ¥5 000/шт
+   если ≤ ¥5 000 → заказать; если дороже → не брать, ждать
+<span class="g">5.</span> Выставить 5060 Ti 16GB на Kufar (2 900–3 300 BYN), продавать ПОСЛЕ
+   первого успешного шага на новой карте
+
+<span class="c"># шаг 3 — приёмка, не пропускать</span>
+<span class="g">6.</span> GPU-Z: вендор памяти, наработка, BIOS, температура в простое
+<span class="g">7.</span> OCCT VRAM 15–20 мин  ← ловит битую память, глазами не видно
+<span class="g">8.</span> FurMark 5–10 мин: &lt;80 °C, без артефактов и троттлинга
+<span class="g">9.</span> Наш стек: probe_vram + 100 шагов обучения (проверка тайлов и bf16)
+<span class="g">10.</span> Договориться о возврате 3–5 дней, если OCCT покажет ошибки</pre>
+
+<h2>9. Что осталось непроверенным</h2>
+<ul><li class="warn">Все цифры конфигураций из раздела 6c — из внешнего обзора, <b>нами не измерены</b>; скорость 26 ток/с зависит от модели, квантизации и RAM-канала</li></ul>
+<ul>
+  <li class="warn">Реальная цена китайского лота — только из чата; $617 почти наверняка номинал (议价)</li>
+  <li class="warn">bf16 для 4080/5070 — оценка по архитектуре; замер у нас есть только для 5060 Ti</li>
+  <li class="warn">Актуальный порог беспошлинного ввоза в BY нужно подтвердить перед покупкой (правила менялись)</li>
+  <li class="warn">Ставки карго и наличие страховки — уточнить у друга, а не по моей оценке</li>
+  <li class="warn">Реальные bf16-цифры 5090 (210 TF — оценка) и паспортная память лота «5090 D v2 24 ГБ»</li>
+  <li class="warn">DSR и число продаж магазина на Taobao — Superbuy их не показывает, видно только из аккаунта</li>
+</ul>
+
+<h2>Источники</h2>
+<ul class="src">
+  <li>TrendForce — GDDR6 $2.50 → $7.50/ГБ, июль 2026</li>
+  <li>3D Center (Германия) — индекс розничных цен RTX 50, +66% г/г, ноя 2025 → окт 2026</li>
+  <li>Board Channels / BenchLife — повышение цен AMD с 1 октября 2026 (третье за год)</li>
+  <li>The FPS Review — RTX 5060 Ti 8GB $749 в Японии, +59%, окт 2026</li>
+  <li>Tech-Insider — RTX 5090 делистинг, $4 299–10 000, 18 окт 2026</li>
+  <li>Jefferies — прогноз памяти +40–50% Q3, +30–40% Q4 2026, +40–45% 2027</li>
+  <li>VideoCardz / Guru3D — RTX 50 Super заморожен из-за цены 3 ГБ GDDR7</li>
+  <li>Kufar (Минск) — 15 объявлений 3090, 7 объявлений 4080/S, 29 окт 2026</li>
+  <li>Onliner Барахолка, раздел «Видеокарты» — 162 объявления, 30 окт 2026</li>
+  <li>Onliner Каталог (catalog.api) — розничные цены, 30 окт 2026</li>
+  <li>Superbuy — карточки лотов и вариантов, 30 окт 2026 (проверено кликом по SKU)</li>
+</ul>
+
+<footer>
+  dormouse · отчёт по закупке GPU · 30.10.2026 · курс 2.9433 BYN/$ (округление до $5) ·
+  все цены на момент публикации, рынок движется ежедневно
+</footer>
+
+</div>
+</body>
+</html>
