@@ -447,7 +447,13 @@ def _launches(fn) -> int:
     fn()  # warm: the kernels must be compiled before the counted run
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         fn()
-    return sum(1 for e in prof.events() if e.name == "cudaLaunchKernel")
+    # THREE names: torch's ops launch through the runtime API
+    # (`cudaLaunchKernel`), a Triton kernel through the driver API
+    # (`cuLaunchKernel` / `cuLaunchKernelEx` measured on this box, 2026-11-08).
+    # Counting only the first made the fused arm read as ZERO launches, so the
+    # "drop" it asserted was the arithmetic 11-0.
+    launch_names = ("cudaLaunchKernel", "cuLaunchKernel", "cuLaunchKernelEx")
+    return sum(1 for e in prof.events() if e.name in launch_names)
 
 
 @CUDA
