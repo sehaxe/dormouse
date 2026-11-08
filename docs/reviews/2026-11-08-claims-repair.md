@@ -557,9 +557,9 @@ The old `1,066,354,113` is not only in the ten. Current non-archive occurrences:
 All are wrong by 4,096 against `port/configs/b1.toml:110,127` and
 `port/tests/test_param_count.py:26`; the fix is the same one-line replace plus
 "old = pre-`af8b0c9`". Do them in one commit so the number cannot be half-fixed.
-`docs/reviews/2026-10-19-model-scorecard.md` exists only in `wt/publish`, not in the
-live tree; if that worktree is ever published, it already carries both numbers and
-needs the same note.
+the 2026-10-19 model scorecard exists only in `wt/publish`, not in the live tree
+(so it is not a repo path to resolve); if that worktree is ever published, it
+already carries both numbers and needs the same note.
 
 ### 4.2 Fused "kept" outside ADR-0003
 
