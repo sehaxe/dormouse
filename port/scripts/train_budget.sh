@@ -23,6 +23,9 @@ BATCH=${BATCH:-8}
 ACCUM=${ACCUM:-1}
 LR=${LR:-3e-4}
 COMPILE=${COMPILE:-0}
+# EMA horizon = 1/(1-decay) steps. The ladder's 0.999 is a 1 000-step horizon —
+# 0.4 % of this run, too short to buy anything; 0.9999 is ~10 000 steps (~4 %).
+EMA=${EMA:-0.9999}
 TAG=${TAG:-budget}
 OUT=${OUT:-/home/sehaxe/dormouse/checkpoints/$TAG}
 MIX=${MIX:-configs/mix_refetch.toml}
@@ -46,11 +49,11 @@ ARGS=(
   --set ns_dtype=bf16 --set muon_state_dtype=bf16
   # EMA is scored by the eval (loop.py wraps `_eval_line` in `_shadow_params`),
   # so this is a free change to the REPORTED number, not just the weights.
-  --set ema_decay=0.999
+  --set "ema_decay=$EMA"
   --set "ckpt_name=$TAG" --set "out_dir=$OUT"
   --json-log "/home/sehaxe/logs/${TAG}.jsonl"
 )
 [ "$COMPILE" = 1 ] && ARGS+=(--set torch_compile=true)
 
-echo "=== $TAG steps=$STEPS bytes=$(( STEPS * BATCH * ACCUM * 1024 )) b=$BATCH a=$ACCUM lr=$LR compile=$COMPILE $(date +%H:%M:%S)"
+echo "=== $TAG steps=$STEPS bytes=$(( STEPS * BATCH * ACCUM * 1024 )) b=$BATCH a=$ACCUM lr=$LR compile=$COMPILE ema=$EMA $(date +%H:%M:%S)"
 exec .venv/bin/dormouse train configs/flagship3_dense.toml "${ARGS[@]}"
