@@ -1,7 +1,13 @@
 # 2026-11-08 — the fused/CUDA-graph cluster: what the seven reds actually are
 
 **Status: 1 real code defect, 3 broken/never-run tests, 1 too-tight tolerance,
-2 card gates that no CPU process can even fail.** The table in
+2 card gates that no CPU process can even fail.** The code/test fixes landed
+in `7f27a83`/`635e767`; §1b ("`_fall_back` hands Muon the AdamW LR") landed in
+`ca9b0e0`; and the card diagnosis of §3/§5 was run on 2026-11-08 05:20: both
+launch gates were counting only `cudaLaunchKernel`, while a Triton kernel
+launches as `cuLaunchKernelEx` — the fused arm read as ZERO launches and the
+"drop" was 11 vs 0. Counting all three names, both pass with real numbers
+(fused 2 vs eager 11; 49 vs 804 on the residual chain, `9865943`). The table in
 `.bulba/plan.md:159-168` is wrong on two counts: it calls all seven
 "pre-existing" and it says several of them pass alone. Only one of them is red
 in a CUDA-hidden process, and that one is flaky, not order-dependent.
@@ -15,15 +21,18 @@ All commands run from `/home/sehaxe/dormouse/port`. `uv run --no-extra gpu`
 because the CPU venv is the same one; `CUDA_VISIBLE_DEVICES=""` is what makes a
 run CPU-only.
 
-**Worktree state at review time.** Another writer is live in this checkout:
-`port/src/dormouse/train/optim.py` carries an **uncommitted** fix at `:2071-2085`
-(the §1 1a change) and `port/tests/test_optimizer_suite.py` carries its gate
-(`test_the_torch_adamw_path_advances_the_bias_correction_counter`, passing on
-CPU). Line numbers below are against `HEAD` (`64bf076`) unless marked
-"working tree"; the uncommitted diff adds 13 lines after `optim.py:2066`, so
-every later `optim.py` reference in this file shifts by +13 in the working
-tree. Do **not** apply 1a twice — the uncommitted version already increments
-`_adamw_t` once per non-fused step.
+**Fixes landed while this review was being written.** `7f27a83` applied §1 1a
+and the §2/§4/§6/§7 test mends; `635e767` applied the §3/§5 precondition
+guards; this review was committed as `28ea81f`. The analysis below describes
+the tree at `64bf076` (the HEAD it was written against), and its line numbers
+are against that commit. What remains open is §1 1b (the Muon LR restored by
+`_fall_back`) and the two card-only diagnoses (#3/#5), which still need the
+card to say whether the launch gates are measuring the kernel or the profiler.
+The CPU-visible mended set is green:
+`CUDA_VISIBLE_DEVICES="" pytest tests/test_fused_epilogue.py
+tests/test_invariants_checkpoint.py tests/test_optimizer_suite.py
+tests/test_moe_combine_fused.py tests/test_fused_residual.py` → no failures
+(the card gates skip).
 
 ---
 
@@ -184,20 +193,20 @@ and the same failure path, so it belongs in the same fix.
 
 ### Fix
 
-1. **Already applied in the working tree** (`src/dormouse/train/optim.py:2071-2085`,
-   uncommitted at review time, not by this review): after the non-fused
-   `self.adamw.step()`, advance `_adamw_t` by one when at least one AdamW
-   parameter has a gradient. The gate is
+1. **Landed in `7f27a83`** (`src/dormouse/train/optim.py:2071-2085`): after
+   the non-fused `self.adamw.step()`, advance `_adamw_t` by one when at least
+   one AdamW parameter has a gradient. The gate is
    `tests/test_optimizer_suite.py::test_the_torch_adamw_path_advances_the_bias_correction_counter`
    (passing on CPU). **Do not also add the increment inside
-   `_gated_adamw_step`** — that would double-count. Verify the gate, then
-   re-run `test_the_first_replay_is_the_eager_step` on the card.
+   `_gated_adamw_step`** — that would double-count. Re-run
+   `test_the_first_replay_is_the_eager_step` on the card.
 2. `src/dormouse/train/graph.py:521-523` — restore the host float only for the
    AdamW groups (`self._capturable_restore` already names them); leave the
    Muon group's device tensor alone — `opt.set_lr` has just filled it with
    `muon_lr * mult`, and the batched Muon step explicitly supports a 0-dim
    tensor (`optim.py:1368-1371`). The next loop iteration's `full.set_lr`
-   replaces it with a float anyway. This one is **not** in the working tree.
+   replaces it with a float anyway. This one is **not** in `7f27a83`; still
+   open.
 
 **Gate for 2:** a CPU wrapper test: `set_lr` + `opt.set_lr` + a forced
 `_fall_back` → each group's LR equals what the eager step would read. The
@@ -277,7 +286,7 @@ PY
 `5e-5` for every name starting with `d_` (cite `fused_residual.PARITY_GRTOL`).
 The two mutation gates in the same file (`:158-186`) all perturb forward
 tensors and keep biting, and the write chain's `assert_parity` still pins the
-gradients at 5e-5.
+gradients at 5e-5. **Landed in `7f27a83`.**
 
 **Gate:** the kernel test itself plus
 `test_the_kernel_gate_reddens_when_the_gain_moves`
@@ -358,10 +367,10 @@ That is the honest limit of this report: the state named above is a
 *process-global*, not a module counter, and only the card can show whether it
 matters.
 
-**Minimal test hardening (not the fix):** `assert n_fused > 0` (a zero count
-must not pass), print both counts on the pass path too,
-`torch.cuda.synchronize()` before opening the profiler, and assert the
-deterministic `Counters` half (`drained["fused_kda_tail_launches"] == 2`)
+**Minimal test hardening (not the fix, landed `635e767`):** `assert n_fused >
+0` (a zero count must not pass), `max(n_fused, 1)` in the ratio, and print the
+counts. Not done: `torch.cuda.synchronize()` before the profiler, and asserting
+the deterministic `Counters` half (`drained["fused_kda_tail_launches"] == 2`)
 *before* the profiler half so a failure names which half broke.
 
 ---
@@ -416,7 +425,7 @@ nudge/restore. The docstring should say `epilogue_read`, not "the pre kernel".
 
 **Gate:** the test itself; it is currently the only thing that would catch a
 `b_pre` wired into the wrong tensor. **Risk:** none — the patch is scoped and
-restores `b_pre` in `finally`.
+restores `b_pre` in `finally`. **Landed in `7f27a83`.**
 
 ---
 
@@ -444,10 +453,10 @@ whether `fr.fused_available()` is True in that process. If `n_fused == 0`, it
 is the profiler, not the chain. If `n_fused` is O(eager), the fused path fell
 back and the reason must be printed. Do not touch the kernel before that.
 
-Same hardening as §3: `assert n_fused > 0`, `max(n_fused, 1)` in the print,
-and a `torch.cuda.synchronize()` before the profiled call. The 5x ratio itself
-is the arm's stated claim (`fused_residual.py:52-60`: 729 → 29 launches on the
-region shape); keep it.
+Same hardening as §3, landed `635e767`: `assert n_fused > 0` and
+`max(n_fused, 1)` in the print. Not done: a `torch.cuda.synchronize()` before
+the profiled call. The 5x ratio itself is the arm's stated claim
+(`fused_residual.py:52-60`: 729 → 29 launches on the region shape); keep it.
 
 ---
 
@@ -519,7 +528,8 @@ fixture that is wrong, not the checkpoint.
 test must be deterministic. **Risk:** seeding hides init-dependent controller
 behaviour; that is acceptable here because this file tests checkpoint
 completeness, and `test_lfb_winds_up_when_the_router_cannot_answer`
-(`tests/test_train.py`) is the controller's own gate.
+(`tests/test_train.py`) is the controller's own gate. **Landed in `7f27a83`**
+(the seed; the `prop` alternative was not taken).
 
 ---
 
@@ -591,7 +601,8 @@ Do not delete the test: the counter is a real log-reader signal, and the
 it is CPU-provable with the probe above, so it can be turned into a CPU gate
 instead of a `skip`-on-CPU card gate by stubbing `_launch` in the test (the
 combine's CUDA assert is the only thing blocking it). **Risk:** none; the
-counter logic is what is being pinned, not the kernel.
+counter logic is what is being pinned, not the kernel. **Landed in `7f27a83`**
+(two calls; still card-gated, not stubbed).
 
 ---
 
@@ -601,14 +612,14 @@ Ordered so every gate can be checked on CPU before the card is used.
 
 | # | file:line | minimal change | gate that catches a regression | risk |
 |---|---|---|---|---|
-| 1a | `src/dormouse/train/optim.py:2071-2085` (working tree) | **already applied, uncommitted**: `_adamw_t += 1` after the non-fused `self.adamw.step()` when any AdamW param has a grad | `test_optimizer_suite.py::test_the_torch_adamw_path_advances_the_bias_correction_counter` (exists, green on CPU) | do not add a second increment inside `_gated_adamw_step`; run `test_muon_launch`, `test_nan_firewall`, `test_opt_region` |
-| 1b | `src/dormouse/train/graph.py:521-523` | restore the host `lr` float for AdamW groups only; leave the Muon tensor (it holds `muon_lr*mult`) | CPU wrapper test: `set_lr` + `opt.set_lr` + forced `_fall_back` → each group's LR equals what the eager step would read | one eager step with a tensor LR in Muon is supported (`optim.py:1368-1371`); the next `full.set_lr` restores floats |
-| 1c | `tests/test_full_graph.py:526-528, :568` | after 1a/1b, re-run; if a ~1e-7 residual remains, say in the docstring that the bound is capturable-vs-fused rounding and raise to 1e-5 | the test itself | do not raise before 1a/1b — 3e-05 is real |
-| 2 | `tests/test_fused_epilogue.py:132-145` | outputs 1e-6, `d_*` 5e-5 (`PARITY_GRTOL`), with the citation | the two mutation gates; the kernel test's own `assert_parity` at 5e-5 | a 1e-5-scale read gradient error would pass at the read gate but is still caught at 5e-5 by `parity(epilogue=True)` |
-| 4 | `tests/test_fused_residual.py:126-135` | patch `fr.epilogue_read` (signature `mhc, xl, gain, gain_mlp, eps, counters`), not `fr.pre` | the test itself; measured Δctx 6.09e-05 vs tol 1.32e-05 | none |
-| 6 | `tests/test_invariants_checkpoint.py:127` | `torch.manual_seed(0)` before the model; or `moe_lb_mode="prop"` in `_run` | the parametrized test, run twice in one process + seeds 0–5 | seeding hides init-dependent controller behaviour; acceptable for a checkpoint-completeness file |
-| 7 | `tests/test_moe_combine_fused.py:402-416` | assert `moe_combine_fused` for fp32; add a `dtype="bf16"` call for both; fix the docstring | the test itself (CPU-provable by stubbing `_launch`) | none |
-| 3/5 | `tests/test_fused_kda.py:454`, `tests/test_fused_residual.py:155` | **no code change**; add `assert n_fused > 0`, `max(n_fused, 1)`, `torch.cuda.synchronize()`, and print both counts | the card run in both orders (§3, §5) | the guard does not fix an unknown cause; it makes the failure legible |
+| 1a | `src/dormouse/train/optim.py:2071-2085` | **landed `7f27a83`**: `_adamw_t += 1` after the non-fused `self.adamw.step()` when any AdamW param has a grad | `test_optimizer_suite.py::test_the_torch_adamw_path_advances_the_bias_correction_counter` (exists, green on CPU) | do not add a second increment inside `_gated_adamw_step`; run `test_muon_launch`, `test_nan_firewall`, `test_opt_region` |
+| 1b | `src/dormouse/train/graph.py:521-523` | restore the host `lr` float for AdamW groups only; leave the Muon tensor (it holds `muon_lr*mult`) | CPU wrapper test: `set_lr` + `opt.set_lr` + forced `_fall_back` → each group's LR equals what the eager step would read | **open**; one eager step with a tensor LR in Muon is supported (`optim.py:1368-1371`); the next `full.set_lr` restores floats |
+| 1c | `tests/test_full_graph.py:526-528, :568` | after 1a/1b, re-run on the card; if a ~1e-7 residual remains, say in the docstring that the bound is capturable-vs-fused rounding and raise to 1e-5 | the test itself | do not raise before 1a/1b — 3e-05 is real |
+| 2 | `tests/test_fused_epilogue.py:132-145` | **landed `7f27a83`**: outputs 1e-6, `d_*` 5e-5 (`PARITY_GRTOL`) | the two mutation gates; the kernel test's own `assert_parity` at 5e-5 | a 1e-5-scale read gradient error would pass at the read gate but is still caught at 5e-5 by `parity(epilogue=True)` |
+| 4 | `tests/test_fused_residual.py:126-135` | **landed `7f27a83`**: patch `fr.epilogue_read` (signature `mhc, xl, gain, gain_mlp, eps, counters`), not `fr.pre` | the test itself; measured Δctx 6.09e-05 vs tol 1.32e-05 | none |
+| 6 | `tests/test_invariants_checkpoint.py:127` | **landed `7f27a83`**: `torch.manual_seed(0)` before the model | the parametrized test, run twice in one process + seeds 0–5 | seeding hides init-dependent controller behaviour; acceptable for a checkpoint-completeness file |
+| 7 | `tests/test_moe_combine_fused.py:402-416` | **landed `7f27a83`**: assert `moe_combine_fused` for fp32; a second `dtype="bf16"` call for both; docstring fixed | the test itself (CPU-provable by stubbing `_launch`) | none |
+| 3/5 | `tests/test_fused_kda.py:454`, `tests/test_fused_residual.py:155` | **landed `635e767`**: `assert n_fused > 0`, `max(n_fused, 1)`, counts printed | the card run in both orders (§3, §5) | the guard does not fix an unknown cause; it makes the failure legible |
 
 The plan's line for #1 must change after the fix: it is not "the reference log
 never says capture failed", it is "the fallback must be the same optimizer
