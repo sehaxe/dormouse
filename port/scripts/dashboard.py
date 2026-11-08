@@ -3,7 +3,12 @@
 Zero dependencies: stdlib HTTP server + SSE, and htmx for the swap. It only reads
 (files + `nvidia-smi` + `git log`); nothing in the training run is touched.
 
-    python scripts/dashboard.py --port 3789 --host 0.0.0.0
+    python scripts/dashboard.py --port 3789            # loopback (default)
+    python scripts/dashboard.py --host 0.0.0.0          # LAN/tailscale: no auth
+
+The default is loopback ON PURPOSE: the page has no authentication and prints
+training logs, paths and git state, so binding all interfaces publishes them to
+the whole network. Pass `--host 0.0.0.0` only behind a trusted network.
 
 htmx is served from `dashboard/static/htmx.min.js`; if that file is missing the
 page still works (server-rendered, refreshed by `<meta http-equiv=refresh>`),
@@ -1015,7 +1020,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
 
-def serve(host: str = "0.0.0.0", port: int = 3789) -> ThreadingHTTPServer:
+def serve(host: str = "127.0.0.1", port: int = 3789) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.daemon_threads = True
     return httpd
@@ -1038,7 +1043,7 @@ def _urls(port: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=3789)
     args = ap.parse_args(argv)
     httpd = serve(args.host, args.port)

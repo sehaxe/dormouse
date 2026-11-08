@@ -333,12 +333,13 @@ def carry_gate(model: torch.nn.Module, item: Item, segment: int) -> dict:
     reddens on arithmetic that changes no answer (measured 2026-11-08: dloss
     6.7e-6 nats, argmax 100% agreement, max|dlogits| 1.26e-3 on logits of ±17).
 
-    The pass rule is therefore the two numbers the claim actually reads:
-    `dloss <= 1e-4` nats (the training metric) and the 8 ANSWER bytes' argmax
-    identical — the claim is exact retrieval of those 8, and bf16 rounding flips
-    ~0.3% of unrelated byte predictions (measured 99.7% global agreement, 3/1024,
-    while the answer agrees). `max|dlogits|`, its scale and the global agreement
-    are PRINTED for the record, not used as the bar.
+    The pass rule is therefore two numbers the claim actually reads: the loss
+    difference PER BYTE (`dloss / n_bytes <= 1e-6` nats/byte) and the 8 ANSWER
+    bytes' argmax identical. Both bars are length- and scale-free on purpose: the
+    absolute logit bar failed on a ±32 logit scale (bf16 rounding), and a TOTAL
+    dloss bar fails on length — the same accumulation measured 1.05e-5 over 1 024
+    bytes and 2.71e-4 over 8 192, i.e. 1.0e-8 vs 3.3e-8 per byte (2026-11-08).
+    `max|dlogits|`, its scale and the global argmax are PRINTED, not used.
     """
     probe = item.scored[: 2 * segment]
     assert len(probe) == 2 * segment, (len(probe), segment)
@@ -359,6 +360,7 @@ def carry_gate(model: torch.nn.Module, item: Item, segment: int) -> dict:
         "dlogits": float((ref - got).abs().max()),
         "scale": float(ref.abs().max()),
         "dloss": float(abs(lref - lgot)),
+        "bytes": float(len(probe)),
         "agree": float((ref.argmax(-1) == got.argmax(-1)).float().mean()),
         "answer_agree": bool(
             torch.equal(ref[key_rows].argmax(-1), got[key_rows].argmax(-1))
@@ -817,15 +819,18 @@ def main(argv: list[str] | None = None) -> int:
     rel = gb["dlogits"] / max(gb["scale"], 1e-30)
     print(
         f"gate B: 1 pass vs 2×{segment} B segments · max|dlogits|={gb["dlogits"]:.3e} "
-        f"of scale {gb["scale"]:.3e} (rel {rel:.2e}) · dloss={gb["dloss"]:.2e} nats · "
+        f"of scale {gb["scale"]:.3e} (rel {rel:.2e}) · dloss={gb["dloss"]:.2e} nats "
+        f"({gb["dloss"]/gb["bytes"]:.1e}/B) · "
         f"answer bytes agree {gb["answer_agree"]} · global argmax {gb["agree"]:.1%} · "
         f"segments={gb["segments"]}",
         flush=True,
     )
-    if gb["dloss"] > 1e-4 or not gb["answer_agree"]:
+    if gb["dloss"] / gb["bytes"] > 1e-6 or not gb["answer_agree"]:
         loud(
             f"gate B: the 2-segment pass is not the 1-pass forward (dloss="
-            f"{gb['dloss']:.2e} nats, answer bytes agree {gb['answer_agree']}; the claim "
+            f"{gb['dloss']:.2e} nats over {gb['bytes']:.0f} B = "
+            f"{gb['dloss']/gb['bytes']:.2e} nats/byte, answer bytes agree "
+            f"{gb['answer_agree']}; the claim "
             f"reads both). The 1M number would be a different function, so the protocol "
             f"stops here. Escape: fix the carry, or do not claim 1M retrieval."
         )
