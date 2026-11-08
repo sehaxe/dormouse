@@ -257,6 +257,7 @@ export const pages = [
 	{ src: 'docs/architecture/f16-plan.md', out: 'architecture/f16-plan', title: 'The f16 storage and compute plan', nav: 'f16 plan' },
 	{ src: 'docs/architecture/library-crate-fate.md', out: 'architecture/library-crate-fate' },
 	{ src: 'docs/architecture/post-training.md', out: 'architecture/post-training' },
+	{ src: 'docs/architecture/checkpoint-format.md', out: 'architecture/checkpoint-format', title: 'The checkpoint format' },
 	{ src: 'docs/architecture/bf16-plan.md', out: 'architecture/bf16-plan' },
 
 	// ── Protocols ────────────────────────────────────────────────────────────
@@ -295,8 +296,10 @@ export const pages = [
 	// lives - these lines index that directory, they are not a second copy.
 	{ src: 'docs/guides/presets.md', out: 'tooling/presets', title: 'Presets: what each one costs and is for', nav: 'Presets' },
 	{ src: 'docs/guides/cli.md', out: 'tooling/cli', title: 'Every flag on train', nav: 'CLI flags' },
+	{ src: 'docs/guides/doctor.md', out: 'tooling/doctor', title: 'dormouse doctor: the pre-flight for a long run', nav: 'Doctor' },
 	{ src: 'docs/guides/dmexp.md', out: 'tooling/dmexp', title: 'The model file: .dmexp', nav: 'The .dmexp file' },
 	{ src: 'docs/guides/first-pr.md', out: 'tooling/first-pr', title: 'Your first pull request', nav: 'First PR' },
+	{ src: 'docs/guides/first-hour.md', out: 'tooling/first-hour', title: 'Your first hour', nav: 'First hour' },
 	// The 2026-10-01 narrative wave: four "how to actually use this" guides
 	// assembled from the protocols, the rulebook and the reviews - no new
 	// numbers, every figure carried with its source.
@@ -304,6 +307,11 @@ export const pages = [
 	{ src: 'docs/guides/determinism.md', out: 'tooling/determinism', title: 'Determinism: why --seed was the easy part', nav: 'Determinism' },
 	{ src: 'docs/guides/ab-testing.md', out: 'tooling/ab-testing', title: 'A/B testing: how an arm is judged here', nav: 'A/B testing' },
 	{ src: 'docs/guides/precision.md', out: 'tooling/precision', title: 'Precision on this backend: why bf16 is slower than fp32', nav: 'Precision' },
+	{ src: 'docs/guides/benchmarking.md', out: 'tooling/benchmarking', title: 'Benchmarking the engine: one shape, one ledger, one number', nav: 'Benchmarking' },
+	// The 2026-11-08 refetch: six datasets, their licences, and what a
+	// commercial release still cannot prove. Every licence checked against the
+	// HF API/card on 2026-11-08; the gaps are §3, the sketch is §4.
+	{ src: 'docs/guides/data-provenance.md', out: 'tooling/data-provenance', title: 'Data provenance: the six sources a commercial release inherits', nav: 'Data provenance' },
 ];
 
 // Everything the manifest does not enumerate, discovered and ordered here.
