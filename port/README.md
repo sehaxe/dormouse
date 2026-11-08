@@ -68,7 +68,7 @@ src/dormouse/
   model/           tsct · experts(MoE) · kda · engram · loopblock · model · byteflow · decode
   train/           data (mmap byte streams) · optim (Muon/AdamW) · lr (WSD) · loop
   cli.py           info | train | eval | decode | plot
-tests/             167 files, 2,194 collected tests, CPU-true by default, CUDA gates opt-in
+tests/             the full suite, CPU-true by default, CUDA gates opt-in (no count: it rotted twice)
 scripts/           bench_moe · smoke_gpu · smoke_byteflow
 configs/           small (9,476,993) · b1 (1,066,358,209)
 ```

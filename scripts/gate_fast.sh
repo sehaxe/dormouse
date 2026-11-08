@@ -12,7 +12,10 @@ step "ruff check (lint)"
 ( cd port && .venv/bin/ruff check src scripts tests ) || fail=1
 
 step "ruff format (this branch's files; FULL_FORMAT=1 for the whole tree)"
-bash scripts/gate_format.sh "${FORMAT_SCOPE:---changed}" || fail=1
+format_scope=${FORMAT_SCOPE:---changed}
+if [ "${FULL_FORMAT:-0}" = 1 ]; then format_scope=""; fi
+# shellcheck disable=SC2086
+bash scripts/gate_format.sh $format_scope || fail=1
 
 step "doc references (a path in a comment must exist)"
 python3 tools/check_doc_refs.py || fail=1

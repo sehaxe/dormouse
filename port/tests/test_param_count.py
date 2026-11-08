@@ -26,6 +26,22 @@ SMALL_PORT_TOTAL = 9_476_993
 B1_PORT_TOTAL = 1_066_358_209  # max_iter 4; MSA off (tie verdict 2026-10-17)
 
 
+def preset_total(name: str) -> int:
+    """The `#   total N N N` line of a preset file — READ, not assumed.
+
+    The docstring above promised this check and the code never did it: editing
+    `configs/small.toml`'s total left the test green (2026-11-08 audit). The
+    comment is the preset's own claim, so the gate parses it.
+    """
+    import re
+    from pathlib import Path as _Path
+
+    text = (_Path(__file__).resolve().parents[1] / "configs" / name).read_text()
+    found = re.findall(r"^#\s+total\s+([\d ]+)\s*$", text, re.M)
+    assert found, f"no '#   total ...' line in configs/{name}"
+    return int(found[-1].replace(" ", ""))
+
+
 def arithmetic(cfg) -> dict[str, int]:
     """The port's module tree, priced by hand, component by component."""
     d, f, r, v = cfg.d_model, cfg.d_ffn, cfg.rank, cfg.vocab
@@ -147,6 +163,7 @@ def test_b1_arithmetic_matches_the_model_and_the_preset():
     model = DormouseModel(cfg, device="meta")
     assert built(model) == want, {k: (want.get(k), built(model).get(k)) for k in want}
     assert sum(want.values()) == B1_PORT_TOTAL == param_count(model)
+    assert preset_total('b1.toml') == B1_PORT_TOTAL, 'configs/b1.toml total rotted'
 
     # The delta against plan §2.2's table, computed from the table's OWN terms:
     #   1024*(2048*64 + 64*5461 + 64) = 492 175 360  (one latent, no down-proj)
@@ -164,6 +181,7 @@ def test_small_arithmetic_matches_the_model_and_the_preset():
     want = arithmetic(cfg)
     assert built(model) == want
     assert sum(want.values()) == SMALL_PORT_TOTAL == param_count(model)
+    assert preset_total('small.toml') == SMALL_PORT_TOTAL, 'configs/small.toml total rotted'
     # The burn side's `small`, measured on ITS instantiated model (2026-10-01):
     BURN_SMALL_TOTAL = 9_197_390
     assert SMALL_PORT_TOTAL - BURN_SMALL_TOTAL == 279_603, (
