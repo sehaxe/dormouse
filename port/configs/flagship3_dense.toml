@@ -9,6 +9,17 @@
 #   * nothing beats a dense transformer at <=200M params in a compute-matched test
 #     (docs/research/2026-11-06-architecture-at-100m.md).
 #
+# THIS FILE IS THE MODEL, NOT THE RUN (2026-11-08 kernel audit §1). As a flat
+# preset it resolves to `seq_len=512, ns_dtype=fp32, muon_state_dtype=fp32,
+# muon_lr_mult=1.0, grad_accum=1, ckpt_every=100` — measured at 283-290 ms/step.
+# The 56 kB/s recipe every number on record uses is this file PLUS six flags
+# (`ns_dtype=bf16`, `muon_state_dtype=bf16`, `muon_lr_mult=12`, `seq_len=1024`,
+# `grad_accum`, `ckpt_every`), applied by `scripts/recipe_ladder.sh`,
+# `scripts/train_budget.sh` and `scripts/train_csa8k.sh`. Train keys cannot live
+# in this file (the preset parser is model-only by design), so the script IS the
+# recipe; run `dormouse train` with no `--set` and you have trained a different,
+# slower, LR-starved arm.
+#
 # Sizing: this is a BYTE-level dense arm (1 byte = 1 token), so the old
 # flagship's 4.485 B/patch factor does not apply. The full fwd+bwd bill at
 # b1 x s1024 is 691.37 MFLOP/byte (block 567.41 + attention core 122.68 +
