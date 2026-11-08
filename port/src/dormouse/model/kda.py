@@ -678,8 +678,14 @@ class KDAAttention(nn.Module):
         dq = (self.dense_qat, self.dense_qat_alpha)
         c = self._latent_base(x, dq)
         qf, kf, vf, gf = self._qkvg(c, dq)
-        q = F.normalize(self._heads(qf, b, t), dim=-1)
-        k = F.normalize(self._heads(self._kv(kf, b, t), b, t), dim=-1)
+        # `eps=1e-6`, the SAME floor `_recurrent_step` uses
+        # (`rsqrt(sum + 1e-6)`). `F.normalize`'s default is 1e-12, so a collapsed
+        # q row (norm between 1e-12 and 1e-6) was blown back up to UNIT length
+        # here and left at its true size in the reference — the two arms were two
+        # different models exactly at the collapse they both guard against
+        # (math audit 2026-11-08, item K4).
+        q = F.normalize(self._heads(qf, b, t), dim=-1, eps=1e-6)
+        k = F.normalize(self._heads(self._kv(kf, b, t), b, t), dim=-1, eps=1e-6)
         v = self._heads(self._kv(vf, b, t), b, t)
         if state is None:
             kk, vv = k, v

@@ -211,7 +211,10 @@ def test_the_sdpa_fallback_normalizes_qk_like_the_kernel():
         gate = torch.sigmoid(attn.g_proj(x))
         got = attn._sdpa_path(x, 1, t, d)
         ref = F.scaled_dot_product_attention(
-            F.normalize(qr, dim=-1) * attn.scale, F.normalize(kr, dim=-1), v, is_causal=True
+            F.normalize(qr, dim=-1, eps=1e-6) * attn.scale,
+            F.normalize(kr, dim=-1, eps=1e-6),
+            v,
+            is_causal=True,
         )
         ref = ref.transpose(1, 2).reshape(1, t, d) * gate
         raw = (

@@ -850,3 +850,41 @@ def test_the_kda_decay_has_no_g_min_floor(monkeypatch):
     _q, _k, _v, g, _beta = attn.projections(torch.zeros(b, t, d))
     assert torch.all(g == -100.0), g
     assert float(g.exp().max()) < 1e-40, float(g.exp().max())
+
+
+def test_the_sdpa_fallback_uses_the_recurrence_norm_epsilon(monkeypatch):
+    """A collapsed q row must not be blown back up to unit length.
+
+    `_recurrent_step` normalizes with `rsqrt(sum + 1e-6)`; `F.normalize`'s
+    default is 1e-12, so before 2026-11-08 the SDPA fallback and the reference
+    recurrence were two different models exactly at the collapse both guard
+    against (math audit item K4). With a q whose norm is 1e-9 the fallback must
+    produce the `eps=1e-6` result (q stays ~1e-3), not the `1e-12` one (q -> 1).
+    """
+    attn = KDAAttention(tiny_cfg(use_kda=True), device="cpu").eval()
+    b, t, d = 1, 4, 64
+    gen = torch.Generator().manual_seed(0)
+    # Random DIRECTIONS with a 1e-9 norm: identical keys would make the softmax
+    # uniform and the scale test vacuous (measured while writing this).
+    q = torch.randn(b, t, d, generator=gen) * 1e-9
+    k = torch.randn(b, t, d, generator=gen)
+    v = torch.randn(b, t, d, generator=gen)
+    g = torch.zeros(b, t, d)
+
+    def qkvg(_c, _dq):
+        return q, k, v, g
+
+    monkeypatch.setattr(attn, "_qkvg", qkvg)
+    got, _ = attn._sdpa_path_carry(torch.zeros(b, t, d), b, t, d, None)
+
+    def ref(eps: float) -> torch.Tensor:
+        qh = F.normalize(attn._heads(q, b, t), dim=-1, eps=eps)
+        kh = F.normalize(attn._heads(k, b, t), dim=-1, eps=eps)
+        vh = attn._heads(v, b, t)
+        y = F.scaled_dot_product_attention(qh * attn.scale, kh, vh, is_causal=True)
+        return y.transpose(1, 2).reshape(b, t, d) * torch.sigmoid(g)
+
+    assert torch.allclose(got, ref(1e-6), atol=1e-6)
+    assert not torch.allclose(got, ref(1e-12), atol=1e-3), (
+        "the fallback kept F.normalize's 1e-12 default: a 1e-9 q row became unit length"
+    )
