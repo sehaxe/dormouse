@@ -172,7 +172,17 @@ suite" was a card-visible run. The real content:
 | 3 | `test_fused_kda::test_kernel_launch_counter_drops` | card-only, never run | guard added; needs one card run |
 | 5 | `test_fused_residual::test_the_fused_path_issues_far_fewer_launches` | card-only, no arithmetic change since written | guard added; needs one card run |
 
-The two card gates still need a quiet card (the ladder owns it until ~10:00).
+**All seven are closed (2026-11-08 05:20).** The two card gates ran on the busy
+card and found a REAL defect in themselves: their launch counter counted only
+`cudaLaunchKernel`, while a Triton kernel launches through the driver API and
+appears as `cuLaunchKernelEx` — so the fused arm read as **zero launches** and
+the "drop" was 11 vs 0, measuring nothing. Counting all three names gives the
+real numbers: **fused 2 vs eager 11** per KDA iteration, and **49 vs 804 (16.4x)**
+for the residual chain. Both pass.
+
+```
+cd port && CUDA_VISIBLE_DEVICES="" pytest -q   # 2 194 tests, exit 0, twice
+```
 
 ## Gates that must stay green
 
