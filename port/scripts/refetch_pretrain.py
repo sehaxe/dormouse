@@ -64,14 +64,20 @@ def text_column(con: duckdb.DuckDBPyConnection, url: str) -> str:
     return "text" if "text" in names else names[0]
 
 
-def fetch(con: duckdb.DuckDBPyConnection, s: Slice, cap: int) -> int:
+def fetch(con: duckdb.DuckDBPyConnection, s: Slice, cap: int, local: Path | None = None) -> int:
+    """Slice one shard into `<name>.bin`.
+
+    `local` jumps the hub entirely: the parquet reader issues hundreds of range
+    requests per shard and the anonymous quota is 500 / 300 s (HTTP 429), so a
+    `curl -L` of one shard plus a local read is the reliable path. The slice is
+    identical either way — same DuckDB scan, same rows.
+    """
     t0 = time.time()
-    col = text_column(con, s.url)
+    url = str(local / f"{s.name}0.parquet") if local else s.url
+    col = text_column(con, url)
     # one row ≈ 6-8 kB of UTF-8; ask for a little more than the cap and stop
     rows = max(1, int(cap / 6500))
-    q = (
-        f"SELECT {col} FROM read_parquet('{s.url}') LIMIT {rows}"
-    )
+    q = f"SELECT {col} FROM read_parquet('{url}') LIMIT {rows}"
     data = con.execute(q).fetchall()
     out = f"{OUT_DIR}/{s.name}.bin"
     n = 0
@@ -93,6 +99,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cap-mb", type=int, default=2000, help="bytes per source")
     ap.add_argument("--only", default="", help="one source name")
+    ap.add_argument(
+        "--local-dir",
+        default="",
+        help="read <name>0.parquet from here instead of the hub (rate-limit escape)",
+    )
     a = ap.parse_args()
     Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
     con = duckdb.connect()
@@ -102,7 +113,7 @@ def main() -> int:
         if a.only and name != a.only:
             continue
         try:
-            total += fetch(con, s, cap)
+            total += fetch(con, s, cap, Path(a.local_dir) if a.local_dir else None)
         except Exception as e:  # noqa: BLE001 - a source that cannot be reached must be seen
             print(f"loud: {name} failed: {type(e).__name__}: {e}", file=sys.stderr)
             return 1
