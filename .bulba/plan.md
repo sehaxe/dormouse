@@ -148,6 +148,13 @@ Until the owner picks, pushes go to `backup/main-local-2026-11-08`.
   old name with a counted note — a decision, not a silent edit. Reverted with the
   test green; C7 (vendor) is still open and needs a workspace build.
 
+## SUITE GREEN, CPU-only (2026-11-08 06:20)
+
+`CUDA_VISIBLE_DEVICES="" pytest -q` over all 2 194 tests: **exit 0**. That is the
+first green full run of the night; the 22-red starting point is closed. The two
+launch-count gates still need a card run (they skip on CPU), and the card is the
+ladder's until ~09:30.
+
 ## Known-red: reclassified 2026-11-08 05:40 (the list was wrong)
 
 The old table said "seven pre-existing, all in the fused/CUDA-graph cluster,
