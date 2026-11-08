@@ -9,6 +9,27 @@ plain decoder-only control trained on **the same bytes**, scored by **the same
 eval harness**, at **the same FLOPs per byte**, and — after the first result
 looked too good — at **the same optimizer cadence**.
 
+> ## UPDATE 2026-11-08 — the magnitude is not attributable; the sign survives
+>
+> The loop arms in this report ran **before `muon_lr_mult` existed** (landed
+> 2026-11-07): their Muon step was the 15–55× deficit the optimizer audit found,
+> measured on the same trainer at **0.246–0.248 BPB** (2 seeds, 49–74 MB,
+> `~/logs/night_opt/*`). The control arms ran **AdamW everywhere — no Muon at
+> all** (`scripts/control_transformer.py:261-263`), the loop's router had
+> collapsed by the 4.2 GB endpoint, the anneal states differ (the control was
+> fully annealed, the loop at peak LR), and the loop side has **zero seeds**.
+> The same-seed rerun moved 0.043. So the *sign* (dense wins) survives — the
+> control wins with 8.4× less data — but the **0.126–0.37 range is a mixture of
+> optimizer, anneal and block**, and the sentence "the block is worth 0.126" is
+> not supported by this file.
+>
+> A fair A/B is specified and priced at ~8 card-hours in
+> `docs/reviews/2026-11-08-loop-ab-fairness.md` (mirror_control 13.5M/135
+> MFLOP/B vs flagship_base 137 MFLOP/B, 500 MB, 2 seeds, pre-registered D ≥
+> +0.03). The independent literature still points the same way — 116-run
+> iso-depth law, r=2 loses +0.03…+0.06 nats — which is why the dense lane stays
+> the live recipe while that A/B waits for a reason to spend 8 hours.
+
 ## Verdict
 
 > **The pipeline is fine and the architecture costs ≈0.13 BPB.** A plain 13.5M
