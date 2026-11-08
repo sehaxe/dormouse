@@ -71,7 +71,13 @@ Until the owner picks, pushes go to `backup/main-local-2026-11-08`.
   `--since <date>` blocking mode plus a CI step; it is not done.
 - **docs drift**: 10 of 10 checked pre-2026-11-01 documents contradict the code
   (`docs/reviews/2026-11-08-deletion-audit.md` §7).
-- **deletions**: C2 + C7 (the 2 010-line safe tier) are unstarted; C4 is done.
+- **deletions**: C4 (agent_rl) is done. **C2 is BLOCKED, not skipped**: deleting
+  `jepa`/`muon_sf_retract` breaks `test_every_snapshot_on_disk_loads`, because
+  153 checkpoint snapshots on disk carry `jepa = false` and the loader refuses an
+  unknown key BY DESIGN (that refusal is a gate, not a nuisance). The honest way
+  to retire a field is a `RETIRED_KEYS` allowlist in the loader that accepts the
+  old name with a counted note — a decision, not a silent edit. Reverted with the
+  test green; C7 (vendor) is still open and needs a workspace build.
 
 ## Known-red at 2026-11-08 02:30 (pre-existing, not from tonight)
 
