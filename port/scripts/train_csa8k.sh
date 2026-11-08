@@ -38,6 +38,11 @@ ARGS=(
   --set use_mhc=true --set use_attnres=true --set share_u=true --set use_engram=true
   --set engram_ram=false --set attn_latent_rank=256
   --set moe_kernel=triton --set moe_capacity=0.0
+  # NOT the legacy `sign` controller: at 8K/b1 it wound its bias to [-95, +57]
+  # over 8 000 steps and collapsed the routing (9 of 512 experts live on the
+  # 2026-11-08 csa8k artifact). `prop` is the bounded arm the 2026-11-04
+  # collapse reviews measured — |bias| <= moe_lb_clamp, and the bank recovers.
+  --set moe_lb_mode=prop --set moe_lb_gamma=0.001 --set moe_lb_clamp=2.0
   # doc_masking needs a `<bin>.docs.json` sidecar; the refetch has none, so the
   # flat stream is the honest arm (say so in any number it produces).
   --set doc_masking=false
