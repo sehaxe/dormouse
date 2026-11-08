@@ -24,7 +24,7 @@ math = "/home/sehaxe/dormouse/data_local/mix/math.bin"
 ru = "/home/sehaxe/dormouse/data_local/mix/ru.bin"
 
 [[stage]]
-until = 1.0
+until_frac = 1.0
 
 [stage.weights]
 fwedu = 0.55
