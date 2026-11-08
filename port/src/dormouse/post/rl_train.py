@@ -450,7 +450,10 @@ def rl_train(
         path = Path(init_from)
         if not path.is_file():
             loud(f"rl --init-from: {path} does not exist. Escape: the pretrain run's .pt path.")
-        foreign = torch.load(path, map_location="cpu", weights_only=False)
+        # A foreign file is the untrusted one: weights_only=True refuses any
+        # pickle naming a class the torch allow-list does not carry (a dormouse
+        # checkpoint is plain tensors/ints/strings and passes it).
+        foreign = torch.load(path, map_location="cpu", weights_only=True)
         sd = unpack_state_dict(foreign.get("model", foreign), foreign.get("model_quant_rung"))
         # `_init_cfg` describes the INIT FILE (its substrate and sidecar path),
         # not this run — the loader's own contract. Imported here, not at module

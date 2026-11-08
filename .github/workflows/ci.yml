@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
 
+# Least privilege for every job: a PR runs repo code (pytest, ruff, the docs
+# gates), so the token must not be able to push. Jobs that need more declare it
+# themselves (the supply-chain job's `contents: read` stays explicit).
+permissions:
+  contents: read
+
 jobs:
   cpu:
     runs-on: ubuntu-latest
@@ -35,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - name: install (frozen)
-        run: cd port && uv sync --frozen || uv sync
+        run: cd port && uv sync --frozen
       - name: ledger (report)
         run: |
           cd port && PYTHONPATH=src uv run python scripts/claims_ledger.py \
@@ -83,7 +89,7 @@ jobs:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
       - name: install (frozen)
-        run: cd port && uv sync --frozen || uv sync
+        run: cd port && uv sync --frozen
       - name: ruff check
         run: cd port && uv run ruff check src scripts tests
       - name: ruff format (changed files only until the sweep lands)
@@ -96,7 +102,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - name: install (frozen)
-        run: cd port && uv sync --frozen || uv sync
+        run: cd port && uv sync --frozen
       - name: pytest (CPU)
         run: cd port && PYTHONPATH=$PWD/src uv run python -m pytest -q -p no:logging
 
@@ -107,7 +113,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - name: install (frozen)
-        run: cd port && uv sync --frozen || uv sync
+        run: cd port && uv sync --frozen
       - name: doc references
         run: python3 tools/check_doc_refs.py
       - name: dead knobs (a preset must not set a field nothing reads)

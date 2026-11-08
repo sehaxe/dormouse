@@ -78,7 +78,7 @@ def main() -> int:
     # histogram describes the model that actually trained (a preset edit would
     # otherwise be refused, correctly).
     run = RunConfig.from_snapshot((base / f"{a.ckpt}.config.toml").read_text())
-    state = torch.load(base / f"{a.ckpt}.pt", map_location="cpu", weights_only=False)
+    state = torch.load(base / f"{a.ckpt}.pt", map_location="cpu", weights_only=True)
     model = DormouseModel(run.model).to("cuda").eval()
     # THE ONE LOADER, not a raw `load_state_dict`: the LFB bias is a
     # non-persistent buffer that travels in the checkpoint's `moe` section, and a

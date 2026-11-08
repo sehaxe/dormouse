@@ -274,7 +274,11 @@ async fn main() {
         .route("/v1/completions", post(completions))
         .route("/v1/models", get(models))
         .with_state(state);
-    let addr = SocketAddr::from(([0, 0, 0, 0], a.port));
+    // Loopback by default: the endpoint has no authentication, so binding all
+    // interfaces publishes an unauthenticated model (and its compute) to the
+    // whole network. A remote deployment terminates TLS/auth in a reverse proxy
+    // in front of 127.0.0.1.
+    let addr = SocketAddr::from(([127, 0, 0, 1], a.port));
     println!(
         "dormouse openai serve {} -> http://{}/v1 (concurrent)",
         a.export.display(),

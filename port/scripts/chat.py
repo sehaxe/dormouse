@@ -67,7 +67,7 @@ def main() -> None:
     run = _snapshot_run(out, args.ckpt_name)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     model = DormouseModel(run.model)
-    ck = torch.load(out / f"{args.ckpt_name}.pt", map_location="cpu", weights_only=False)
+    ck = torch.load(out / f"{args.ckpt_name}.pt", map_location="cpu", weights_only=True)
     # The shared loader (`train.loop.load_model_state`): a storage rung is
     # unpacked, and an `engram_ram` checkpoint switches the model to host tables
     # and restores its `.ngram` sibling. `strict=False` keeps the drift

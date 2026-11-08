@@ -67,7 +67,7 @@ def main() -> int:
     state = torch.load(
         os.path.join(run.train.out_dir, f"{args.ckpt_name}.pt"),
         map_location=dev,
-        weights_only=False,
+        weights_only=True,
     )
     model.load_state_dict(state.get("model", state), strict=False)
     max_iter = args.max_iter or run.model.max_iter

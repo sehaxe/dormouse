@@ -27,6 +27,10 @@ on:
   push:
   pull_request:
 
+# Least privilege: these jobs compile and test pull-request code.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # cubecl compiles CUDA kernels through NVRTC at runtime, so the cuda-feature

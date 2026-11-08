@@ -110,6 +110,7 @@ from .loop import (
     load_ckpt,
     load_model_state,
     save_ckpt,
+    seed_router_jitter,
     unpack_state_dict,
 )
 from .lr import wsd_lr
@@ -1159,7 +1160,10 @@ def sft_train(
         path = Path(init_from)
         if not path.is_file():
             loud(f"sft --init-from: {path} does not exist. Escape: the pretrain run's .pt path.")
-        foreign = torch.load(path, map_location="cpu", weights_only=False)
+        # A foreign file is the untrusted one: weights_only=True refuses any
+        # pickle naming a class the torch allow-list does not carry (a dormouse
+        # checkpoint is plain tensors/ints/strings and passes it).
+        foreign = torch.load(path, map_location="cpu", weights_only=True)
         sd = unpack_state_dict(foreign.get("model", foreign), foreign.get("model_quant_rung"))
         # The ONE loader (`load_model_state`), which is what makes a host-table
         # init possible at all: such a checkpoint's model half carries no
@@ -1223,7 +1227,13 @@ def sft_train(
             opt=cfg.opt,
             resumed=start,
         )
+    jitter_rng = any(getattr(m, "router_jitter", 0.0) > 0.0 for m in model.modules())
     for step in range(start, cfg.steps):
+        # The router-jitter arm's noise is a global-RNG draw in the forward;
+        # `(seed, step)` seeding is what lets a resume continue it (the same
+        # rule and the same reason as `train/loop.py::seed_router_jitter`).
+        if jitter_rng:
+            seed_router_jitter(cfg.seed, step)
         lr = wsd_lr(
             step,
             total_steps=cfg.steps,

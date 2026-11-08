@@ -25,31 +25,12 @@ from pathlib import Path
 import torch
 
 from dormouse.cli import _device, _model, _snapshot_run
+from dormouse.eval_window import training_overlap, training_paths  # noqa: F401
 from dormouse.instrument import loud
 from dormouse.train.data import eval_batches_for, open_streams
 from dormouse.train.loop import evaluate, load_model_half, load_model_state
 
 LN2 = 0.6931471805599453
-
-
-def training_paths(run) -> set[Path]:
-    """Every file the run TRAINS on: the flat data file plus each mix source.
-
-    Used by the overlap gate below: a window inside one of these is not held
-    out, whatever its offset.
-    """
-    out: set[Path] = set()
-    if run.train.data:
-        out.add(Path(run.train.data).resolve())
-    plan = run.train.mix_plan
-    if plan:
-        import tomllib
-
-        with open(plan, "rb") as fh:
-            table = tomllib.load(fh)
-        for value in (table.get("sources") or {}).values():
-            out.add(Path(value).resolve())
-    return out
 
 
 def refuse_training_overlap(run, eval_path: Path, allow: bool) -> None:
@@ -63,11 +44,10 @@ def refuse_training_overlap(run, eval_path: Path, allow: bool) -> None:
     """
     if allow:
         return
-    hits = training_paths(run)
-    if eval_path.resolve() in hits:
+    hit = training_overlap(run.train.data, run.train.mix_plan, eval_path)
+    if hit is not None:
         loud(
-            f"--eval {eval_path} is ALSO a training source of this run "
-            f"({', '.join(sorted(str(p) for p in hits if p == eval_path.resolve()))}). "
+            f"--eval {eval_path} is ALSO a training source of this run ({hit}). "
             f"A window in it is not held out: the model may have read those bytes. "
             f"Escape: point --eval at a file no source reads, or pass "
             f"--allow-train-overlap and name the number accordingly."

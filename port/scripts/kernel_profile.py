@@ -859,11 +859,11 @@ def print_diff(a: dict[str, Any], b: dict[str, Any], *, top: int = 30) -> None:
 def _read_start_step(checkpoint: Path) -> int:
     """The checkpoint's next step, without materialising 1.7 GiB of weights."""
     try:
-        ck = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
+        ck = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
     except (RuntimeError, TypeError):
         # An older/foreign file may not be mmap-able; the fallback is slower but
         # this is a header read, not a model load.
-        ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        ck = torch.load(checkpoint, map_location="cpu", weights_only=True)
     return int(ck.get("step", 0)) + 1
 
 
