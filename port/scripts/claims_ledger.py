@@ -1235,6 +1235,14 @@ def render(claims: list[Claim], args, gate: list[Claim]) -> str:
         f"{t.get('retracted', 0)} | {t.get('mismatch', 0)} |"
     )
     w("")
+    if args.no_params:
+        w(
+            "**`--no-params` was passed: param-count claims were NOT checked.** A "
+            "`DERIVED` claim that needs the module tree is left at its stated value, "
+            "so this mismatch count is a LOWER bound (2026-11-08: 1 here, 9 with the "
+            "param subprocess). Do not quote it as the ledger's verdict."
+        )
+        w("")
     w("## Method")
     w("")
     w(
@@ -1331,6 +1339,14 @@ def render(claims: list[Claim], args, gate: list[Claim]) -> str:
     w("")
     if gate:
         w(f"**FAIL — {len(gate)} new claim(s) name no evidence.** `--check` exits 1.")
+        w("")
+        w(
+            "Read this count with its scope: `new` means the DOCUMENT's date is "
+            f"`{args.today}` or later, and a report written today that quotes an "
+            "earlier document's number is new by that rule. The count is a "
+            "precision problem before it is a finding — the CI job is report-only "
+            "until the evidence association is line-accurate (`.bulba/plan.md`)."
+        )
         w("")
         for c in gate:
             w(f"* `{c.doc}:{c.line}` — {c.raw} ({c.unit})")
