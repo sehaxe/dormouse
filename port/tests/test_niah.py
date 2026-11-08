@@ -235,3 +235,30 @@ def test_rank_probe_runs_on_a_tiny_snapshot(tmp_path, capsys):
     assert rc == 0
     assert "gate C: flat best-layer rank" in out
     print(out)
+
+
+def test_the_window_refusal_is_a_caveat_when_it_is_a_generalization_test():
+    """`max_seq_len < context` refuses by default and is legal with the flag.
+
+    The loop form has no absolute position table and carries KDA/CSA state, so a
+    pass past the trained window is mechanically expressible — and whether it
+    generalizes is the experiment. The flag names that, and the `use_csa=false`
+    refusal must survive it (a lenient flag cannot wave through a different
+    network).
+    """
+    from dormouse.config import ModelConfig
+
+    artifact_refusal = niah.artifact_refusal
+    dense = ModelConfig(block_form="transformer", max_iter=1, n_layers=2,
+                        use_kda=False, use_engram=False, engram_rows=0)
+    assert artifact_refusal(dense, 1024) is not None
+    assert artifact_refusal(dense, 1024, allow_beyond_window=True) is not None, (
+        "the use_csa refusal must not be waived by the window flag"
+    )
+
+    csa = ModelConfig(
+        block_form="kda", use_csa=True, csa_chunk=8, csa_coarse_chunk=256,
+        max_seq_len=8192, max_iter=2, loop_blocks=1,
+    )
+    assert artifact_refusal(csa, 1_048_576) is not None
+    assert artifact_refusal(csa, 1_048_576, allow_beyond_window=True) is None

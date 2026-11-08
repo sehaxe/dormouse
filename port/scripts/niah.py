@@ -216,7 +216,9 @@ def effective_segment(context: int, segment: int) -> int:
 # --- gates A and the segmented preflight -----------------------------------
 
 
-def artifact_refusal(cfg: ModelConfig, context: int) -> str | None:
+def artifact_refusal(
+    cfg: ModelConfig, context: int, *, allow_beyond_window: bool = False
+) -> str | None:
     """Gate A's config half: why a 1M retrieval number cannot be measured, or None.
 
     `use_csa=false` means the checkpoint is not the network this task is about —
@@ -230,13 +232,14 @@ def artifact_refusal(cfg: ModelConfig, context: int) -> str | None:
             f"would measure a different network (the 1K dense control, or a CSA branch "
             f"nothing trained). Escape: {ESCAPE}."
         )
-    if cfg.max_seq_len < context:
+    if cfg.max_seq_len < context and not allow_beyond_window:
         return (
             f"gate A: max_seq_len={cfg.max_seq_len} < context={context} bytes — the "
             f"snapshot declares a {cfg.max_seq_len}-byte window, so a {context}-byte pass "
             f"is outside its own config. Escape: {ESCAPE}, with max_seq_len >= the "
-            f"context you want to measure; or a context <= {cfg.max_seq_len} (the 1K "
-            f"positive control)."
+            f"context <= {cfg.max_seq_len} (the 1K positive control). A LENGTH-"
+            f"GENERALIZATION pass (trained at {cfg.max_seq_len}, evaluated at "
+            f"{context}) is legal and is what --allow-beyond-window names."
         )
     return None
 
@@ -702,6 +705,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--control-1k", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="build items, print arithmetic, exit 0")
     ap.add_argument("--artifact", action="store_true", help="gate A only (config + live gate)")
+    ap.add_argument(
+        "--allow-beyond-window",
+        action="store_true",
+        help=(
+            "evaluate past the snapshot's trained window (a length-generalization "
+            "test; the caveat is printed and every number must carry it)"
+        ),
+    )
     ap.add_argument("--ckpt-dir", type=Path, default=None)
     ap.add_argument("--ckpt-name", default=None)
     ap.add_argument("--device", default="auto")
@@ -730,9 +741,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     ckpt_dir = a.ckpt_dir or Path("checkpoints") / a.ckpt_name
     run = _snapshot_run(ckpt_dir, a.ckpt_name)
-    why = artifact_refusal(run.model, a.context)
+    why = artifact_refusal(run.model, a.context, allow_beyond_window=a.allow_beyond_window)
     if why is not None:
         loud(why)
+    if a.allow_beyond_window and run.model.max_seq_len < a.context:
+        print(
+            f"CAVEAT: trained window {run.model.max_seq_len} B, evaluating "
+            f"{a.context} B. This is a LENGTH-GENERALIZATION pass, not an in-window "
+            f"measurement: quote it as 'trained at {run.model.max_seq_len}, evaluated "
+            f"at {a.context}'. Mechanically legal because the loop form has no absolute "
+            f"position table and the KDA/CSA state is carried; whether the model "
+            f"generalizes is exactly what the run measures.",
+            flush=True,
+        )
     if a.artifact:
         model = _model(run)
         load_model_state(model, run.train, load_model_half(ckpt_dir / f"{a.ckpt_name}.pt"))
