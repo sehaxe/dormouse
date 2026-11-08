@@ -167,6 +167,29 @@ Until the owner picks, pushes go to `backup/main-local-2026-11-08`.
   old name with a counted note — a decision, not a silent edit. Reverted with the
   test green; C7 (vendor) is still open and needs a workspace build.
 
+## COMPANY MODE — 2026-11-08 13:30
+
+The owner's bar: commercial byte-level models trained from scratch, and the
+open-source engine must be the best available. Twenty agent workstreams ran on
+2026-11-08 (docs/reviews, docs/architecture, docs/guides, port/scripts).
+
+Four findings that change decisions:
+
+1. **MFU is 43.8%, not 73%** (`docs/reviews/2026-11-08-mfu-first-look.md`): the
+   6N bill is 21% low (executed 691.37 FLOP/byte), and the repo's 47.7 TF/s pin
+   is the 5060 Ti's number. fp8/kernels are the lever; grad-accum buys 1.03-1.11x.
+2. **The code slice is legally unresolved** (`docs/guides/data-provenance.md`):
+   `mix/code.bin` is 40.08% GPL/AGPL/LGPL and codeparrot declares no licence;
+   `refetch_pretrain.py` wrongly calls cosmopedia ODC-By (it is Apache-2.0).
+   The 2 GB budget run proceeds as RESEARCH on this corpus; a commercial
+   checkpoint must replace the code slice and carry the manifest (G1-G8 in the
+   provenance doc).
+3. **The LR schedule is 1.5% of the run's value** (`docs/research/2026-11-08-lr-schedule.md`):
+   WSD 3e-4, 1% warmup, 10% decay, min-lr 0.1. The one 0.25-BPB risk (no warmup)
+   is now closed by default in `train_budget.sh`.
+4. **The 2 GB run is 2.29x the hardware floor**, not "near" it: a fused-quantize
+   fp8 lane is the only remaining large throughput lever (1.4-1.6x projected).
+
 ## SUITE GREEN, CPU-only (2026-11-08 06:20)
 
 `CUDA_VISIBLE_DEVICES="" pytest -q` over all 2 194 tests: **exit 0**, three
