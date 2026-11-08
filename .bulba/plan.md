@@ -41,6 +41,16 @@ the lane — see `docs/PLAN-minimal-core.md`.
   It touches every doc path, so it goes after the audit lands.
 - Rust lane: delete or keep frozen. The audit reports its real status.
 
+## Debt that needs an owner decision
+
+- **claims ledger**: 1 875 claims, 9 mismatches, 373 without evidence (all dated
+  before the rule). `scripts/gate_fast.sh` reports it instead of blocking, and
+  CI has no ledger job — so nothing enforces the rule today. The fix is a
+  `--since <date>` blocking mode plus a CI step; it is not done.
+- **docs drift**: 10 of 10 checked pre-2026-11-01 documents contradict the code
+  (`docs/reviews/2026-11-08-deletion-audit.md` §7).
+- **deletions**: C2 + C7 (the 2 010-line safe tier) are unstarted; C4 is done.
+
 ## Gates that must stay green
 
 `scripts/gate_fast.sh`, `scripts/gate_format.sh`, `pytest -q`, `dead_knob_audit`,
