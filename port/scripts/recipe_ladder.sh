@@ -30,8 +30,8 @@ BYTES=${BYTES:-120000000}
 # MIX/EVAL let the ladder run on the refetched sources; a run on those is a NEW
 # number and the caller must tag it (RUN_TAG).
 MIX=${MIX:-configs/mix_v7.toml}
-EVAL=${EVAL:-../data_local/mix4/web_eval.bin}
-DATA=${DATA:-../data_local/best/fwedu.bin}
+EVAL=${EVAL:-../data_local/best/fwedu_eval.bin}
+DATA=${DATA:-../data_local/best/fwedu_train.bin}
 TAG=${RUN_TAG:-}
 # FAST=1 runs every arm on the SAFE Muon rung (see e1_bytes_vs_patch.sh):
 # ns_dtype=bf16 + state bf16, ns_steps stays 5.

@@ -7,13 +7,16 @@
 # number and must say so.
 #
 # One stage, weights sum to 1.0. The shares keep fwedu dominant because that is
-# the domain the held-out window will be carved from.
+# the domain the held-out window was carved from: `fwedu.bin` was split at a
+# document separator into `fwedu_train.bin` (the head, the source here) and
+# `fwedu_eval.bin` (the tail, 8 MiB, a file NO source reads — the overlap gate
+# compares paths, so a window inside a source is not held out).
 
 max_epochs = 4.0
 seed = 20261027
 
 [sources]
-fwedu = "/home/sehaxe/dormouse/data_local/best/fwedu.bin"
+fwedu = "/home/sehaxe/dormouse/data_local/best/fwedu_train.bin"
 cosmo = "/home/sehaxe/dormouse/data_local/best/cosmo.bin"
 finemath = "/home/sehaxe/dormouse/data_local/best/finemath.bin"
 code = "/home/sehaxe/dormouse/data_local/mix/code.bin"
