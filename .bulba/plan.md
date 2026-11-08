@@ -35,6 +35,21 @@ the lane — see `docs/PLAN-minimal-core.md`.
 - 1B-on-one-card research (`docs/research/2026-11-08-1b-on-one-card.md`).
 - Post-training research (`docs/research/2026-11-08-post-training-at-1b.md`).
 
+## INCIDENT 2026-11-08: 94 GB of artifacts deleted by the merge
+
+`data_local/` (80 GB corpus) and `checkpoints/` (14 GB) are gone — `origin/main`
+tracks both as SYMLINKS over the local ignored directories, and the merge
+checkout removed the directories to write the links. Full report:
+`docs/reviews/2026-11-08-merge-incident.md`.
+
+Recovered so far: `flagship3.pt` copied out of /tmp into
+`checkpoints/flagship3/`; `port/scripts/fetch_mix_sources.py` refetched 600 MB of
+code/math/RU; `port/scripts/refetch_pretrain.py` is fetching fwedu/cosmo/finemath
+(1.2 GB each). The EVAL WINDOW is gone with the corpus: any run on the refetched
+sources is a NEW number and must say so.
+
+**Do not merge or checkout while these paths exist.**
+
 ## The GitHub divergence (found 2026-11-08 while pushing)
 
 `origin/main` is NOT this lane. Its tree is the Rust-era layout (`src/`,
