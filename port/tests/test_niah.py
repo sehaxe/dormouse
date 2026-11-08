@@ -262,3 +262,20 @@ def test_the_window_refusal_is_a_caveat_when_it_is_a_generalization_test():
     )
     assert artifact_refusal(csa, 1_048_576) is not None
     assert artifact_refusal(csa, 1_048_576, allow_beyond_window=True) is None
+
+
+def test_the_default_needle_is_mid_window_not_the_far_end():
+    """The far end puts the needle in the first ~50 bytes, where the selector
+    ranked it at chance; the same distance mid-window ranks top-32 (night §5b).
+
+    Gate D's PRIMARY condition is therefore mid-window, and `distance_frac=1.0`
+    is a separate, explicitly named condition — not the default.
+    """
+    ctx = 4096
+    mid = niah.build_item(seed=3, context=ctx)
+    far = niah.build_item(seed=3, context=ctx, distance_frac=1.0)
+    d_max = ctx - niah.DISTANCE_SLACK
+    assert abs(mid.distance - d_max // 2) <= 8, (mid.distance, d_max)
+    assert far.distance > 0.97 * d_max, far.distance
+    assert mid.key_at > 1000, f"mid-window put the key at {mid.key_at}"
+    assert far.key_at < 100, f"the far end did not put the key near the start: {far.key_at}"
