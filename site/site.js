@@ -148,6 +148,10 @@ void main(){
     }
   }
 
+  // NOTE: this element's id must never collide with a section anchor. It did
+  // twice today (id="bytes" on a section and a <pre>, id="data" on a section and
+  // this script): getElementById returns the FIRST match, JSON.parse throws on
+  // the section's text, and the whole behaviour script dies silently.
   const d = JSON.parse(document.getElementById('data').textContent);
   const fmt = (x, n = 1) => Number(x).toFixed(n);
 
@@ -229,6 +233,15 @@ void main(){
       entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
     }, { rootMargin: '0px 0px -12% 0px', threshold: 0.12 });
     items.forEach((el) => io.observe(el));
+    // Progressive enhancement must not hide content: an element already in (or
+    // above) the viewport reveals at once, and a 2 s fallback reveals the rest —
+    // a screenshot, a crawler or a missed callback can never leave a blank page.
+    const revealNow = () => items.forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.top < innerHeight * 0.95) el.classList.add('in');
+    });
+    revealNow();
+    setTimeout(() => items.forEach((el) => el.classList.add('in')), 2000);
 
     // count-up for the plain integers: 95M, 12, 256, 1, 16, 8h
     const counters = document.querySelectorAll('.band .v, .stat .v');
@@ -252,6 +265,28 @@ void main(){
       entries.forEach((e) => { if (e.isIntersecting && !seen.has(e.target)) { seen.add(e.target); run(e.target); } });
     }, { threshold: 0.5 });
     counters.forEach((el) => { if (/^\d+$/.test(el.textContent.trim())) io2.observe(el); });
+
+    // the progress line
+    const prog = document.getElementById('prog');
+    const paintProg = () => {
+      if (!prog) return;
+      const h = document.documentElement.scrollHeight - innerHeight;
+      prog.style.width = `${h > 0 ? Math.min(100, (scrollY / h) * 100) : 0}%`;
+    };
+    addEventListener('scroll', paintProg, { passive: true });
+    addEventListener('resize', paintProg);
+    paintProg();
+
+    // data bars fill when they arrive
+    const barIo = new IntersectionObserver((entries) => {
+      entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); barIo.unobserve(e.target); } });
+    }, { threshold: 0.4 });
+    document.querySelectorAll('.bar').forEach((b) => { b.classList.remove('in'); barIo.observe(b); });
+
+    // stagger the cards in a band
+    document.querySelectorAll('.band .cell').forEach((el, i) => {
+      el.style.transitionDelay = `${i * 70}ms`;
+    });
 
     // the hero drifts a little as you scroll: 0.18x, capped
     const hero = document.querySelector('header');

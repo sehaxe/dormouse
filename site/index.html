@@ -221,9 +221,51 @@
     .reveal{opacity:1;transform:none;transition:none}
     header .wrap{transform:none}
   }
+
+  /* --- rhythm: alternating grounds, tighter spacing, sticky visuals ------ */
+  section{padding:64px 0;border-top:1px solid var(--line);margin-top:0;scroll-margin-top:64px}
+  section:nth-of-type(even){background:var(--panel2)}
+  .chapter{grid-template-columns:1.05fr .95fr;gap:52px}
+  @media (min-width:861px){
+    .chapter .visual{min-height:340px}
+    .chapter .visual video,.chapter .visual img{height:340px;object-fit:cover}
+  }
+  /* the scroll progress line */
+  #prog{position:fixed;top:0;left:0;height:2px;width:0;background:var(--accent);z-index:60;
+    transition:width .08s linear}
+  /* a full-bleed statement */
+  .quote{padding:96px 0;border-top:1px solid var(--line);background:var(--bg)}
+  .quote blockquote{margin:0;max-width:22ch;font-family:var(--mono);font-weight:400;
+    font-size:clamp(28px,4.4vw,54px);line-height:1.12;letter-spacing:-.03em;color:var(--ink)}
+  .quote blockquote em{font-style:normal;color:var(--accent)}
+  .quote .src{margin-top:26px;font-family:var(--mono);font-size:11.5px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--dimmer)}
+  /* the data bars */
+  .bars{display:grid;gap:14px;margin-top:8px}
+  .bar{display:grid;grid-template-columns:104px 1fr 52px;align-items:center;gap:16px;
+    font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+  .bar .name{color:var(--ink)}
+  .bar .track{height:10px;border-radius:5px;background:var(--line2);overflow:hidden}
+  .bar .fill{display:block;height:100%;width:0;border-radius:5px;background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 55%,var(--good)));
+    transition:width 1.1s cubic-bezier(.2,.65,.2,1)}
+  .bar.in .fill{width:var(--w)}
+  .bar .pct{text-align:right;color:var(--dimmer)}
+  /* the step diagram */
+  .step{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:30px 0 8px}
+  .step .node{border:1px solid var(--line2);background:var(--panel);border-radius:10px;
+    padding:9px 13px;font-family:var(--mono);font-size:12px;color:var(--ink);white-space:nowrap}
+  .step .node.hot{border-color:var(--accent);color:var(--accent)}
+  .step .arw{color:var(--dimmer);font-family:var(--mono);font-size:14px}
+  .step .node{position:relative;overflow:hidden}
+  .step .node::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,
+    transparent, color-mix(in srgb, var(--accent) 22%, transparent), transparent);
+    transform:translateX(-120%);animation:sweep 7s linear infinite;animation-delay:var(--d,0s)}
+  @keyframes sweep{0%,72%{transform:translateX(-120%)}88%,100%{transform:translateX(120%)}}
+  @media (prefers-reduced-motion:reduce){.step .node::after{display:none}}
 </style>
 </head>
 <body>
+<div id="prog"></div>
 
 <nav><div class="wrap">
   <b>dormouse</b>
@@ -333,8 +375,48 @@
   </div>
 </div></div></section>
 
+<section class="quote"><div class="wrap">
+  <blockquote>A number you cannot check is <em>a rumour.</em></blockquote>
+  <div class="src">so every number here names its run</div>
+</div></section>
+
+<section id="dataset"><div class="wrap">
+  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">05 · the data</div>
+  <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">What it reads</h2>
+  <p class="lead" style="max-width:62ch">Six open datasets, mixed by weight. Web text for the language, code and
+    maths for the structure, Russian so the byte alphabet is not only English. Every source is filtered,
+    deduplicated and held out of the evaluation window.</p>
+  <div class="bars">
+    <div class="bar in" style="--w:55%"><span class="name">fwedu</span><span class="track"><span class="fill"></span></span><span class="pct">55%</span></div>
+    <div class="bar in" style="--w:12%"><span class="name">cosmo</span><span class="track"><span class="fill"></span></span><span class="pct">12%</span></div>
+    <div class="bar in" style="--w:11%"><span class="name">code</span><span class="track"><span class="fill"></span></span><span class="pct">11%</span></div>
+    <div class="bar in" style="--w:10%"><span class="name">ru</span><span class="track"><span class="fill"></span></span><span class="pct">10%</span></div>
+    <div class="bar in" style="--w:6%"><span class="name">math</span><span class="track"><span class="fill"></span></span><span class="pct">6%</span></div>
+    <div class="bar in" style="--w:6%"><span class="name">finemath</span><span class="track"><span class="fill"></span></span><span class="pct">6%</span></div>
+  </div>
+  <p class="note" style="margin-top:14px">mixture weights · configs/mix_refetch.toml · 2.7 GB on disk, 1.9 GB read in the long run</p>
+</div></section>
+
+<section id="step"><div class="wrap">
+  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">06 · one step</div>
+  <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">Eight kilobytes at a time</h2>
+  <p class="lead" style="max-width:64ch">Training is a loop of tiny, boring steps. Eight kilobytes of text go in;
+    a prediction and a loss come out; the loss is pushed backwards through the same twelve blocks; the
+    optimizer nudges every weight a little. Then the next eight kilobytes.</p>
+  <div class="step">
+    <span class="node" style="--d:0s">8 KB of bytes</span><span class="arw">→</span>
+    <span class="node hot" style="--d:.4s">12 blocks</span><span class="arw">→</span>
+    <span class="node" style="--d:.8s">prediction</span><span class="arw">→</span>
+    <span class="node" style="--d:1.2s">loss</span><span class="arw">→</span>
+    <span class="node hot" style="--d:1.6s">backward</span><span class="arw">→</span>
+    <span class="node" style="--d:2s">Muon · AdamW</span><span class="arw">→</span>
+    <span class="node" style="--d:2.4s">weights</span>
+  </div>
+  <p class="note" style="margin-top:18px">about 145 ms per step on one card · ~8 000 steps per hour</p>
+</div></section>
+
 <section id="curve"><div class="wrap">
-  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">05 · the result</div>
+  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">07 · the result</div>
   <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">What learning looks like</h2>
   <p class="lead" style="max-width:62ch">Bits per byte, measured on text the model never trained on. Lower is
     better: 1.74 at the start, 1.48 after 120 MB — about 20% less surprise. A strong general compressor needs
@@ -355,7 +437,7 @@
 
 <section id="neural"><div class="wrap"><div class="chapter">
   <div class="txt">
-    <div class="num">06 · the inside</div>
+    <div class="num">08 · the inside</div>
     <h2>What the model sees</h2>
     <p>Every byte is a small bet. Before it reads a character the model has a distribution over all 256
       possibilities; after it sees the character, the surprise is <span class="mono">−log2 p</span>.</p>
@@ -371,7 +453,7 @@
 </div></div></section>
 
 <section id="next"><div class="wrap">
-  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">07 · next</div>
+  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">09 · next</div>
   <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">A million bytes of context</h2>
   <p class="lead" style="max-width:64ch">The next step is memory. The design keeps a compressed summary of
     everything the model has read, so a single pass can reach a million bytes without its state growing.
@@ -544,6 +626,10 @@ void main(){
     }
   }
 
+  // NOTE: this element's id must never collide with a section anchor. It did
+  // twice today (id="bytes" on a section and a <pre>, id="data" on a section and
+  // this script): getElementById returns the FIRST match, JSON.parse throws on
+  // the section's text, and the whole behaviour script dies silently.
   const d = JSON.parse(document.getElementById('data').textContent);
   const fmt = (x, n = 1) => Number(x).toFixed(n);
 
@@ -625,6 +711,15 @@ void main(){
       entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
     }, { rootMargin: '0px 0px -12% 0px', threshold: 0.12 });
     items.forEach((el) => io.observe(el));
+    // Progressive enhancement must not hide content: an element already in (or
+    // above) the viewport reveals at once, and a 2 s fallback reveals the rest —
+    // a screenshot, a crawler or a missed callback can never leave a blank page.
+    const revealNow = () => items.forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.top < innerHeight * 0.95) el.classList.add('in');
+    });
+    revealNow();
+    setTimeout(() => items.forEach((el) => el.classList.add('in')), 2000);
 
     // count-up for the plain integers: 95M, 12, 256, 1, 16, 8h
     const counters = document.querySelectorAll('.band .v, .stat .v');
@@ -648,6 +743,28 @@ void main(){
       entries.forEach((e) => { if (e.isIntersecting && !seen.has(e.target)) { seen.add(e.target); run(e.target); } });
     }, { threshold: 0.5 });
     counters.forEach((el) => { if (/^\d+$/.test(el.textContent.trim())) io2.observe(el); });
+
+    // the progress line
+    const prog = document.getElementById('prog');
+    const paintProg = () => {
+      if (!prog) return;
+      const h = document.documentElement.scrollHeight - innerHeight;
+      prog.style.width = `${h > 0 ? Math.min(100, (scrollY / h) * 100) : 0}%`;
+    };
+    addEventListener('scroll', paintProg, { passive: true });
+    addEventListener('resize', paintProg);
+    paintProg();
+
+    // data bars fill when they arrive
+    const barIo = new IntersectionObserver((entries) => {
+      entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); barIo.unobserve(e.target); } });
+    }, { threshold: 0.4 });
+    document.querySelectorAll('.bar').forEach((b) => { b.classList.remove('in'); barIo.observe(b); });
+
+    // stagger the cards in a band
+    document.querySelectorAll('.band .cell').forEach((el, i) => {
+      el.style.transitionDelay = `${i * 70}ms`;
+    });
 
     // the hero drifts a little as you scroll: 0.18x, capped
     const hero = document.querySelector('header');
