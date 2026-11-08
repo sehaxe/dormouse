@@ -1,5 +1,13 @@
 # MSA is cut, not deferred (supersedes ADR-0012's "arm off, rewrite deferred")
 
+> **NOT EXECUTED (checked 2026-11-08).** This decision was written but the cut
+> never landed: `crates/dormouse-core/Cargo.toml:45` still depends on
+> `burn-msa`, `use_msa`/`msa_topk`/`msa_block` are live at
+> `port/src/dormouse/config.py:1586-1588`, and `~/logs/medium_long.log:11` shows
+> the arm running (`msa_blocks=588,816,384`). The body below is the decision as
+> written; the tree never followed it.
+> ([claims repair](docs/reviews/2026-11-08-claims-repair.md) D1)
+
 ADR-0012 shipped the MSA arm disabled on the pre.4 stack: the indexer emits
 garbage block indices and every gather goes out of bounds (cuEventCreate 700 /
 IllegalAddress), in both the fused kernel and the tensor fallback. That left

@@ -1,5 +1,12 @@
 # fused/ fast path: measure, then keep or delete
 
+> **SUPERSEDED (2026-11-08).** The directory this ADR kept is gone:
+> `crates/dormouse-core/src/fused/` was deleted in `5abdf3c` (7,432 lines) and
+> `grep DM_FUSED crates` returns nothing. ADR-0009 records the measured loss
+> (1.25x) that settled it. The body below is the 2026-09-21 record, kept as
+> history — its "6,568 LOC / DM_FUSED=1 / kept" is not the tree's state.
+> ([claims repair](docs/reviews/2026-11-08-claims-repair.md) D5)
+
 Status: accepted, smoke verdict 2026-09-21.
 
 `crates/dormouse-core/src/fused/` is 6,568 LOC, 54% of core: a hand-written CUDA autodiff op for the whole ponder loop. It is off by default (`DM_FUSED=1`), excluded from the flagship recipe (host rows, JEPA targets, bf16, act quant, GR all bypass it), and its backward contains acknowledged approximations (gradcheck limit 2.0). Decision: one smoke measuring tokens/s fused vs unfused on a config where both paths run. At 1.5x or better we finish compatibility with the flagship recipe; below that we delete the directory and pursue performance with CUDA graphs and burn-fused kernels.

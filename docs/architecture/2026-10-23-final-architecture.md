@@ -1,6 +1,14 @@
 # The final architecture — design, and the one experiment that decides it
 
 **Date:** 2026-10-23 · **Status:** design frozen; one A/B outstanding (the ByteFlow arm).
+
+> **SUPERSEDED for the recipe (2026-11-08).** The "final" bank recipe (E=256,
+> top-k 2, dropless TSCT experts) lost to a dense transformer at equal bytes:
+> 13.5M dense beat the 102.7M KDA/CSA/mHC loop by 0.126-0.37 BPB
+> ([dense verdict](docs/reviews/2026-11-06-control-transformer.md); the live
+> recipe is `port/configs/arch_dense_byteflow8.toml`). The shape arithmetic below
+> stays valid as arithmetic; the verdict it was written for does not.
+> ([claims repair](docs/reviews/2026-11-08-claims-repair.md) D6)
 **Evidence:** `docs/reviews/2026-10-23-architecture-verdict.md` (every number below traces to a log there).
 
 ---

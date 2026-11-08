@@ -44,6 +44,14 @@ d=4096: dense 329.9M  vs expert 11.5M  (29x)
 
 At 1024 the bank is a rounding error; at 3072 the *dense* side (KDA projections + `out_proj` + `down`) dominates the step. **The scaling consequence: width is the expensive direction, and experts+rank are the cheap one.** So a large model should be **wide-ish and expert-rich**, not enormously deep in `d`.
 
+> **RETRACTED for the recipe (2026-11-08).** The arithmetic above is still true
+> per step, but the direction was measured wrong: at equal bytes the 13.5M dense
+> control beat the 102.7M expert bank by 0.126-0.37 BPB
+> ([dense verdict](docs/reviews/2026-11-06-control-transformer.md)), and at equal
+> active MAC the bank lost by 0.067 ([review](docs/reviews/2026-11-05-architecture-review-dense.md)
+> §0). "Expert-rich" is not the cheap direction for quality; it is the cheap
+> direction for parameters. ([claims repair](docs/reviews/2026-11-08-claims-repair.md) D7)
+
 ---
 
 ## 3. Attention, by context length
