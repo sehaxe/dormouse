@@ -2079,9 +2079,7 @@ class MixOptimizer:
             # correction at a STALE t. Measured 2026-11-08: a 6-step capture test
             # diverged 3.1e-05 at `embed.weight` with the losses identical to
             # nine digits — the forward agreed, the update did not.
-            if any(
-                p.grad is not None for g in self.adamw.param_groups for p in g["params"]
-            ):
+            if any(p.grad is not None for g in self.adamw.param_groups for p in g["params"]):
                 self._adamw_t += 1
         self.steps += 1
 
