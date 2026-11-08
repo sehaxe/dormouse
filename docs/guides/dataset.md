@@ -15,6 +15,14 @@
 > | `data_local/mix/{code,math,ru}.bin` | 209 7xx xxx each | `scripts/fetch_mix_sources.py --cap-mb 200` |
 > | `data_local/parquet/*.parquet` | 3.0 GB | one shard each, `curl -L` (the hub's parquet reader burns the anonymous quota — HTTP 429) |
 >
+> **Health check, 2026-11-08 (the refetch was never inspected before this):** all
+> six files decode as UTF-8 at 100%; duplicate 1 KiB blocks (200 MB sample,
+> every 64th block) are 0.0% in fwedu/cosmo/code/math/ru and 1.9% in finemath;
+> document separators (`\n\n---\n\n`) are present in the three `best/` files
+> (fwedu 191 894 docs, finemath 167 361, cosmo 110 842, eval window 1 688) and
+> absent in the three `mix/` files because `fetch_mix_sources.py` writes raw text
+> — which is why every run on this corpus pins `doc_masking=false`.
+>
 > `port/configs/mix_refetch.toml` is the six-source plan that names them; the
 > ladder runs on it with `MIX=configs/mix_refetch.toml`. **Every number measured
 > on this data is a new number** — it is not comparable to the `mix4`/`mix_v7`
