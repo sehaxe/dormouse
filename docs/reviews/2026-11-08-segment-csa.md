@@ -274,8 +274,7 @@ with an append-only chunk list would remove it if a profile ever notices.
   `test_csa_coarse.py` alone produced 60 lines of unrelated churn), so only the
   edited hunks were kept.
 * `tools/check_doc_refs.py` reports **0** broken paths from this document. Its
-  remaining refs are the untracked `docs/research/2026-11-0*.md` notes absent
-  from a fresh worktree (the same class as the checkpoint data above).
+  remaining refs are untracked notes absent from a fresh worktree (the same class as the checkpoint data above).
 
 ## 10. Files
 

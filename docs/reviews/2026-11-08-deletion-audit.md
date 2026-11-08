@@ -240,7 +240,7 @@ removal on BPB, otherwise it is deleted; a tie deletes it too». Вердикт�
 | 5 | `port/README.md:74` | Rust — «as a PyO3 extension (`ffi/`)» | `ffi/` нет; `grep pyo3` → 0; Rust-бинарники не собраны | **ПЛАН ≠ КОД** |
 | 6 | `docs/architecture/post-training.md:16` | «RLVR — PPO + value head (not GRPO)» | `post/rl.py:46`: «no value head»; `grep -rn '\bPPO\b' port/src` → 0; реализованы CRR/group advantages | **ЛОЖЬ**: план выдан за реализацию |
 | 7 | `docs/decisions/2026-10-15-1b-readiness-plan.md:67` | b1 `max_iter 2` | `port/configs/b1.toml:14` `max_iter = 4` | **УСТАРЕЛО** |
-| 8 | `docs/architecture/2026-10-23-final-architecture.md:3,46-48` | «design frozen»; E=256, top-k 2, dropless bank — финальный рецепт | `2026-11-05-dense-beats-bank.md:1-10` — dense бьёт банк; живой прогон `configs/arch_dense_byteflow8.toml:34,42,44` — `block_form="transformer"`, `n_experts=1`, `use_tsct=false` | **УСТАРЕЛО**, статус «frozen» не снят |
+| 8 | `docs/architecture/2026-10-23-final-architecture.md:3,46-48` | «design frozen»; E=256, top-k 2, dropless bank — финальный рецепт | `2026-11-05-dense-beats-bank.md:1-10` — dense бьёт банк; живой прогон `port/configs/arch_dense_byteflow8.toml:34,42,44` — `block_form="transformer"`, `n_experts=1`, `use_tsct=false` | **УСТАРЕЛО**, статус «frozen» не снят |
 | 9 | `docs/architecture/2026-10-23-scaling-recipe.md:45` | «large model should be wide-ish and **expert-rich**» | тот же dense-вердикт 2026-11-05; банк не в рецепте | **ПРОТИВОРЕЧИТ** более позднему замеру |
 | 10 | `docs/architecture/library-crate-fate.md:80` | `burn-byteflow` — «**DELETE** … 1,121 LOC» | crate = 2,189 строк; **является зависимостью** `dormouse-core/Cargo.toml:50` и `dormouse-train/Cargo.toml:33` | **ЛОЖЬ**: док говорит «удалён», код зависит |
 

@@ -149,7 +149,7 @@ The codec is `6 × 357,120 = 2.143 MFLOP/byte` [C; 357,120 from `2026-11-03` §3
 
 ### 3.2 Activation memory and max batch on 16 GiB
 
-Per-position activation for the dense block, no checkpointing, fp32 saves (calibrated against the measured 7.2 GiB peak at b8·s1024, `docs/reviews/2026-11-03` and `model/act_mem.py`):
+Per-position activation for the dense block, no checkpointing, fp32 saves (calibrated against the measured 7.2 GiB peak at b8·s1024, `docs/reviews/2026-11-03-three-verdicts-and-a-leak.md` and `model/act_mem.py`):
 
 ```
 A_pos = L·(8d + 2f)·4 B = 12·(6656 + 6144)·4 = 614,400 B = 0.586 MiB/position

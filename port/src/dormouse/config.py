@@ -410,8 +410,9 @@ class ModelConfig:
     n_layers: int = 0
     #: ---- THE RECIPE KNOBS (unique stack only; every one defaults OFF) ----
     #: The 2026-11-06 Ripple-65B ladder compounded SIX cheap recipe changes into
-    #: 16x compute efficiency at 4B on code CE (`docs/reviews/2026-11-08-
-    #: ripple-65b.md`), which is larger than any architectural delta measured in
+    #: 16x compute efficiency at 4B on code CE
+    #: (`docs/reviews/2026-11-08-ripple-65b.md`), which is larger than any
+    #: architectural delta measured in
     #: this repo. These four are the cheap, independent members of that list;
     #: each is one A/B at 95M and none of them changes a default.
     #:
