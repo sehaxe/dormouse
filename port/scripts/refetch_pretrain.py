@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["duckdb>=1.3"]
+# ///
 """Refetch the pretraining sources after the 2026-11-08 artifact loss.
 
 The merge deleted `data_local/` (80 GB). The sources are open Hub datasets, and
