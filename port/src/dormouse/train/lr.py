@@ -58,6 +58,13 @@ def wsd_lr(
     else:
         lr = peak_lr
     decay_start = max(total_steps - decay_steps, warmup_steps)
+    # The decay must FIT in what the warmup leaves: with
+    # `warmup_steps + decay_steps > total_steps` the old code started the decay
+    # at `warmup_steps` and ran `decay_steps` long, so the last step landed at
+    # 0.685x peak instead of the requested floor (math audit, 2026-11-08).
+    # Clamping the window makes the tail always reach `final_frac`; no config on
+    # record has a non-zero warmup, so no number moves.
+    decay_steps = min(decay_steps, max(total_steps - warmup_steps, 0))
     if step < decay_start or decay_steps == 0:
         return lr
     frac = min(1.0, float(step - decay_start + 1) / float(decay_steps))

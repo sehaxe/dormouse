@@ -357,13 +357,25 @@ class LayerRoPESite(nn.Module):
         j = torch.arange(d // 2, device=device, dtype=torch.float32)
         self.register_buffer("freq", base ** (-2.0 * j / d))
         self.register_buffer("log_l", torch.log(torch.arange(1.0, n_layers + 1, device=device)))
+        #: Device-side tally of clamped exponents. `a_mag` is a LEARNED scalar
+        #: feeding `exp`, and a corrupted step can take it to 95+, where the
+        #: table goes inf and the loss NaN (numerics audit 2026-11-08). The
+        #: clamp is bounded at 80 (exp(80) = 5.5e34, finite in fp32); the tally
+        #: is a buffer, not a host read, so the hot path never syncs.
+        self.register_buffer(
+            "clamped", torch.zeros((), dtype=torch.int64, device=device), persistent=False
+        )
 
     def table(self) -> torch.Tensor:
         """The paper's `forward()`: `[n_layers, d]`, the gain at every depth."""
         if self.identity:
             return self.gamma.unsqueeze(0).expand(self.n_layers, self.d)
-        r = self.a_mag + self.b_mag * self.log_l
-        theta = torch.exp(self.a_rot + self.b_rot * self.log_l)
+        r_raw = self.a_mag + self.b_mag * self.log_l
+        theta_raw = self.a_rot + self.b_rot * self.log_l
+        self.clamped += (r_raw > 80.0).sum().to(self.clamped.dtype)
+        self.clamped += (theta_raw > 80.0).sum().to(self.clamped.dtype)
+        r = r_raw.clamp(max=80.0)
+        theta = torch.exp(theta_raw.clamp(max=80.0))
         ang = theta[:, None] * self.freq
         c = torch.polar(torch.exp(r)[:, None].expand_as(ang), ang)
         g = torch.view_as_complex(self.gamma.view(-1, 2))

@@ -749,7 +749,7 @@ def test_paper_g_parameter_counts():
     )
     assert site_counts == [d + 4] * 4
     assert block == 4 * (d + 4)
-    assert buffers == 2, buffers  # freq, log_l
+    assert buffers == 3, buffers  # freq, log_l, clamped (the exp-bound tally)
     assert v1_count == d + 2 * v1.layerrope.n_depths
     # The block's own norm gain (d) is replaced by the four sites.
     assert delta == block - d == 4 * (d + 4) - d
@@ -965,3 +965,24 @@ def test_paper_the_driver_has_the_new_ab_arms():
     assert "2 x spread(control)" in mod.__doc__, "the verdict rule must be pre-registered"
     assert mod.main(["plan"]) == 0
     print("[paper] driver plan: 9 arms resolve, run mode NOT executed")
+
+
+def test_a_runaway_magnitude_parameter_cannot_make_the_table_inf():
+    """`a_mag` is learned and feeds exp; a corrupted step reached 95 and NaN'd.
+
+    Numerics audit 2026-11-08 §2.3: `a_mag=100 -> table inf`, `a_mag=95 -> model
+    loss NaN`. The clamp is at 80 (exp(80) is finite in fp32) and the site keeps
+    a device-side tally, so a clamp that fires is not silent (ADR-0019).
+    """
+    import torch
+
+    from dormouse.config import ModelConfig
+    from dormouse.model.layerrope import LayerRoPESite
+
+    site = LayerRoPESite(d=64, n_layers=4, base=10000.0, device="cpu")
+    with torch.no_grad():
+        site.a_mag.fill_(200.0)
+        site.a_rot.fill_(200.0)
+    table = site.table()
+    assert torch.isfinite(table).all(), "the table must stay finite at a_mag=200"
+    assert int(site.clamped) >= 2, "the clamp must be counted for mag AND rot"

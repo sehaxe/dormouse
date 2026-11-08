@@ -284,3 +284,17 @@ def test_zero_min_lr_frac_is_a_full_cooldown() -> None:
     mid = wsd_lr(949, total_steps=1000, peak_lr=1e-3, warmup_steps=0,
                  decay_steps=100, final_frac=0.0)
     assert 0.0 < mid < 1e-3, "only the LAST step is zero"
+
+
+def test_a_warmup_longer_than_the_decay_window_still_reaches_the_floor() -> None:
+    """`warmup + decay > total` used to leave the last step at 0.685x peak.
+
+    The decay window is clamped to what the warmup leaves, so the tail always
+    lands on `final_frac` however the two overlap (math audit, 2026-11-08).
+    """
+    last = wsd_lr(99, total_steps=100, peak_lr=1.0, warmup_steps=90,
+                  decay_steps=50, final_frac=0.1)
+    assert last == pytest.approx(0.1, rel=1e-9), last
+    mid = wsd_lr(94, total_steps=100, peak_lr=1.0, warmup_steps=90,
+                 decay_steps=50, final_frac=0.1)
+    assert 0.1 < mid <= 1.0, mid
