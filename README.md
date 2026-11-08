@@ -7,7 +7,7 @@
 **A byte-level language model that trains on one workstation — with every
 claim measured, and every retraction kept.**
 
-[![CI](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml)
+[![CI](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml/badge.svg?branch=backup/main-local-2026-11-08)](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml?query=branch%3Abackup%2Fmain-local-2026-11-08)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org)
 [![CUDA](https://img.shields.io/badge/CUDA-sm_120-green.svg)](https://developer.nvidia.com/cuda-gpus)
@@ -20,6 +20,11 @@ the Python lane's numbers settle. One RTX 5070 Ti (16 GB, sm_120).
 
 **Landing page:** [`site/index.html`](site/index.html) — two themes, a photograph
 through a halftone shader, and every number on it computed from the run logs.
+
+**Which branch is real:** this lane lives on `backup/main-local-2026-11-08`;
+`origin/main` is a *different lineage* (the Rust-era tree, see
+`.bulba/plan.md`). The badge above points at this lane's branch on purpose — a
+badge for `main` would report a CI run of code this README does not describe.
 
 </div>
 
