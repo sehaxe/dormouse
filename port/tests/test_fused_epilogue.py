@@ -135,7 +135,12 @@ def _assert_read_parity(rep: dict, rtol: float = 1e-6) -> None:
     for name, (d, m) in rep.items():
         if name == "scale":
             continue
-        tol = rtol * max(m, 1e-30)
+        # The module's own rule (`fused_residual.PARITY_GRTOL`): a FORWARD output
+        # is held to fp32 round-off, a gradient to 5e-5, because the write's VJP
+        # composes more roundings than the forward. The single 1e-6 that used to
+        # cover both reddened `one-gain` at 1.37x on a division that changed no
+        # algorithm (2026-11-08 fused-cluster review §2).
+        tol = (rtol if not name.startswith("d_") else fr.PARITY_GRTOL) * max(m, 1e-30)
         if d > tol:
             raise AssertionError(
                 f"epilogue read parity: {name} moved by {d:.3e} (reference {m:.3e}, "

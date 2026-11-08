@@ -405,6 +405,11 @@ def test_the_fused_combine_counter_is_counted_by_the_kernel() -> None:
     Written and skipped: `combine` asserts CUDA, and the card is on a multi-day
     run. The CPU wiring gate above asserts the branch hands it `fused=True`;
     this is the arm's own "it ran" evidence for a log reader.
+
+    Two arms, because the counter is dtype-dependent: `combine` stores fp32 by
+    default, and only a NON-fp32 store counts `moe_combine_bf16`
+    (`moe_kernels.py:1604`). The old single call used the default and asserted
+    the bf16 counter — a test that could never pass.
     """
     if not torch.cuda.is_available():
         pytest.skip("needs the card: the combine asserts CUDA")
@@ -413,4 +418,7 @@ def test_the_fused_combine_counter_is_counted_by_the_kernel() -> None:
     rowmap = torch.arange(16, dtype=torch.int32, device="cuda").view(8, 2)
     c = Counters()
     mk.combine(y, w, rowmap.reshape(-1), rowmap, 8, counters=c, fused=True)
-    assert c["moe_combine_fused"] == 1 and c["moe_combine_bf16"] == 1, c
+    assert c["moe_combine_fused"] == 1 and "moe_combine_bf16" not in c, c
+    c2 = Counters()
+    mk.combine(y, w, rowmap.reshape(-1), rowmap, 8, counters=c2, fused=True, dtype="bf16")
+    assert c2["moe_combine_fused"] == 1 and c2["moe_combine_bf16"] == 1, c2

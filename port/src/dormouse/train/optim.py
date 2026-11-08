@@ -2066,10 +2066,23 @@ class MixOptimizer:
             # each parameter's step scalar to the host). Gated and healthy steps
             # share ONE definition, so the firewall cannot change the arithmetic.
             self._foreach_adamw_step(flag)
-        elif flag is None:
-            self.adamw.step()
         else:
-            self._gated_adamw_step(flag)
+            if flag is None:
+                self.adamw.step()
+            else:
+                self._gated_adamw_step(flag)
+            # The bias correction is a function of the OPTIMIZER's step, and the
+            # fused path advances `_adamw_t` once per step. torch's own step
+            # advances each parameter's `state["step"]` but not this counter, so
+            # a run that switches implementations mid-flight (the CUDA-graph
+            # capture fallback does exactly that) would resume the fused
+            # correction at a STALE t. Measured 2026-11-08: a 6-step capture test
+            # diverged 3.1e-05 at `embed.weight` with the losses identical to
+            # nine digits — the forward agreed, the update did not.
+            if any(
+                p.grad is not None for g in self.adamw.param_groups for p in g["params"]
+            ):
+                self._adamw_t += 1
         self.steps += 1
 
     def _fast_adamw_ok(self) -> bool:

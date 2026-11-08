@@ -120,19 +120,19 @@ def test_gate_reddens_when_the_attnres_query_is_zeroed(monkeypatch) -> None:
 def test_gate_reddens_when_the_pre_bias_moves(monkeypatch) -> None:
     """A 1e-4 nudge of `b_pre` — the pre kernel's own wiring, not a re-derivation."""
     _clean_passes()
-    real = fr.pre
+    real = fr.epilogue_read
 
-    def nudged(mhc, xl, counters):
+    def nudged(mhc, xl, gain, gain_mlp, eps_norm, counters):
         before = mhc.b_pre.data.clone()
         with torch.no_grad():
             mhc.b_pre.add_(1e-4)
         try:
-            return real(mhc, xl, counters)
+            return real(mhc, xl, gain, gain_mlp, eps_norm, counters)
         finally:
             with torch.no_grad():
                 mhc.b_pre.copy_(before)
 
-    monkeypatch.setattr(fr, "pre", nudged)
+    monkeypatch.setattr(fr, "epilogue_read", nudged)
     rep = fr.parity(b=3, t=8, d=64, compose=True)
     print(f"\n  b_pre + 1e-4: max|Δctx| {rep['ctx'][0]:.3e}")
     with pytest.raises(AssertionError):

@@ -1040,3 +1040,56 @@ def test_rl_forwards_adam_eps_to_the_optimizer(monkeypatch, tmp_path):
     torch.manual_seed(0)
     rl_train(run, log=lambda *a, **k: None)
     assert seen.get("eps") == 1e-3, f"RL dropped adam_eps: {seen.get('eps')}"
+
+
+def _adamw_arm(lr: float = 0.05):
+    """A tiny model whose 2-D weight goes to Muon and the rest to AdamW.
+
+    Seeded: two arms must start from the SAME weights, or the comparison
+    measures the initialisation, not the optimizer (a 0.7 divergence that looks
+    like a bug and is not).
+    """
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4))
+    opt = MixOptimizer(model, lr=lr, wd=0.01)
+    return model, opt
+
+
+def _fixed_grads(model, seed: int = 0) -> None:
+    g = torch.Generator().manual_seed(seed)
+    for p in model.parameters():
+        p.grad = torch.randn(p.shape, generator=g)
+
+
+def test_the_torch_adamw_path_advances_the_bias_correction_counter(monkeypatch):
+    """A mid-run switch of AdamW implementation must not reuse a stale step.
+
+    The fused writer forms the bias correction from `_adamw_t`; torch's own
+    `step()` advances each parameter's `state["step"]` but not that counter. A
+    run that falls back from the captured graph (or from the fused writer) to
+    the torch path therefore resumed the fused correction at t=1 — measured as a
+    3.1e-05 divergence at `embed.weight` with losses equal to nine digits
+    (docs/reviews/2026-11-08-fused-cluster.md §1).
+    """
+    slow_m, slow_o = _adamw_arm()
+    fast_m, fast_o = _adamw_arm()
+    _fixed_grads(slow_m)
+    _fixed_grads(fast_m)
+
+    monkeypatch.setattr(slow_o, "_fast_adamw_ok", lambda: False)
+    slow_o.step()
+    monkeypatch.setattr(slow_o, "_fast_adamw_ok", lambda: True)
+    slow_o.step()
+
+    fast_o.step()
+    fast_o.step()
+
+    assert slow_o._adamw_t == 2, slow_o._adamw_t
+    assert fast_o._adamw_t == 2, fast_o._adamw_t
+    for (n, a), (_, b) in zip(
+        slow_m.named_parameters(), fast_m.named_parameters(), strict=True
+    ):
+        assert torch.allclose(a, b, rtol=0, atol=0), (
+            f"{n}: the torch path and the fused path diverged — "
+            f"max|d|={float((a - b).abs().max()):.3e}"
+        )

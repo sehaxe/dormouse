@@ -124,6 +124,11 @@ def test_every_nonpersistent_buffer_is_carried_or_provable(tmp_path, form):
     corpus = tmp_path / "corpus.bin"
     corpus.write_bytes(bytes(range(16)) * 256)
     run = _run(tmp_path, form, coef=0.5)
+    # Seeded: without it the sign-LFB controller's moves depend on the global RNG
+    # a previous test left behind, and it can legitimately read all zeros — the
+    # buffer under test then never leaves zero (2026-11-08 fused-cluster review
+    # §6: seeds 1/4/9 red, 0/2 green, on the same tree).
+    torch.manual_seed(0)
     model = DormouseModel(run.model)
     opt = _train_steps(model)
     weights, snapshot = save_ckpt(run, model, opt, step=4)
