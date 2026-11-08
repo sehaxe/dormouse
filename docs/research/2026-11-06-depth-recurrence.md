@@ -7,6 +7,23 @@
 
 ---
 
+> **CORRECTION 2026-11-08** (from `docs/research/2026-11-08-hyperconnections.md`):
+> the claim below that no ≤200M iso-FLOP loop win exists was true of the papers
+> read on 2026-11-06 and is FALSE as of 2026-07: **Hyperloop Transformers**
+> (arXiv:2604.21254v3, read in full on 2026-11-08) reports a **135.7M looped
+> model at 14.40 PPL against a 238.0M dense at 14.65** — same tokens, same 16
+> layer-applications — and against a dense model carrying the same
+> hyperconnections (14.55). It is the first real iso-FLOP win for loops at our
+> scale.
+>
+> **It does not revive OUR loop.** Hyperloop's cell is a prelude + a 4L middle
+> repeated + a coda = **8 unique layers** (its own shape ablation: 4L 14.40,
+> 3L 14.62, 2L 15.06; **1L is outside the table**). Our `loop_blocks=1,
+> max_iter=3` is 1 unique layer, and no connection scheme adds the missing
+> blocks: even φ=1 gives 3 layer-equivalents of 12. The fair next step is an
+> 8-unique-layer Hyperloop-shaped arm at equal FLOPs, not a hyperconnection on
+> the 1×3.
+
 ## TL;DR
 
 1. **The decisive experiment exists and it is at our scale.** Schwethelm et al., *How Much Is One Recurrence Worth?* (arXiv:2604.21106v3, 2026-05-07), sweeps `r ∈ {1,2,4,8}` loops at **20 effective layers**, six compute budgets from **4.64e17 to 2.15e19 FLOPs** (= 30–400M params), 116 runs, and fits a **recurrence-equivalence exponent φ = 0.46** (95% CI **[0.41, 0.53]**). Each recurrence is worth **0.46 of a unique block**. At matched FLOPs the looped frontier trails by **+0.03…0.06 nats (r=2)**, **+0.05…0.08 (r=4)**, **+0.09…0.12 (r=8)**, and **the gap widens at lower budgets** [T/F].
