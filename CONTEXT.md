@@ -10,9 +10,17 @@ term, where it lives, and what it is confused with — read
 [`docs/glossary.md`](docs/glossary.md). For how to work here, read
 [`AGENTS.md`](AGENTS.md). For the decisions, read `docs/adr/`.
 
-**The one thing to know before anything else:** the depth of this model comes
-from *iterations of one weight-shared block*, not from layers. Everything else
-in the architecture follows from that.
+**WHAT IS LIVE (2026-11-08).** The recipe that runs today is a **vanilla dense
+pre-LN transformer** — `block_form="transformer"`, 12 unique layers,
+`d_model=832`, 95,035,200 params (`port/configs/flagship3_dense.toml`) — because
+a 13.5M dense control beat the 102.7M KDA/CSA/mHC loop by 0.126–0.37 BPB at
+equal bytes (`docs/reviews/2026-11-06-control-transformer.md`). The **loop form**
+described below is the frontier lane: every mechanism in it exists as a flag, and
+its one trained long-context checkpoint died with the corpus on 2026-11-08.
+
+**The one thing to know before anything else (the LOOP lane):** the depth of that
+model comes from *iterations of one weight-shared block*, not from layers. The
+dense lane above has no loop: 12 distinct blocks, one pass.
 
 ---
 
@@ -259,11 +267,15 @@ Knowing what is *not* in the model is part of the model:
 
 - **No PonderNet, no halt head, no `p_n`, no KL** (ADR-0013). The loss is an
   honest unweighted CE, so every train-CE number from the PonderNet era is void.
-- **No MSA, no second attention arm, no top-k sparse gather** (ADR-0014). The
-  code is deleted, not disabled. Re-entry needs a working implementation from
-  FLA or flash-attn, not this crate.
+- **No MSA in the recipe** — but ADR-0014 (the cut) was **never executed**: the
+  `burn-msa` crate is still a live `dormouse-core` dependency and `use_msa` is a
+  live config field (`docs/reviews/2026-11-08-claims-repair.md` D1). The arm is
+  off in every preset; the code is not deleted.
 - **No output-side memory.** The Engram is input features only.
-- **No tokenizer, no patches.** Byte-level all the way down.
+- **No tokenizer.** Byte-level all the way down. The byte-patch unit (8 bytes per
+  position) exists as an arm and is **rejected on quality**: 3.3007 BPB against
+  1.4946 at 250 MB, and 3.742 vs 2.547 at equal steps
+  (`docs/reviews/2026-11-08-data-eval-integrity.md`).
 - **No learned halting and no depth schedule.** Fixed depth by default; the two
   adaptive-depth arms are the queue's rung 4.
 - **No silent fallbacks.** Every degradation is LOUD, COUNTED, or fixed
@@ -275,8 +287,9 @@ Knowing what is *not* in the model is part of the model:
 1. this file, end to end;
 2. [`docs/glossary.md`](docs/glossary.md) §1 and §6 (the compute spine, and the
    `fused` disambiguation);
-3. `crates/dormouse-core/src/loop_block.rs:302-563` — the loop body, which is
-   the whole architecture in 260 lines;
+3. `crates/dormouse-core/src/loop_block.rs:302-563` — the FROZEN lane's loop
+   body (260 lines), the formula source for the Python `LoopBlock`; the live
+   dense lane is `port/src/dormouse/model/transformer.py`;
 4. [`AGENTS.md`](AGENTS.md) §1 RULES and §2 MACHINE FACTS, before the first GPU
    run;
 5. `docs/protocols/AB-PROTOCOL.md` — how a mechanism gets judged, and what is in the queue.
