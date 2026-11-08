@@ -148,27 +148,24 @@ Until the owner picks, pushes go to `backup/main-local-2026-11-08`.
   old name with a counted note — a decision, not a silent edit. Reverted with the
   test green; C7 (vendor) is still open and needs a workspace build.
 
-## Known-red at 2026-11-08 02:30 (pre-existing, not from tonight)
+## Known-red: reclassified 2026-11-08 05:40 (the list was wrong)
 
-**The suite is at 7 red, down from 22** (2026-11-08 04:00 run). Fifteen were
-stale test stubs or my own regression; these seven remain, all in the
-fused/CUDA-graph cluster, all written before tonight
-(`acb013f`, `0f118b2`, `b342390`), and several are ORDER-dependent: the same
-test passes when its file runs alone and fails in a mixed run, which points at
-process-global counters rather than at the kernel.
+The old table said "seven pre-existing, all in the fused/CUDA-graph cluster,
+several pass alone". `docs/reviews/2026-11-08-fused-cluster.md` measured the
+seven with CUDA hidden: **five SKIP** (they are card gates), so the "7 red CPU
+suite" was a card-visible run. The real content:
 
-| test | what it says |
-|---|---|
-| `test_full_graph::test_the_first_replay_is_the_eager_step` | the reference log never says "capture failed" |
-| `test_fused_epilogue::test_the_kernel_is_fp32_roundoff[one-gain]` | parity 2.861e-06 vs tolerance 2.082e-06 (1.37x over) |
-| `test_fused_kda::test_kernel_launch_counter_drops` | passes alone, red in a mixed run |
-| `test_fused_residual::test_gate_reddens_when_the_pre_bias_moves` | the sanity gate did NOT redden on a 1e-4 perturbation |
-| `test_fused_residual::test_the_fused_path_issues_far_fewer_launches` | launch count |
-| `test_invariants_checkpoint::test_every_nonpersistent_buffer_is_carried_or_provable[kda+shareu]` | passes alone |
-| `test_moe_combine_fused::test_the_fused_combine_counter_is_counted_by_the_kernel` | counter |
+| # | test | class | fix |
+|---|---|---|---|
+| 1 | `test_full_graph::test_the_first_replay_is_the_eager_step` | **real defect**: the AdamW bias-correction counter (`_adamw_t`) was not advanced by the torch path, so the graph fallback resumed at a stale t (3.1e-05 at embed.weight) | **fixed** + CPU two-arm gate |
+| 2 | `test_fused_epilogue::test_the_kernel_is_fp32_roundoff[one-gain]` | stale tolerance: gradients held to 1e-6 where the module's own `PARITY_GRTOL` is 5e-5 | **fixed** |
+| 4 | `test_fused_residual::test_gate_reddens_when_the_pre_bias_moves` | stale test: patched `fr.pre`, which the compose path never calls | **fixed** (patches `fr.epilogue_read`) |
+| 6 | `test_invariants_checkpoint::...[kda+shareu]` | flaky: unseeded model + sign-LFB controller can read all zeros | **fixed** (seeded) |
+| 7 | `test_moe_combine_fused::test_the_fused_combine_counter...` | stale: asserted the bf16 counter on a default fp32 store | **fixed** (two arms) |
+| 3 | `test_fused_kda::test_kernel_launch_counter_drops` | card-only, never run | guard added; needs one card run |
+| 5 | `test_fused_residual::test_the_fused_path_issues_far_fewer_launches` | card-only, no arithmetic change since written | guard added; needs one card run |
 
-They need a GPU session with the counters printed, not a blind fix. Recorded so
-the next full-suite run is read against this list, not against "22 red".
+The two card gates still need a quiet card (the ladder owns it until ~10:00).
 
 ## Gates that must stay green
 
