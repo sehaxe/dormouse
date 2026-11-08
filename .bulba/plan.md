@@ -87,6 +87,23 @@ CSA model at 8K on the refetched corpus (longctx1's recipe, 102.7M, ~500 MB
 seen), then run the S-NIAH-8 harness (`port/scripts/niah.py`, being built) for
 gate D.
 
+## Claims ledger: what the nine mismatches actually were (2026-11-08 05:20)
+
+The claims-repair review found that **seven of nine were ledger parser artifacts**
+(reading the wrong column of a table), and **two documents were genuinely stale**:
+`muon-variants.md` (medium totals since `907b3b5` set `use_msa=false`) and
+`token-skipping.md` (b1 count since `af8b0c9`). Both fixed with the old value kept
+as superseded. The ten drifted claims from the deletion audit are repaired too:
+three README numbers, the PPO-as-shipped paragraph, the 1B plan's self-contradiction,
+and status banners on ADR-0014 (MSA not cut), ADR-0003 (fused deleted), the "final"
+bank architecture (dense won), the scaling recipe's "expert-rich" direction, and
+the burn-byteflow DELETE row.
+
+**The gate itself is not armed and now says why:** `--no-params` makes the
+mismatch count a lower bound (1 vs 9), and "new" means the document is dated
+today — 220 claims in tonight's own reports are "new" by that rule. Arming it
+needs line-accurate evidence association first.
+
 ## The GitHub divergence (found 2026-11-08 while pushing)
 
 `origin/main` is NOT this lane. Its tree is the Rust-era layout (`src/`,
