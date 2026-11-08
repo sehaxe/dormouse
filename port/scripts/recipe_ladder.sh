@@ -33,6 +33,10 @@ MIX=${MIX:-configs/mix_v7.toml}
 EVAL=${EVAL:-../data_local/best/fwedu_eval.bin}
 DATA=${DATA:-../data_local/best/fwedu_train.bin}
 TAG=${RUN_TAG:-}
+# A replication needs the seed and the arm list to be arguments, not edits:
+#   SEED=2 RUN_TAG=_s2 ONLY="control all" bash scripts/recipe_ladder.sh
+SEED=${SEED:-1}
+ONLY=${ONLY:-control vr gate clip nope cooldown all}
 # FAST=1 runs every arm on the SAFE Muon rung (see e1_bytes_vs_patch.sh):
 # ns_dtype=bf16 + state bf16, ns_steps stays 5.
 FAST=${FAST:-0}
@@ -45,10 +49,11 @@ EVAL_EVERY=$(( STEPS / 4 ))
 
 run() { # tag extra-set-args...
   local tag=$1; shift
-  echo "=== $tag steps=$STEPS $* $(date +%H:%M:%S)"
+  case " $ONLY " in *" $tag "*) ;; *) return 0 ;; esac
+  echo "=== $tag steps=$STEPS seed=$SEED $* $(date +%H:%M:%S)"
   $PY -u -m dormouse.cli train configs/flagship3_dense.toml \
     --data "$DATA" --eval "$EVAL" \
-    --set steps=$STEPS --set batch=8 --set seq_len=1024 --set seed=1 \
+    --set steps=$STEPS --set batch=8 --set seq_len=1024 --set seed=$SEED \
     --set lr=3e-4 --set opt=mix --set muon_lr_mult=12 \
     --set mix_plan="$MIX" --set doc_masking=false \
     --set eval=true --set eval_every=$EVAL_EVERY --set log_every=$EVAL_EVERY \
