@@ -59,6 +59,10 @@ select = ["E", "F", "I", "W", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# `slow` = the inductor/compile gates: 32% of the suite's wall time
+# (docs/reviews/2026-11-08-suite-speed.md). Deselect with `-m "not slow"` while
+# iterating; the gate still runs everything.
+markers = ["slow: real inductor compilation / compile-boundary gates"]
 
 [project.scripts]
 dormouse = "dormouse.cli:main"

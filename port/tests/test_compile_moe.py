@@ -35,12 +35,16 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 from conftest import tiny_cfg
 from torch._dynamo.eval_frame import _debug_get_cache_entry_list
 
 from dormouse.model import DormouseModel
 from dormouse.model.experts import SparseMoE
+
+# inductor compilation dominates this file's wall time; see pyproject markers.
+pytestmark = pytest.mark.slow
 
 #: The dense blend `small` ships (`configs/small.toml`, `moe_topk = 0`) — the
 #: only arm that calls `_banks` on CPU (`_dispatch` sends a CPU tensor to the

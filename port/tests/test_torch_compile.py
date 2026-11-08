@@ -40,6 +40,9 @@ from conftest import tiny_cfg, tiny_run
 
 from dormouse.model import DormouseModel
 from dormouse.train.data import eval_window_bytes
+
+# real inductor compilation; see the `slow` marker in pyproject.
+pytestmark = pytest.mark.slow
 from dormouse.train.loop import (
     _ema_update,
     _lfb_modules,

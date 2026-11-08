@@ -37,6 +37,9 @@ from dormouse.config import ModelConfig
 from dormouse.model import DormouseModel
 from dormouse.model.experts import SparseMoE
 
+# dynamo/inductor work; see the `slow` marker in pyproject.
+pytestmark = pytest.mark.slow
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
