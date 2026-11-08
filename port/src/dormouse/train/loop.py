@@ -1765,14 +1765,17 @@ def _train_impl(
                 "is neither needed nor wanted under a graph (the graph already removes "
                 "the host dispatch). Escape: torch_compile=false, or opt_graph=false."
             )
-        # torch.compile(dynamic=True) — the spike's measured winner at the b1
-        # shape (273.5 vs 357.3 ms/step, 1.31x; its dynamic=False arm read
-        # 298.0, 1.20x). Wrapped AFTER the resume
+        # torch.compile(dynamic=False, mode="max-autotune-no-cudagraphs"). The trainer's own
+        # matrix (docs/reviews/2026-11-08-compile-matrix.md) measured dynamic=True
+        # at 0.952x and static at 1.149x, static+max-autotune at 1.275x — every
+        # step here has the same shape, so the dynamic guards only cost. The b1
+        # spike's 1.31x for dynamic came from its bare fwd+bwd arm, which the
+        # matrix shows ran ~2x slow overall. Wrapped AFTER the resume
         # load: an OptimizedModule's state_dict carries a `_orig_mod.` prefix,
         # so loading into the wrapped model would rename every key. The
         # inductor cache persists in ~/.cache/torch — the warmup is once per
         # machine, not per run.
-        model = torch.compile(model, dynamic=True)
+        model = torch.compile(model, dynamic=False, mode="max-autotune-no-cudagraphs")
         log("torch_compile: model wrapped (first steps pay the warmup)")
     # The EMA shadow is built AFTER the resume load AND after torch.compile:
     # it must clone the RESOLVED weights, and its keys must be the live

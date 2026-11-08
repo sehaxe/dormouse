@@ -170,21 +170,27 @@ def test_loss_is_finite_and_the_loop_runs_the_configured_depth(tmp_path):
 
 def test_torch_compile_flag_wraps_the_model_after_resume(tmp_path, monkeypatch):
     """The wiring gate: with `torch_compile=true` the trainer hands the model
-    to `torch.compile(dynamic=True)` — once, after any resume load (the
+    to `torch.compile(dynamic=False, mode="max-autotune-no-cudagraphs")` —
+    once, after any resume load (the
     `_orig_mod.` prefix rule). `torch.compile` itself is patched out: this is
     a wiring test, not a compiler test."""
     calls: list[dict] = []
-    real = torch.compile
 
     def spy(mod, **kw):
         calls.append(kw)
-        return real(mod, **kw)
+        # Return the module unwrapped: this test's claim is that the trainer
+        # asks for a static max-autotune compile exactly once. Running a real inductor
+        # compile here cost 52.8s (2026-11-08) for coverage
+        # `test_torch_compile.py` already owns end-to-end, and `test_ckpt_prefix`
+        # owns the `_orig_mod.` shape.
+        return mod
 
     monkeypatch.setattr(torch, "compile", spy)
     run = tiny_run(tmp_path, steps=2, log_every=2, torch_compile=True)
     lines: list[str] = []
     report = train(DormouseModel(run.model), run, log=lines.append)
-    assert len(calls) == 1 and calls[0].get("dynamic") is True
+    assert len(calls) == 1 and calls[0].get("dynamic") is False
+    assert calls[0].get("mode") == "max-autotune-no-cudagraphs"
     assert any("torch_compile" in s for s in lines)
     assert math.isfinite(report["loss"])
 

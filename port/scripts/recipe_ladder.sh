@@ -26,6 +26,8 @@ PY=.venv/bin/python
 OUT=/home/sehaxe/logs/ladder
 mkdir -p "$OUT"
 BYTES=${BYTES:-120000000}
+BATCH=${BATCH:-8}
+LR=${LR:-3e-4}
 # The corpus was deleted 2026-11-08 (docs/reviews/2026-11-08-merge-incident.md).
 # MIX/EVAL let the ladder run on the refetched sources; a run on those is a NEW
 # number and the caller must tag it (RUN_TAG).
@@ -44,7 +46,7 @@ FOPT=()
 if [ "$FAST" = 1 ]; then
   FOPT=(--set ns_dtype=bf16 --set muon_state_dtype=bf16)
 fi
-STEPS=$(( BYTES / (8 * 1024) ))
+STEPS=$(( BYTES / (BATCH * 1024) ))
 EVAL_EVERY=$(( STEPS / 4 ))
 
 run() { # tag extra-set-args...
@@ -53,8 +55,8 @@ run() { # tag extra-set-args...
   echo "=== $tag steps=$STEPS seed=$SEED $* $(date +%H:%M:%S)"
   $PY -u -m dormouse.cli train configs/flagship3_dense.toml \
     --data "$DATA" --eval "$EVAL" \
-    --set steps=$STEPS --set batch=8 --set seq_len=1024 --set seed=$SEED \
-    --set lr=3e-4 --set opt=mix --set muon_lr_mult=12 \
+    --set steps=$STEPS --set batch=$BATCH --set seq_len=1024 --set seed=$SEED \
+    --set lr=$LR --set opt=mix --set muon_lr_mult=12 \
     --set mix_plan="$MIX" --set doc_masking=false \
     --set eval=true --set eval_every=$EVAL_EVERY --set log_every=$EVAL_EVERY \
     --set ckpt_every=1000000 --set out_dir=/tmp/opencode/ladder_$tag \

@@ -17,21 +17,23 @@ PY=.venv/bin/python
 OUT=/home/sehaxe/logs/batch
 mkdir -p "$OUT"
 STEPS=${STEPS:-40}
+MIX=${MIX:-configs/mix_refetch.toml}
+DATA=${DATA:-../data_local/best/fwedu_train.bin}
 
 arm() { # batch extra...
   local b=$1; shift
   local tag="b$b"
   $PY -u -m dormouse.cli train configs/flagship3_dense.toml \
-    --data ../data_local/best/fwedu.bin --set steps=$STEPS --set batch=$b \
+    --data "$DATA" --set steps=$STEPS --set batch=$b \
     --set seq_len=1024 --set opt=mix --set muon_lr_mult=12 --set lr=3e-4 \
-    --set eval=false --set mix_plan=configs/mix_v7.toml --set doc_masking=false \
+    --set eval=false --set mix_plan="$MIX" --set doc_masking=false \
     --set ns_dtype=bf16 --set ns_steps=3 --set muon_state_dtype=bf16 \
     --set log_every=10 --set ckpt_every=1000000 --set out_dir=/tmp/opencode/batch_$tag \
     --json-log "$OUT/$tag.jsonl" "$@" > "$OUT/$tag.log" 2>&1
   echo "=== batch $b done $(date +%H:%M:%S)"
 }
 
-for b in 8 16 32 48 64; do arm $b; done
+for b in ${BATCHES:-8 16 32 48 64}; do arm "$b"; done
 
 $PY - "$OUT" <<'PY'
 import json, sys
