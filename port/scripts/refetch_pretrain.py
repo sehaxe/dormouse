@@ -24,6 +24,7 @@ import argparse
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import duckdb
 
@@ -93,6 +94,7 @@ def main() -> int:
     ap.add_argument("--cap-mb", type=int, default=2000, help="bytes per source")
     ap.add_argument("--only", default="", help="one source name")
     a = ap.parse_args()
+    Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
     con = duckdb.connect()
     cap = a.cap_mb * 2**20
     total = 0
