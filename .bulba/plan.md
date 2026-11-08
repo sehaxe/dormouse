@@ -150,8 +150,8 @@ Until the owner picks, pushes go to `backup/main-local-2026-11-08`.
 
 ## SUITE GREEN, CPU-only (2026-11-08 06:20)
 
-`CUDA_VISIBLE_DEVICES="" pytest -q` over all 2 194 tests: **exit 0**. That is the
-first green full run of the night; the 22-red starting point is closed. The two
+`CUDA_VISIBLE_DEVICES="" pytest -q` over all 2 194 tests: **exit 0**, three
+times, the last after every edit. The 22-red starting point is closed. The two
 launch-count gates still need a card run (they skip on CPU), and the card is the
 ladder's until ~09:30.
 
