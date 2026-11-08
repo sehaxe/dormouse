@@ -160,6 +160,12 @@ class TransformerBlock(nn.Module):
         #: is the source, so `last_v` is set whenever the arm is on.
         self.value_residual = bool(cfg.value_residual)
         self.ffn_clip = float(cfg.ffn_clip)
+        #: `nn.LayerNorm`'s OWN default eps (1e-5), deliberately: the dense
+        #: form's blocks have never read `cfg.norm_eps`, and wiring it now would
+        #: move every recorded dense number (the knob's default is 1e-3 for the
+        #: KDA form's RMSNorms). The knob is NOT dead on this form — the FINAL
+        #: RMSNorm in `model.py` reads it — so an A/B on `norm_eps` tests the
+        #: final norm only; `tests/test_block_form.py` pins both halves.
         self.ln1 = nn.LayerNorm(d, device=device)
         self.qkv = nn.Linear(d, 3 * d, bias=False, device=device)
         self.proj = nn.Linear(d, d, bias=False, device=device)

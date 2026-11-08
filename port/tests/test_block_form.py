@@ -351,3 +351,31 @@ def test_load_run_block_form_is_not_inert(tmp_path):
     assert not torch.equal(logits_k, logits_t), (
         "block_form is inert: both forms produced the same logits"
     )
+
+
+def test_norm_eps_is_live_on_the_dense_form_but_only_through_the_final_norm():
+    """The math audit called `norm_eps` dead on `block_form="transformer"`; it is not.
+
+    Reading the tree: the 12 block LayerNorms use torch's own 1e-5 (they never
+    read the knob), while the final RMSNorm in `model.py` reads `cfg.norm_eps`
+    (default 1e-3). So the knob DOES move the dense logits — measured 0.20 at
+    1e-3 -> 1e-1 on the tiny model — and an A/B on it is an A/B on the FINAL
+    norm only. Both halves are pinned here so the caveat cannot rot.
+    """
+    cfg = dict(
+        block_form="transformer", max_iter=1, n_layers=2, use_kda=False,
+        use_engram=False, engram_rows=0,
+    )
+    torch.manual_seed(0)
+    low = DormouseModel(tiny_cfg(norm_eps=1e-3, **cfg))
+    torch.manual_seed(0)
+    high = DormouseModel(tiny_cfg(norm_eps=1e-1, **cfg))
+    assert low.transformer_blocks[0].ln1.eps == 1e-5, (
+        "the block LayerNorm started reading norm_eps: every recorded dense number moves"
+    )
+    assert low.norm.eps == 1e-3 and high.norm.eps == 1e-1, "the final norm must read the knob"
+    x = torch.arange(32, dtype=torch.long).reshape(1, 32) % 251
+    with torch.no_grad():
+        a, _, _ = low(x, (x + 1) % 251)
+        b, _, _ = high(x, (x + 1) % 251)
+    assert float((a - b).abs().max()) > 1e-3, "norm_eps is inert on the dense form"
