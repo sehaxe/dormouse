@@ -300,6 +300,8 @@ export const pages = [
 	{ src: 'docs/guides/dmexp.md', out: 'tooling/dmexp', title: 'The model file: .dmexp', nav: 'The .dmexp file' },
 	{ src: 'docs/guides/first-pr.md', out: 'tooling/first-pr', title: 'Your first pull request', nav: 'First PR' },
 	{ src: 'docs/guides/first-hour.md', out: 'tooling/first-hour', title: 'Your first hour', nav: 'First hour' },
+	{ src: 'docs/guides/diagnose.md', out: 'tooling/diagnose', title: 'dormouse diagnose: reading a bad run', nav: 'Diagnose' },
+	{ src: 'docs/guides/runs.md', out: 'tooling/runs', title: 'The run registry', nav: 'Runs' },
 	// The 2026-10-01 narrative wave: four "how to actually use this" guides
 	// assembled from the protocols, the rulebook and the reviews - no new
 	// numbers, every figure carried with its source.
