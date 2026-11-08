@@ -16,7 +16,13 @@ Every arXiv ID below was re-resolved and its abstract/HTML read this session via
 
 ## 0. The dormouse facts that constrain every design (read from the repo, cited)
 
-* **Shape.** b1 = 1,066,354,113 total / **~57M active**, `max_iter 2`, topk-2 over 1024 TSCT experts + Engram (`port/configs/b1.toml`; `docs/decisions/2026-10-15-1b-readiness-plan.md` §2.2). Port `small` = **9,476,993** params, `max_iter 4` in the file, **operating depth 2** on the burn side (`port/configs/small.toml`; `docs/protocols/AB-PROTOCOL.md:179`).
+* **Shape.** b1 = **1,066,358,209** total / **~57M active**, **`max_iter 4`**
+  (train deeper than infer; `port/configs/b1.toml:14`), topk-2 over 1024 TSCT
+  experts + Engram (`port/configs/b1.toml:110,127`;
+  `port/tests/test_param_count.py:26`). The old **1,066,354,113 / `max_iter 2`**
+  is the pre-`af8b0c9` (2026-10-16) count and is superseded. Port `small` =
+  **9,476,993** params, `max_iter 4` in the file, **operating depth 2** on the
+  burn side (`port/configs/small.toml`; `docs/protocols/AB-PROTOCOL.md:179`).
 * **The loop shares weights per iteration.** `loop_block.rs:381` resets `h = h_ctx` each iteration; the readout is the **mean of per-iteration outputs**, and every iteration's own logits are in the loss (recurrence-equivalence, `docs/research/2026-09-27-adaptive-depth-safe.md` §0). So "skip an iteration for a token" is **not** "skip a layer": it changes the readout function, and there are only 2–4 slots.
 * **It is launch-bound, not FLOP-bound.** Warm step ~245 ms at 9.2M; **mean GPU utilisation 13.3%, 79% of samples ≤5%**; GEMMs ≈ **16% of a warm step** (AGENTS.md §3.1, D1 correction). Card ceiling bf16 **44.06 TFLOP/s**; effective **0.6–1.2 TFLOP/s → 40–70× headroom, all in software** (plan §2.1).
 * **The plan's own verdict, quoted.** ADR-0013: *"the loop runs at fixed max_iter=4 with an honest unweighted CE… MoR-style routers (2507.10524) are the only sanctioned re-entry path for adaptive depth — REJECTED for now: MoR underperforms vanilla at 135M (we are 7.5M) and its per-depth gathers are sm_120-hostile."* Plan §5 trap list, verbatim: *"Carrying losing arms into 1B (GR, AttnRes, mHC, MoR, full-arms `small` — all ties/losses at 9.2M). They re-enter only if the 100M rung revives them."* Token sparsity is costed as **plan §2.4 item 2**: "per-position adaptive depth via the in-tree MoR arm or an ALoDLM-style learned schedule".

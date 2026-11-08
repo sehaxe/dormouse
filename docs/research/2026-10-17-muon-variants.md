@@ -13,8 +13,10 @@ paraphrased from a title), 14 section reads across 8 papers, three repos' code r
 (`microsoft/dion` tree + `README` + `requirements_gns.txt` +
 `dion/newton_schulz_triton.py`; `thib-s/flash-newton-schulz` README;
 `zichongli5/NorMuon` metadata only). Measured on `meta`, not the card:
-`configs/medium.toml` = **141 910 405** params, **90 925 952** in the Muon group,
-**12** distinct shapes [ours, 2026-10-17].
+`configs/medium.toml` = **138,436,993** params, **87,452,544** in the Muon group,
+**11** distinct shapes [ours, 2026-11-05 re-measure: `907b3b5` set `use_msa=false`.
+The 2026-10-17 values **141,910,405 / 90,925,952 / 12** were the `use_msa=true`
+config at `907b3b5^`; they are the historical MSA-on measurement, not today's file].
 **Marks:** **[A]** the paper's own words · **[code]** the authors' code · **[ours]**
 repo fact, file named · **[S]** SPECULATION (my inference, no source).
 
