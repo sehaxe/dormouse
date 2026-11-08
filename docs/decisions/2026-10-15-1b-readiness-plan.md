@@ -64,7 +64,9 @@ The three parts of that headroom, measured:
 
 ### 2.2 The candidate 1B shape ("b1", derived)
 
-d 2048 · H 32×64 · d_ffn 5461 · rank 64 · max_iter 2 · E 1024 experts, topk 2 ·
+d 2048 · H 32×64 · d_ffn 5461 · rank 64 · **max_iter 4** · E 1024 experts, topk 2 ·
+(the 2026-10-15 draft said `max_iter 2`; `af8b0c9` changed b1 to 4 and the
+file's own §7 correction at `:478` already says so — this line had not caught up)
 Engram 4M rows/order × 3 orders × dim 32 (the DeepSeek-Flash operating point,
 26% by our attribute table; no published "20-25% law" survives verification and
 the allocation is swept, not cited — `configs/small.toml`, AB-PROTOCOL row 6b,
@@ -78,7 +80,9 @@ the tech-verification doc §4):
 | Engram tables (4M rows/order) | 402M |
 | TSCT experts: 1024 × (dual gate/up latent 2·(2048·64+64) + down 64·5461) + shared (rank 192 + its write) | ~639.5M (MEASURED on the instantiated port model, 2026-10-15: the §2.2 draft missed the down-projection and the second latent — the spike found it; `configs/b1.toml` comments carry the arithmetic) |
 | Engram tables: 4M rows/order × 3 orders × dim 32 | 402.65M |
-| **total** | **1,066,354,113 ≈ 1.07B (MEASURED, `tests/test_param_count.py`)** |
+| **total** | **1,066,358,209 ≈ 1.07B (MEASURED, `port/tests/test_param_count.py:26`; the
+2026-10-15 draft's 1,066,354,113 is the pre-`af8b0c9` max_iter-2 count, +4,096 = two
+iteration-embedding rows)** |
 | active per token | ~57M (unchanged in shape) |
 | **active per token (train, both iters)** | **~57M** |
 | FLOPs/token (train, derived) | ~0.40 GFLOP |

@@ -13,7 +13,7 @@ I → J[Holdout] →|beats| K[Promote] →|no| L[Strategy review] → G
 
 ## SFT (policy init, 30-50% expert, 30-50% synthetic verified, 10-20% repair, 10-25% chat)
 
-## RLVR — PPO + value head (not GRPO)
+## RLVR — CRR / group-relative advantages (no value head; the PPO row is a plan, not code)
 
 ### Reward shape for token thrift (MiMo-V2.6, 2610.11959 + 2609.32577)
 
@@ -28,10 +28,16 @@ I → J[Holdout] →|beats| K[Promote] →|no| L[Strategy review] → G
 
 
 
-- Value head V(s) bf16, GAE λ0.95, PPO clip 0.2, KL 0.01
-- reward = verifier_pass − λ_tokens·T − λ_cost·tools
-- Token-level advantage, not group-relative (GRPO is DPO, encourages verbosity)
-- EBRM (2504.13134): energy-score уточняет reward на инференсе/в loop — robustness к reward-hack, кандидат после первого PPO-прохода
+- **Shipped:** two advantage arms, `group` (GRPO's `(r − group_mean) / group_std`,
+  `post/rl.py:364`) and `crr` (fork-replay, `post/train_steps.py:1`), aggregated
+  per prompt (`post/rl.py:374-375`). There is **no value head, no GAE, and no
+  importance-sampling clip** (`post/rl.py:43-46`).
+- reward = `R_test · S_sol · S_beh` minus the gated group-relative length term
+  (`post/rl.py:1-42`); prompt-mean aggregation is the default (`post/rl.py:113-115`).
+- **Not shipped:** the PPO value-head recipe (`V(s)`, GAE λ0.95, PPO clip 0.2,
+  KL 0.01) and the "token-level advantage" claim; `grep -rn '\bPPO\b' port/src`
+  returns nothing. EBRM (2504.13134) remains a candidate after the first **RL**
+  pass, not a PPO pass.
 
 ## On-policy distillation — selective (SEED 2607.14777)
 
