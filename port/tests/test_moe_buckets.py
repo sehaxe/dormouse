@@ -94,9 +94,7 @@ def test_one_bucket_is_the_batched_arm(bf16, capacity):
         f"[one bucket] bf16={bf16} capacity={capacity} buckets=1 "
         f"bank={counters['moe_bank_bytes']} B equal={torch.equal(got, ref)}"
     )
-    assert torch.equal(got, ref), (
-        f"max|Δ|={float((got - ref).abs().max()):.3e} at one bucket"
-    )
+    assert torch.equal(got, ref), f"max|Δ|={float((got - ref).abs().max()):.3e} at one bucket"
 
 
 # ------------------------------------------- b. pathological routing / budget
@@ -106,9 +104,7 @@ def test_pathological_routing_matches_the_loop_and_stays_in_budget():
     moe = _moe(d_model=32, d_ffn=48, head_dim=8, rank=4, n_experts=32, moe_capacity=0.0)
     n, k = 200, 2
     flat = torch.zeros(n * k, dtype=torch.long)
-    flat[int(0.9 * n * k) :] = torch.arange(n * k - int(0.9 * n * k)) % (
-        moe.n_experts - 1
-    ) + 1
+    flat[int(0.9 * n * k) :] = torch.arange(n * k - int(0.9 * n * k)) % (moe.n_experts - 1) + 1
     index = flat.reshape(n, k)
     weight = torch.ones(n, k) / k
     order, keep, _ = moe._permute(index)
@@ -187,9 +183,7 @@ def test_dropped_rows_are_exactly_zero():
     moe = _moe(moe_capacity=1.0)
     n, k = 8, 2
     # counts [6, 2, 2, 2]; cap = 4 → expert 0 drops 2 rows, experts 1-3 pad 2.
-    index = torch.tensor(
-        [[0, 0], [0, 0], [0, 0], [1, 1], [2, 2], [2, 2], [3, 3], [3, 3]]
-    )
+    index = torch.tensor([[0, 0], [0, 0], [0, 0], [1, 1], [2, 2], [2, 2], [3, 3], [3, 3]])
     weight = torch.ones(n, k) / k
     order, keep, dropped = moe._permute(index)
     assert not keep.all() and int(dropped) > 0

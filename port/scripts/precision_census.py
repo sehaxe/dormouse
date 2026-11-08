@@ -338,8 +338,7 @@ def tensors(cfg, b: int, s: int) -> list[Tensor]:
             p,
             "f32",
             True,
-            "the final norm and head must be fp32: bf16 logits NaN on this stack "
-            "(AGENTS §2.2)",
+            "the final norm and head must be fp32: bf16 logits NaN on this stack (AGENTS §2.2)",
         )
     )
     rows.append(
@@ -637,8 +636,7 @@ def tensors(cfg, b: int, s: int) -> list[Tensor]:
             p,
             compute,
             False,
-            "the bank computes in its own dtype; a bf16 residual makes the seam cast a "
-            "no-op",
+            "the bank computes in its own dtype; a bf16 residual makes the seam cast a no-op",
             after=compute,
         )
     )
@@ -705,10 +703,7 @@ def report(cfg, rows: list[Tensor], c: Ctx, top: int = 0) -> dict:
         f"\n== precision census: b{c.b} x s{c.s}  d_model={c.d}  bf16={c.bf16}  "
         f"max_iter={cfg.max_iter}  (ONE iteration)"
     )
-    print(
-        f"   one [n, d_model] pass = {ref32 / 1e6:.2f} MB fp32 / "
-        f"{ref16 / 1e6:.2f} MB bf16"
-    )
+    print(f"   one [n, d_model] pass = {ref32 / 1e6:.2f} MB fp32 / {ref16 / 1e6:.2f} MB bf16")
     print(
         f"   {'group':<9} {'tensor':<34} {'shape':<16} {'dtype':<6} "
         f"{'MB':>8} {'req':>4} {'after':<6} site"
@@ -739,10 +734,7 @@ def report(cfg, rows: list[Tensor], c: Ctx, top: int = 0) -> dict:
         f"{(now - after) / ref16:5.1f} bf16 passes saved"
     )
     n_req = sum(1 for r in rows if r.required)
-    print(
-        f"   {len(rows)} tensors, {n_req} fp32-required, "
-        f"{len(rows) - n_req} carried/free"
-    )
+    print(f"   {len(rows)} tensors, {n_req} fp32-required, {len(rows) - n_req} carried/free")
     by_group: dict[str, list[int]] = {}
     for r in rows:
         g = by_group.setdefault(r.group, [0, 0])
@@ -751,8 +743,10 @@ def report(cfg, rows: list[Tensor], c: Ctx, top: int = 0) -> dict:
     print("\n   -- by group (the stream halves; the reductions/state do not) --")
     for g, (a, b) in sorted(by_group.items(), key=lambda kv: -kv[1][0]):
         print(f"   {g:<10} {a / 1e9:7.3f} -> {b / 1e9:7.3f} GB  {(b - a) / a * 100:+6.1f} %")
-    print(f"   {'TOTAL':<10} {now / 1e9:7.3f} -> {after / 1e9:7.3f} GB  "
-          f"{(after - now) / now * 100:+6.1f} %")
+    print(
+        f"   {'TOTAL':<10} {now / 1e9:7.3f} -> {after / 1e9:7.3f} GB  "
+        f"{(after - now) / now * 100:+6.1f} %"
+    )
     print("\n   -- state, kept fp32 (no bytes counted) --")
     for note in state_notes(cfg):
         print(f"   * {note}")
@@ -812,10 +806,7 @@ def _diff(a: dict, b: dict) -> None:
                 f"{(bb - ba) / 1e6:+8.2f} MB  "
                 f"{ra['dtype'] if ra else '-':<6} -> {rb['dtype'] if rb else '-':<6}"
             )
-    print(
-        f"   {'TOTAL':<9} {'':<34} "
-        f"{(b['total_bytes'] - a['total_bytes']) / 1e6:+8.2f} MB"
-    )
+    print(f"   {'TOTAL':<9} {'':<34} {(b['total_bytes'] - a['total_bytes']) / 1e6:+8.2f} MB")
 
 
 def main(argv: list[str] | None = None) -> int:

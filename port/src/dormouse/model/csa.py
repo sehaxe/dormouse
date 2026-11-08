@@ -747,7 +747,7 @@ class CompressedSelectiveAttention(nn.Module):
         """
         b, qn, _ = q.shape
         keep = None  # [b,Q,k] indices into the parent level's entries
-        sel = None   # [b,Q,n_parent] flags of the previous level, inside the loop
+        sel = None  # [b,Q,n_parent] flags of the previous level, inside the loop
         last_allowed = None
         n_parent = 0
         parent_chunk = 0
@@ -780,7 +780,7 @@ class CompressedSelectiveAttention(nn.Module):
                 scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
             k_lv = min(self.topk, n)
             keep = scores.topk(k_lv, dim=-1).indices  # [b,Q,k_lv]
-            last_allowed = allowed                   # [b,Q,n] for THIS level
+            last_allowed = allowed  # [b,Q,n] for THIS level
             n_parent = n
             parent_chunk = chunk
             counters.count(name, b * qn * k_lv)
@@ -801,7 +801,7 @@ class CompressedSelectiveAttention(nn.Module):
             # `keep` selects the LAST level's entries, so the parent flags are
             # that level's own `allowed` mask — not `sel`, which describes the
             # level before it.
-            parent_ok = last_allowed.gather(2, keep)   # [b,Q,k_lv]
+            parent_ok = last_allowed.gather(2, keep)  # [b,Q,k_lv]
             ok = ok & parent_ok.repeat_interleave(ratio, dim=-1)
         cand = cand.clamp(max=max(n_fine - 1, 0))
         k_g = (

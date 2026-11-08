@@ -64,6 +64,7 @@ def main() -> int:
                 break
             if path.endswith(".json.gz") or path.endswith(".jsonl.gz"):
                 import gzip
+
                 with gzip.open(path, "rt", encoding="utf-8", errors="replace") as gh:
                     for line in gh:
                         try:
@@ -97,10 +98,13 @@ def main() -> int:
                         kept_bytes += len(raw)
                         total_bytes += len(raw)
                         kept_docs += 1
-                print(f"  {Path(path).name}: rows={rows} kept={kept_docs} "
-                      f"{kept_bytes / 1e9:.2f} GB", flush=True)
+                print(
+                    f"  {Path(path).name}: rows={rows} kept={kept_docs} {kept_bytes / 1e9:.2f} GB",
+                    flush=True,
+                )
                 continue
             import pyarrow.parquet as pq
+
             pf = pq.ParquetFile(path)
             for batch in pf.iter_batches(batch_size=a.batch, columns=[a.column]):
                 for text in batch.column(0).to_pylist():
@@ -132,8 +136,10 @@ def main() -> int:
                     kept_docs += 1
                 if kept_bytes >= a.max_total:
                     break
-            print(f"  {Path(path).name}: rows={rows} kept={kept_docs} "
-                  f"{kept_bytes / 1e9:.2f} GB", flush=True)
+            print(
+                f"  {Path(path).name}: rows={rows} kept={kept_docs} {kept_bytes / 1e9:.2f} GB",
+                flush=True,
+            )
 
     (a.out_dir / f"{a.name}.bin.docs.json").write_text(
         json.dumps({"version": 1, "size": kept_bytes, "starts": starts})
@@ -148,8 +154,7 @@ def main() -> int:
         "separator_bytes": kept_bytes - total_bytes,
         "drops": drops,
         "unique_docs": len(seen),
-        "limits": {"min_bytes": a.min_bytes, "max_bytes": a.max_bytes,
-                   "max_total": a.max_total},
+        "limits": {"min_bytes": a.min_bytes, "max_bytes": a.max_bytes, "max_total": a.max_total},
     }
     (a.out_dir / f"{a.name}.manifest.json").write_text(json.dumps(manifest, indent=2))
     print(json.dumps(manifest, indent=2)[:1500])

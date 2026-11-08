@@ -1,4 +1,5 @@
 """Is `muon_lr_mult` live in a training run? Reproduce the trainer's write."""
+
 from __future__ import annotations
 
 import sys

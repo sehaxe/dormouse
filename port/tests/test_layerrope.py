@@ -976,7 +976,6 @@ def test_a_runaway_magnitude_parameter_cannot_make_the_table_inf():
     """
     import torch
 
-    from dormouse.config import ModelConfig
     from dormouse.model.layerrope import LayerRoPESite
 
     site = LayerRoPESite(d=64, n_layers=4, base=10000.0, device="cpu")

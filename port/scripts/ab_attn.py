@@ -412,11 +412,7 @@ def profile(args: argparse.Namespace) -> int:
         train(model, run, device=torch.device(device), log=print)
         rates = [
             r["tokens_per_s"]
-            for r in (
-                json.loads(line)
-                for line in out.read_text().splitlines()
-                if line.strip()
-            )
+            for r in (json.loads(line) for line in out.read_text().splitlines() if line.strip())
             if r.get("event") == "log"
             and r.get("step", 0) > args.profile_steps / 2
             and r.get("tokens_per_s")

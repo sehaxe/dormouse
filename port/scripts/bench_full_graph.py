@@ -113,6 +113,7 @@ def arm(shape: str, mode: str, *, steps: int, warm: int, reps: int, data: Path):
     over["full_graph"] = mode == "full_graph"
     over["opt_graph"] = mode == "opt_graph"
     run = load_run("final_byte", train_overrides=over, model_overrides=dict(bf16=True))
+
     # ONE `train()` CALL PER MODEL. `engram_ram` is destructive: the first call
     # switches the Engram to host tables and DELETES `engram.tables`, so a
     # second call on the same object refuses ("no Engram to host") — measured
@@ -181,8 +182,7 @@ def main() -> int:
     if not data.is_file():
         data.write_bytes(bytes(range(256)) * 240_000)  # 61 MB: 24*1025*20 steps fits
     print(
-        f"\n--- {args.shape} (steps={args.steps} reps={args.reps} "
-        f"engram_ram={ENGRAM_RAM}) ---",
+        f"\n--- {args.shape} (steps={args.steps} reps={args.reps} engram_ram={ENGRAM_RAM}) ---",
         flush=True,
     )
     print(f"{'arm':>11s} {'ms/step':>9s} {'bytes/s':>12s} {'launches/step':>14s}  note")
@@ -191,8 +191,9 @@ def main() -> int:
     for mode in args.modes.split(","):
         ms, n, rep = None, None, None
         try:
-            ms, n, rep = arm(args.shape, mode, steps=args.steps, warm=args.warm, reps=args.reps,
-                             data=data)
+            ms, n, rep = arm(
+                args.shape, mode, steps=args.steps, warm=args.warm, reps=args.reps, data=data
+            )
         except LoudError as e:
             print(f"{mode:>11s} {'refused':>9s} {'-':>12s} {'-':>14s}  LOUD: {str(e)[:80]}")
             torch.cuda.empty_cache()

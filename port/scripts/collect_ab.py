@@ -85,9 +85,7 @@ def main() -> int:
         if not m:
             continue
         arm_paths.setdefault(m.group(1), []).append(path)
-    arms: dict[str, list[float]] = {
-        a: _read(sorted(ps), f"arm {a}") for a, ps in arm_paths.items()
-    }
+    arms: dict[str, list[float]] = {a: _read(sorted(ps), f"arm {a}") for a, ps in arm_paths.items()}
     arms = {a: v for a, v in arms.items() if v}
 
     # A CONTROL WITH ONE SEED HAS NO SPREAD, AND `bar = c_mean - 2*0` MAKES AN
@@ -122,10 +120,7 @@ def main() -> int:
     need = max(2 * c_spread, MIN_EFFECT)
     bar = c_mean - need
     print(f"control: n={len(ctl)} {[round(x, 4) for x in ctl]}")
-    print(
-        f"  mean={c_mean:.4f}  spread={c_spread:.4f}  need={need:.4f}  "
-        f"promotion bar={bar:.4f}\n"
-    )
+    print(f"  mean={c_mean:.4f}  spread={c_spread:.4f}  need={need:.4f}  promotion bar={bar:.4f}\n")
     print(f"{'arm':16s} {'n':>2s} {'mean':>7s} {'spread':>7s} {'delta':>8s}  verdict")
     print("-" * 58)
     for arm in sorted(arms, key=lambda a: statistics.mean(arms[a])):

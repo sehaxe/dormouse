@@ -147,22 +147,26 @@ def ledger(cfg: ModelConfig, capacity: float, *, seq_len: int, name: str = "") -
 
         layers = cfg.max_iter
         out_rank = cfg.out_proj_rank or (cfg.rank if cfg.use_tsct else 0)
-        body = 2.0 * active_macs_per_token(
-            d,
-            iters=cfg.max_iter,
-            n_heads=cfg.n_heads,
-            attn_latent_rank=cfg.attn_latent_rank,
-            n_kv_heads=cfg.n_kv_heads,
-            out_proj_rank=out_rank,
-            f=cfg.d_ffn,
-            ffn_form=cfg.ffn_form,
-            ffn_rank=cfg.rank,
-            ffn_rank_gate=cfg.ffn_rank_gate,
-            ffn_rank_down=cfg.ffn_rank_down,
-            n_experts=cfg.n_experts,
-            topk=cfg.moe_topk,
-            shared_rank=cfg.shared_rank,
-        ) / 1e6
+        body = (
+            2.0
+            * active_macs_per_token(
+                d,
+                iters=cfg.max_iter,
+                n_heads=cfg.n_heads,
+                attn_latent_rank=cfg.attn_latent_rank,
+                n_kv_heads=cfg.n_kv_heads,
+                out_proj_rank=out_rank,
+                f=cfg.d_ffn,
+                ffn_form=cfg.ffn_form,
+                ffn_rank=cfg.rank,
+                ffn_rank_gate=cfg.ffn_rank_gate,
+                ffn_rank_down=cfg.ffn_rank_down,
+                n_experts=cfg.n_experts,
+                topk=cfg.moe_topk,
+                shared_rank=cfg.shared_rank,
+            )
+            / 1e6
+        )
         core = 4.0 * layers * t * d / 1e6
         if (d, layers) == (1024, 3):
             # The flagship shape the measured bill belongs to. Absorb the
@@ -222,10 +226,12 @@ def main(argv: list[str] | None = None) -> int:
     for preset in presets:
         cfg = load_preset(preset)
         name = "flagship" if Path(preset).stem == "flagship_base" else Path(preset).stem
-        print(f"[{preset}] form={cfg.block_form} d={cfg.d_model} "
-              f"L={cfg.n_layers or cfg.loop_blocks * cfg.max_iter} "
-              f"T={min(args.seq_len, cfg.max_seq_len)} V={cfg.vocab} "
-              f"experts={cfg.n_experts} top{k if (k := cfg.moe_topk) else 'dense'}")
+        print(
+            f"[{preset}] form={cfg.block_form} d={cfg.d_model} "
+            f"L={cfg.n_layers or cfg.loop_blocks * cfg.max_iter} "
+            f"T={min(args.seq_len, cfg.max_seq_len)} V={cfg.vocab} "
+            f"experts={cfg.n_experts} top{k if (k := cfg.moe_topk) else 'dense'}"
+        )
         header = (
             f"{'capacity':>8s} {'C/T':>8s} {'params':>12s} {'+router':>8s} "
             f"{'MFLOP/B':>9s} {'ratio':>7s} {'all-routed':>10s}"

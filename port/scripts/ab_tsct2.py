@@ -230,14 +230,18 @@ def plan(args: argparse.Namespace) -> int:
     check_equal_active_macs(arms)
     control = arms[0]
     print(f"preset {BASE_PRESET}  steps {STEPS}  b{BATCH} x s{SEQ}  window {WINDOW:,} B")
-    print(f"{'arm':>8s} {'params':>12s} {'bank':>12s} {'active MAC/B':>14s} "
-          f"{'Δparams':>10s} {'fold MAC/step':>14s}")
+    print(
+        f"{'arm':>8s} {'params':>12s} {'bank':>12s} {'active MAC/B':>14s} "
+        f"{'Δparams':>10s} {'fold MAC/step':>14s}"
+    )
     for a in arms:
         cfg = a.run.model
         delta = int(a.row["params"]) - int(control.row["params"])
         fold = fold_macs(cfg) if cfg.tsct_expert_basis else 0
-        print(f"{a.name:>8s} {int(a.row['params']):12,d} {int(a.row['bank']):12,d} "
-              f"{int(a.row['active_macs']):14,d} {delta:+10,d} {fold:14,d}")
+        print(
+            f"{a.name:>8s} {int(a.row['params']):12,d} {int(a.row['bank']):12,d} "
+            f"{int(a.row['active_macs']):14,d} {delta:+10,d} {fold:14,d}"
+        )
         print(f"         {a.note}")
     expected = tsct_basis_param_delta(512, 1536, 64, 192)
     got = int(next(a for a in arms if a.name == "+basis").row["params"]) - int(
@@ -252,10 +256,12 @@ def plan(args: argparse.Namespace) -> int:
         f"fold: {fold_macs(control.run.model):,} MAC once per optimizer step "
         f"(not per token; active MAC/B unchanged by construction)."
     )
-    print("\nDECISION RULE: arm WINs iff (a) every seed is finite and scored "
-          f"{WINDOW:,} B, (b) final-window live/E >= {MIN_LIVE:.0%} in every seed, "
-          "(c) mean < control_mean - max(2*control_spread, 0.01). Otherwise TIE "
-          "inside the band (fewer parameters wins) or LOSS. A VOID seed voids the arm.")
+    print(
+        "\nDECISION RULE: arm WINs iff (a) every seed is finite and scored "
+        f"{WINDOW:,} B, (b) final-window live/E >= {MIN_LIVE:.0%} in every seed, "
+        "(c) mean < control_mean - max(2*control_spread, 0.01). Otherwise TIE "
+        "inside the band (fewer parameters wins) or LOSS. A VOID seed voids the arm."
+    )
     return 0
 
 
@@ -290,24 +296,25 @@ def summarize(values: list[float]) -> tuple[float, float]:
     return statistics.mean(values), max(values) - min(values)
 
 
-def decide(control: list[dict], arm: list[dict], *, params: int, cparams: int,
-           e_total: int) -> dict:
+def decide(
+    control: list[dict], arm: list[dict], *, params: int, cparams: int, e_total: int
+) -> dict:
     """One arm against the control under the file's pre-registered rule."""
-    ctl = [r["bpb"] for r in control if r["bpb"] is not None and r["scored"] == WINDOW
-           and not r["nan"]]
+    ctl = [
+        r["bpb"] for r in control if r["bpb"] is not None and r["scored"] == WINDOW and not r["nan"]
+    ]
     if len(ctl) < 3:
         raise LoudError(f"control has {len(ctl)} finite {WINDOW}-B seeds, need 3")
     cmean, cspread = summarize(ctl)
     need = max(2.0 * cspread, MIN_EFFECT)
     rows = arm
-    healthy = all(
-        r["live"] is not None and r["live"] / e_total >= MIN_LIVE for r in rows
-    )
+    healthy = all(r["live"] is not None and r["live"] / e_total >= MIN_LIVE for r in rows)
     void = any(r["bpb"] is None or r["scored"] != WINDOW or r["nan"] for r in rows)
     if void or not healthy:
         return {
             "mean": statistics.mean([r["bpb"] for r in rows if r["bpb"] is not None])
-            if any(r["bpb"] is not None for r in rows) else float("nan"),
+            if any(r["bpb"] is not None for r in rows)
+            else float("nan"),
             "spread": 0.0,
             "delta": float("nan"),
             "need": need,
@@ -334,8 +341,9 @@ def report(out: Path) -> int:
     e_total = load_run(str(BASE_PRESET), model_overrides=COMMON_MODEL).model.n_experts
     data: dict[str, list[dict]] = {}
     for name, _, _ in ARMS:
-        data[name] = [read_run(out / f"{name.replace('+', 'plus_')}_s{s}" / "run.jsonl")
-                      for s in SEEDS]
+        data[name] = [
+            read_run(out / f"{name.replace('+', 'plus_')}_s{s}" / "run.jsonl") for s in SEEDS
+        ]
     control = data["control"]
     ctl = [r["bpb"] for r in control if r["bpb"] is not None]
     if len(ctl) < 3:
@@ -343,26 +351,39 @@ def report(out: Path) -> int:
     cmean, cspread = summarize(ctl)
     need = max(2.0 * cspread, MIN_EFFECT)
     cparams = int(
-        cm.measure(
-            load_run(str(BASE_PRESET), model_overrides=COMMON_MODEL), batch=BATCH, seq=SEQ
-        )["params"]
+        cm.measure(load_run(str(BASE_PRESET), model_overrides=COMMON_MODEL), batch=BATCH, seq=SEQ)[
+            "params"
+        ]
     )
     print(f"control mean={cmean:.4f} spread={cspread:.4f} bar={cmean - need:.4f}")
-    print(f"{'arm':>8s} {'mean':>8s} {'spread':>8s} {'delta':>8s} {'live':>7s} "
-          f"{'params':>12s} {'verdict':>8s}")
-    decisions: list[dict] = [{"arm": "control", "mean": cmean, "spread": cspread,
-                              "delta": 0.0, "verdict": "CONTROL", "params": cparams}]
+    print(
+        f"{'arm':>8s} {'mean':>8s} {'spread':>8s} {'delta':>8s} {'live':>7s} "
+        f"{'params':>12s} {'verdict':>8s}"
+    )
+    decisions: list[dict] = [
+        {
+            "arm": "control",
+            "mean": cmean,
+            "spread": cspread,
+            "delta": 0.0,
+            "verdict": "CONTROL",
+            "params": cparams,
+        }
+    ]
     for name, _, _ in ARMS[1:]:
         rows = data[name]
-        run = load_run(str(BASE_PRESET),
-                       model_overrides={**COMMON_MODEL, **dict(ARMS_by_name()[name])})
+        run = load_run(
+            str(BASE_PRESET), model_overrides={**COMMON_MODEL, **dict(ARMS_by_name()[name])}
+        )
         params = int(cm.measure(run, batch=BATCH, seq=SEQ)["params"])
         d = decide(control, rows, params=params, cparams=cparams, e_total=e_total)
         lives = [r["live"] / e_total for r in rows if r["live"] is not None]
         live = min(lives) if lives else float("nan")
-        print(f"{name:>8s} {d['mean']:8.4f} {d['spread']:8.4f} {d['delta']:+8.4f} "
-              f"{live:7.1%} {params:12,d} {d['verdict']:>8s}"
-              + (f"  ({d['why']})" if d["why"] else ""))
+        print(
+            f"{name:>8s} {d['mean']:8.4f} {d['spread']:8.4f} {d['delta']:+8.4f} "
+            f"{live:7.1%} {params:12,d} {d['verdict']:>8s}"
+            + (f"  ({d['why']})" if d["why"] else "")
+        )
         d["arm"] = name
         decisions.append(d)
     wins = [d for d in decisions if d["verdict"] == "WIN"]
@@ -372,8 +393,9 @@ def report(out: Path) -> int:
         return 0
     tied = [d for d in decisions if d["verdict"] in ("CONTROL", "TIE")]
     best = min(tied, key=lambda d: (d["params"], d["mean"]))
-    print(f"\nno WIN; tie/control goes to fewer parameters: {best['arm']} "
-          f"({best['params']:,} params)")
+    print(
+        f"\nno WIN; tie/control goes to fewer parameters: {best['arm']} ({best['params']:,} params)"
+    )
     return 0
 
 

@@ -271,10 +271,16 @@ def test_activation_offload_is_exact_and_returns_every_buffer():
     # The forward itself is exact: one step's logits are `torch.equal` on both
     # arms (the hook fires when autograd SAVES, never when it computes). The
     # five-step curves diverge only through the 1e-9 parameter move above.
-    assert _rel(_one_step(over=BF16_CFG)[0], _one_step(
-        lambda m: m.configure_actmem(iter_checkpoint=False, activation_offload=0.01),
-        over=BF16_CFG,
-    )[0]) <= 1e-6
+    assert (
+        _rel(
+            _one_step(over=BF16_CFG)[0],
+            _one_step(
+                lambda m: m.configure_actmem(iter_checkpoint=False, activation_offload=0.01),
+                over=BF16_CFG,
+            )[0],
+        )
+        <= 1e-6
+    )
 
     mech = model._act_offload
     assert mech is not None
@@ -304,9 +310,7 @@ def test_activation_offload_is_exact_and_returns_every_buffer():
             f"the counter and the mechanism disagree: {parked_bytes} != "
             f"{record['stats']['last_forward_bytes']}"
         )
-        assert parked_bytes <= mech.budget, (
-            f"parked {parked_bytes} B > budget {mech.budget} B"
-        )
+        assert parked_bytes <= mech.budget, f"parked {parked_bytes} B > budget {mech.budget} B"
     # The pool is provably REUSED, not just stable: after the profile every
     # later forward checks out a buffer a previous backward returned.
     assert mech.stats()["reuses"] > 0, mech.stats()

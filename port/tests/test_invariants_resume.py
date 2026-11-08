@@ -285,8 +285,10 @@ def test_a_steps_change_matches_the_stitched_schedule(tmp_path, monkeypatch):
     other = _go(fresh, _run(fresh_dir, TFORM, steps=45, **over))
     assert other["loss"] != report["loss"]
     gap = abs(other["loss"] - report["loss"])
-    print(f"steps-change: fresh-45 loss {other['loss']:.9f} vs stitched {report['loss']:.9f} "
-          f"(gap {gap:.3e} nats, cause: the 12..14 LR prefix)")
+    print(
+        f"steps-change: fresh-45 loss {other['loss']:.9f} vs stitched {report['loss']:.9f} "
+        f"(gap {gap:.3e} nats, cause: the 12..14 LR prefix)"
+    )
     assert gap > 1e-9
 
 

@@ -117,9 +117,7 @@ def test_muon_matches_the_reference_transcription() -> None:
     for shape in SHAPES:
         ours, g = step_delta(shape, 1.0)
         ref = reference_step(g)
-        cos = torch.nn.functional.cosine_similarity(
-            ours.flatten(), ref.flatten(), dim=0
-        ).item()
+        cos = torch.nn.functional.cosine_similarity(ours.flatten(), ref.flatten(), dim=0).item()
         rms_ratio = ours.pow(2).mean().sqrt().item() / ref.pow(2).mean().sqrt().item()
         assert cos > 0.99, f"{shape}: cosine {cos:.4f} — the transcription moved"
         # ColRow equalises ROW norms, so a tall matrix ends up sqrt(rows/cols)

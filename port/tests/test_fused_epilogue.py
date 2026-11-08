@@ -112,8 +112,7 @@ def test_off_is_bit_identical_to_clean_main() -> None:
     ids = torch.arange(96, dtype=torch.long).reshape(3, 32) % 251
     got = _pinned(lambda: _digest(a, ids))
     assert got == PIN_A, (
-        "the epilogue arm's OFF path moved: the flag must be a route, not a "
-        f"formula. got {got}"
+        f"the epilogue arm's OFF path moved: the flag must be a route, not a formula. got {got}"
     )
 
 
@@ -217,8 +216,7 @@ def test_one_latent_gemm_is_fp32_roundoff_and_splits_by_view(capsys) -> None:
     d, m, name = _proj_diff(off, on, x)
     with capsys.disabled():
         print(
-            f"\n  latent fp32: worst {name} |Δ|={d:.3e} scale={m:.3e} "
-            f"rel={d / max(m, 1e-30):.2e}"
+            f"\n  latent fp32: worst {name} |Δ|={d:.3e} scale={m:.3e} rel={d / max(m, 1e-30):.2e}"
         )
     assert d <= 1e-6 * max(m, 1e-30), f"{name} moved by {d:.3e} on scale {m:.3e}"
 
@@ -276,8 +274,7 @@ def test_one_latent_gemm_is_bf16_1e2(capsys) -> None:
         d, m, name = _proj_diff(off, on, x)
     with capsys.disabled():
         print(
-            f"\n  latent bf16: worst {name} |Δ|={d:.3e} scale={m:.3e} "
-            f"rel={d / max(m, 1e-30):.2e}"
+            f"\n  latent bf16: worst {name} |Δ|={d:.3e} scale={m:.3e} rel={d / max(m, 1e-30):.2e}"
         )
     assert d <= 1e-2 * max(m, 1e-30), f"bf16 {name} moved by {d:.3e} on scale {m:.3e}"
 
@@ -477,9 +474,7 @@ def test_the_kernel_is_fp32_roundoff(separate: bool) -> None:
 def test_1536_is_legal_and_the_kernel_matches_there() -> None:
     """The m400 width: `d=1536` is NOT a power of two and must not refuse."""
     assert fr.unsupported_reason(torch.float32, 2, 2 * 1536) is None
-    fr.assert_parity(
-        fr.parity(b=1, t=4, d=1536, compose=True, epilogue=True, separate=True)
-    )
+    fr.assert_parity(fr.parity(b=1, t=4, d=1536, compose=True, epilogue=True, separate=True))
 
 
 @CUDA

@@ -224,9 +224,7 @@ def _cpu_capture(monkeypatch, body, *, log=None, pre_capture=None) -> FullGraph:
     monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
     monkeypatch.setattr(torch.cuda, "CUDAGraph", _FakeGraph)
     monkeypatch.setattr(torch.cuda, "graph", graph_ctx)
-    monkeypatch.setattr(
-        torch.autograd.graph, "set_override_stale_capture_stream", lambda _v: None
-    )
+    monkeypatch.setattr(torch.autograd.graph, "set_override_stale_capture_stream", lambda _v: None)
     opt = _FakeOpt()
     graph = FullGraph(
         opt,
@@ -414,9 +412,7 @@ def _run_gpu(run, data):
     return report, seconds, logs
 
 
-@pytest.mark.skipif(
-    _card_reason() is not None, reason=_card_reason() or "GPU gate"
-)
+@pytest.mark.skipif(_card_reason() is not None, reason=_card_reason() or "GPU gate")
 def test_the_m400b_recipe_captures_and_replays_twenty_steps(tmp_path):
     """26 steps: 5 eager, ONE capture, 20 replays, no COUNTED fallback."""
     run = _gpu_recipe(26)
@@ -441,9 +437,7 @@ def test_the_m400b_recipe_captures_and_replays_twenty_steps(tmp_path):
         _free_gpu()
 
 
-@pytest.mark.skipif(
-    _card_reason() is not None, reason=_card_reason() or "GPU gate"
-)
+@pytest.mark.skipif(_card_reason() is not None, reason=_card_reason() or "GPU gate")
 def test_the_first_replay_is_the_arms_own_eager_program(tmp_path, monkeypatch):
     """Capture vs the same arm with `capture` disabled: <=1e-6 after ONE replay.
 
@@ -486,9 +480,7 @@ def test_the_first_replay_is_the_arms_own_eager_program(tmp_path, monkeypatch):
     assert rep_e["counters"].get("full_graph_fallback") == 1
 
 
-@pytest.mark.skipif(
-    _card_reason() is not None, reason=_card_reason() or "GPU gate"
-)
+@pytest.mark.skipif(_card_reason() is not None, reason=_card_reason() or "GPU gate")
 def test_the_twenty_step_parity_is_reported_not_asserted(tmp_path, monkeypatch):
     """The drift over 20 replays is a READING, not a 1e-6 bound.
 

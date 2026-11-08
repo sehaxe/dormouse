@@ -170,14 +170,35 @@ def _typed(flags: dict[str, str]) -> dict:
 
 
 MODEL_KEYS = (
-    "use_msa", "use_csa", "csa_chunk", "csa_coarse_chunk", "use_mhc",
-    "use_attnres", "share_u", "use_engram", "attn_latent_rank", "moe_kernel",
-    "layerrope", "layerrope_form", "layerrope_index", "layerrope_init", "rank",
+    "use_msa",
+    "use_csa",
+    "csa_chunk",
+    "csa_coarse_chunk",
+    "use_mhc",
+    "use_attnres",
+    "share_u",
+    "use_engram",
+    "attn_latent_rank",
+    "moe_kernel",
+    "layerrope",
+    "layerrope_form",
+    "layerrope_index",
+    "layerrope_init",
+    "rank",
     "n_experts",
 )
 TRAIN_KEYS = (
-    "batch", "seq_len", "grad_accum", "lr", "decay_frac", "min_lr_frac",
-    "engram_ram", "doc_masking", "seed", "opt_graph", "iter_checkpoint",
+    "batch",
+    "seq_len",
+    "grad_accum",
+    "lr",
+    "decay_frac",
+    "min_lr_frac",
+    "engram_ram",
+    "doc_masking",
+    "seed",
+    "opt_graph",
+    "iter_checkpoint",
 )
 
 
@@ -276,8 +297,7 @@ def format_plan(p: dict) -> str:
         f" · kernel {p['kernel']} · balance {p['balance']})",
         f"budget  20 B/param Chinchilla: {b['chinchilla_gb']:.2f} GB"
         f" ({b['chinchilla_tokens']:,} tokens)",
-        f"        one pass of mix_v7:    {b['one_pass_gb']:.1f} GB"
-        f" ({b['passes']:.1f}x Chinchilla)",
+        f"        one pass of mix_v7:    {b['one_pass_gb']:.1f} GB ({b['passes']:.1f}x Chinchilla)",
         f"eta     at {MEASURED_BPS:,.0f} B/s: {_days(b['eta_s'])} Chinchilla"
         f" · {_days(b['one_pass_eta_s'])} one pass",
     ]
@@ -289,9 +309,7 @@ def format_plan(p: dict) -> str:
     else:
         live = p["live_experts"]
         frac = 100.0 * live / max(1, p["n_experts"])
-        lines.append(
-            f"routing {live}/{p['n_experts']} live ({frac:.1f}%) from {p['route_json']}"
-        )
+        lines.append(f"routing {live}/{p['n_experts']} live ({frac:.1f}%) from {p['route_json']}")
     if p["warning"]:
         lines.append(p["warning"])
     return "\n".join(lines)

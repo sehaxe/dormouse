@@ -164,7 +164,7 @@ def test_the_window_is_bit_identical_to_the_pylong_path():
 
     from dormouse.train.data import _windows
 
-    raw = bytes(range(256))          # 4 x 64 = 256 bytes exactly
+    raw = bytes(range(256))  # 4 x 64 = 256 bytes exactly
     ids, tgt = _windows(raw, batch=4, seq_len=63)
     expect = torch.tensor(list(raw), dtype=torch.long).view(4, 64)
     assert ids.dtype == tgt.dtype == torch.long

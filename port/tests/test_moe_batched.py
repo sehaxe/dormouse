@@ -68,9 +68,7 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
 
 def _grads(moe: SparseMoE) -> dict:
     return {
-        f"{i}.{name}": p.grad
-        for i, e in enumerate(moe.experts)
-        for name, p in e.named_parameters()
+        f"{i}.{name}": p.grad for i, e in enumerate(moe.experts) for name, p in e.named_parameters()
     }
 
 
@@ -232,9 +230,7 @@ def test_one_row_and_forty_rows_give_the_loop_answer():
     ref = moe._naive_dispatch(x2, weight, index, order, keep, Counters())
     ref.square().sum().backward()
     ref_grads = {
-        f"{i}.{name}": p.grad
-        for i, e in enumerate(moe.experts)
-        for name, p in e.named_parameters()
+        f"{i}.{name}": p.grad for i, e in enumerate(moe.experts) for name, p in e.named_parameters()
     }
     print(
         f"[unequal] counts={counts.tolist()} cap={moe._batched_cap(index, weight)} "
@@ -320,9 +316,7 @@ def test_padded_rows_carry_no_value_or_gradient():
     # cap = 4 (capacity 1.0 x 8 tokens x 2 / 4 experts): expert 0 owns 6 rows
     # (2 dropped past the cap), expert 1 owns 2 (2 PADDED bank rows), so one
     # fixture proves both sinks: the padding inside [E, cap] and the dump slot.
-    index = torch.tensor(
-        [[0, 0], [0, 0], [0, 0], [1, 1], [2, 2], [2, 2], [3, 3], [3, 3]]
-    )
+    index = torch.tensor([[0, 0], [0, 0], [0, 0], [1, 1], [2, 2], [2, 2], [3, 3], [3, 3]])
     weight = torch.ones(n, k) / k
     order, keep, dropped = moe._permute(index)
     counts = torch.bincount(index.reshape(-1), minlength=moe.n_experts)

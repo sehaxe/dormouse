@@ -100,8 +100,7 @@ def write_sidecar(
     size = bin_path.stat().st_size
     if not starts or starts[0] != 0:
         raise SystemExit(
-            f"{bin_path}: starts must begin at 0, got {starts[:1]}; "
-            f"refusing to write a sidecar"
+            f"{bin_path}: starts must begin at 0, got {starts[:1]}; refusing to write a sidecar"
         )
     for a, b in zip(starts, starts[1:], strict=False):
         if b <= a:
@@ -111,8 +110,7 @@ def write_sidecar(
             )
     if starts[-1] >= size:
         raise SystemExit(
-            f"{bin_path}: a document starts at {starts[-1]} >= {size}; "
-            f"refusing to write a sidecar"
+            f"{bin_path}: a document starts at {starts[-1]} >= {size}; refusing to write a sidecar"
         )
     side = Path(str(bin_path) + ".docs.json") if out is None else Path(out)
     doc = {

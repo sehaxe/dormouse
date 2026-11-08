@@ -202,6 +202,9 @@ def test_a_different_offset_is_a_different_window(tmp_path):
     bpb1, count1, _ = _independent(f["model"], moved)
     assert count1 == count0
     assert bpb0 != bpb1, "moving the offset did not move the scored bytes"
-    assert "off=3" not in _eval_line(
-        f["model"], open_streams(moved)[1], moved.train, run.model.max_iter, None, 2
-    )[0]
+    assert (
+        "off=3"
+        not in _eval_line(
+            f["model"], open_streams(moved)[1], moved.train, run.model.max_iter, None, 2
+        )[0]
+    )

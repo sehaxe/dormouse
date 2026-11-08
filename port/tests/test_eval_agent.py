@@ -169,9 +169,10 @@ def test_the_sample_is_the_shipped_builder_output():
         "string_list": 4,
         "algorithmic": 4,
     }
-    assert all(set(record) == {
-        "id", "kind", "prompt", "answer", "verifier", "difficulty_hint"
-    } for record in records)
+    assert all(
+        set(record) == {"id", "kind", "prompt", "answer", "verifier", "difficulty_hint"}
+        for record in records
+    )
 
 
 def test_dry_run_refuses_a_checkpoint_model(tmp_path: Path):

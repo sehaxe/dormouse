@@ -219,7 +219,7 @@ def test_gate_3_hierarchy_selects_the_flat_region_when_topk_covers_it():
     # through to the same keys; every later partially-built container differs.
     # The OLD assertion (equal everywhere) was false and passed only while the
     # parent mask was missing — see docs/reviews/2026-11-08-math-audit.md §6.3.
-    chunk = 4                        # csa_chunk in `cover`
+    chunk = 4  # csa_chunk in `cover`
     d_first = float((yh[:, :chunk] - yf[:, :chunk]).abs().max())
     d_rest = float((yh[:, chunk:] - yf[:, chunk:]).abs().max())
     tol = 1e-5

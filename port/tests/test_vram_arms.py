@@ -203,9 +203,7 @@ def test_the_saved_tensor_table_is_pinned_per_arm():
     for mode in ("none", "full", "selective"):
         model = _model(mode)
         ids, targets = _ids()
-        table, logits = saved_table(
-            lambda m=model, i=ids, t=targets: m(i, t, ck)
-        )
+        table, logits = saved_table(lambda m=model, i=ids, t=targets: m(i, t, ck))
         assert table.tensors and table.bytes
         want = SAVE_TABLE[mode]
         assert (table.tensors, table.bytes) == want, (
@@ -254,9 +252,7 @@ def test_every_new_refusal_fires():
         "opt_graph",
     )
     _loud(
-        lambda: validate_train(
-            TrainConfig(iter_checkpoint=True, activation_recompute="selective")
-        ),
+        lambda: validate_train(TrainConfig(iter_checkpoint=True, activation_recompute="selective")),
         "iter_checkpoint",
         "selective",
     )
@@ -266,9 +262,7 @@ def test_every_new_refusal_fires():
         "use_byteflow",
     )
     _loud(
-        lambda: validate_model_train(
-            ModelConfig(**CFG), TrainConfig(activation_offload=4.0)
-        ),
+        lambda: validate_model_train(ModelConfig(**CFG), TrainConfig(activation_offload=4.0)),
         "bf16=false",
     )
     # A hand-built model reaches the same refusals at the runtime seam.

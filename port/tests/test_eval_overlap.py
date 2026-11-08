@@ -15,9 +15,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from conftest import tiny_cfg, tiny_run  # noqa: E402
-from dormouse.instrument import LoudError  # noqa: E402
+from conftest import tiny_run  # noqa: E402
 from eval_window import refuse_training_overlap, training_paths  # noqa: E402
+
+from dormouse.instrument import LoudError  # noqa: E402
 
 
 def _run_with(tmp_path: Path, **over):

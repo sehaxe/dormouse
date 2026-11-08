@@ -354,4 +354,3 @@ def test_the_refusals_hold_at_the_model_seam_too():
     with pytest.raises(LoudError) as e:
         DormouseModel(cfg)
     assert "mod_aux_weight" in str(e.value)
-

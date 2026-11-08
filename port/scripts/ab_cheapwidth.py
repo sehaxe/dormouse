@@ -150,8 +150,7 @@ ARMS = (
 #: The pure-arithmetic prediction each row is judged against.
 BASE_MACS = macs_per_token(D, iters=3, n_heads=H)
 MAC_CUT = {
-    arm: 1.0 - macs_per_token(D, iters=3, n_heads=H, **flags) / BASE_MACS
-    for arm, flags in ARMS
+    arm: 1.0 - macs_per_token(D, iters=3, n_heads=H, **flags) / BASE_MACS for arm, flags in ARMS
 }
 PARAMS_DELTA = {arm: param_delta(D, n_heads=H, **flags) for arm, flags in ARMS}
 
@@ -438,8 +437,7 @@ def ab(args: argparse.Namespace) -> int:
             f"{v['ms_delta']:+.1f})" + (f" — {v['reason']}" if v["reason"] else "")
         )
     print(
-        "\nms/step is the SEPARATE verdict (review §6.1): reported, never folded "
-        "into the BPB rule."
+        "\nms/step is the SEPARATE verdict (review §6.1): reported, never folded into the BPB rule."
     )
     return 0
 

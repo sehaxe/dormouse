@@ -61,23 +61,46 @@ def main() -> int:
     # every flag the real launcher passes: a resume compares the snapshot, and a
     # missing `data` is a loud refusal before the first step
     sets = [
-        "steps=150040", "batch=8", "seq_len=1024", "max_seq_len=1024", "grad_accum=1",
-        "lr=5e-4", "warmup_tokens=126000000", "decay_frac=0.4", "min_lr_frac=0.01",
-        "use_msa=false", "use_csa=true", "csa_chunk=8", "csa_coarse_chunk=256",
-        "use_mhc=true", "use_attnres=true", "share_u=true",
-        "use_engram=true", "engram_ram=false",
-        "attn_latent_rank=256", "moe_kernel=triton", "moe_capacity=0.0",
+        "steps=150040",
+        "batch=8",
+        "seq_len=1024",
+        "max_seq_len=1024",
+        "grad_accum=1",
+        "lr=5e-4",
+        "warmup_tokens=126000000",
+        "decay_frac=0.4",
+        "min_lr_frac=0.01",
+        "use_msa=false",
+        "use_csa=true",
+        "csa_chunk=8",
+        "csa_coarse_chunk=256",
+        "use_mhc=true",
+        "use_attnres=true",
+        "share_u=true",
+        "use_engram=true",
+        "engram_ram=false",
+        "attn_latent_rank=256",
+        "moe_kernel=triton",
+        "moe_capacity=0.0",
         "doc_masking=false",
         "data=/home/sehaxe/dormouse/data_local/best/fwedu.bin",
-        "mix_plan=configs/mix_v7.toml", "eval=false", "log_every=1",
+        "mix_plan=configs/mix_v7.toml",
+        "eval=false",
+        "log_every=1",
         "eval_data=/home/sehaxe/dormouse/data_local/mix4/web_eval.bin",
         "eval_batches=8",
         "ckpt_every=100000",
-        "layerrope=true", "layerrope_form=paper", "layerrope_index=iteration",
+        "layerrope=true",
+        "layerrope_form=paper",
+        "layerrope_index=iteration",
         "layerrope_init=paper",
-        "rank=64", "n_experts=512", "seed=1", "opt_graph=false",
+        "rank=64",
+        "n_experts=512",
+        "seed=1",
+        "opt_graph=false",
         "iter_checkpoint=false",
-        "ckpt_name=syncaudit", "out_dir=/tmp/opencode/syncaudit",
+        "ckpt_name=syncaudit",
+        "out_dir=/tmp/opencode/syncaudit",
     ]
     argv = ["train", "configs/m400.toml", "--resume"]
     for kv in sets:
@@ -95,7 +118,7 @@ def main() -> int:
     for key, val in (
         ("ckpt_name", '"syncaudit"'),
         ("out_dir", '"/tmp/opencode/syncaudit"'),
-            ):
+    ):
         cfg = re.sub(rf"^{key} = .*$", f"{key} = {val}", cfg, flags=re.M)
     (dst / "syncaudit.config.toml").write_text(cfg)
     try:

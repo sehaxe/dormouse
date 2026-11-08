@@ -377,18 +377,61 @@ def _permute_rows(c: Ctx) -> list[Row]:
             )
         )
     rows += [
-        Row("permute", "sorted_ids = safe[order]", "experts._permute", R,
-            ((R, "int64"), (R, "int64")), ((R, "int64"),), 1),
-        Row("permute", "counts = bincount(sorted_ids)", "experts._permute: _bincount",
-            (c.E,), ((R, "int64"),), ((c.E,), "int64"), 1),
-        Row("permute", "offsets = cumsum(counts) - counts", "experts._permute",
-            (c.E,), ((c.E,), "int64"), ((c.E,), "int64"), 1),
-        Row("permute", "pos = arange - offsets[sorted_ids]", "experts._permute", R,
-            ((R, "int64"), ((c.E,), "int64")), ((R, "int64"),), 2),
-        Row("permute", "keep_cap = pos < cap", "experts._permute", R,
-            ((R, "int64"),), ((R,), "bool"), 1, note="dropless: ones_like"),
-        Row("permute", "dropped = (~keep).sum()", "experts._permute", (1,),
-            ((R,), "bool"), ((1,), "int64"), 2),
+        Row(
+            "permute",
+            "sorted_ids = safe[order]",
+            "experts._permute",
+            R,
+            ((R, "int64"), (R, "int64")),
+            ((R, "int64"),),
+            1,
+        ),
+        Row(
+            "permute",
+            "counts = bincount(sorted_ids)",
+            "experts._permute: _bincount",
+            (c.E,),
+            ((R, "int64"),),
+            ((c.E,), "int64"),
+            1,
+        ),
+        Row(
+            "permute",
+            "offsets = cumsum(counts) - counts",
+            "experts._permute",
+            (c.E,),
+            ((c.E,), "int64"),
+            ((c.E,), "int64"),
+            1,
+        ),
+        Row(
+            "permute",
+            "pos = arange - offsets[sorted_ids]",
+            "experts._permute",
+            R,
+            ((R, "int64"), ((c.E,), "int64")),
+            ((R, "int64"),),
+            2,
+        ),
+        Row(
+            "permute",
+            "keep_cap = pos < cap",
+            "experts._permute",
+            R,
+            ((R, "int64"),),
+            ((R,), "bool"),
+            1,
+            note="dropless: ones_like",
+        ),
+        Row(
+            "permute",
+            "dropped = (~keep).sum()",
+            "experts._permute",
+            (1,),
+            ((R,), "bool"),
+            ((1,), "int64"),
+            2,
+        ),
     ]
     return rows
 
@@ -397,36 +440,104 @@ def _gather_rows(c: Ctx) -> list[Row]:
     """`_triton_dispatch`'s row map and the A operand (`xg` or `x[toks]`)."""
     R, n, k = c.R, c.n, c.k
     rows: list[Row] = [
-        Row("gather", "owner = rows // k", "_triton_dispatch", (R,),
-            ((R, "int64"),), ((R, "int64"),), 1),
-        Row("gather", "kept = index.reshape(-1)[rows]", "_triton_dispatch", (R,),
-            ((R, "int64"), (R, "int64")), ((R, "int64"),), 1),
-        Row("gather", "counts = bincount(kept)", "_triton_dispatch: _bincount", (c.E,),
-            ((R, "int64"),), ((c.E,), "int64"), 1),
-        Row("gather", "offs = zeros(E+1); offs[1:] = cumsum(counts)", "_triton_dispatch",
-            (c.E + 1,), ((c.E,), "int64"), ((c.E + 1,), "int32"), 3),
-        Row("gather", "rowmap = full(nk,-1); rowmap[rows] = arange(R)", "_triton_dispatch",
-            (n, k), ((R, "int64"), (R, "int64")), ((n * k,), "int32"), 2),
-        Row("gather", "seg = kept.to(int32)", "_triton_dispatch", (R,),
-            ((R, "int64"),), ((R,), "int32"), 1),
-        Row("gather", "w = weight.reshape(-1)[rows].float()", "_triton_dispatch: combine arg",
-            (R,), ((R, "int64"), (R, c.dt)), ((R,), "f32"), 2),
+        Row(
+            "gather",
+            "owner = rows // k",
+            "_triton_dispatch",
+            (R,),
+            ((R, "int64"),),
+            ((R, "int64"),),
+            1,
+        ),
+        Row(
+            "gather",
+            "kept = index.reshape(-1)[rows]",
+            "_triton_dispatch",
+            (R,),
+            ((R, "int64"), (R, "int64")),
+            ((R, "int64"),),
+            1,
+        ),
+        Row(
+            "gather",
+            "counts = bincount(kept)",
+            "_triton_dispatch: _bincount",
+            (c.E,),
+            ((R, "int64"),),
+            ((c.E,), "int64"),
+            1,
+        ),
+        Row(
+            "gather",
+            "offs = zeros(E+1); offs[1:] = cumsum(counts)",
+            "_triton_dispatch",
+            (c.E + 1,),
+            ((c.E,), "int64"),
+            ((c.E + 1,), "int32"),
+            3,
+        ),
+        Row(
+            "gather",
+            "rowmap = full(nk,-1); rowmap[rows] = arange(R)",
+            "_triton_dispatch",
+            (n, k),
+            ((R, "int64"), (R, "int64")),
+            ((n * k,), "int32"),
+            2,
+        ),
+        Row(
+            "gather",
+            "seg = kept.to(int32)",
+            "_triton_dispatch",
+            (R,),
+            ((R, "int64"),),
+            ((R,), "int32"),
+            1,
+        ),
+        Row(
+            "gather",
+            "w = weight.reshape(-1)[rows].float()",
+            "_triton_dispatch: combine arg",
+            (R,),
+            ((R, "int64"), (R, c.dt)),
+            ((R,), "f32"),
+            2,
+        ),
     ]
     if c.gather == "kernel":
         # `gather_abi` + the kernel's own `x[toks]` read: no materialized copy.
         rows += [
-            Row("gather", "toks = (rows//k).to(int32)", "moe_sonic.gather_abi", (R,),
-                ((R, "int64"),), ((R,), "int32"), 1),
-            Row("gather", "x[toks] read inside the expert kernel", "moe_sonic._gather_glu_kernel",
-                (R, c.d), (((R, c.d), c.dt),), (), 0),
+            Row(
+                "gather",
+                "toks = (rows//k).to(int32)",
+                "moe_sonic.gather_abi",
+                (R,),
+                ((R, "int64"),),
+                ((R,), "int32"),
+                1,
+            ),
+            Row(
+                "gather",
+                "x[toks] read inside the expert kernel",
+                "moe_sonic._gather_glu_kernel",
+                (R, c.d),
+                (((R, c.d), c.dt),),
+                (),
+                0,
+            ),
             # `_GatherGlu` has no adjoint: its backward RE-RUNS the shipped
             # expert forward on the same rows. That is a whole forward's traffic
             # added to the PASS (the prototype's own finding).
-            Row("gather", "gather arm: recompute one expert forward",
-                "moe_sonic._GatherGlu.backward -> _shipped_forward", (R, c.f),
+            Row(
+                "gather",
+                "gather arm: recompute one expert forward",
+                "moe_sonic._GatherGlu.backward -> _shipped_forward",
+                (R, c.f),
                 (((c.E, c.d, c.r), c.dt),) * 2 + (((c.E, c.r, c.f), c.dt),) + (((R, c.d), c.dt),),
-                (((R, c.f), c.dt),), 1,
-                note="the arm's backward has no adjoint: one extra forward per pass"),
+                (((R, c.f), c.dt),),
+                1,
+                note="the arm's backward has no adjoint: one extra forward per pass",
+            ),
         ]
     else:
         rows.append(
@@ -446,9 +557,16 @@ def _gather_rows(c: Ctx) -> list[Row]:
         # `nonzero` underneath (the op ADR-0018's capture note bans).
         rows.insert(
             0,
-            Row("gather", "rows = order[keep]", "_dispatch: keep_rows = keep", (R,),
-                ((R, "int64"), (R, "bool")), ((R, "int64"),), 1,
-                note="bool-mask index: a host-side length, refused by full_graph"),
+            Row(
+                "gather",
+                "rows = order[keep]",
+                "_dispatch: keep_rows = keep",
+                (R,),
+                ((R, "int64"), (R, "bool")),
+                ((R, "int64"),),
+                1,
+                note="bool-mask index: a host-side length, refused by full_graph",
+            ),
         )
     return rows
 
@@ -489,16 +607,43 @@ def _combine_rows(c: Ctx) -> list[Row]:
             ),
         ]
     return [
-        Row("combine", "out = zeros(n, f) fp32", "experts._triton_dispatch: combine",
-            (n, f), (), ((n, f), "f32"), 1),
-        Row("combine", "y.to(f32) * w", "moe_kernels._Combine.forward", (R, f),
-            ((R, f), c.dt), ((R, f), "f32"), 1,
-            note="the fp32 widening at the MoE output boundary"),
-        Row("combine", "out.index_add_(owner, ·)", "moe_kernels._Combine.forward", (n, f),
-            ((R, f), "f32") + ((n, f), "f32"), ((n, f), "f32"), 1),
-        Row("combine", "combine backward", "moe_kernels._Combine.backward (one launch)",
-            (n, f), ((n, f), "f32") + ((R, f), c.dt) + ((R,), "f32"),
-            ((R, f), c.dt) + ((R,), "f32"), 1),
+        Row(
+            "combine",
+            "out = zeros(n, f) fp32",
+            "experts._triton_dispatch: combine",
+            (n, f),
+            (),
+            ((n, f), "f32"),
+            1,
+        ),
+        Row(
+            "combine",
+            "y.to(f32) * w",
+            "moe_kernels._Combine.forward",
+            (R, f),
+            ((R, f), c.dt),
+            ((R, f), "f32"),
+            1,
+            note="the fp32 widening at the MoE output boundary",
+        ),
+        Row(
+            "combine",
+            "out.index_add_(owner, ·)",
+            "moe_kernels._Combine.forward",
+            (n, f),
+            ((R, f), "f32") + ((n, f), "f32"),
+            ((n, f), "f32"),
+            1,
+        ),
+        Row(
+            "combine",
+            "combine backward",
+            "moe_kernels._Combine.backward (one launch)",
+            (n, f),
+            ((n, f), "f32") + ((R, f), c.dt) + ((R,), "f32"),
+            ((R, f), c.dt) + ((R,), "f32"),
+            1,
+        ),
     ]
 
 
@@ -507,10 +652,24 @@ def _lfb_rows(c: Ctx) -> list[Row]:
     if c.lb_mode == "aux":
         return []
     return [
-        Row("lfb", "counts = bincount(real)", "experts.forward: _bincount", (c.E,),
-            ((c.R,), "int64"), ((c.E,), "int64"), 1),
-        Row("lfb", "b -= coef·sign(L-mean) / prop", "experts._lfb_step", (c.E,),
-            ((c.E, "int64"), (c.E, "f32"), (c.E, "f32"), (c.E, "f32")), ((c.E,), "f32"), 5),
+        Row(
+            "lfb",
+            "counts = bincount(real)",
+            "experts.forward: _bincount",
+            (c.E,),
+            ((c.R,), "int64"),
+            ((c.E,), "int64"),
+            1,
+        ),
+        Row(
+            "lfb",
+            "b -= coef·sign(L-mean) / prop",
+            "experts._lfb_step",
+            (c.E,),
+            ((c.E, "int64"), (c.E, "f32"), (c.E, "f32"), (c.E, "f32")),
+            ((c.E,), "f32"),
+            5,
+        ),
     ]
 
 
@@ -532,35 +691,62 @@ def _bank_rows(c: Ctx) -> list[Row]:
             (),
             (),
             0,
-            host_us=(
-                E * KEY_WALK_US_PER_EXPERT
-                if not c.bank_epoch
-                else EPOCH_KEY_US
-            ),
+            host_us=(E * KEY_WALK_US_PER_EXPERT if not c.bank_epoch else EPOCH_KEY_US),
             note="HOST per `_banks` call, i.e. per forward (measured 2026-11-05)",
         )
     ]
     if c.share_u == "plane":
         for name in ("gate_u", "up_u"):
             rows.append(
-                Row("bank", f"{name} plane -> [E,d,r]", "experts._banks: u.expand(E).contiguous()",
-                    (E, d, r), ((d, r), c.dt), ((E, d, r), c.dt), 1, per_step=True)
+                Row(
+                    "bank",
+                    f"{name} plane -> [E,d,r]",
+                    "experts._banks: u.expand(E).contiguous()",
+                    (E, d, r),
+                    ((d, r), c.dt),
+                    ((E, d, r), c.dt),
+                    1,
+                    per_step=True,
+                )
             )
     else:
         for name in ("gate_u", "up_u"):
             rows.append(
-                Row("bank", f"{name} stack [E,d,r]",
-                    "experts._banks: torch.stack([e.gate_u.to(dt)...])", (E, d, r),
-                    ((E, d, r), "f32"), ((E, d, r), c.dt), E + 1, per_step=True)
+                Row(
+                    "bank",
+                    f"{name} stack [E,d,r]",
+                    "experts._banks: torch.stack([e.gate_u.to(dt)...])",
+                    (E, d, r),
+                    ((E, d, r), "f32"),
+                    ((E, d, r), c.dt),
+                    E + 1,
+                    per_step=True,
+                )
             )
     rows.append(
-        Row("bank", "v stack [E,r,f]", "experts._banks: torch.stack([e.v.to(dt)...])",
-            (E, r, f), ((E, r, f), "f32"), ((E, r, f), c.dt), E + 1, per_step=True)
+        Row(
+            "bank",
+            "v stack [E,r,f]",
+            "experts._banks: torch.stack([e.v.to(dt)...])",
+            (E, r, f),
+            ((E, r, f), "f32"),
+            ((E, r, f), c.dt),
+            E + 1,
+            per_step=True,
+        )
     )
     for name in ("gate_s", "up_s"):
         rows.append(
-            Row("bank", f"{name} stack [E,r]", f"experts._banks: {name}", (E, r),
-                ((E, r), "f32"), ((E, r), c.dt), 2, per_step=True)
+            Row(
+                "bank",
+                f"{name} stack [E,r]",
+                f"experts._banks: {name}",
+                (E, r),
+                ((E, r), "f32"),
+                ((E, r), c.dt),
+                2,
+                per_step=True,
+            )
         )
     return rows
 
@@ -573,16 +759,44 @@ def _down_rows(c: Ctx) -> list[Row]:
         # With a bf16 combine store `weighted` is ALREADY dt: `.to(dt)` is a
         # no-op and its whole pass (134 MB read + 67 MB write) disappears.
         rows.append(
-            Row("down", "weighted.to(dt)", "experts.forward: mm_mixed(weighted.to(dt), ...)",
-                (n, f), ((n, f), "f32"), ((n, f), c.dt), 1)
+            Row(
+                "down",
+                "weighted.to(dt)",
+                "experts.forward: mm_mixed(weighted.to(dt), ...)",
+                (n, f),
+                ((n, f), "f32"),
+                ((n, f), c.dt),
+                1,
+            )
         )
     rows += [
-        Row("down", "down weight cast", "tsct.mm_mixed: weight.to(dt)", (d, f),
-            ((d, f), "f32"), ((d, f), c.dt), 1),
-        Row("down", "down gemm", "tsct.mm_mixed: x @ w.t()", (n, d),
-            ((n, f), c.dt) + ((d, f), c.dt), ((n, d), c.dt), 1),
-        Row("down", "out.to(f32)", "experts.forward: ...to(torch.float32)", (n, d),
-            ((n, d), c.dt), ((n, d), "f32"), 1),
+        Row(
+            "down",
+            "down weight cast",
+            "tsct.mm_mixed: weight.to(dt)",
+            (d, f),
+            ((d, f), "f32"),
+            ((d, f), c.dt),
+            1,
+        ),
+        Row(
+            "down",
+            "down gemm",
+            "tsct.mm_mixed: x @ w.t()",
+            (n, d),
+            ((n, f), c.dt) + ((d, f), c.dt),
+            ((n, d), c.dt),
+            1,
+        ),
+        Row(
+            "down",
+            "out.to(f32)",
+            "experts.forward: ...to(torch.float32)",
+            (n, d),
+            ((n, d), c.dt),
+            ((n, d), "f32"),
+            1,
+        ),
     ]
     return rows
 
@@ -597,14 +811,35 @@ def _expert_rows(c: Ctx) -> list[Row]:
     R, E, d, f, r = c.R, c.E, c.d, c.f, c.r
     bank = nbytes((E, d, r), c.dt) * 2 + nbytes((E, r, f), c.dt)
     return [
-        Row("expert", "expert fwd (bank read + y)", "moe_kernels._ExpertGemmGlu.forward",
-            (R, f), (((E, d, r), c.dt), ((E, d, r), c.dt), ((E, r, f), c.dt)),
-            ((R, f), c.dt), 1, note=f"bank read {bank / 1e6:.0f} MB"),
-        Row("expert", "expert bwd: dx (pair) + 3 wgrad", "moe_kernels._glu_backward_fused",
-            (R, f), (((E, d, r), c.dt),) * 2, (((E, d, r), c.dt),) * 2 + (((E, r, f), c.dt),), 4,
-            note="1 grouped pair + 3 _wgrad"),
-        Row("expert", "expert bwd: ~20 pointwise [R,r]", "moe_kernels._glu_backward_fused",
-            (R, r), ((R, r), "f32") * 20, ((R, r), "f32") * 20, 20),
+        Row(
+            "expert",
+            "expert fwd (bank read + y)",
+            "moe_kernels._ExpertGemmGlu.forward",
+            (R, f),
+            (((E, d, r), c.dt), ((E, d, r), c.dt), ((E, r, f), c.dt)),
+            ((R, f), c.dt),
+            1,
+            note=f"bank read {bank / 1e6:.0f} MB",
+        ),
+        Row(
+            "expert",
+            "expert bwd: dx (pair) + 3 wgrad",
+            "moe_kernels._glu_backward_fused",
+            (R, f),
+            (((E, d, r), c.dt),) * 2,
+            (((E, d, r), c.dt),) * 2 + (((E, r, f), c.dt),),
+            4,
+            note="1 grouped pair + 3 _wgrad",
+        ),
+        Row(
+            "expert",
+            "expert bwd: ~20 pointwise [R,r]",
+            "moe_kernels._glu_backward_fused",
+            (R, r),
+            ((R, r), "f32") * 20,
+            ((R, r), "f32") * 20,
+            20,
+        ),
     ]
 
 
@@ -634,9 +869,7 @@ def _shape(row: Row) -> str:
     return "x".join(str(x) for x in row.shape)
 
 
-def report(
-    cfg: ModelConfig, rows: list[Row], c: Ctx, bw: float, *, top: int = 0
-) -> dict:
+def report(cfg: ModelConfig, rows: list[Row], c: Ctx, bw: float, *, top: int = 0) -> dict:
     total = sum(r.nbytes for r in rows)
     launches = sum(r.launches for r in rows)
     print(
@@ -687,10 +920,19 @@ def report(
             print(f"   top: {r.nbytes / 1e6:8.1f} MB  {r.group:<9} {r.op}")
     return {
         "config": {
-            "n": c.n, "E": c.E, "d": c.d, "f": c.f, "r": c.r, "k": c.k,
-            "cap": c.cap, "bf16": c.bf16, "max_iter": c.max_iter,
-            "moe_gather": c.gather, "moe_permute": c.permute,
-            "moe_route_fused": c.route_fused, "share_u": c.share_u,
+            "n": c.n,
+            "E": c.E,
+            "d": c.d,
+            "f": c.f,
+            "r": c.r,
+            "k": c.k,
+            "cap": c.cap,
+            "bf16": c.bf16,
+            "max_iter": c.max_iter,
+            "moe_gather": c.gather,
+            "moe_permute": c.permute,
+            "moe_route_fused": c.route_fused,
+            "share_u": c.share_u,
         },
         "total_bytes": total,
         "total_launches": launches,
@@ -700,14 +942,18 @@ def report(
         "step_bytes": step_b,
         "step_launches": step_l,
         "groups": [
-            {"group": g, "bytes": nb, "launches": nl, "us": nb / bw * 1e6}
-            for g, nb, nl in by_group
+            {"group": g, "bytes": nb, "launches": nl, "us": nb / bw * 1e6} for g, nb, nl in by_group
         ],
         "rows": [
             {
-                "group": r.group, "op": r.op, "site": r.site,
-                "shape": list(r.shape), "dtypes": r.dtypes,
-                "bytes": r.nbytes, "launches": r.launches, "per_step": r.per_step,
+                "group": r.group,
+                "op": r.op,
+                "site": r.site,
+                "shape": list(r.shape),
+                "dtypes": r.dtypes,
+                "bytes": r.nbytes,
+                "launches": r.launches,
+                "per_step": r.per_step,
             }
             for r in rows
         ],
@@ -717,8 +963,16 @@ def report(
 def ab(cfg: ModelConfig, batch: int, seq: int) -> dict[str, dict]:
     """The shipped arms vs each new one, SAME geometry — the A/B the flags need."""
     arms = (
-        ("shipped", dict(moe_route_fused=False, moe_permute="argsort",
-                         moe_combine="torch", moe_combine_dtype="fp32", moe_bank_epoch=False)),
+        (
+            "shipped",
+            dict(
+                moe_route_fused=False,
+                moe_permute="argsort",
+                moe_combine="torch",
+                moe_combine_dtype="fp32",
+                moe_bank_epoch=False,
+            ),
+        ),
         ("fused-route", dict(moe_route_fused=True, moe_permute="count")),
         ("fused-combine", dict(moe_combine="fused")),
         ("combine-bf16", dict(moe_combine="fused", moe_combine_dtype="bf16")),
@@ -726,10 +980,22 @@ def ab(cfg: ModelConfig, batch: int, seq: int) -> dict[str, dict]:
         # The combination the report PICKS: the fused route + counting permute +
         # fp32 fused combine (bit-identical) + the epoch key. bf16 is priced
         # separately because it does not meet the 1e-3 logits target.
-        ("picked", dict(moe_route_fused=True, moe_permute="count",
-                        moe_combine="fused", moe_bank_epoch=True)),
-        ("all", dict(moe_route_fused=True, moe_permute="count", moe_combine="fused",
-                     moe_combine_dtype="bf16", moe_bank_epoch=True)),
+        (
+            "picked",
+            dict(
+                moe_route_fused=True, moe_permute="count", moe_combine="fused", moe_bank_epoch=True
+            ),
+        ),
+        (
+            "all",
+            dict(
+                moe_route_fused=True,
+                moe_permute="count",
+                moe_combine="fused",
+                moe_combine_dtype="bf16",
+                moe_bank_epoch=True,
+            ),
+        ),
     )
     out: dict[str, dict] = {}
     for name, over in arms:
@@ -743,8 +1009,7 @@ def ab(cfg: ModelConfig, batch: int, seq: int) -> dict[str, dict]:
         }
     base = out["shipped"]
     print(
-        f"\n== A/B at the same geometry — n={base['ctx'].n}, "
-        f"E={base['ctx'].E}, k={base['ctx'].k}"
+        f"\n== A/B at the same geometry — n={base['ctx'].n}, E={base['ctx'].E}, k={base['ctx'].k}"
     )
     print(
         f"   {'arm':<15}{'route MB':>10}{'Δ MB':>10}{'launches':>10}{'Δ launch':>10}"

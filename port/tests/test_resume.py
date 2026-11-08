@@ -83,6 +83,7 @@ def test_optimizer_state_round_trips(tiny, byte_tensor):
     assert other.steps == 1
     assert other.adamw.state_dict()["state"], "AdamW moments must travel with the checkpoint"
 
+
 def test_the_window_is_a_progress_key_but_a_shrink_is_not(tmp_path):
     """`seq_len` widens mid-run (curriculum); `max_seq_len` follows it up but
     never down, and only on arms with no positional table.
@@ -116,8 +117,9 @@ def test_the_window_is_a_progress_key_but_a_shrink_is_not(tmp_path):
 
     # ...but a SHRINK is a different run, not a resume. `diff_keys(self=stored,
     # other=incoming)`, so the incoming run is the narrow one.
-    narrowed = load_run("configs/m400.toml", model_overrides={"max_seq_len": 512},
-                        train_overrides={"seq_len": 512})
+    narrowed = load_run(
+        "configs/m400.toml", model_overrides={"max_seq_len": 512}, train_overrides={"seq_len": 512}
+    )
     # direction-agnostic: BOTH call sites must agree (`load_ckpt` passes
     # (new, stored), the test below passes (stored, new))
     assert base.diff_keys(narrowed) == narrowed.diff_keys(base) == []
@@ -126,8 +128,11 @@ def test_the_window_is_a_progress_key_but_a_shrink_is_not(tmp_path):
     assert "train.seq_len" not in base.diff_keys(narrowed)
 
     # the TOKEN BUDGET per step is the real identity: re-shard it freely...
-    reshard = load_run("configs/m400.toml", model_overrides={"max_seq_len": 8192},
-                       train_overrides={"batch": 1, "seq_len": 8192})
+    reshard = load_run(
+        "configs/m400.toml",
+        model_overrides={"max_seq_len": 8192},
+        train_overrides={"batch": 1, "seq_len": 8192},
+    )
     assert base.diff_keys(reshard) == []
     # ...but a different budget is a different run
     smaller = load_run("configs/m400.toml", train_overrides={"batch": 1, "seq_len": 1024})

@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from dataclasses import replace
 
 import torch
 
@@ -33,7 +32,9 @@ from dormouse.config import ModelConfig
 from dormouse.model.model import DormouseModel
 
 
-def build(d_model: int, layers: int, context: int, hierarchical: bool, coarse: bool = True) -> DormouseModel:
+def build(
+    d_model: int, layers: int, context: int, hierarchical: bool, coarse: bool = True
+) -> DormouseModel:
     cfg = ModelConfig(
         d_model=d_model,
         n_heads=max(1, d_model // 64),
@@ -68,7 +69,8 @@ def measure(model: DormouseModel, context: int) -> dict:
     dev = next(model.parameters()).device
     x = torch.randint(0, 256, (1, context), device=dev)
     if dev.type == "cuda":
-        torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
     model(x)
     if dev.type == "cuda":
@@ -78,7 +80,9 @@ def measure(model: DormouseModel, context: int) -> dict:
         "context": context,
         "ms": round(dt * 1000, 1),
         "us_per_byte": round(dt / context * 1e6, 2),
-        "peak_GiB": round(torch.cuda.max_memory_allocated() / 2**30, 3) if dev.type == "cuda" else None,
+        "peak_GiB": round(torch.cuda.max_memory_allocated() / 2**30, 3)
+        if dev.type == "cuda"
+        else None,
     }
 
 
@@ -114,8 +118,12 @@ def recall(model: DormouseModel, context: int, distances=(0.1, 0.5, 0.95)) -> li
             near_logits[near + 28 : near + 32].float().reshape(-1, 256), y_near[-4:]
         ).item()
         out.append(
-            {"distance": d, "ce_needle": round(ce, 4), "ce_near": round(ce_near, 4),
-             "ratio": round(ce / max(1e-9, ce_near), 3)}
+            {
+                "distance": d,
+                "ce_needle": round(ce, 4),
+                "ce_near": round(ce_near, 4),
+                "ratio": round(ce / max(1e-9, ce_near), 3),
+            }
         )
     return out
 

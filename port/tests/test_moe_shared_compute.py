@@ -207,14 +207,30 @@ def _matmul_dispatches(fn) -> tuple[int, list[str]]:
 def test_c_the_flag_launches_fewer_matmul_ops() -> None:
     torch.manual_seed(0)
     off = SparseMoE(
-        tiny_cfg(n_experts=4, moe_topk=2, rank=4, d_ffn=64, share_u=True,
-                 moe_kernel="batched", moe_capacity=1.0, moe_shared_compute=False),
+        tiny_cfg(
+            n_experts=4,
+            moe_topk=2,
+            rank=4,
+            d_ffn=64,
+            share_u=True,
+            moe_kernel="batched",
+            moe_capacity=1.0,
+            moe_shared_compute=False,
+        ),
         device="cpu",
     )
     torch.manual_seed(0)
     on = SparseMoE(
-        tiny_cfg(n_experts=4, moe_topk=2, rank=4, d_ffn=64, share_u=True,
-                 moe_kernel="batched", moe_capacity=1.0, moe_shared_compute=True),
+        tiny_cfg(
+            n_experts=4,
+            moe_topk=2,
+            rank=4,
+            d_ffn=64,
+            share_u=True,
+            moe_kernel="batched",
+            moe_capacity=1.0,
+            moe_shared_compute=True,
+        ),
         device="cpu",
     )
     x = torch.randn(8, off.d)
@@ -223,9 +239,7 @@ def test_c_the_flag_launches_fewer_matmul_ops() -> None:
 
     def one(moe: SparseMoE) -> int:
         order, keep, _ = moe._permute(index)
-        n, _ = _matmul_dispatches(
-            lambda: moe._batched_dispatch(x, weight, index, order, keep)
-        )
+        n, _ = _matmul_dispatches(lambda: moe._batched_dispatch(x, weight, index, order, keep))
         return n
 
     n_off, n_on = one(off), one(on)
@@ -260,8 +274,14 @@ def test_d_refusals_name_the_escape() -> None:
         )
     torch.manual_seed(0)
     moe = SparseMoE(
-        tiny_cfg(n_experts=2, moe_topk=2, rank=4, share_u=True,
-                 moe_kernel="batched", moe_shared_compute=True),
+        tiny_cfg(
+            n_experts=2,
+            moe_topk=2,
+            rank=4,
+            share_u=True,
+            moe_kernel="batched",
+            moe_shared_compute=True,
+        ),
         device="cpu",
     )
     with pytest.raises(LoudError, match="ADAPTIVE RANK"):
@@ -280,9 +300,15 @@ def test_e_the_shared_forward_touches_no_host(monkeypatch: pytest.MonkeyPatch) -
     def arm(shared: bool) -> SparseMoE:
         torch.manual_seed(0)
         return SparseMoE(
-            tiny_cfg(n_experts=4, moe_topk=2, rank=4, share_u=True,
-                     moe_kernel="batched", moe_capacity=1.0,
-                     moe_shared_compute=shared),
+            tiny_cfg(
+                n_experts=4,
+                moe_topk=2,
+                rank=4,
+                share_u=True,
+                moe_kernel="batched",
+                moe_capacity=1.0,
+                moe_shared_compute=shared,
+            ),
             device="cpu",
         )
 

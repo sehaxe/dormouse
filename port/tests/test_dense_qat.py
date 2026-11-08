@@ -144,9 +144,9 @@ def test_dense_projector_is_the_factor_projector(kind):
     torch.manual_seed(0)
     w = torch.randn(16, 32) * 0.2
     for alpha in (0.0, 0.25, 1.0):
-        assert torch.equal(
-            dense_qat_project(w, kind, alpha), factor_qat_project(w, kind, alpha)
-        ), f"{kind} at alpha={alpha} diverged from the factor path"
+        assert torch.equal(dense_qat_project(w, kind, alpha), factor_qat_project(w, kind, alpha)), (
+            f"{kind} at alpha={alpha} diverged from the factor path"
+        )
     assert torch.equal(dense_qat_project(w, kind, 0.0), w), "alpha=0 must be the master"
 
 
@@ -332,11 +332,7 @@ ATTN_SITES = DENSE_QAT_ATTN_SITES
 
 
 def _walk(model: nn.Module) -> dict[str, nn.Module]:
-    return {
-        name: m
-        for name, m in model.named_modules()
-        if isinstance(m, (nn.Linear, DenseLinear))
-    }
+    return {name: m for name, m in model.named_modules() if isinstance(m, (nn.Linear, DenseLinear))}
 
 
 def _walk_forward(model: DormouseModel) -> None:
@@ -376,9 +372,7 @@ def test_coverage_every_dense_weight_is_classified(monkeypatch, attn_kind):
         "the covered-module list moved: a dense weight was added or removed"
     )
     assert set(ATTN_SITES) - set(sites) == (
-        {"loop.attn.g_proj", "loop.attn.beta_proj"}
-        if attn_kind == "full"
-        else {"loop.attn.o_proj"}
+        {"loop.attn.g_proj", "loop.attn.beta_proj"} if attn_kind == "full" else {"loop.attn.o_proj"}
     ), "an arm's attention sites moved: kda owns g/beta, full owns o_proj"
     assert not set(COVERED) & set(sites), "a site cannot be both classes"
     projected = _projected_names(model, seen)
@@ -412,9 +406,7 @@ def test_skip_attn_defaults_on_and_loads():
     assert tiny_cfg().dense_qat_skip_attn is True
     on = load_run("small", model_overrides={"dense_qat": "ternary"})
     assert on.model.dense_qat_skip_attn is True
-    off = load_run(
-        "small", model_overrides={"dense_qat": "ternary", "dense_qat_skip_attn": False}
-    )
+    off = load_run("small", model_overrides={"dense_qat": "ternary", "dense_qat_skip_attn": False})
     assert off.model.dense_qat_skip_attn is False
 
 

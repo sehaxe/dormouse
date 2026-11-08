@@ -108,8 +108,10 @@ def main() -> int:
             )
             return 0
     else:
-        print(f"[NOTE] --device {dev}: this measures the HOST, not the card — the s/byte "
-              "SHAPE is the claim, the absolute rate is not a GPU number")
+        print(
+            f"[NOTE] --device {dev}: this measures the HOST, not the card — the s/byte "
+            "SHAPE is the claim, the absolute rate is not a GPU number"
+        )
 
     out_dir = Path(args.out_dir)
     run = _snapshot_run(out_dir, args.ckpt_name)
@@ -181,8 +183,10 @@ def main() -> int:
     for ctx in contexts:
         chunked = rows[(ctx, "chunked")][1]
         recurrent = rows[(ctx, "recurrent")][1]
-        print(f"  context {ctx:>5}: chunked {chunked:>9.1f} B/s · recurrent {recurrent:>9.1f} "
-              f"B/s · {recurrent / max(chunked, 1e-9):>6.2f}x")
+        print(
+            f"  context {ctx:>5}: chunked {chunked:>9.1f} B/s · recurrent {recurrent:>9.1f} "
+            f"B/s · {recurrent / max(chunked, 1e-9):>6.2f}x"
+        )
     print(
         "\nread it: `gen B/s` is the per-byte generation rate with the O(context) part\n"
         "of a call cancelled; `total B/s` charges the recurrent arm's prefill (one\n"

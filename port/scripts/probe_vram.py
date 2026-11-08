@@ -89,8 +89,7 @@ def accounting() -> None:
     run = load_run("medium")
     model = _model(run)
     total = sum(p.numel() for p in model.parameters())
-    muon = sum(p.numel() for n, p in model.named_parameters()
-               if p.ndim == 2 and "engram" not in n)
+    muon = sum(p.numel() for n, p in model.named_parameters() if p.ndim == 2 and "engram" not in n)
     adam = total - muon
     g = 2**30
     print(f"params            {total / 1e6:8.1f} M")
@@ -103,8 +102,10 @@ def accounting() -> None:
     for b in (8, 16, 24, 32):
         t = b * 1024
         moe = t * 2730 * 2 / 2**20
-        print(f"  batch {b:2d}: one [b*t, f] MoE buffer {moe:6.0f} MiB; "
-              f"saved activations scale linearly with batch")
+        print(
+            f"  batch {b:2d}: one [b*t, f] MoE buffer {moe:6.0f} MiB; "
+            f"saved activations scale linearly with batch"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -125,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     rows = []
-    for levers in ([False, True] if args.levers else [False]):
+    for levers in [False, True] if args.levers else [False]:
         for b in (int(x) for x in args.batches.split(",")):
             row = one(b, args.seq, args.steps, levers)
             rows.append(row)
@@ -133,8 +134,10 @@ def main(argv: list[str] | None = None) -> int:
     good = [r for r in rows if r["ok"]]
     if good:
         best = max(good, key=lambda r: r["batch"])
-        print(f"\nlargest fitting here: batch {best['batch']} seq {best['seq']} "
-              f"levers={best['levers']} peak {best['peak_gib']} GiB of {best['total_gib']}")
+        print(
+            f"\nlargest fitting here: batch {best['batch']} seq {best['seq']} "
+            f"levers={best['levers']} peak {best['peak_gib']} GiB of {best['total_gib']}"
+        )
     return 0
 
 

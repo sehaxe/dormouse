@@ -220,8 +220,7 @@ def ab(args: argparse.Namespace) -> int:
         for arm in arms
     }
     print(
-        f"\n{'arm':>15s} {'seed':>4s} {'bpb':>8s} {'scored B':>9s} "
-        f"{'warm tok/s':>10s} {'nan':>4s}"
+        f"\n{'arm':>15s} {'seed':>4s} {'bpb':>8s} {'scored B':>9s} {'warm tok/s':>10s} {'nan':>4s}"
     )
     for arm, runs in table.items():
         for r in runs:
@@ -323,8 +322,10 @@ def gate(args: argparse.Namespace) -> int:
         f"max rel loss {loss_rel:.6g}; fp32 seed spread {seed_spread:.6g}; "
         f"worst parameter delta {param_ulp:.4g} bf16 ulp at scale"
     )
-    print(f"[gate] losses fp32[0,-1]={fp32[0]:.6f},{fp32[-1]:.6f}  "
-          f"bf16[0,-1]={bf16[0]:.6f},{bf16[-1]:.6f}")
+    print(
+        f"[gate] losses fp32[0,-1]={fp32[0]:.6f},{fp32[-1]:.6f}  "
+        f"bf16[0,-1]={bf16[0]:.6f},{bf16[-1]:.6f}"
+    )
     if loss_rel < seed_spread:
         print("[gate] VERDICT: the state rung is inside the fp32 seed spread (a quality tie).")
         return 0

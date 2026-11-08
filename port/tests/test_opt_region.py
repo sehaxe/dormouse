@@ -231,9 +231,7 @@ def test_a_resume_with_a_new_ns_steps_reaches_the_live_muon_group(tmp_path):
 
     first = tiny_run(tmp_path, steps=2, ckpt_every=2, log_every=10)
     train(DormouseModel(first.model), first, log=lambda *_: None)
-    second = dataclasses.replace(
-        first, train=dataclasses.replace(first.train, steps=4, ns_steps=3)
-    )
+    second = dataclasses.replace(first, train=dataclasses.replace(first.train, steps=4, ns_steps=3))
     assert second.diff_keys(first) == []
 
     import dormouse.train.loop as train_loop

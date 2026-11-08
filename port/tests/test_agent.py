@@ -30,16 +30,12 @@ from dormouse.instrument import LoudError
 from dormouse.post.agent import (
     ScriptedModel,
     Tool,
-    ToolCall,
     Trajectory,
-    TurnSpan,
     agent_rollout,
     calc_tool,
     parse_turn,
 )
-from dormouse.post.rl import RLConfig
 from dormouse.post.tasks import Task
-from dormouse.post.verifiers import Verdict
 from dormouse.serve import ServeServer, ServeState, build_server, make_handler
 from dormouse.train.data import ByteStream
 from dormouse.train.sft import (
@@ -200,9 +196,7 @@ def test_markers_inside_the_text_are_refused():
     with pytest.raises(LoudError, match="marker 0x04"):
         render_conversation([Segment("user", b"hi\x04there"), Segment("end")])
     with pytest.raises(LoudError, match="marker 0x07"):
-        render_conversation(
-            [Segment("user", "q"), Segment("assistant", b"a\x07"), Segment("end")]
-        )
+        render_conversation([Segment("user", "q"), Segment("assistant", b"a\x07"), Segment("end")])
 
 
 def test_a_call_outside_an_assistant_turn_is_refused():
@@ -223,7 +217,7 @@ def test_malformed_call_json_is_refused_loudly():
     with pytest.raises(LoudError, match="not valid JSON"):
         render_conversation(bad)
     with pytest.raises(LoudError, match="not valid JSON"):
-        parse_turn(b'\x04calc\x05{oops}\x06', {"calc": calc_tool().schema})
+        parse_turn(b"\x04calc\x05{oops}\x06", {"calc": calc_tool().schema})
     with pytest.raises(LoudError, match="not an object"):
         parse_turn(b"\x04calc\x05[1, 2]\x06", {"calc": calc_tool().schema})
 
@@ -287,8 +281,11 @@ def test_args_that_miss_the_schema_are_loud():
     with pytest.raises(LoudError, match="unknown arg"):
         _trajectory(
             b'\x04calc\x05{"expr": "1", "z": 2}\x06' + ANSWER_4,
-            tools=[Tool("calc", {**calc_tool().schema, "additionalProperties": False}, _echo,
-                        pure=True)],
+            tools=[
+                Tool(
+                    "calc", {**calc_tool().schema, "additionalProperties": False}, _echo, pure=True
+                )
+            ],
         )
 
 
@@ -330,11 +327,7 @@ def test_a_sandboxed_tool_runs_in_the_verifier_jail():
 
 def test_an_escaping_tool_is_refused_by_screen_code_and_never_runs(tmp_path: Path):
     marker = tmp_path / "escaped"
-    spec = (
-        b"\x04escape\x05"
-        + json.dumps({"path": str(marker)}).encode()
-        + b"\x06answer: 0\x03"
-    )
+    spec = b"\x04escape\x05" + json.dumps({"path": str(marker)}).encode() + b"\x06answer: 0\x03"
     with pytest.raises(LoudError, match="refused by the sandbox screen") as exc:
         _trajectory(spec, expected="0", tools=[Tool("escape", PATH_SCHEMA, _escape_process)])
     assert "process spawn" in str(exc.value)
@@ -349,8 +342,11 @@ def test_an_escaping_tool_is_refused_by_screen_code_and_never_runs(tmp_path: Pat
 def test_pure_is_the_only_unsourced_callable():
     mul = Tool(
         "mul",
-        {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-         "required": ["a", "b"]},
+        {
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+            "required": ["a", "b"],
+        },
         lambda args: str(args["a"] * args["b"]),
     )
     with pytest.raises(LoudError, match="must be a plain module-level function"):
@@ -368,8 +364,11 @@ CALC_DECL = {
     "function": {
         "name": "calc",
         "description": "arithmetic",
-        "parameters": {"type": "object", "properties": {"expr": {"type": "string"}},
-                       "required": ["expr"]},
+        "parameters": {
+            "type": "object",
+            "properties": {"expr": {"type": "string"}},
+            "required": ["expr"],
+        },
     },
 }
 
@@ -454,8 +453,11 @@ def test_serve_accepts_a_tool_role_message_as_an_observation():
             "role": "assistant",
             "content": None,
             "tool_calls": [
-                {"id": "c1", "type": "function",
-                 "function": {"name": "calc", "arguments": '{"expr": "2 + 2"}'}}
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "calc", "arguments": '{"expr": "2 + 2"}'},
+                }
             ],
         },
         {"role": "tool", "content": "4"},

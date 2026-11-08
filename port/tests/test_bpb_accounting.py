@@ -82,9 +82,7 @@ def test_the_headline_is_the_final_iteration_not_the_depth_mean(tmp_path):
     # No bare `bpb=`: a reader cannot pick the old field by accident.
     assert " bpb=" not in line
 
-    row = eval_row(
-        step=7, ev=ev, fin=fin, scored=scored, cfg=run.train, offset=stream.lo
-    )
+    row = eval_row(step=7, ev=ev, fin=fin, scored=scored, cfg=run.train, offset=stream.lo)
     assert row["bpb"] == pytest.approx(1.0 / LN2)
     assert row["bpb_fin"] == row["bpb"]
     assert row["bpb_mean"] == pytest.approx(2.5 / LN2)

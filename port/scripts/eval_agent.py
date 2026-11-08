@@ -182,8 +182,7 @@ def _format_label(message: str) -> str:
     if "not valid JSON" in message or "not an object" in message:
         return "invalid_json"
     if any(
-        s in message
-        for s in ("missing required arg", "unknown arg", "declares type", "expected ")
+        s in message for s in ("missing required arg", "unknown arg", "declares type", "expected ")
     ):
         return "invalid_args"
     return "malformed"
@@ -450,9 +449,7 @@ def build_report(
     execution["ran"] = execution_counts["ran"]
     execution["refused"] = execution_counts["refused"]
     execution["errors"] = execution_counts["error"]
-    execution["rate"] = (
-        execution["ran"] / execution["accepted"] if execution["accepted"] else None
-    )
+    execution["rate"] = execution["ran"] / execution["accepted"] if execution["accepted"] else None
     for key in ("math", "code", "all"):
         n = success[key]["tasks"]
         first = success[key].pop("first")

@@ -62,9 +62,7 @@ def _moe(**over) -> SparseMoE:
     arm's `[E, cap, ·]` bmm is plain torch and takes the same cache on any device.
     """
     torch.manual_seed(0)
-    return SparseMoE(
-        _cfg(moe_capacity=1.0, moe_kernel="batched", **over), device="cpu"
-    )
+    return SparseMoE(_cfg(moe_capacity=1.0, moe_kernel="batched", **over), device="cpu")
 
 
 def _bank(moe: SparseMoE) -> tuple:
@@ -114,7 +112,7 @@ def test_the_epoch_key_is_one_integer_and_the_old_key_is_the_walk() -> None:
     _bank(off)
     _bank(on)
     old_key, new_key = off._bank_cache[0], on._bank_cache[0]
-    assert len(new_key) == 4 and (on._bank_cache[3], ) == (on._bank_epoch,), on._bank_cache[3]
+    assert len(new_key) == 4 and (on._bank_cache[3],) == (on._bank_epoch,), on._bank_cache[3]
     n_versions = sum(1 for e in off.experts for _ in e.parameters())
     assert isinstance(old_key[3], tuple) and len(old_key[3]) == n_versions, (
         "the OFF key's version tuple IS the parameter walk"

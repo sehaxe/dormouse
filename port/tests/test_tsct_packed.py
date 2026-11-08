@@ -362,9 +362,9 @@ def test_muon_routes_a_marked_batch_and_refuses_elsewhere() -> None:
 
     model = _build(tsct_packed=True)
     moe = model.loop.moe
-    assert all(
-        getattr(p, "_muon_batched", False) for p in (moe.packed_v,)
-    ), "the packed write lost its Muon marker"
+    assert all(getattr(p, "_muon_batched", False) for p in (moe.packed_v,)), (
+        "the packed write lost its Muon marker"
+    )
     assert not getattr(moe.packed_s, "_muon_batched", False), "scales are not matrices"
     routing = MixOptimizer(model, lr=1e-3, wd=0.0).routing
     assert routing["loop.moe.packed_v"] == "muon"
@@ -388,9 +388,9 @@ def test_muon_routes_a_marked_batch_and_refuses_elsewhere() -> None:
     ref = Muon(rows, lr=0.05, ns_steps=3, momentum=0.9)
     ref.batched_step_from_model(None)
     for i, row in enumerate(rows):
-        assert torch.equal(
-            packed.detach()[i], row.detach()
-        ), f"packed slice {i} differs from the per-expert Muon step"
+        assert torch.equal(packed.detach()[i], row.detach()), (
+            f"packed slice {i} differs from the per-expert Muon step"
+        )
 
     # The per-parameter contract refuses the rank-3 write LOUDLY.
     packed.grad = grad.clone()

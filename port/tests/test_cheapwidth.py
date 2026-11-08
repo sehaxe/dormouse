@@ -233,8 +233,15 @@ def _stub_fla(monkeypatch) -> list[dict]:
     mod = types.ModuleType("fla.ops.kda")
 
     def chunk_kda(q, k, v, **kw):
-        calls.append({"q": tuple(q.shape), "k": tuple(k.shape), "v": tuple(v.shape),
-                      "g": tuple(kw["g"].shape), "beta": tuple(kw["beta"].shape)})
+        calls.append(
+            {
+                "q": tuple(q.shape),
+                "k": tuple(k.shape),
+                "v": tuple(v.shape),
+                "g": tuple(kw["g"].shape),
+                "beta": tuple(kw["beta"].shape),
+            }
+        )
         b, t, h, hd = q.shape
         out = torch.zeros_like(q)
         ht = torch.zeros(b, h, hd, hd, dtype=torch.float32, device=q.device)
@@ -336,8 +343,9 @@ def test_out_proj_rank_on_the_tsct_rung_sets_that_readout_s_rank():
     assert model.loop.out_proj.rank == 16
     base = DormouseModel(_cfg())
     assert base.loop.out_proj.rank == base.cfg.rank
-    assert isinstance(DormouseModel(_cfg(use_tsct=False, out_proj_rank=16)).loop.out_proj,
-                      DenseLowRank)
+    assert isinstance(
+        DormouseModel(_cfg(use_tsct=False, out_proj_rank=16)).loop.out_proj, DenseLowRank
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -413,13 +421,25 @@ def test_ab_cheapwidth_is_preregistered():
 def test_ab_cheapwidth_verdict_is_the_preregistered_rule():
     ab = _load_script("ab_cheapwidth")
     good = [
-        {"seed": s, "bpb": 3.0 + 0.01 * s, "scored": ab.WINDOW, "nan": 0, "ms_per_step": 100.0,
-         "counters": {}}
+        {
+            "seed": s,
+            "bpb": 3.0 + 0.01 * s,
+            "scored": ab.WINDOW,
+            "nan": 0,
+            "ms_per_step": 100.0,
+            "counters": {},
+        }
         for s in (1, 2, 3)
     ]
     arm = [
-        {"seed": s, "bpb": 3.005 + 0.01 * s, "scored": ab.WINDOW, "nan": 0, "ms_per_step": 90.0,
-         "counters": {}}
+        {
+            "seed": s,
+            "bpb": 3.005 + 0.01 * s,
+            "scored": ab.WINDOW,
+            "nan": 0,
+            "ms_per_step": 90.0,
+            "counters": {},
+        }
         for s in (1, 2, 3)
     ]
     v = ab.verdict(good, arm, ab.WINDOW, ab.MAC_CUT["latent"])

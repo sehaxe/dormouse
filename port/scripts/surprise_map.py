@@ -41,8 +41,9 @@ def main() -> int:
     a = ap.parse_args()
 
     run = _snapshot_run(a.ckpt_dir, a.ckpt_name, eval_file=str(a.dataset), eval_batches=None)
-    run.train = dataclasses.replace(run.train, eval_offset=a.offset, eval_batches=None,
-                                    eval_bytes=a.bytes)
+    run.train = dataclasses.replace(
+        run.train, eval_offset=a.offset, eval_batches=None, eval_bytes=a.bytes
+    )
     seq = run.train.seq_len
     if a.bytes % seq:
         raise SystemExit(f"--bytes must be a multiple of seq_len={seq}")
@@ -84,8 +85,10 @@ def main() -> int:
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(out, separators=(",", ":")))
     lo, hi = min(rows), max(rows)
-    print(f"wrote {a.out} · {len(rows)} bytes · bits {lo:.2f}..{hi:.2f} · "
-          f"mean {sum(rows) / len(rows):.3f}")
+    print(
+        f"wrote {a.out} · {len(rows)} bytes · bits {lo:.2f}..{hi:.2f} · "
+        f"mean {sum(rows) / len(rows):.3f}"
+    )
     return 0
 
 

@@ -109,9 +109,7 @@ def test_every_row_renders_through_the_real_sft_path():
     rendered.sort()
     p50 = rendered[len(rendered) // 2]
     p90 = rendered[int(len(rendered) * 0.9)]
-    print(
-        f"[sft_v2] rows {total} rendered bytes p50 {p50} p90 {p90} max {rendered[-1]}"
-    )
+    print(f"[sft_v2] rows {total} rendered bytes p50 {p50} p90 {p90} max {rendered[-1]}")
     assert rendered[-1] <= 1024, "a pair is longer than the model window"
 
 
@@ -178,6 +176,5 @@ def test_the_manifest_accounts_for_every_row():
     clean_rows = sum(e["rows"] for n, e in man["sources"].items() if n not in risky)
     assert man["totals"]["clean_rows"] == clean_rows
     print(
-        f"[sft_v2] manifest: {total} rows, clean subset {clean_rows}, "
-        f"quarantined {risky or 'none'}"
+        f"[sft_v2] manifest: {total} rows, clean subset {clean_rows}, quarantined {risky or 'none'}"
     )

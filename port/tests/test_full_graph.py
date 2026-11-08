@@ -102,9 +102,7 @@ def test_the_default_path_is_byte_identical(tmp_path):
         "full_graph=false moved the default path's parameters — this arm must be a "
         "no-op when it is off"
     )
-    assert logits == _PRE_CHANGE_LOGITS_SHA, (
-        "full_graph=false moved the default path's logits"
-    )
+    assert logits == _PRE_CHANGE_LOGITS_SHA, "full_graph=false moved the default path's logits"
 
 
 # --- the capture blocker: `torch.bincount` is not capturable ----------------
@@ -154,9 +152,7 @@ def _card_reason(min_free_mib: int = 2048) -> str | None:
     return None
 
 
-CUDA = pytest.mark.skipif(
-    _card_reason(512) is not None, reason=_card_reason(512) or "GPU gate"
-)
+CUDA = pytest.mark.skipif(_card_reason(512) is not None, reason=_card_reason(512) or "GPU gate")
 
 
 @CUDA
@@ -298,9 +294,7 @@ def test_the_b24_s1024_optimizer_stage_replays_20_times(b24_model):
     either way.
     """
     run, model = b24_model
-    opt = MixOptimizer(
-        model, lr=3e-4, wd=run.train.wd, muon_state_dtype="bf16", ns_dtype="bf16"
-    )
+    opt = MixOptimizer(model, lr=3e-4, wd=run.train.wd, muon_state_dtype="bf16", ns_dtype="bf16")
     gen = torch.Generator(device="cuda").manual_seed(7)
     for p in model.parameters():
         if p.requires_grad:
@@ -566,9 +560,7 @@ def test_the_first_replay_is_the_eager_step(tmp_path, monkeypatch):
     assert not any("capture failed" in ln for ln in eager_logs), eager_logs
     assert any("capture failed" in ln for ln in graph_logs), "the reference must be the EAGER arm"
 
-    worst = max(
-        ((a - graph_sd[k]).abs().max().item(), k) for k, a in eager_sd.items()
-    )
+    worst = max(((a - graph_sd[k]).abs().max().item(), k) for k, a in eager_sd.items())
     print(
         f"[first replay] worst |delta| = {worst[0]:.3e} @ {worst[1]}; "
         f"loss {eager_loss} vs {graph_loss}"

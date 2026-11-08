@@ -74,9 +74,7 @@ def _docs_file(tmp_path: Path, docs: list[bytes], name: str = "d.bin") -> Path:
     starts = [0]
     for d in docs[:-1]:
         starts.append(starts[-1] + len(d))
-    doc_sidecar_path(p).write_text(
-        json.dumps({"version": 1, "size": len(data), "starts": starts})
-    )
+    doc_sidecar_path(p).write_text(json.dumps({"version": 1, "size": len(data), "starts": starts}))
     return p
 
 
@@ -127,9 +125,7 @@ def test_audit_rejects_a_file_seam_sidecar_and_names_a_builder_refusal(tmp_path)
     # One "document" per 30 KB: the audit's own BOGUS rule must fire.
     path = tmp_path / "bogus.bin"
     path.write_bytes(b"x" * 30_000)
-    doc_sidecar_path(path).write_text(
-        json.dumps({"version": 1, "size": 30_000, "starts": [0]})
-    )
+    doc_sidecar_path(path).write_text(json.dumps({"version": 1, "size": 30_000, "starts": [0]}))
     report = tmp_path / "audit.json"
     out = subprocess.run(
         [sys.executable, str(AUDIT), "--bin", str(path), "--json", str(report)],
@@ -239,9 +235,7 @@ def test_builder_records_core_refuses_an_off_by_one(tmp_path):
 def test_trainer_refuses_a_sidecar_with_the_wrong_total_length(tmp_path):
     path = tmp_path / "corpus.bin"
     path.write_bytes(bytes(range(256)) * 16)
-    doc_sidecar_path(path).write_text(
-        json.dumps({"version": 1, "size": 4095, "starts": [0, 100]})
-    )
+    doc_sidecar_path(path).write_text(json.dumps({"version": 1, "size": 4095, "starts": [0, 100]}))
     run = _run(tmp_path, path, doc_masking=True)
     with pytest.raises(LoudError, match="Escape:"):
         open_streams(run)

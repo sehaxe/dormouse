@@ -469,12 +469,18 @@ def test_the_census_prices_the_region() -> None:
         + (2 * n * E * 4 + n * k * 8 + n * k * 4)
         + (n * E * dtb + n * k * 8 + n * k * dtb)
     )
-    legacy_bwd = sum(by[o].nbytes for o in (
-        "gather backward (zero scatter)", "softmax backward", "bias-add backward"))
+    legacy_bwd = sum(
+        by[o].nbytes
+        for o in ("gather backward (zero scatter)", "softmax backward", "bias-add backward")
+    )
     assert legacy_bwd == (
-        n * k * 8 + n * k * dtb + n * E * dtb  # gather bwd
-        + 2 * n * E * dtb + n * E * dtb  # softmax bwd
-        + n * E * 4 + n * E * dtb  # add bwd
+        n * k * 8
+        + n * k * dtb
+        + n * E * dtb  # gather bwd
+        + 2 * n * E * dtb
+        + n * E * dtb  # softmax bwd
+        + n * E * 4
+        + n * E * dtb  # add bwd
     )
 
     def arm(**over):
@@ -566,8 +572,13 @@ def test_the_kernels_build_for_sm_120() -> None:
         src = ASTSource(
             fn=rf._route_kernel,
             signature={
-                "X": f"*{dt}", "B": "*fp32", "IDX": "*i64", "W": f"*{dt}",
-                "E": "constexpr", "K": "constexpr", "BLOCK_E": "constexpr",
+                "X": f"*{dt}",
+                "B": "*fp32",
+                "IDX": "*i64",
+                "W": f"*{dt}",
+                "E": "constexpr",
+                "K": "constexpr",
+                "BLOCK_E": "constexpr",
             },
             constexprs={"E": 512, "K": 2, "BLOCK_E": 512},
         )
@@ -577,8 +588,13 @@ def test_the_kernels_build_for_sm_120() -> None:
         bwd = ASTSource(
             fn=rf._route_bwd_kernel,
             signature={
-                "X": f"*{dt}", "IDX": "*i64", "DW": f"*{dt}", "DLOG": f"*{dt}",
-                "E": "constexpr", "K": "constexpr", "BLOCK_E": "constexpr",
+                "X": f"*{dt}",
+                "IDX": "*i64",
+                "DW": f"*{dt}",
+                "DLOG": f"*{dt}",
+                "E": "constexpr",
+                "K": "constexpr",
+                "BLOCK_E": "constexpr",
             },
             constexprs={"E": 512, "K": 2, "BLOCK_E": 512},
         )
@@ -588,8 +604,11 @@ def test_the_kernels_build_for_sm_120() -> None:
     perm = ASTSource(
         fn=rf._count_permute_kernel,
         signature={
-            "IDS": "*i32", "STARTS": "*i32", "ORDER": "*i64",
-            "N": "constexpr", "BLOCK": "constexpr",
+            "IDS": "*i32",
+            "STARTS": "*i32",
+            "ORDER": "*i64",
+            "N": "constexpr",
+            "BLOCK": "constexpr",
         },
         constexprs={"N": 16384, "BLOCK": 1024},
     )

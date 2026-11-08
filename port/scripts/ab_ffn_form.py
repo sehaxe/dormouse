@@ -126,16 +126,31 @@ def arm_specs() -> list[tuple[str, dict[str, object], str]]:
     rd_eq = _equal_rank_down(d, f, 1024)
     return [
         ("dense", {"ffn_form": "dense"}, "3·d·f + f + d, no rank"),
-        ("tsct_r256", {"ffn_form": "tsct", "ffn_rank_gate": 256, "ffn_rank_down": 256},
-         "compressed r_g=r_d=256"),
-        ("tsct_r512", {"ffn_form": "tsct", "ffn_rank_gate": 512, "ffn_rank_down": 512},
-         "compressed r_g=r_d=512"),
-        ("tsct_r1024", {"ffn_form": "tsct", "ffn_rank_gate": 1024, "ffn_rank_down": 1024},
-         "compressed r_g=r_d=1024"),
-        ("tsct_eq", {"ffn_form": "tsct", "ffn_rank_gate": 1024, "ffn_rank_down": rd_eq},
-         f"equal budget r_g=1024, r_d={rd_eq}"),
-        ("tsct_full", {"ffn_form": "tsct", "ffn_rank_gate": lo, "ffn_rank_down": lo},
-         f"exact reparameterisation r_g=r_d={lo}"),
+        (
+            "tsct_r256",
+            {"ffn_form": "tsct", "ffn_rank_gate": 256, "ffn_rank_down": 256},
+            "compressed r_g=r_d=256",
+        ),
+        (
+            "tsct_r512",
+            {"ffn_form": "tsct", "ffn_rank_gate": 512, "ffn_rank_down": 512},
+            "compressed r_g=r_d=512",
+        ),
+        (
+            "tsct_r1024",
+            {"ffn_form": "tsct", "ffn_rank_gate": 1024, "ffn_rank_down": 1024},
+            "compressed r_g=r_d=1024",
+        ),
+        (
+            "tsct_eq",
+            {"ffn_form": "tsct", "ffn_rank_gate": 1024, "ffn_rank_down": rd_eq},
+            f"equal budget r_g=1024, r_d={rd_eq}",
+        ),
+        (
+            "tsct_full",
+            {"ffn_form": "tsct", "ffn_rank_gate": lo, "ffn_rank_down": lo},
+            f"exact reparameterisation r_g=r_d={lo}",
+        ),
     ]
 
 
@@ -342,10 +357,14 @@ def report(arms: list[Arm], runs: list[dict]) -> int:
         print(f"dense control has {len(ctl)} finite seeds, need {len(SEEDS)}")
         return 1
     cmean, cspread = summarize(ctl)
-    print(f"{'arm':>10s} {'params':>13s} {'mean BPB':>9s} {'spread':>8s} "
-          f"{'delta':>8s} {'verdict':>8s} {'reason':>40s}")
-    print(f"{'dense':>10s} {control[0]['params']:13,d} {cmean:9.4f} {cspread:8.4f} "
-          f"{0.0:+8.4f} {'CONTROL':>8s}")
+    print(
+        f"{'arm':>10s} {'params':>13s} {'mean BPB':>9s} {'spread':>8s} "
+        f"{'delta':>8s} {'verdict':>8s} {'reason':>40s}"
+    )
+    print(
+        f"{'dense':>10s} {control[0]['params']:13,d} {cmean:9.4f} {cspread:8.4f} "
+        f"{0.0:+8.4f} {'CONTROL':>8s}"
+    )
     rows: list[dict] = []
     for a in arms[1:]:
         rs = by[a.name]
@@ -363,13 +382,17 @@ def report(arms: list[Arm], runs: list[dict]) -> int:
             else:
                 vals.append(float(r["bpb"]))
         if void:
-            print(f"{a.name:>10s} {int(a.row['params']):13,d} {'VOID':>9s} "
-                  f"{'':8s} {'':8s} {'VOID':>8s} {'; '.join(void):>40s}")
+            print(
+                f"{a.name:>10s} {int(a.row['params']):13,d} {'VOID':>9s} "
+                f"{'':8s} {'':8s} {'VOID':>8s} {'; '.join(void):>40s}"
+            )
             continue
         dec = decide_row(ctl, vals, cparams=int(control[0]["params"]), aparams=int(a.row["params"]))
-        print(f"{a.name:>10s} {int(a.row['params']):13,d} {dec['mean']:9.4f} "
-              f"{dec['spread']:8.4f} {dec['delta']:+8.4f} {dec['verdict']:>8s} "
-              f"{dec['reason']:>40s}")
+        print(
+            f"{a.name:>10s} {int(a.row['params']):13,d} {dec['mean']:9.4f} "
+            f"{dec['spread']:8.4f} {dec['delta']:+8.4f} {dec['verdict']:>8s} "
+            f"{dec['reason']:>40s}"
+        )
         rows.append({"arm": a.name, "params": int(a.row["params"]), **dec})
     if not rows:
         return 1
@@ -381,8 +404,10 @@ def report(arms: list[Arm], runs: list[dict]) -> int:
         pick = min(ties, key=lambda r: r["params"])
     else:
         pick = None
-    print(f"\ndecision: {pick['arm'] if pick else 'dense control'} — "
-          f"{(pick['verdict'] + ': ' + pick['reason']) if pick else 'no arm beats control'}")
+    print(
+        f"\ndecision: {pick['arm'] if pick else 'dense control'} — "
+        f"{(pick['verdict'] + ': ' + pick['reason']) if pick else 'no arm beats control'}"
+    )
     return 0
 
 

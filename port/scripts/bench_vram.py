@@ -71,8 +71,7 @@ def _arm(name: str, offload_gib: float):
         # flag. A named budget is authoritative (the report quotes that arm).
         return True, "none", float(suffix) if suffix else offload_gib
     raise argparse.ArgumentTypeError(
-        f"arm {name!r}: known none, iter, selective, iter+offload<N> (the budget "
-        f"is --offload-gib)"
+        f"arm {name!r}: known none, iter, selective, iter+offload<N> (the budget is --offload-gib)"
     )
 
 
@@ -94,8 +93,15 @@ def _step(model, opt, ids, targets, device) -> None:
     opt.step()
 
 
-def bench(config: str, arms: list[str], shapes: list[tuple[int, int]], offload_gib: float,
-          reps: int, warm: int, device_name: str) -> None:
+def bench(
+    config: str,
+    arms: list[str],
+    shapes: list[tuple[int, int]],
+    offload_gib: float,
+    reps: int,
+    warm: int,
+    device_name: str,
+) -> None:
     from dormouse.config import load_run
     from dormouse.model import DormouseModel
     from dormouse.train.optim import MixOptimizer
@@ -160,8 +166,11 @@ def ledger(config: str, arms: list[str], seq: int, offload_gib: float) -> None:
     from dormouse.model import DormouseModel
     from dormouse.model.recompute import saved_table
 
-    run = load_run(config, train_overrides={"batch": 1, "seq_len": min(seq, 512)},
-                   model_overrides={"max_seq_len": min(seq, 512)})
+    run = load_run(
+        config,
+        train_overrides={"batch": 1, "seq_len": min(seq, 512)},
+        model_overrides={"max_seq_len": min(seq, 512)},
+    )
     torch.manual_seed(0)
     torch.set_num_threads(1)
     model = DormouseModel(run.model)

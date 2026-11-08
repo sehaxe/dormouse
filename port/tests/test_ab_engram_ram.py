@@ -84,9 +84,10 @@ def test_no_effect_when_it_closes_but_not_by_more_than_the_spread():
 
 
 def test_not_needed_when_the_screen_does_not_reproduce_the_gap():
-    assert _arms([2.650, 2.652, 2.648], [2.651, 2.653, 2.649], [2.650, 2.651, 2.649])[
-        "verdict"
-    ] == "not-needed"
+    assert (
+        _arms([2.650, 2.652, 2.648], [2.651, 2.653, 2.649], [2.650, 2.651, 2.649])["verdict"]
+        == "not-needed"
+    )
 
 
 def test_harmful_when_the_corrected_arm_is_worse_than_control():

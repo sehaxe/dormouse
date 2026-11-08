@@ -252,9 +252,7 @@ def iter_ratchet(path: Path):
                 continue
             row = json.loads(line)
             prompt_msgs = row.get("prompt") or []
-            user = next(
-                (m["content"] for m in prompt_msgs if m.get("role") == "user"), None
-            )
+            user = next((m["content"] for m in prompt_msgs if m.get("role") == "user"), None)
             comp = row.get("completion") or []
             asst = next((m["content"] for m in comp if m.get("role") == "assistant"), None)
             if not user or not asst:
@@ -493,12 +491,10 @@ def build(src: Path, out: Path, *, limit: int = 0, eval_path: Path | None = None
                 f.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
         files[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
         st = manifest["sources"][name]["stat"]
-        st["bytes_out"] = sum(
-            len(r["prompt"].encode()) + len(r["response"].encode()) for r in rows
+        st["bytes_out"] = sum(len(r["prompt"].encode()) + len(r["response"].encode()) for r in rows)
+        st["accounts"] = (
+            st["kept"] == sum(v for k, v in st["drops"].items() if k != "quota") + st["kept"]
         )
-        st["accounts"] = st["kept"] == sum(
-            v for k, v in st["drops"].items() if k != "quota"
-        ) + st["kept"]
         manifest["sources"][name].pop("_buckets", None)
         manifest["sources"][name]["rows"] = len(rows)
 
@@ -524,13 +520,10 @@ def build(src: Path, out: Path, *, limit: int = 0, eval_path: Path | None = None
         "train_rows": total_rows,
         "holdout_rows": len(hold),
         "bytes": sum(m["stat"]["bytes_out"] for m in manifest["sources"].values()),
-        "clean_rows": sum(
-            m["rows"] for k, m in manifest["sources"].items() if RISK[k] == "low"
-        ),
+        "clean_rows": sum(m["rows"] for k, m in manifest["sources"].items() if RISK[k] == "low"),
     }
     manifest["mix"] = {
-        k: round(100.0 * m["rows"] / max(1, total_rows), 2)
-        for k, m in manifest["sources"].items()
+        k: round(100.0 * m["rows"] / max(1, total_rows), 2) for k, m in manifest["sources"].items()
     }
     manifest["files"] = files
     (out / "manifest.json").write_text(

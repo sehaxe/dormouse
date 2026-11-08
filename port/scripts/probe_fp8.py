@@ -28,7 +28,7 @@ import torch
 
 from dormouse.instrument import loud
 
-M, K, N = 8192, 832, 3072   # the dense stack's real shape at b=8, s=1024
+M, K, N = 8192, 832, 3072  # the dense stack's real shape at b=8, s=1024
 E4M3_MAX = 448.0
 
 
@@ -48,7 +48,7 @@ def bench(fn, iters: int = 50) -> float:
     for _ in range(iters):
         fn()
     torch.cuda.synchronize()
-    return (time.perf_counter() - t0) / iters * 1e3   # ms
+    return (time.perf_counter() - t0) / iters * 1e3  # ms
 
 
 def main() -> None:
@@ -61,7 +61,7 @@ def main() -> None:
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
     x = x * (0.5 + torch.rand(M, 1, device="cuda", dtype=torch.bfloat16))  # per-row spread
-    x[0, :64] *= 40.0                                  # one outlier row: the fp8 failure mode
+    x[0, :64] *= 40.0  # one outlier row: the fp8 failure mode
 
     # --- 1. does the kernel accept the call? ---------------------------------
     try:
@@ -76,28 +76,36 @@ def main() -> None:
 
     # --- 2. speed against the bf16 GEMM it replaces --------------------------
     y_bf16 = x @ w.t()
-    t8 = bench(lambda: torch._scaled_mm(qx, qw.t(), scale_a=sx, scale_b=sw,
-                                       out_dtype=torch.bfloat16))
+    t8 = bench(
+        lambda: torch._scaled_mm(qx, qw.t(), scale_a=sx, scale_b=sw, out_dtype=torch.bfloat16)
+    )
     tq = bench(lambda: (quant_e4m3(x), quant_e4m3(w)))
     tb = bench(lambda: x @ w.t())
-    print(f"RESULT 2: bf16 {tb:.3f} ms | fp8 gemm {t8:.3f} ms | quantize {tq:.3f} ms | "
-          f"end-to-end {t8 + tq:.3f} ms -> speedup {(tb / (t8 + tq)):.2f}x")
+    print(
+        f"RESULT 2: bf16 {tb:.3f} ms | fp8 gemm {t8:.3f} ms | quantize {tq:.3f} ms | "
+        f"end-to-end {t8 + tq:.3f} ms -> speedup {(tb / (t8 + tq)):.2f}x"
+    )
 
     # --- 3. accuracy of per-tensor scaling ----------------------------------
     err = (y8.float() - y_bf16.float()).abs()
     denom = y_bf16.float().abs().clamp_min(1e-3)
-    print(f"RESULT 3: max abs err {err.max():.4f} | mean rel err "
-          f"{(err / denom).mean() * 100:.2f}% | outlier-row rel err "
-          f"{(err[0].mean() / denom[0].mean()) * 100:.2f}%")
+    print(
+        f"RESULT 3: max abs err {err.max():.4f} | mean rel err "
+        f"{(err / denom).mean() * 100:.2f}% | outlier-row rel err "
+        f"{(err[0].mean() / denom[0].mean()) * 100:.2f}%"
+    )
 
     # --- 4. is the backward the blocker this repo says it is? ---------------
     xr = x.detach().clone().requires_grad_(True)
     try:
-        torch._scaled_mm(*quant_e4m3(xr), qw.t(), scale_b=sw, out_dtype=torch.bfloat16).sum().backward()
+        y = torch._scaled_mm(*quant_e4m3(xr), qw.t(), scale_b=sw, out_dtype=torch.bfloat16)
+        y.sum().backward()
         print("RESULT 4: _scaled_mm HAS a backward in this torch (the 2026-10-23 note is stale)")
     except Exception as e:  # noqa: BLE001
-        print(f"RESULT 4: no backward ({type(e).__name__}: {str(e)[:90]}) -> "
-              f"a custom autograd Function is required")
+        print(
+            f"RESULT 4: no backward ({type(e).__name__}: {str(e)[:90]}) -> "
+            f"a custom autograd Function is required"
+        )
 
 
 if __name__ == "__main__":

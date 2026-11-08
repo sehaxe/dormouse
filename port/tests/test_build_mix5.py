@@ -33,8 +33,7 @@ def _text(n_words: int, seed: int, vocab: int = 600) -> bytes:
     """Prose-shaped: ~20% stopwords and lines that end in punctuation."""
     rng = random.Random(seed)
     words = [
-        b"the" if i % 5 == 0 else f"w{rng.randrange(vocab):04d}".encode()
-        for i in range(n_words)
+        b"the" if i % 5 == 0 else f"w{rng.randrange(vocab):04d}".encode() for i in range(n_words)
     ]
     lines = [b" ".join(words[i : i + 12]) + b"." for i in range(0, len(words), 12)]
     return b"\n".join(lines) + b"\n"
@@ -273,9 +272,7 @@ def test_quality_band_drops_each_defect_for_its_own_reason() -> None:
     assert len(checked) == len(mix.QUALITY_BANDS)
     assert metrics["score"] == 1.0
 
-    prose = b" ".join(
-        (b"the" if i % 5 == 0 else b"w%04d" % (i % 600)) for i in range(900)
-    )
+    prose = b" ".join((b"the" if i % 5 == 0 else b"w%04d" % (i % 600)) for i in range(900))
     cases = {
         "words": b"too short.",
         "mean_word_len": b" ".join([b"a" * 24] * 900) + b".",
@@ -299,10 +296,13 @@ def test_quality_band_drops_each_defect_for_its_own_reason() -> None:
         assert not ok, want
         assert reason == want, (want, reason)
 
-    ru = b" ".join(
-        b"\xd0\xb8" if i % 5 == 0 else f"\u0441\u043b\u043e\u0432\u043e{i % 600}".encode()
-        for i in range(600)
-    ) + b"."
+    ru = (
+        b" ".join(
+            b"\xd0\xb8" if i % 5 == 0 else f"\u0441\u043b\u043e\u0432\u043e{i % 600}".encode()
+            for i in range(600)
+        )
+        + b"."
+    )
     ok, reason, metrics, _ = _q(ru, "ru")
     assert ok, (reason, metrics)
 

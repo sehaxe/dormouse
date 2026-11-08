@@ -106,8 +106,9 @@ def test_the_server_serves_health_and_sse(dash):
             # arrived instead of assuming they fit in one 4 kB read.
             while len(chunk) < 32768:
                 chunk += r.read(2048).decode("utf-8", "replace")
-                if all(f"event: {n}" in chunk for n in
-                       ("metrics", "hero", "chart", "panels", "evals")):
+                if all(
+                    f"event: {n}" in chunk for n in ("metrics", "hero", "chart", "panels", "evals")
+                ):
                     break
         for name in ("metrics", "hero", "chart", "panels", "evals"):
             assert f"event: {name}" in chunk, f"no {name} event in the first chunk"

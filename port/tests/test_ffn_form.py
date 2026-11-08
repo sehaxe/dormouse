@@ -190,9 +190,7 @@ def test_dense_has_exactly_three_plain_matmuls_and_no_rank():
 def test_tsct_at_full_rank_is_output_equivalent_to_dense():
     cfg_d = _cfg(**FORM_OVER["dense"])
     lo = min(cfg_d.d_model, cfg_d.d_ffn)
-    cfg_t = dataclasses.replace(
-        cfg_d, ffn_form="tsct", ffn_rank_gate=lo, ffn_rank_down=lo
-    )
+    cfg_t = dataclasses.replace(cfg_d, ffn_form="tsct", ffn_rank_gate=lo, ffn_rank_down=lo)
     dense = _built(FORM_OVER["dense"])
     tsct = _built(
         {
@@ -208,11 +206,9 @@ def test_tsct_at_full_rank_is_output_equivalent_to_dense():
     max_diff = float((a - b).abs().max())
     assert max_diff <= 1e-5, f"full-rank tsct != dense: max|Δ|={max_diff:.3e}"
     # Not a parameter tie: the reparameterisation carries extra factors.
-    assert (
-        width.ffn_params("tsct", cfg_t.d_model, cfg_t.d_ffn, rank=cfg_t.rank,
-                         rank_gate=lo, rank_down=lo)
-        > width.ffn_params("dense", cfg_t.d_model, cfg_t.d_ffn)
-    )
+    assert width.ffn_params(
+        "tsct", cfg_t.d_model, cfg_t.d_ffn, rank=cfg_t.rank, rank_gate=lo, rank_down=lo
+    ) > width.ffn_params("dense", cfg_t.d_model, cfg_t.d_ffn)
 
 
 # ---------------------------------------------------------------------------
@@ -236,9 +232,8 @@ def test_small_rank_tsct_has_fewer_params_and_is_not_equivalent():
     assert width.ffn_params("tsct", 64, 128, rank=8, rank_gate=8, rank_down=8) < (
         width.ffn_params("dense", 64, 128)
     )
-    assert (
-        sum(p.numel() for p in small.loop.moe.parameters())
-        < sum(p.numel() for p in dense.loop.moe.parameters())
+    assert sum(p.numel() for p in small.loop.moe.parameters()) < sum(
+        p.numel() for p in dense.loop.moe.parameters()
     )
     max_diff = float((_logits(dense) - _logits(small)).abs().max())
     assert max_diff > 1e-2, f"rank-8 tsct matched dense (max|Δ|={max_diff:.3e})"
@@ -318,11 +313,7 @@ def test_checkpoints_round_trip_per_form_and_wrong_form_names_the_tensors(tmp_pa
 
 
 def _info_row(output: str, form: str) -> tuple[int, int]:
-    line = next(
-        x
-        for x in output.splitlines()
-        if "│" in x and x.lstrip("│ ").startswith(form)
-    )
+    line = next(x for x in output.splitlines() if "│" in x and x.lstrip("│ ").startswith(form))
     nums = [int(x.replace(",", "")) for x in re.findall(r"\d[\d,]*", line)]
     return nums[0], nums[1]
 
@@ -353,36 +344,42 @@ def test_info_prints_the_independently_computed_table():
         + d
     )
     want = {
-        "bank": (bank_params, body + iters * d * f
-                 + (2 * d * rank + rank * f)
-                 + (2 * d * shared + shared * f) + d),
+        "bank": (
+            bank_params,
+            body + iters * d * f + (2 * d * rank + rank * f) + (2 * d * shared + shared * f) + d,
+        ),
         "dense": (dense_params, body + iters * dense_params),
         "tsct": (tsct_params, body + iters * tsct_params),
     }
     for form, (params, macs) in want.items():
         got_params, got_macs = _info_row(out.output, form)
         assert (got_params, got_macs) == (params, macs), (
-            f"{form}: info {got_params:,}/{got_macs:,} != "
-            f"table {params:,}/{macs:,}"
+            f"{form}: info {got_params:,}/{got_macs:,} != table {params:,}/{macs:,}"
         )
     core = iters * (4 * d * d + 2 * d * rank)
-    assert width.macs_per_token(
-        d,
-        iters=iters,
-        n_heads=24,
-        out_proj_rank=rank,
-        f=f,
-        ffn_form="dense",
-    ) == core + iters * dense_params
-    assert width.macs_per_token(
-        d,
-        iters=iters,
-        n_heads=24,
-        out_proj_rank=rank,
-        f=f,
-        ffn_form="tsct",
-        ffn_rank=rank,
-    ) == core + iters * tsct_params
+    assert (
+        width.macs_per_token(
+            d,
+            iters=iters,
+            n_heads=24,
+            out_proj_rank=rank,
+            f=f,
+            ffn_form="dense",
+        )
+        == core + iters * dense_params
+    )
+    assert (
+        width.macs_per_token(
+            d,
+            iters=iters,
+            n_heads=24,
+            out_proj_rank=rank,
+            f=f,
+            ffn_form="tsct",
+            ffn_rank=rank,
+        )
+        == core + iters * tsct_params
+    )
     # And the formula is the module tree at tiny shape, not just arithmetic.
     for form, over in FORM_OVER.items():
         model = _built(over)

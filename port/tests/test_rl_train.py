@@ -308,9 +308,7 @@ def test_the_group_relative_length_penalty_is_evaluated_when_it_is_on(monkeypatc
         ]
     )
     monkeypatch.setattr(_RL_TRAIN, "rollout", lambda *a, **kw: next(hand))
-    run = rl_run(
-        tmp_path, steps=1, rl_group=4, rl_adv="group", rl_len_penalty=0.4, rl_holdout=0
-    )
+    run = rl_run(tmp_path, steps=1, rl_group=4, rl_adv="group", rl_len_penalty=0.4, rl_holdout=0)
     lines: list[str] = []
     report = rl_train(run, log=lines.append)
     assert report["counters"]["rl_len_penalty_active"] == 2, "the term ran on both passes"
@@ -488,16 +486,26 @@ def test_difficulty_side_is_inclusive_and_names_the_side():
 def test_the_band_drops_all_easy_and_all_hard_and_counts_the_side(monkeypatch, tmp_path: Path):
     """A synthetic all-easy/all-hard set: one of each side, the last trains anyway."""
     easy = Task(
-        cls="math", tid="easy-0", prompt="Compute 1 + 1. answer: <value>", expected="2",
-        solution="answer: 2", tests=(), match="exact", budget=64,
+        cls="math",
+        tid="easy-0",
+        prompt="Compute 1 + 1. answer: <value>",
+        expected="2",
+        solution="answer: 2",
+        tests=(),
+        match="exact",
+        budget=64,
     )
     hard = Task(
-        cls="math", tid="hard-0", prompt="Compute 7 * 8. answer: <value>", expected="56",
-        solution="answer: 56", tests=(), match="exact", budget=64,
+        cls="math",
+        tid="hard-0",
+        prompt="Compute 7 * 8. answer: <value>",
+        expected="56",
+        solution="answer: 56",
+        tests=(),
+        match="exact",
+        budget=64,
     )
-    cfg = dataclasses.replace(
-        rl_run(tmp_path).train, rl_band_attempts=2, rl_group=2, rl_budget=128
-    )
+    cfg = dataclasses.replace(rl_run(tmp_path).train, rl_band_attempts=2, rl_group=2, rl_budget=128)
     monkeypatch.setattr(_RL_TRAIN, "rl_task_index", lambda seed, step, n, attempt=0: attempt % n)
     monkeypatch.setattr(_RL_TRAIN, "rollout", _scripted_rollout)
     counters = Counters()
@@ -663,9 +671,7 @@ def test_a_twenty_step_cpu_run_is_finite_writes_a_checkpoint_and_counts_everythi
     corpus = _scripted_corpus(tmp_path / "c.jsonl")
     monkeypatch.setattr(_RL_TRAIN, "rollout", _scripted_rollout)
     lines: list[str] = []
-    report = _twenty_step_run(
-        tmp_path / "run", corpus, steps=20, ckpt_every=10, log=lines.append
-    )
+    report = _twenty_step_run(tmp_path / "run", corpus, steps=20, ckpt_every=10, log=lines.append)
     counters = report["counters"]
     assert math.isfinite(report["loss"]) and report["nan_skipped"] == 0
     assert report["opt_steps"] == 20

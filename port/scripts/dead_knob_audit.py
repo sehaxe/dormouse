@@ -65,6 +65,19 @@ PORT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIGS = ("src/dormouse/config.py", "src/dormouse/post/rl.py")
 DEFAULT_ROOTS = ("src/dormouse",)
 DEFAULT_PRESET_GLOB = "configs/**/*.toml"
+
+#: Fields whose DEAD verdict is KNOWN and accepted for now. The retirement is
+#: blocked, not forgotten: the name stays visible in every run's output and in
+#: `.bulba/plan.md`. Adding an entry here without a reason is the defect this
+#: list exists to make impossible.
+KNOWN_DEAD = {
+    "jepa": "retiring it breaks test_every_snapshot_on_disk_loads: 153 snapshots "
+    "carry `jepa = false` and the loader refuses unknown keys on purpose "
+    "(.bulba/plan.md, C2 blocked)",
+    "muon_sf_retract": "a boolean whose only legal value is false; retiring it "
+    "needs the same loader allowlist as `jepa`",
+}
+
 DEFAULT_CLASSES = ("ModelConfig", "TrainConfig", "RLConfig")
 
 #: Unannotated receivers this codebase uses for a config object. `cfg` is the
@@ -1041,8 +1054,13 @@ def static_audit(
         rep.guarded = sorted(guards.get(name, []))
 
     findings = [
-        f"{r.verdict}: {n}" for n, r in sorted(reports.items()) if r.verdict in ("DEAD", "SHADOWED")
+        f"{r.verdict}: {n}"
+        for n, r in sorted(reports.items())
+        if r.verdict in ("DEAD", "SHADOWED") and n not in KNOWN_DEAD
     ]
+    for n in KNOWN_DEAD:
+        if reports.get(n) and reports[n].verdict in ("DEAD", "SHADOWED"):
+            print(f"known-dead (allowed, pending retirement): {n} — {KNOWN_DEAD[n]}")
     return reports, findings, scanner
 
 

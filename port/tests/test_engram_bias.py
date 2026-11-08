@@ -91,7 +91,7 @@ def test_a_cold_row_first_touch_moves_at_the_raw_gradient():
         new_block, g[0], rtol=FP32_SLACK, atol=0, msg="the corrected block is the gradient"
     )
     # The code's own arithmetic: block_new = block_old / (1-μ^{t+1}), bitwise.
-    denom = torch.tensor(1.0 - MU ** 2, dtype=torch.float32)
+    denom = torch.tensor(1.0 - MU**2, dtype=torch.float32)
     assert torch.equal(new_block, old_block / denom), "the divisor is the whole fix"
     # The momentum is the UNcorrected (1-μ)g — the correction scales the applied
     # block, it does not rewrite the optimizer's state.
@@ -244,9 +244,7 @@ def test_the_trainer_wires_the_flag_and_logs_which_formula_ran(tmp_path, monkeyp
     the seam that lets the CPU suite drive it is patched here.
     """
     monkeypatch.setattr(train_loop, "host_device_type", lambda _m: "cuda")
-    run = tiny_run(
-        tmp_path, steps=1, log_every=1, engram_ram=True, engram_bias_correction=False
-    )
+    run = tiny_run(tmp_path, steps=1, log_every=1, engram_ram=True, engram_bias_correction=False)
     model = DormouseModel(run.model)
     lines: list[str] = []
     train(model, run, log=lines.append)

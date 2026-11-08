@@ -196,8 +196,7 @@ def _seam_dtypes(cfg: ModelConfig) -> dict[str, set[torch.dtype]]:
     torch.manual_seed(0)
     model = DormouseModel(cfg, device="cpu").train()
     seen: dict[str, set[torch.dtype]] = {
-        k: set()
-        for k in ("h", "streams", "attn", "branch", "normed_mlp", "ctx", "step_out", "xn")
+        k: set() for k in ("h", "streams", "attn", "branch", "normed_mlp", "ctx", "step_out", "xn")
     }
     orig_post = LoopBlock._step_post
     orig_ce = LoopBlock._iter_ce
@@ -310,8 +309,7 @@ def test_on_vs_off_drift_is_the_measured_200_step_value() -> None:
         f"{GATE_FINAL_DELTA:.6e} × {DRIFT_BAND}"
     )
     assert last20 <= GATE_LAST20_MEAN * DRIFT_BAND, (
-        f"last-20 mean |Δloss| {last20:.6e}, past the pinned "
-        f"{GATE_LAST20_MEAN:.6e} × {DRIFT_BAND}"
+        f"last-20 mean |Δloss| {last20:.6e}, past the pinned {GATE_LAST20_MEAN:.6e} × {DRIFT_BAND}"
     )
     assert all(torch.isfinite(torch.tensor(v)) for v in bf16), "a loss went non-finite"
 
@@ -430,6 +428,7 @@ def test_the_bf16_residual_forward_touches_no_host(monkeypatch) -> None:
     pre-existing `.tolist()` outside this task. The residual seam and the arms
     it widens add none.
     """
+
     def boom(*_a, **_k):
         raise AssertionError("host sync in the residual-bf16 forward")
 

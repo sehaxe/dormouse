@@ -125,8 +125,11 @@ def test_a_off_is_bit_identical_and_the_on_arm_does_not_shift_other_params() -> 
     ):
         model = _build(**over)
         pin = GOLDEN[name]
-        assert (model.cfg.tsct_expert_basis, model.cfg.tsct_expert_lr,
-                model.cfg.tsct_expert_revive) == (0, 0.0, 0)
+        assert (
+            model.cfg.tsct_expert_basis,
+            model.cfg.tsct_expert_lr,
+            model.cfg.tsct_expert_revive,
+        ) == (0, 0.0, 0)
         assert param_count(model) == pin["params"]
         assert _state_sha(model) == pin["sd"], f"the new fields moved the {name} init"
         logits, loss = _forward(model)
@@ -226,8 +229,10 @@ def test_c_non_trivial_selector_matches_the_literal_form() -> None:
             worst.append((_rel(banked[n], p.grad), n))
     worst.sort(reverse=True)
     logit_rel = _rel(lb, ln)
-    print(f"[gate C] banked vs reference: logits rel={logit_rel:.3e}, "
-          f"worst TSCT-2 grad {worst[0][1]} rel={worst[0][0]:.3e}")
+    print(
+        f"[gate C] banked vs reference: logits rel={logit_rel:.3e}, "
+        f"worst TSCT-2 grad {worst[0][1]} rel={worst[0][0]:.3e}"
+    )
     assert logit_rel <= 1e-6
     assert worst[0][0] <= 1e-6
 
@@ -243,9 +248,9 @@ def test_d_lr_multiplier_is_pure_clipped_and_touches_only_v() -> None:
     assert torch.equal(got, expert_lr_multipliers(counts.clone(), 1.0)), "not pure"
     clip = expert_lr_multipliers(torch.tensor([0.0, 1e4, 1.0]), 10.0)
     assert torch.equal(clip, torch.tensor([5.0, 0.2, 5.0])), f"clip wrong: {clip}"
-    assert torch.equal(
-        expert_lr_multipliers(torch.full((4,), 7.0), 3.0), torch.ones(4)
-    ), "equal counts must be exactly lr"
+    assert torch.equal(expert_lr_multipliers(torch.full((4,), 7.0), 3.0), torch.ones(4)), (
+        "equal counts must be exactly lr"
+    )
 
     cfg = dict(
         share_u_mode="plane",
@@ -375,8 +380,10 @@ def test_e_revive_deterministic_donor_copy_and_inert_off() -> None:
 
     control = live_run(0)
     revived = live_run(2)
-    print(f"[gate E] live control min/mean={min(control)}/{sum(control)/len(control):.2f}, "
-          f"revive min/mean={min(revived)}/{sum(revived)/len(revived):.2f}")
+    print(
+        f"[gate E] live control min/mean={min(control)}/{sum(control) / len(control):.2f}, "
+        f"revive min/mean={min(revived)}/{sum(revived) / len(revived):.2f}"
+    )
     assert min(revived) >= min(control)
     assert sum(revived) >= sum(control)
 
@@ -453,12 +460,8 @@ def test_the_constructor_refuses_what_the_config_refuses() -> None:
 
 
 def test_the_optimizer_refuses_the_tails_it_cannot_scale() -> None:
-    model = _build(
-        share_u_mode="plane", tsct_expert_lr=1.0, moe_lb_mode="prop", moe_lb_gamma=0.002
-    )
+    model = _build(share_u_mode="plane", tsct_expert_lr=1.0, moe_lb_mode="prop", moe_lb_gamma=0.002)
     with pytest.raises(LoudError, match="Escape:"):
         MixOptimizer(model, lr=0.01, wd=0.0, opt="adamw", tsct_expert_lr=1.0)
     with pytest.raises(LoudError, match="Escape:"):
-        MixOptimizer(
-            model, lr=0.01, wd=0.0, opt="mix", muon_variant="normuon", tsct_expert_lr=1.0
-        )
+        MixOptimizer(model, lr=0.01, wd=0.0, opt="mix", muon_variant="normuon", tsct_expert_lr=1.0)

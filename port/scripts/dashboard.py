@@ -33,8 +33,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]          # port/
-REPO = ROOT.parent                                   # dormouse/
+ROOT = Path(__file__).resolve().parents[1]  # port/
+REPO = ROOT.parent  # dormouse/
 LOGS = Path(os.environ.get("DASH_LOGS", Path.home() / "logs"))
 
 
@@ -209,18 +209,20 @@ def routing_data(s: dict) -> dict:
     """
     counters = s.get("counters") or {}
     run = s.get("run") or {}
-    live = _first_number(
-        counters, ("moe_live_experts", "live_experts", "moe_experts_live")
-    )
+    live = _first_number(counters, ("moe_live_experts", "live_experts", "moe_experts_live"))
     top10 = _share(
         counters,
-        ("moe_top10_share_x100", "moe_top10_share_pct", "moe_top10_share",
-         "top10_share_x100", "top10_share"),
+        (
+            "moe_top10_share_x100",
+            "moe_top10_share_pct",
+            "moe_top10_share",
+            "top10_share_x100",
+            "top10_share",
+        ),
     )
     max_share = _share(
         counters,
-        ("moe_max_share_x100", "moe_max_share_pct", "moe_max_share",
-         "max_share_x100", "max_share"),
+        ("moe_max_share_x100", "moe_max_share_pct", "moe_max_share", "max_share_x100", "max_share"),
     )
     experts = _first_number(counters, ("moe_n_experts", "n_experts", "moe_experts"))
     source = "counters" if live is not None else ""
@@ -232,11 +234,13 @@ def routing_data(s: dict) -> dict:
         if hist:
             source = str(ROUTING_JSON)
             live = _first_number(hist, ("live_experts", "moe_live_experts"))
-            top10 = top10 if top10 is not None else _share(
-                hist, ("top10_share_x100", "top10_share")
+            top10 = (
+                top10 if top10 is not None else _share(hist, ("top10_share_x100", "top10_share"))
             )
-            max_share = max_share if max_share is not None else _share(
-                hist, ("max_share_x100", "max_share")
+            max_share = (
+                max_share
+                if max_share is not None
+                else _share(hist, ("max_share_x100", "max_share"))
             )
             experts = _first_number(hist, ("n_experts", "moe_n_experts")) or experts
             counts = hist.get("counts")
@@ -349,9 +353,7 @@ def snapshot() -> dict:
     if CKPT.exists():
         for p in sorted(CKPT.glob("*.pt"), key=lambda q: q.stat().st_mtime, reverse=True)[:5]:
             st = p.stat()
-            ckpts.append(
-                {"name": p.name, "mb": st.st_size / 1e6, "age": now - st.st_mtime}
-            )
+            ckpts.append({"name": p.name, "mb": st.st_size / 1e6, "age": now - st.st_mtime})
 
     sft = {}
     try:
@@ -383,9 +385,9 @@ def snapshot() -> dict:
         "run": {
             "name": RUN,
             "shape": (
-                f"d{run_cfg.get('d_model','?')} · b{run_cfg.get('batch','?')}"
-                f"×s{run_cfg.get('seq_len','?')}×accum{run_cfg.get('grad_accum',1)}"
-                f" · it{run_cfg.get('max_iter','?')}"
+                f"d{run_cfg.get('d_model', '?')} · b{run_cfg.get('batch', '?')}"
+                f"×s{run_cfg.get('seq_len', '?')}×accum{run_cfg.get('grad_accum', 1)}"
+                f" · it{run_cfg.get('max_iter', '?')}"
             ),
             "params": run_cfg.get("params"),
             "experts": run_cfg.get("n_experts"),
@@ -477,15 +479,15 @@ def frag_metrics(s: dict) -> str:
     }.get(metric, "held-out bpb (fin)")
     return f"""<div class="nums">
   <div class="cell hero"><span class="k">{label}</span>
-    <div class="v">{_fmt(r['bpb'])}</div>
-    <span class="sub">{arrow} vs previous eval · ×{8 / (r['bpb'] or 8):.1f} compression</span>
+    <div class="v">{_fmt(r["bpb"])}</div>
+    <span class="sub">{arrow} vs previous eval · ×{8 / (r["bpb"] or 8):.1f} compression</span>
     <span class="sub">{proj}</span></div>
-  <div class="cell"><span class="k">loss</span><div class="v">{_fmt(r['loss'], '{:.4f}')}</div>
-    <span class="sub">lr {_fmt(r['lr'], '{:.1e}')}</span></div>
-  <div class="cell"><span class="k">bytes / s</span><div class="v">{r['tps'] / 1000:.1f}<span style="font-size:19px">k</span></div>
-    <span class="sub">{_human_bytes(r['seen'])} seen</span></div>
-  <div class="cell"><span class="k">eta</span><div class="v" style="font-size:26px">{_human_secs(r['eta'])}</div>
-    <span class="sub">{pct:.1f}% of {r['total_steps']:,}</span></div>
+  <div class="cell"><span class="k">loss</span><div class="v">{_fmt(r["loss"], "{:.4f}")}</div>
+    <span class="sub">lr {_fmt(r["lr"], "{:.1e}")}</span></div>
+  <div class="cell"><span class="k">bytes / s</span><div class="v">{r["tps"] / 1000:.1f}<span style="font-size:19px">k</span></div>
+    <span class="sub">{_human_bytes(r["seen"])} seen</span></div>
+  <div class="cell"><span class="k">eta</span><div class="v" style="font-size:26px">{_human_secs(r["eta"])}</div>
+    <span class="sub">{pct:.1f}% of {r["total_steps"]:,}</span></div>
 </div>"""
 
 
@@ -507,8 +509,8 @@ def frag_hero(s: dict) -> str:
     age = s["age"]
     return f"""<div class="term">
   <div class="bar-top"><span>{run} · train</span>
-    <span>{'log ' + _human_secs(age) + ' old' if age < 1e9 else 'no log'}</span></div>
-  <pre>{''.join(out)}</pre>
+    <span>{"log " + _human_secs(age) + " old" if age < 1e9 else "no log"}</span></div>
+  <pre>{"".join(out)}</pre>
 </div>"""
 
 
@@ -523,11 +525,13 @@ def frag_chart(s: dict) -> str:
     y0, y1 = min(ys), max(ys)
     pad = max(0.004, (y1 - y0) * 0.18)
     y0, y1 = y0 - pad, y1 + pad
+
     def sx(x: float) -> float:
         return PADL + (x - x0) / max(1, (x1 - x0)) * (W - PADL - 8)
 
     def sy(y: float) -> float:
         return PADT + (1 - (y - y0) / max(1e-9, (y1 - y0))) * (H - PADT - PADB)
+
     pts = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in zip(xs, ys, strict=True))
     area = f"{PADL:.1f},{H - PADB:.1f} {pts} {sx(x1):.1f},{H - PADB:.1f}"
     grid, labels = [], []
@@ -544,7 +548,8 @@ def frag_chart(s: dict) -> str:
             f'<text class="axis" x="{sx(x):.1f}" y="{H - 5}" text-anchor="middle">{x / 1000:.0f}k</text>'
         )
     dots = "".join(
-        f'<circle class="pt" cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="2.4"/>' for x, y in zip(xs, ys, strict=True)
+        f'<circle class="pt" cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="2.4"/>'
+        for x, y in zip(xs, ys, strict=True)
     )
     # the 105M reference on the same token axis (GB), when it exists
     st = s.get("stair") or {}
@@ -570,15 +575,15 @@ def frag_chart(s: dict) -> str:
     return f"""<div class="chart">
 <svg viewBox="0 0 {W} {H}" preserveAspectRatio="none" role="img"
      aria-label="held-out BPB over training steps">
-  <g class="grid">{''.join(grid)}</g>
+  <g class="grid">{"".join(grid)}</g>
   <polygon class="area" points="{area}"/>
   <polyline class="line" points="{pts}"/>
   {f'<polyline class="line ref" points="{ref_pts}"/>' if ref_pts else ""}
   {dots}
-  <circle class="pt last" cx="{sx(last['step']):.1f}" cy="{sy(last['bpb']):.1f}" r="3.6"/>
-  <text class="lbl" x="{min(W - 12, sx(last['step']) + 9):.1f}"
-        y="{sy(last['bpb']) - 8:.1f}">{last['bpb']:.4f}</text>
-  {''.join(labels)}
+  <circle class="pt last" cx="{sx(last["step"]):.1f}" cy="{sy(last["bpb"]):.1f}" r="3.6"/>
+  <text class="lbl" x="{min(W - 12, sx(last["step"]) + 9):.1f}"
+        y="{sy(last["bpb"]) - 8:.1f}">{last["bpb"]:.4f}</text>
+  {"".join(labels)}
 </svg></div>"""
 
 
@@ -586,26 +591,26 @@ def frag_routing(s: dict) -> str:
     r = s.get("routing") or routing_data(s)
     if r["live"] is None or not r["experts"]:
         cmd = f"scripts/route_hist.py --json {ROUTING_JSON}"
-        return f'<div class="void">[–] no routing health yet — <code>{html.escape(cmd)}</code></div>'
+        return (
+            f'<div class="void">[–] no routing health yet — <code>{html.escape(cmd)}</code></div>'
+        )
     pct = 100.0 * r["frac"]
     label = {"ok": "healthy", "warn": "degraded", "bad": "collapsed"}[r["state"]]
     top10 = "—" if r["top10"] is None else f"{100 * r['top10']:.1f}%"
     mx = "—" if r["max_share"] is None else f"{100 * r['max_share']:.1f}%"
-    source = (
-        f' · source {html.escape(r["source"])}' if r.get("source") else ""
-    )
-    return f"""<div class="routing route-{r['state']}">
+    source = f" · source {html.escape(r['source'])}" if r.get("source") else ""
+    return f"""<div class="routing route-{r["state"]}">
   <div class="gauge">
     <div class="row"><span class="lab">live</span>
-      <div class="track"><div class="mk {r['state']}" style="width:{pct:.1f}%"></div></div>
-      <span class="val">{r['live']} / {r['experts']}</span></div>
+      <div class="track"><div class="mk {r["state"]}" style="width:{pct:.1f}%"></div></div>
+      <span class="val">{r["live"]} / {r["experts"]}</span></div>
   </div>
   <div class="kv">
-    <div class="k">live experts</div><div class="v">{r['live']} / {r['experts']} · {pct:.1f}%</div>
+    <div class="k">live experts</div><div class="v">{r["live"]} / {r["experts"]} · {pct:.1f}%</div>
     <div class="k">top-10 share</div><div class="v">{top10}</div>
     <div class="k">max share</div><div class="v">{mx}</div>
   </div>
-  <div class="route-state {r['state']}"><b>{label}</b> · live &lt; 50% of E is the red line{source}</div>
+  <div class="route-state {r["state"]}"><b>{label}</b> · live &lt; 50% of E is the red line{source}</div>
 </div>"""
 
 
@@ -636,20 +641,20 @@ def frag_panels(s: dict) -> str:
         pw = 100.0 * g["power"] / max(1.0, g["power_limit"])
         gpu_html = f"""<div class="gauge">
   <div class="row"><span class="lab">util</span>
-    <div class="track"><div class="mk{' hot' if util > 90 else ''}" style="width:{util:.0f}%"></div></div>
+    <div class="track"><div class="mk{" hot" if util > 90 else ""}" style="width:{util:.0f}%"></div></div>
     <span class="val">{util:.0f}%</span></div>
   <div class="row"><span class="lab">vram</span>
     <div class="track"><div class="mk" style="width:{vram:.0f}%"></div></div>
-    <span class="val">{g['vram_used'] / 1024:.1f}/{g['vram_total'] / 1024:.0f} GiB</span></div>
+    <span class="val">{g["vram_used"] / 1024:.1f}/{g["vram_total"] / 1024:.0f} GiB</span></div>
   <div class="row"><span class="lab">power</span>
     <div class="track"><div class="mk" style="width:{pw:.0f}%"></div></div>
-    <span class="val">{g['power']:.0f}/{g['power_limit']:.0f} W</span></div>
+    <span class="val">{g["power"]:.0f}/{g["power_limit"]:.0f} W</span></div>
   <div class="row"><span class="lab">clock</span>
-    <div class="track"><div class="mk" style="width:{min(100, g['clock'] / 31.8):.0f}%"></div></div>
-    <span class="val">{g['clock']:.0f} MHz</span></div>
+    <div class="track"><div class="mk" style="width:{min(100, g["clock"] / 31.8):.0f}%"></div></div>
+    <span class="val">{g["clock"]:.0f} MHz</span></div>
   <div class="row"><span class="lab">temp</span>
-    <div class="track"><div class="mk{' hot' if g['temp'] > 78 else ''}" style="width:{min(100, g['temp']):.0f}%"></div></div>
-    <span class="val">{g['temp']:.0f} °C</span></div>
+    <div class="track"><div class="mk{" hot" if g["temp"] > 78 else ""}" style="width:{min(100, g["temp"]):.0f}%"></div></div>
+    <span class="val">{g["temp"]:.0f} °C</span></div>
 </div>"""
     else:
         gpu_html = '<div class="void">[–] nvidia-smi unavailable</div>'
@@ -666,16 +671,17 @@ def frag_panels(s: dict) -> str:
 
     ag = s.get("agent") or {}
     if ag:
+
         def pct(v):
             return f"{100 * v:.0f}%" if isinstance(v, (int, float)) else "—"
 
         ag_html = f"""<div class="kv">
-  <div class="k">format (valid call)</div><div class="v">{pct(ag.get('format'))}</div>
-  <div class="k">prose, no call</div><div class="v">{ag.get('no_call', '—')}/{ag.get('prompts', '—')}</div>
-  <div class="k">executable</div><div class="v">{pct(ag.get('exec'))}</div>
-  <div class="k">task success</div><div class="v">{ag.get('passed')}/{ag.get('tasks')}</div>
-  <div class="k">sandbox refusals</div><div class="v">{ag.get('audit', '—')}</div>
-</div><div class="void" style="margin-top:10px">{html.escape(str(ag.get('run')))} · {html.escape(str(ag.get('state')))}</div>"""
+  <div class="k">format (valid call)</div><div class="v">{pct(ag.get("format"))}</div>
+  <div class="k">prose, no call</div><div class="v">{ag.get("no_call", "—")}/{ag.get("prompts", "—")}</div>
+  <div class="k">executable</div><div class="v">{pct(ag.get("exec"))}</div>
+  <div class="k">task success</div><div class="v">{ag.get("passed")}/{ag.get("tasks")}</div>
+  <div class="k">sandbox refusals</div><div class="v">{ag.get("audit", "—")}</div>
+</div><div class="void" style="margin-top:10px">{html.escape(str(ag.get("run")))} · {html.escape(str(ag.get("state")))}</div>"""
     else:
         ag_html = '<div class="void">[–] no agent eval yet</div>'
 
@@ -687,20 +693,23 @@ def frag_panels(s: dict) -> str:
         )
         risky = [k for k, v in sf["sources"].items() if v.get("risk") == "unclear"]
         sft_html = f"""<div class="kv">
-  <div class="k">train rows</div><div class="v">{sf['rows']:,}</div>
-  <div class="k">holdout</div><div class="v">{sf['holdout']}</div>
-  <div class="k">clean subset</div><div class="v">{sf['clean']:,}</div>
-  <div class="k">bytes</div><div class="v">{_human_bytes(sf['bytes'])}</div>
+  <div class="k">train rows</div><div class="v">{sf["rows"]:,}</div>
+  <div class="k">holdout</div><div class="v">{sf["holdout"]}</div>
+  <div class="k">clean subset</div><div class="v">{sf["clean"]:,}</div>
+  <div class="k">bytes</div><div class="v">{_human_bytes(sf["bytes"])}</div>
   <div class="k">quarantined</div><div class="v">{len(risky)} sources</div>
 </div><div class="void" style="margin-top:10px">{html.escape(mix)}</div>"""
     else:
         sft_html = '<div class="void">[–] corpus not built</div>'
 
-    commits = "".join(
-        f"<li><span class='m'>›</span><b>{html.escape(r['subject'][:58])}</b>"
-        f"<span class='r'>{r['sha']} · {html.escape(r['when'])}</span></li>"
-        for r in s["git"][:5]
-    ) or "<li><span class='m'>·</span>no git history<span class='r'></span></li>"
+    commits = (
+        "".join(
+            f"<li><span class='m'>›</span><b>{html.escape(r['subject'][:58])}</b>"
+            f"<span class='r'>{r['sha']} · {html.escape(r['when'])}</span></li>"
+            for r in s["git"][:5]
+        )
+        or "<li><span class='m'>·</span>no git history<span class='r'></span></li>"
+    )
 
     return f"""<div class="grid">
   <div class="panel"><h3>mechanisms · live counters</h3><div class="kv">{mechanisms}</div></div>
@@ -721,8 +730,10 @@ def frag_evals(s: dict) -> str:
     rows, prev = [], None
     for p in h:
         d = "—" if prev is None else f"{p['bpb'] - prev:+.4f}"
-        cls = "steady" if prev is None or abs(p["bpb"] - prev) < 0.0005 else (
-            "down" if p["bpb"] < prev else "up"
+        cls = (
+            "steady"
+            if prev is None or abs(p["bpb"] - prev) < 0.0005
+            else ("down" if p["bpb"] < prev else "up")
         )
         rows.append(
             f"<li><span class='m'>·</span><b>{p['step']:,}</b>"
@@ -737,7 +748,7 @@ FRAGS = {
     "hero": frag_hero,
     "chart": frag_chart,
     "panels": frag_panels,
-  "routing": frag_routing,
+    "routing": frag_routing,
     "evals": frag_evals,
 }
 
@@ -753,7 +764,11 @@ def page(s: dict, query: str = "") -> str:
     label = {"live": "live", "stale": "stalled", "dead": "offline"}[state]
     host = socket.gethostname().split(".")[0]
     dark = "theme=dark" in query
-    htmx = '<script src="/static/htmx.min.js" defer></script>' if (STATIC / "htmx.min.js").exists() else ""
+    htmx = (
+        '<script src="/static/htmx.min.js" defer></script>'
+        if (STATIC / "htmx.min.js").exists()
+        else ""
+    )
     fallback = "" if htmx else '<meta http-equiv="refresh" content="5">'
     cfg = _jsonl_snapshot_cfg()
     return f"""<!doctype html>
@@ -782,26 +797,26 @@ def page(s: dict, query: str = "") -> str:
   </div>
 
   <div class="block" style="--i:0">
-    <h2>run <span class="hint">{html.escape(r['shape'])} · {_params(r['params'])}</span></h2>
+    <h2>run <span class="hint">{html.escape(r["shape"])} · {_params(r["params"])}</span></h2>
     <div class="run">
-      <span class="id">{r['name']}</span>
-      <span>step <b>{r['step']:,}</b> / {r['total_steps']:,}</span>
+      <span class="id">{r["name"]}</span>
+      <span>step <b>{r["step"]:,}</b> / {r["total_steps"]:,}</span>
       <span>{pct:.2f}%</span>
-      <span>nan_skipped <b>{r['nan']}</b></span>
-      <span>{_human_bytes(r['seen'])} of {_human_bytes(r['budget'])}</span>
+      <span>nan_skipped <b>{r["nan"]}</b></span>
+      <span>{_human_bytes(r["seen"])} of {_human_bytes(r["budget"])}</span>
     </div>
     <div class="bar">
       <div class="fill" style="width:{pct:.3f}%"></div>
       <div class="decay" style="left:{decay:.3f}%"></div>
     </div>
-    <div class="scale"><span>0</span><span>{r['total_steps'] // 2:,}</span>
-      <span>decay {r['decay_at']:,}</span><span>{r['total_steps']:,}</span></div>
+    <div class="scale"><span>0</span><span>{r["total_steps"] // 2:,}</span>
+      <span>decay {r["decay_at"]:,}</span><span>{r["total_steps"]:,}</span></div>
   </div>
 
   <div class="block" style="--i:1" id="hero" sse-swap="hero">{frag_hero(s)}</div>
   <div class="block" style="--i:2" id="metrics" sse-swap="metrics">{frag_metrics(s)}</div>
 <div class="block" style="--i:3"><h2>held-out bpb (fin) <span class="hint">eval every 2k steps ·
-      {s['run']['eval_bytes']:,} B window</span></h2>
+      {s["run"]["eval_bytes"]:,} B window</span></h2>
     <div id="chart" sse-swap="chart">{frag_chart(s)}</div></div>
   <div class="block" style="--i:4" id="routing" sse-swap="routing">
     <h2>routing health <span class="hint">live experts / E · below 50% is a dead bank</span></h2>
@@ -810,7 +825,7 @@ def page(s: dict, query: str = "") -> str:
 
   <div class="foot">
     <span>read-only · SSE every {REFRESH_S:.0f}s · no torch, no GPU lock</span>
-    <span>{s['exited'] or 'training in progress'}</span>
+    <span>{s["exited"] or "training in progress"}</span>
     <span><a href="/api/snapshot">/api/snapshot</a></span>
   </div>
 </div>
@@ -822,8 +837,6 @@ tick(); setInterval(tick, 1000);
 </body></html>"""
 
 
-
-
 def _params(n) -> str:
     """`param_count` lives behind the model build; the snapshot has no count.
 
@@ -831,7 +844,6 @@ def _params(n) -> str:
     (that is the bug this whole block exists to kill).
     """
     return f"{int(n):,} params" if n else "params n/a"
-
 
 
 def _stair(evals: list[dict], run_cfg: dict) -> dict:
@@ -843,7 +855,8 @@ def _stair(evals: list[dict], run_cfg: dict) -> dict:
     """
     try:
         bps = (
-            int(run_cfg.get("batch", 8)) * int(run_cfg.get("seq_len", 1024))
+            int(run_cfg.get("batch", 8))
+            * int(run_cfg.get("seq_len", 1024))
             * int(run_cfg.get("grad_accum", 1))
         )
         ref_rows = _jsonl(LOGS / "flagship_resume.jsonl") + _jsonl(LOGS / "flagship.jsonl")
@@ -867,7 +880,6 @@ def _stair(evals: list[dict], run_cfg: dict) -> dict:
         }
     except Exception:
         return {}
-
 
 
 def _agent_eval() -> dict:
@@ -958,14 +970,10 @@ class Handler(BaseHTTPRequestHandler):
                 "text/plain; charset=utf-8",
             )
         if path == "/api/snapshot":
-            return self._send(
-                200, json.dumps(snapshot(), default=str).encode(), "application/json"
-            )
+            return self._send(200, json.dumps(snapshot(), default=str).encode(), "application/json")
         if path == "/":
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
-            return self._send(
-                200, page(snapshot(), query).encode(), "text/html; charset=utf-8"
-            )
+            return self._send(200, page(snapshot(), query).encode(), "text/html; charset=utf-8")
         if path.startswith("/frag/"):
             name = path.split("/")[-1]
             fn = FRAGS.get(name)
@@ -1016,9 +1024,11 @@ def serve(host: str = "0.0.0.0", port: int = 3789) -> ThreadingHTTPServer:
 def _urls(port: int) -> None:
     print(f"  local      http://127.0.0.1:{port}/")
     try:
-        ip = subprocess.run(
-            ["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=2
-        ).stdout.strip().splitlines()
+        ip = (
+            subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=2)
+            .stdout.strip()
+            .splitlines()
+        )
         if ip:
             print(f"  tailscale  http://{ip[0]}:{port}/")
     except Exception:

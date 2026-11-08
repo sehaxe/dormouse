@@ -43,16 +43,23 @@ def test_the_decay_lands_on_min_lr_frac() -> None:
     """
     peak, total, decay = 5e-4, 1000, 200
     curve = [
-        wsd_lr(s, total_steps=total, peak_lr=peak, warmup_steps=0, decay_steps=decay,
-               final_frac=0.01)
+        wsd_lr(
+            s, total_steps=total, peak_lr=peak, warmup_steps=0, decay_steps=decay, final_frac=0.01
+        )
         for s in range(total - decay, total)
     ]
     assert curve[-1] == pytest.approx(peak * 0.01, rel=1e-12), curve[-1]
     assert curve[0] < peak, "the first decayed step must already be below the peak"
     assert all(a >= b for a, b in zip(curve, curve[1:], strict=False)), "the decay must be monotone"
     # ... and the same run with the old floor lands 10x higher.
-    old = wsd_lr(total - 1, total_steps=total, peak_lr=peak, warmup_steps=0,
-                 decay_steps=decay, final_frac=0.1)
+    old = wsd_lr(
+        total - 1,
+        total_steps=total,
+        peak_lr=peak,
+        warmup_steps=0,
+        decay_steps=decay,
+        final_frac=0.1,
+    )
     assert old == pytest.approx(peak * 0.1, rel=1e-12)
     assert old / curve[-1] == pytest.approx(10.0, rel=1e-12)
 
@@ -65,10 +72,22 @@ def test_a_longer_decay_starts_earlier_and_ends_at_the_same_floor() -> None:
     is still at the peak, and `before_short == peak` fails.
     """
     peak, total = 1e-3, 10_000
-    short = wsd_lr(total - 5_000, total_steps=total, peak_lr=peak, warmup_steps=0,
-                   decay_steps=1_000, final_frac=0.01)
-    long_ = wsd_lr(total - 5_000, total_steps=total, peak_lr=peak, warmup_steps=0,
-                   decay_steps=5_000, final_frac=0.01)
+    short = wsd_lr(
+        total - 5_000,
+        total_steps=total,
+        peak_lr=peak,
+        warmup_steps=0,
+        decay_steps=1_000,
+        final_frac=0.01,
+    )
+    long_ = wsd_lr(
+        total - 5_000,
+        total_steps=total,
+        peak_lr=peak,
+        warmup_steps=0,
+        decay_steps=5_000,
+        final_frac=0.01,
+    )
     assert long_ < short, "a longer decay has travelled further at the same step"
     assert short == pytest.approx(peak), "the short decay has not started yet"
 
@@ -86,9 +105,12 @@ def test_the_tail_is_replannable_on_a_resume(key: str, value: float) -> None:
     `train.<key>` and a resume refuses, which is exactly the 2026-10-30 block.
     """
     a = _run(decay_frac=0.15, min_lr_frac=0.1)
-    b = _run(**{key: value, **{k: v for k, v in
-                              (("decay_frac", 0.15), ("min_lr_frac", 0.1))
-                              if k != key}})
+    b = _run(
+        **{
+            key: value,
+            **{k: v for k, v in (("decay_frac", 0.15), ("min_lr_frac", 0.1)) if k != key},
+        }
+    )
     assert getattr(b.train, key) == value, "the replacement did not take"
     assert b.diff_keys(a) == [], b.diff_keys(a)
 
@@ -207,14 +229,27 @@ def test_the_replanned_tail_matches_the_arithmetic_that_motivated_it() -> None:
     start = steps - decay
     assert start == 102_000, start
     peak = 5e-4
-    assert wsd_lr(start - 1, total_steps=steps, peak_lr=peak, warmup_steps=0,
-                  decay_steps=decay, final_frac=0.01) == pytest.approx(peak)
+    assert wsd_lr(
+        start - 1,
+        total_steps=steps,
+        peak_lr=peak,
+        warmup_steps=0,
+        decay_steps=decay,
+        final_frac=0.01,
+    ) == pytest.approx(peak)
     # the first decayed step moves by exactly one increment (1/decay of the
     # (1 - floor) span): a hair below the peak, not the peak.
-    assert wsd_lr(at, total_steps=steps, peak_lr=peak, warmup_steps=0,
-                  decay_steps=decay, final_frac=0.01) == pytest.approx(peak, rel=1e-4)
-    assert wsd_lr(steps - 1, total_steps=steps, peak_lr=peak, warmup_steps=0,
-                  decay_steps=decay, final_frac=0.01) == pytest.approx(peak * 0.01)
+    assert wsd_lr(
+        at, total_steps=steps, peak_lr=peak, warmup_steps=0, decay_steps=decay, final_frac=0.01
+    ) == pytest.approx(peak, rel=1e-4)
+    assert wsd_lr(
+        steps - 1,
+        total_steps=steps,
+        peak_lr=peak,
+        warmup_steps=0,
+        decay_steps=decay,
+        final_frac=0.01,
+    ) == pytest.approx(peak * 0.01)
 
 
 def test_the_lr_curve_of_the_shipped_recipe_is_unchanged() -> None:
@@ -227,14 +262,20 @@ def test_the_lr_curve_of_the_shipped_recipe_is_unchanged() -> None:
     """
     peak, total, decay = 5e-4, 1000, 100
     curve = [
-        wsd_lr(s, total_steps=total, peak_lr=peak, warmup_steps=10, decay_steps=decay,
-               final_frac=TrainConfig().min_lr_frac)
+        wsd_lr(
+            s,
+            total_steps=total,
+            peak_lr=peak,
+            warmup_steps=10,
+            decay_steps=decay,
+            final_frac=TrainConfig().min_lr_frac,
+        )
         for s in range(total)
     ]
     assert TrainConfig().min_lr_frac == 0.1
     assert curve[-1] == pytest.approx(peak * 0.1, rel=1e-12)
     assert curve[9] == pytest.approx(peak, rel=1e-12), "warmup still ends at the peak"
-    assert len(set(curve[10:total - decay])) == 1, "the plateau is flat"
+    assert len(set(curve[10 : total - decay])) == 1, "the plateau is flat"
 
 
 def test_progress_keys_are_a_closed_set() -> None:
@@ -278,11 +319,13 @@ def test_zero_min_lr_frac_is_a_full_cooldown() -> None:
     from dormouse.config import validate_train
 
     validate_train(TrainConfig(min_lr_frac=0.0))
-    last = wsd_lr(999, total_steps=1000, peak_lr=1e-3, warmup_steps=0,
-                  decay_steps=100, final_frac=0.0)
+    last = wsd_lr(
+        999, total_steps=1000, peak_lr=1e-3, warmup_steps=0, decay_steps=100, final_frac=0.0
+    )
     assert last == pytest.approx(0.0, abs=1e-12)
-    mid = wsd_lr(949, total_steps=1000, peak_lr=1e-3, warmup_steps=0,
-                 decay_steps=100, final_frac=0.0)
+    mid = wsd_lr(
+        949, total_steps=1000, peak_lr=1e-3, warmup_steps=0, decay_steps=100, final_frac=0.0
+    )
     assert 0.0 < mid < 1e-3, "only the LAST step is zero"
 
 
@@ -292,9 +335,7 @@ def test_a_warmup_longer_than_the_decay_window_still_reaches_the_floor() -> None
     The decay window is clamped to what the warmup leaves, so the tail always
     lands on `final_frac` however the two overlap (math audit, 2026-11-08).
     """
-    last = wsd_lr(99, total_steps=100, peak_lr=1.0, warmup_steps=90,
-                  decay_steps=50, final_frac=0.1)
+    last = wsd_lr(99, total_steps=100, peak_lr=1.0, warmup_steps=90, decay_steps=50, final_frac=0.1)
     assert last == pytest.approx(0.1, rel=1e-9), last
-    mid = wsd_lr(94, total_steps=100, peak_lr=1.0, warmup_steps=90,
-                 decay_steps=50, final_frac=0.1)
+    mid = wsd_lr(94, total_steps=100, peak_lr=1.0, warmup_steps=90, decay_steps=50, final_frac=0.1)
     assert 0.1 < mid <= 1.0, mid

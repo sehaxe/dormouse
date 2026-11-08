@@ -112,9 +112,7 @@ def _recompute_from_logits(model, stream, batches, *, masked: bool, max_iter: in
 
 def test_bpb_fin_and_mean_are_sum_nats_over_ln2_bytes(tmp_path):
     run = tiny_run(tmp_path, eval=True, eval_batches=2)
-    run = dataclasses.replace(
-        run, model=dataclasses.replace(run.model, max_iter=3)
-    )
+    run = dataclasses.replace(run, model=dataclasses.replace(run.model, max_iter=3))
     model = DormouseModel(run.model)
     _train, stream = open_streams(run)
     assert stream is not None
@@ -147,9 +145,7 @@ def test_a_masked_eval_divides_by_the_positions_it_selected(tmp_path):
     Path(str(data) + ".docs.json").write_text(
         json.dumps({"version": 1, "size": n, "starts": [0, 200, 700, 1500, 2500, 3300]})
     )
-    run = dataclasses.replace(
-        run, model=dataclasses.replace(run.model, max_iter=3)
-    )
+    run = dataclasses.replace(run, model=dataclasses.replace(run.model, max_iter=3))
     model = DormouseModel(run.model)
     _train, stream = open_streams(run)
     assert isinstance(stream, MaskedByteStream)
@@ -201,9 +197,7 @@ def test_bytes_seen_is_the_optimizer_step_product_and_resume_continues_it(tmp_pa
     second = tmp_path / "second.jsonl"
     run2 = dataclasses.replace(
         run,
-        train=dataclasses.replace(
-            run.train, steps=6, json_log=str(second)
-        ),
+        train=dataclasses.replace(run.train, steps=6, json_log=str(second)),
     )
     train(DormouseModel(run2.model), run2, resume=True, log=lambda *_: None)
     rows2 = _jsonl(second)
@@ -325,9 +319,7 @@ def test_the_predictable_arm_counters_equal_their_config_formula():
     assert kda_field(full) == f"kda=full,n={cfg.max_iter}"
 
     # Composition counters: one per window/forward, `mhc` once per iteration.
-    _m, both = _run_once(
-        tiny_cfg(max_iter=3, use_mhc=True, use_attnres=True), ids, targets
-    )
+    _m, both = _run_once(tiny_cfg(max_iter=3, use_mhc=True, use_attnres=True), ids, targets)
     assert both["mhc"] == cfg.max_iter
     assert both["mhc_attnres_forward"] == 1
 

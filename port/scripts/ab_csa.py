@@ -378,9 +378,7 @@ def longctx(args: argparse.Namespace) -> int:
         ("csa", args.csa_dir, args.csa),
     ):
         model, run, loaded = load_checkpoint(Path(base).expanduser(), ckpt, str(dev))
-        rows[name] = _score_windows(
-            model, args.eval, windows, args.batches, args.seg, loaded
-        )
+        rows[name] = _score_windows(model, args.eval, windows, args.batches, args.seg, loaded)
         labels[name] = tuple(sorted({label for _w, label in rows[name]}))
         print(
             f"{name}: use_csa={run.model.use_csa}, chunk={run.model.csa_chunk}, "
@@ -390,8 +388,7 @@ def longctx(args: argparse.Namespace) -> int:
         )
         del model
     print(
-        f"\n{'window':>7s} {'model':>4s} {'variant':>7s} {'bpb':>8s} {'seg':>4s} "
-        f"{'scored B':>9s}"
+        f"\n{'window':>7s} {'model':>4s} {'variant':>7s} {'bpb':>8s} {'seg':>4s} {'scored B':>9s}"
     )
     for window in windows:
         for name in ("off", "csa"):
@@ -439,9 +436,7 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--eval", default=EVAL)
     a.add_argument("--device", default="cuda")
     a.add_argument("--out-dir", default="~/logs/ab_csa")
-    lc = sub.add_parser(
-        "longctx", help="4096 and 16384-byte held-out BPB, control vs CSA"
-    )
+    lc = sub.add_parser("longctx", help="4096 and 16384-byte held-out BPB, control vs CSA")
     lc.add_argument("--control-dir", required=True)
     lc.add_argument("--control", required=True)
     lc.add_argument("--csa-dir", required=True)

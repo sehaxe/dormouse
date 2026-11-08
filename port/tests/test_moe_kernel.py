@@ -185,11 +185,19 @@ def test_the_bf16_module_forward_trains_through_the_fused_combine(capacity, monk
     seen: dict = {}
     real = SparseMoE._triton_dispatch
 
-    def spy(self, xi, weight, index, order, keep, *, dropless=False, fused_bwd=True,
-            counters=None):   # `_expert_pass` forwards the counters since 2026-11-07
+    def spy(
+        self, xi, weight, index, order, keep, *, dropless=False, fused_bwd=True, counters=None
+    ):  # `_expert_pass` forwards the counters since 2026-11-07
         seen.update(weight=weight, index=index, order=order, keep=keep, dropless=dropless)
         seen["out"] = real(
-            self, xi, weight, index, order, keep, dropless=dropless, fused_bwd=fused_bwd,
+            self,
+            xi,
+            weight,
+            index,
+            order,
+            keep,
+            dropless=dropless,
+            fused_bwd=fused_bwd,
             counters=counters,
         )
         return seen["out"]
@@ -449,7 +457,7 @@ def test_the_glu_scales_are_masked_and_a_nan_tail_cannot_reach_y(rank, monkeypat
 
     real_banks = moe._banks
 
-    def nan_tail_banks(dt, counters=None):   # `_banks` gained the counters arg
+    def nan_tail_banks(dt, counters=None):  # `_banks` gained the counters arg
         gu, uu, v, gs, us = real_banks(dt, counters)
 
         def tail(t):

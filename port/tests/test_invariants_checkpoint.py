@@ -157,9 +157,9 @@ def test_every_nonpersistent_buffer_is_carried_or_provable(tmp_path, form):
             # different router — the 2026-11-04 50/51-tensor repro, re-checked.
             fresh = DormouseModel(run.model)
             live = _lfb_modules(model)[mod].lfb_bias
-            assert not torch.equal(
-                live, _lfb_modules(fresh)[mod].lfb_bias
-            ), "the fixture must actually move lfb_bias"
+            assert not torch.equal(live, _lfb_modules(fresh)[mod].lfb_bias), (
+                "the fixture must actually move lfb_bias"
+            )
         elif how == "derived":
             # Rebuilding the same config reproduces it bit for bit (no global
             # RNG, no training history): the only legal way to be non-persistent.

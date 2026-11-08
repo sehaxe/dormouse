@@ -137,9 +137,9 @@ def test_combine_reference_is_the_torch_scatter(k) -> None:
         assert torch.allclose(got, want, atol=1e-6, rtol=0), f"k={k}: {d}"
     # bf16: the SAME fp32 sum, rounded ONCE on the store.
     got16 = mk.combine_reference(y, w, rowmap, n, out_dtype=torch.bfloat16)
-    assert torch.equal(
-        got16, want.to(torch.bfloat16)
-    ), "the bf16 store must round the fp32 sum once"
+    assert torch.equal(got16, want.to(torch.bfloat16)), (
+        "the bf16 store must round the fp32 sum once"
+    )
     print(f"[reference] k={k}: fp32 matches the torch scatter; bf16 == its single rounding")
 
 
@@ -183,9 +183,7 @@ def test_the_dispatch_passes_the_combine_switches(monkeypatch) -> None:
 # D. model-level parity: fp32 bit-identical, bf16 measured
 # --------------------------------------------------------------------------- #
 def _model(combine: str, dtype: str, seed: int = 0) -> DormouseModel:
-    cfg = ModelConfig(
-        **_cfg(moe_capacity=0.0, moe_combine=combine, moe_combine_dtype=dtype)
-    )
+    cfg = ModelConfig(**_cfg(moe_capacity=0.0, moe_combine=combine, moe_combine_dtype=dtype))
     torch.manual_seed(seed)
     return DormouseModel(cfg)
 
@@ -195,11 +193,7 @@ def _forward_backward(model, ids):
     model.zero_grad()
     logits.float().pow(2).mean().backward()
     grads = torch.cat(
-        [
-            p.grad.reshape(-1)
-            for _, p in sorted(model.named_parameters())
-            if p.grad is not None
-        ]
+        [p.grad.reshape(-1) for _, p in sorted(model.named_parameters()) if p.grad is not None]
     )
     return logits.detach().float(), grads
 
@@ -217,8 +211,9 @@ def grouped_cpu(monkeypatch):
     def glu_stub(xg, gu, uu, gs, us, v, offs, **kw):
         return mk._glu_torch(xg, gu, uu, gs, us, v, offs)
 
-    def combine_proxy(y, w, owner, rowmap, n, *, ws=None, tiles=None, counters=None,
-                      fused=False, dtype="fp32"):
+    def combine_proxy(
+        y, w, owner, rowmap, n, *, ws=None, tiles=None, counters=None, fused=False, dtype="fp32"
+    ):
         if not fused:  # the `torch` arm: `_Combine.forward`'s three passes
             out = torch.zeros(n, y.shape[1], dtype=torch.float32)
             out.index_add_(0, owner, y.to(torch.float32) * w.unsqueeze(-1))
@@ -229,7 +224,13 @@ def grouped_cpu(monkeypatch):
 
     def via_triton(self, x, weight, index, order, keep, keep_rows, counters):
         return self._triton_dispatch(
-            x, weight, index, order, keep_rows, dropless=True, fused_bwd=True,
+            x,
+            weight,
+            index,
+            order,
+            keep_rows,
+            dropless=True,
+            fused_bwd=True,
             counters=counters,
         )
 
@@ -356,10 +357,16 @@ def test_the_combine_kernel_builds_for_sm_120() -> None:
         src = ASTSource(
             fn=mk._combine_fwd_kernel,
             signature={
-                "y_ptr": f"*{dt}", "w_ptr": "*fp32", "rowmap_ptr": "*i32",
-                "out_ptr": f"*{dt}", "N": "i32", "F_": "i32",
-                "K": "constexpr", "TOP_K": "constexpr",
-                "BLOCK_T": "constexpr", "BLOCK_F": "constexpr",
+                "y_ptr": f"*{dt}",
+                "w_ptr": "*fp32",
+                "rowmap_ptr": "*i32",
+                "out_ptr": f"*{dt}",
+                "N": "i32",
+                "F_": "i32",
+                "K": "constexpr",
+                "TOP_K": "constexpr",
+                "BLOCK_T": "constexpr",
+                "BLOCK_F": "constexpr",
             },
             constexprs={"K": 2, "TOP_K": 2, "BLOCK_T": 16, "BLOCK_F": 128},
         )
@@ -371,10 +378,18 @@ def test_the_combine_kernel_builds_for_sm_120() -> None:
     bwd = ASTSource(
         fn=mk._combine_bwd_kernel,
         signature={
-            "dout_ptr": "*bf16", "y_ptr": "*bf16", "w_ptr": "*fp32",
-            "rowmap_ptr": "*i32", "dy_ptr": "*bf16", "dw_ptr": "*fp32",
-            "N": "i32", "F_": "i32", "K": "constexpr", "TOP_K": "constexpr",
-            "BLOCK_T": "constexpr", "BLOCK_F": "constexpr",
+            "dout_ptr": "*bf16",
+            "y_ptr": "*bf16",
+            "w_ptr": "*fp32",
+            "rowmap_ptr": "*i32",
+            "dy_ptr": "*bf16",
+            "dw_ptr": "*fp32",
+            "N": "i32",
+            "F_": "i32",
+            "K": "constexpr",
+            "TOP_K": "constexpr",
+            "BLOCK_T": "constexpr",
+            "BLOCK_F": "constexpr",
         },
         constexprs={"K": 2, "TOP_K": 2, "BLOCK_T": 16, "BLOCK_F": 128},
     )

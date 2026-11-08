@@ -214,9 +214,7 @@ def _parity(run: RunConfig, *, steps: int, data: Path) -> tuple[float, float]:
             pair.append((report, sd))
         worst = max(((pair[0][1][k] - pair[1][1][k]).abs().max().item(), k) for k in pair[0][1])
         results.append(worst)
-        print(
-            f"[parity {label:2d} step(s)] worst |delta| = {worst[0]:.3e} @ {worst[1]}"
-        )
+        print(f"[parity {label:2d} step(s)] worst |delta| = {worst[0]:.3e} @ {worst[1]}")
     return results[0][0], results[1][0]
 
 

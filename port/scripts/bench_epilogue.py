@@ -313,8 +313,7 @@ def main() -> int:
     torch.manual_seed(a.seed)
     shapes = a.shape or ["b8s1024", "b1s8192"]
     print(
-        f"\n{'shape':10s} {'arm':22s} {'ms min':>8s} {'ms med':>8s} "
-        f"{'launches':>9s} {'GPU ms':>8s}"
+        f"\n{'shape':10s} {'arm':22s} {'ms min':>8s} {'ms med':>8s} {'launches':>9s} {'GPU ms':>8s}"
     )
     for tag in shapes:
         b, s = (8, 1024) if tag == "b8s1024" else (1, 8192)

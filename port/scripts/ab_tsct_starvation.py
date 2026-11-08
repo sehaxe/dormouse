@@ -166,15 +166,13 @@ def resolve(*, seq_hi: int = 1024) -> list[dict]:
     rows: list[dict] = []
     for spec in ARMS:
         seq = seq_hi if spec.tier == "hi" else 1024
-        run: RunConfig = load_run(
-            str(BASE_PRESET), model_overrides={**COMMON, **spec.overrides}
-        )
+        run: RunConfig = load_run(str(BASE_PRESET), model_overrides={**COMMON, **spec.overrides})
         row = cm.measure(run, batch=spec.batch, seq=seq)
         topk = run.model.moe_topk if run.model.moe_topk > 0 else run.model.n_experts
         direct = tokens_per_expert(spec.batch, seq, topk, run.model.n_experts)
-        assert math.isclose(
-            float(row["tokens_per_expert_step"]), direct, rel_tol=1e-9
-        ), f"{spec.name}: capacity_math and b*s*k/E disagree"
+        assert math.isclose(float(row["tokens_per_expert_step"]), direct, rel_tol=1e-9), (
+            f"{spec.name}: capacity_math and b*s*k/E disagree"
+        )
         rows.append(
             {
                 "arm": spec.name,
@@ -348,8 +346,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.seq is not None:
         seq_hi = args.seq
     rows = resolve(seq_hi=seq_hi)
-    print(f"\nSTEPS={STEPS}  SEEDS={list(SEEDS)}  EVAL_EVERY={EVAL_EVERY} "
-          f"EVAL_BATCHES={EVAL_BATCHES}")
+    print(
+        f"\nSTEPS={STEPS}  SEEDS={list(SEEDS)}  EVAL_EVERY={EVAL_EVERY} EVAL_BATCHES={EVAL_BATCHES}"
+    )
     print_table(rows, seq_hi=seq_hi)
     print("\n" + RULE)
     if args.dry_run or not args.run:

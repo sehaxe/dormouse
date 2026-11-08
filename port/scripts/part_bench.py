@@ -60,16 +60,16 @@ def main() -> int:
     def dense():
         # 4 latent projections (d -> 256) then out (256 -> d), the shapes the
         # block really multiplies
-        q = x @ wqkv[:256].T            # [t, 256]  (the 4 latent projections)
+        q = x @ wqkv[:256].T  # [t, 256]  (the 4 latent projections)
         k = x @ wqkv[256:512].T
-        return (k + q) @ wout.T         # [t, d]    (out_proj back to d)
+        return (k + q) @ wout.T  # [t, d]    (out_proj back to d)
 
     def expert_one():
         # what ONE expert does with the rows it owns
         rows = max(1, t * a.topk // e)
         h = torch.randn(rows, d, device=dev, dtype=dt)
-        g = h @ u.T                      # [rows, r]
-        y = g @ gu.T                     # [rows, 2f]
+        g = h @ u.T  # [rows, r]
+        y = g @ gu.T  # [rows, 2f]
         v = y[..., :f] * torch.nn.functional.silu(y[..., f:])
         return v @ down.T
 
@@ -95,10 +95,10 @@ def main() -> int:
     xb = torch.randn(e, rows, d, device=dev, dtype=dt)
 
     def expert_bmm():
-        g = torch.bmm(xb, UB.transpose(1, 2))          # [E, rows, r]
-        y = torch.bmm(g, GUB.transpose(1, 2))          # [E, rows, 2f]
+        g = torch.bmm(xb, UB.transpose(1, 2))  # [E, rows, r]
+        y = torch.bmm(g, GUB.transpose(1, 2))  # [E, rows, 2f]
         v = y[..., :f] * torch.nn.functional.silu(y[..., f:])
-        return torch.bmm(v, DOWNB.transpose(1, 2))     # [E, rows, d]
+        return torch.bmm(v, DOWNB.transpose(1, 2))  # [E, rows, d]
 
     def norm_epilogue():
         for _ in range(6):  # the per-iteration norms/mHC/AttnRes chain, roughly

@@ -343,9 +343,7 @@ def test_snapshot_round_trip_and_progress_exemption():
     # span both halves — a key that exists in NEITHER is still a red test.
     from dormouse.config import ModelConfig
 
-    known = set(TrainConfig().__dataclass_fields__) | set(
-        ModelConfig().__dataclass_fields__
-    )
+    known = set(TrainConfig().__dataclass_fields__) | set(ModelConfig().__dataclass_fields__)
     assert set(PROGRESS_KEYS) <= known
     # ... and so is the telemetry sink: it decides WHERE the measurement goes,
     # never what the model computes (audit MINOR 23, 2026-10-17).

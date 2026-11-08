@@ -101,21 +101,84 @@ def clean(s: str) -> str:
 #: Imperative task verbs (prefixes, lowercase). A paragraph opening with one is
 #: a user turn even without a `?` — the FLAN-style templates rely on it.
 _IMPER = (
-    "напиш", "созда", "сгенериру", "объясн", "расскаж", "перевед", "прочит",
-    "определ", "выдел", "посчита", "состав", "исправ", "провер", "найд",
-    "придума", "продолж", "законч", "ответь", "помог", "покаж", "оцен", "назов",
-    "перечисли", "докаж", "реши", "вычисл", "подскаж", "дай ", "задай", "опиши",
-    "сравни", "уточни", "выбери", "сформулируй", "перефразируй", "сократи",
-    "раздели", "заполни", "перепиши", "законспектируй", "порекомендуй",
-    "предложи", "сочини", "замени", "измени", "добавь", "вставь", "удали",
-    "нарисуй", "спланируй", "проанализируй", "классифицируй", "поясни",
-    "разъясни", "оформи", "выпиши", "отредактируй", "начни",
+    "напиш",
+    "созда",
+    "сгенериру",
+    "объясн",
+    "расскаж",
+    "перевед",
+    "прочит",
+    "определ",
+    "выдел",
+    "посчита",
+    "состав",
+    "исправ",
+    "провер",
+    "найд",
+    "придума",
+    "продолж",
+    "законч",
+    "ответь",
+    "помог",
+    "покаж",
+    "оцен",
+    "назов",
+    "перечисли",
+    "докаж",
+    "реши",
+    "вычисл",
+    "подскаж",
+    "дай ",
+    "задай",
+    "опиши",
+    "сравни",
+    "уточни",
+    "выбери",
+    "сформулируй",
+    "перефразируй",
+    "сократи",
+    "раздели",
+    "заполни",
+    "перепиши",
+    "законспектируй",
+    "порекомендуй",
+    "предложи",
+    "сочини",
+    "замени",
+    "измени",
+    "добавь",
+    "вставь",
+    "удали",
+    "нарисуй",
+    "спланируй",
+    "проанализируй",
+    "классифицируй",
+    "поясни",
+    "разъясни",
+    "оформи",
+    "выпиши",
+    "отредактируй",
+    "начни",
 )
 #: Words that mark a paragraph as a persona/system prompt rather than a turn.
 _PERSONA_KW = (
-    "ассистент", "помощник", "языковая модель", "нейросет", "gpt", "claude",
-    "сайга", "коуч", "отвеча", "помога", "должен ответить", "должна ответить",
-    "эксперт", "специалист", "консультант", "тренер", "бот",
+    "ассистент",
+    "помощник",
+    "языковая модель",
+    "нейросет",
+    "gpt",
+    "claude",
+    "сайга",
+    "коуч",
+    "отвеча",
+    "помога",
+    "должен ответить",
+    "должна ответить",
+    "эксперт",
+    "специалист",
+    "консультант",
+    "тренер",
+    "бот",
 )
 
 
@@ -236,9 +299,7 @@ def jsonl_schema_ok(first_line: str) -> bool:
         return False
     if not isinstance(obj, dict):
         return False
-    return ("instruction" in obj and "response" in obj) or (
-        "user" in obj and "assistant" in obj
-    )
+    return ("instruction" in obj and "response" in obj) or ("user" in obj and "assistant" in obj)
 
 
 # ---------------------------------------------------------------------------
@@ -261,14 +322,14 @@ def parse_reasoning_think(text: str) -> Iterator[tuple[str, str, str]]:
     answers: list[str] = []
     prev = 0
     for k in range(n):
-        seg = text[prev:opens[k]].strip("\n")
+        seg = text[prev : opens[k]].strip("\n")
         if k == 0:
             instrs.append(seg)
         else:
             ans, instr = seg.rsplit("\n", 1) if "\n" in seg else ("", seg)
             answers.append(ans.strip())
             instrs.append(instr.strip())
-        thoughts.append(text[opens[k] + len(THINK_OPEN):closes[k]].strip())
+        thoughts.append(text[opens[k] + len(THINK_OPEN) : closes[k]].strip())
         prev = closes[k] + len(THINK_CLOSE)
     answers.append(text[prev:].strip("\n"))
     for instr, thought, ans in zip(instrs, thoughts, answers, strict=False):
@@ -293,9 +354,9 @@ def parse_reasoning_bot(text: str) -> Iterator[tuple[str, str, str]]:
         if not b[k] < e[k] < s[k] < z[k] or (k > 0 and z[k - 1] > b[k]):
             return
         yield (
-            text[prev:b[k]].strip(),
-            text[b[k] + len(BOT):e[k]].strip(),
-            text[s[k] + len(BOS):z[k]].strip(),
+            text[prev : b[k]].strip(),
+            text[b[k] + len(BOT) : e[k]].strip(),
+            text[s[k] + len(BOS) : z[k]].strip(),
         )
         prev = z[k] + len(EOS)
 
@@ -320,12 +381,12 @@ def parse_reasoning(text: str) -> Iterator[tuple[str, str, str]]:
 
 @dataclass
 class Stats:
-    scanned: int = 0        # raw pairs the source parser produced
+    scanned: int = 0  # raw pairs the source parser produced
     kept: int = 0
-    dropped_long: int = 0   # instruction + response over LIMIT bytes
+    dropped_long: int = 0  # instruction + response over LIMIT bytes
     dropped_dirty: int = 0  # a half under 2 bytes / role-word / repr-junk
-    duplicates: int = 0     # same sha1(instruction, response) seen before
-    cleaned: int = 0        # rows that had sentinels / <|...|> removed
+    duplicates: int = 0  # same sha1(instruction, response) seen before
+    cleaned: int = 0  # rows that had sentinels / <|...|> removed
     files_read: int = 0
     files_skipped: int = 0
     lines: int = 0
@@ -388,8 +449,8 @@ class Sink:
 
 
 def _family(path: Path) -> str:
-    name = re.sub(r"_\d{4,}\.", ".", path.name)      # agentic_00001.txt -> agentic.txt
-    return re.sub(r"_shard-\d+", "", name)           # ..._shard-00007.jsonl
+    name = re.sub(r"_\d{4,}\.", ".", path.name)  # agentic_00001.txt -> agentic.txt
+    return re.sub(r"_shard-\d+", "", name)  # ..._shard-00007.jsonl
 
 
 def order_files(files: list[Path], seed: int) -> list[Path]:
@@ -433,8 +494,13 @@ def _has_mythos(path: Path) -> bool:
         return MYTHOS in fh.read(4096)
 
 
-def run_txt_source(paths: list[Path], parse: Callable[[str], Iterator], sink: Sink,
-                   max_seconds: float, probe: Callable[[Path], bool] | None = None) -> None:
+def run_txt_source(
+    paths: list[Path],
+    parse: Callable[[str], Iterator],
+    sink: Sink,
+    max_seconds: float,
+    probe: Callable[[Path], bool] | None = None,
+) -> None:
     t0 = time.time()
     for path in paths:
         if sink.full() or time.time() - t0 > max_seconds:
@@ -489,8 +555,13 @@ def run_reasoning_source(paths: list[Path], sink: Sink, max_seconds: float) -> N
             # The char count is a lower bound on the byte count, so it filters
             # out the (usually huge) thoughts before the expensive clean().
             if thought and len(instr) + len(thought) + len(ans) + 2 <= sink.limit:
-                if len(clean(instr).encode()) + len(clean(thought).encode()) \
-                        + len(clean(ans).encode()) + 2 <= sink.limit:
+                if (
+                    len(clean(instr).encode())
+                    + len(clean(thought).encode())
+                    + len(clean(ans).encode())
+                    + 2
+                    <= sink.limit
+                ):
                     sink.offer(instr, thought + "\n\n" + ans)
                     if sink.full():
                         break
@@ -510,11 +581,15 @@ def run_reasoning_source(paths: list[Path], sink: Sink, max_seconds: float) -> N
 def report(name: str, sink: Sink, size: int) -> None:
     s = sink.stats
     print(f"\n=== {sink.path.name}  (source: {name}) ===")
-    print(f"  files read {s.files_read}  skipped {s.files_skipped}  jsonl lines {s.lines}"
-          f"  ({s.seconds:.1f} s)")
-    print(f"  scanned {s.scanned}  kept {s.kept}  dropped_long {s.dropped_long}"
-          f"  dropped_dirty {s.dropped_dirty}  duplicates {s.duplicates}"
-          f"  cleaned {s.cleaned}")
+    print(
+        f"  files read {s.files_read}  skipped {s.files_skipped}  jsonl lines {s.lines}"
+        f"  ({s.seconds:.1f} s)"
+    )
+    print(
+        f"  scanned {s.scanned}  kept {s.kept}  dropped_long {s.dropped_long}"
+        f"  dropped_dirty {s.dropped_dirty}  duplicates {s.duplicates}"
+        f"  cleaned {s.cleaned}"
+    )
     for n, (i, a) in enumerate(sink.samples, 1):
         print(f"  sample {n}: instruction={i[:200]!r}")
         print(f"            response={a[:200]!r}")
@@ -534,10 +609,12 @@ def verify_output(path: Path) -> int:
             i, a = row["instruction"], row["response"]
             raw_i, raw_a = i.encode(), a.encode()
             assert len(raw_i) + len(raw_a) + 4 <= 512, f"{path}:{lineno}: too long"
-            assert all(b not in raw_i for b in (0, 1, 2, 3)), \
+            assert all(b not in raw_i for b in (0, 1, 2, 3)), (
                 f"{path}:{lineno}: sentinel in instruction"
-            assert all(b not in raw_a for b in (0, 1, 2, 3)), \
+            )
+            assert all(b not in raw_a for b in (0, 1, 2, 3)), (
                 f"{path}:{lineno}: sentinel in response"
+            )
             assert len(raw_i) >= 2 and len(raw_a) >= 2, f"{path}:{lineno}: too short"
             rows += 1
     return rows
@@ -583,9 +660,22 @@ def selftest() -> None:
     ], got
 
     bot = (
-        "Task three?\n\n" + BOT + "\nthink three\n" + EOT + "\n\n" + BOS
-        + "\nAnswer three.\n" + EOS + "\nTask four?\n\n" + BOT + "\nthink four\n"
-        + EOT + "\n\n" + BOS + "\nAnswer four.\n" + EOS
+        "Task three?\n\n"
+        + BOT
+        + "\nthink three\n"
+        + EOT
+        + "\n\n"
+        + BOS
+        + "\nAnswer three.\n"
+        + EOS
+        + "\nTask four?\n\n"
+        + BOT
+        + "\nthink four\n"
+        + EOT
+        + "\n\n"
+        + BOS
+        + "\nAnswer four.\n"
+        + EOS
     )
     got = list(parse_reasoning(bot))
     assert got == [
@@ -598,14 +688,19 @@ def selftest() -> None:
     with tempfile.TemporaryDirectory() as td:
         sink = Sink(Path(td) / "t.jsonl", cap=10)
         sink.offer("Q1", "A1")
-        sink.offer("Q1", "A1")                      # duplicate
-        sink.offer("Q2", "x" * 500)                 # long
-        sink.offer("Q3", "")                        # dirty
+        sink.offer("Q1", "A1")  # duplicate
+        sink.offer("Q2", "x" * 500)  # long
+        sink.offer("Q3", "")  # dirty
         sink.offer("Q\x00\x01x", "A<|endoftext|>2")  # cleaned, kept
         sink.close()
         s = sink.stats
-        assert (s.kept, s.duplicates, s.dropped_long, s.dropped_dirty, s.cleaned) == \
-               (2, 1, 1, 1, 1), s
+        assert (s.kept, s.duplicates, s.dropped_long, s.dropped_dirty, s.cleaned) == (
+            2,
+            1,
+            1,
+            1,
+            1,
+        ), s
         assert verify_output(Path(td) / "t.jsonl") == 2
     print("selftest ok")
 
@@ -619,13 +714,25 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--mix-root", type=Path, default=MIX_DEFAULT)
     ap.add_argument("--out-dir", type=Path, default=OUT_DEFAULT)
-    ap.add_argument("--source", action="append", choices=["ru", "en", "reason"],
-                    help="build only these outputs (default: all three)")
-    ap.add_argument("--cap", type=int, default=CAP_DEFAULT,
-                    help=f"kept pairs per output (default {CAP_DEFAULT})")
+    ap.add_argument(
+        "--source",
+        action="append",
+        choices=["ru", "en", "reason"],
+        help="build only these outputs (default: all three)",
+    )
+    ap.add_argument(
+        "--cap",
+        type=int,
+        default=CAP_DEFAULT,
+        help=f"kept pairs per output (default {CAP_DEFAULT})",
+    )
     ap.add_argument("--seed", type=int, default=SEED_DEFAULT)
-    ap.add_argument("--max-seconds", type=float, default=SECONDS_DEFAULT,
-                    help="safety net per source (default 1500 s)")
+    ap.add_argument(
+        "--max-seconds",
+        type=float,
+        default=SECONDS_DEFAULT,
+        help="safety net per source (default 1500 s)",
+    )
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
 
@@ -652,11 +759,14 @@ def main(argv: list[str] | None = None) -> int:
         txts = sorted(d.glob("agentic_*.txt"))
         jsonls = sorted(d.glob("*.jsonl"))
         sink = Sink(args.out_dir / "aria_en.jsonl", args.cap)
-        run_txt_source(order_files(txts, args.seed), parse_mythos, sink, args.max_seconds,
-                       probe=_has_mythos)
-        print(f"  [agentic txt phase] files read {sink.stats.files_read}"
-              f" skipped {sink.stats.files_skipped} scanned {sink.stats.scanned}"
-              f" kept {sink.stats.kept}")
+        run_txt_source(
+            order_files(txts, args.seed), parse_mythos, sink, args.max_seconds, probe=_has_mythos
+        )
+        print(
+            f"  [agentic txt phase] files read {sink.stats.files_read}"
+            f" skipped {sink.stats.files_skipped} scanned {sink.stats.scanned}"
+            f" kept {sink.stats.kept}"
+        )
         run_jsonl_source(order_files(jsonls, args.seed), sink, args.max_seconds)
         size = sink.close()
         report("agentic", sink, size)

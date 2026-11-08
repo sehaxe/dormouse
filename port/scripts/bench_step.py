@@ -89,9 +89,17 @@ def main() -> int:
     load_model_state(model, run.train, load_model_half(ckpt))
     c = run.train
     opt = MixOptimizer(
-        model, lr=c.lr, wd=c.wd, opt=c.opt, ns_steps=c.ns_steps, ns_kind=c.ns_kind,
-        colrow_3d=c.muon_colrow_3d, muon_state_dtype=c.muon_state_dtype,
-        ns_dtype=c.ns_dtype, muon_variant=c.muon_variant, muon_sf=c.muon_sf,
+        model,
+        lr=c.lr,
+        wd=c.wd,
+        opt=c.opt,
+        ns_steps=c.ns_steps,
+        ns_kind=c.ns_kind,
+        colrow_3d=c.muon_colrow_3d,
+        muon_state_dtype=c.muon_state_dtype,
+        ns_dtype=c.ns_dtype,
+        muon_variant=c.muon_variant,
+        muon_sf=c.muon_sf,
         muon_sf_wd=c.muon_sf_wd,
     )
 
