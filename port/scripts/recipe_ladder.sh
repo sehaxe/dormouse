@@ -74,7 +74,9 @@ rows = []
 for p in sorted(Path(sys.argv[1]).glob("*.jsonl")):
     ev = [json.loads(l) for l in p.read_text().splitlines() if '"eval"' in l]
     if ev:
-        rows.append((p.stem, ev[-1]["bpb_fin"], ev[-1]["bytes_seen"] / 1e9))
-for tag, bpb, gb in sorted(rows, key=lambda r: r[1]):
-    print(f"{tag:10s} bpb_fin={bpb:.4f} at {gb:.3f} GB")
+        rows.append((p.stem, ev[-1]["bpb_fin"], ev[-1]["bytes_seen"] / 1e6))
+base = next((b for t, b, _ in rows if t.startswith("control")), None)
+for tag, bpb, mb in sorted(rows, key=lambda r: r[1]):
+    delta = "" if base is None else f"  delta {bpb - base:+.4f}"
+    print(f"{tag:12s} bpb_fin={bpb:.4f} at {mb:.0f} MB{delta}")
 PY
