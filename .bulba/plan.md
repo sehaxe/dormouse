@@ -73,6 +73,26 @@ Until the owner picks, pushes go to `backup/main-local-2026-11-08`.
   (`docs/reviews/2026-11-08-deletion-audit.md` §7).
 - **deletions**: C2 + C7 (the 2 010-line safe tier) are unstarted; C4 is done.
 
+## Known-red at 2026-11-08 02:30 (pre-existing, not from tonight)
+
+Seven tests, all in the fused/CUDA-graph cluster, all written before tonight
+(`acb013f`, `0f118b2`, `b342390`), and several are ORDER-dependent: the same
+test passes when its file runs alone and fails in a mixed run, which points at
+process-global counters rather than at the kernel.
+
+| test | what it says |
+|---|---|
+| `test_full_graph::test_the_first_replay_is_the_eager_step` | the reference log never says "capture failed" |
+| `test_fused_epilogue::test_the_kernel_is_fp32_roundoff[one-gain]` | parity 2.861e-06 vs tolerance 2.082e-06 (1.37x over) |
+| `test_fused_kda::test_kernel_launch_counter_drops` | passes alone, red in a mixed run |
+| `test_fused_residual::test_gate_reddens_when_the_pre_bias_moves` | the sanity gate did NOT redden on a 1e-4 perturbation |
+| `test_fused_residual::test_the_fused_path_issues_far_fewer_launches` | launch count |
+| `test_invariants_checkpoint::test_every_nonpersistent_buffer_is_carried_or_provable[kda+shareu]` | passes alone |
+| `test_moe_combine_fused::test_the_fused_combine_counter_is_counted_by_the_kernel` | counter |
+
+They need a GPU session with the counters printed, not a blind fix. Recorded so
+the next full-suite run is read against this list, not against "22 red".
+
 ## Gates that must stay green
 
 `scripts/gate_fast.sh`, `scripts/gate_format.sh`, `pytest -q`, `dead_knob_audit`,
