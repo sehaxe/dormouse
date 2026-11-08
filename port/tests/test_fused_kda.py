@@ -485,6 +485,9 @@ def test_kernel_launch_counter_drops(monkeypatch) -> None:
     n_fused = _launches(fused)
     n_eager = _launches(eager)
     print(f"\n  launches/iteration: fused {n_fused}, eager {n_eager}")
+    # A zero from the profiler would make the DROP trivially true; the count that
+    # matters is only a measurement if the fused arm launched something.
+    assert n_fused > 0, "the profiler saw no kernel launch from the fused arm — nothing measured"
     assert n_fused <= 3, f"two fused chains plus the tuple add must be <= 3, saw {n_fused}"
     assert n_eager - n_fused >= 8, f"expected a large drop, saw {n_eager} -> {n_fused}"
 

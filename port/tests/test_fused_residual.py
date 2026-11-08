@@ -177,9 +177,10 @@ def test_the_fused_path_issues_far_fewer_launches(capsys) -> None:
 
     n_eager = _launches(eager)
     n_fused = _launches(fused)
+    assert n_fused > 0, "the profiler saw no kernel launch from the fused arm — nothing measured"
     print(
         f"\n  launches per residual chain: eager {n_eager}  fused {n_fused}  "
-        f"({n_eager / n_fused:.1f}x)"
+        f"({n_eager / max(n_fused, 1):.1f}x)"
     )
     assert n_fused * 5 <= n_eager, (
         f"fused_residual issued {n_fused} launches against eager's {n_eager}: the "
