@@ -28,9 +28,11 @@ COMPILE=${COMPILE:-0}
 # time. An EMA/SWA pass is a POST-RUN fork from the checkpoint (~30 min), not a
 # knob that makes this run incomparable. EMA=0.9999 turns it on.
 EMA=${EMA:-0.0}
-# 1% warmup (19 MB of 1.9 GB): the repo has NEVER run warmup at the live shape,
-# and the one no-warmup LR arm lost 0.25 BPB (LR research, [M]). 0 would repeat it.
-WARMUP=${WARMUP:-19000000}
+# 1% warmup, SCALED TO THE BUDGET (19 MB for 1.9 GB, 1.2 MB for a 120 MB anchor):
+# the repo has NEVER run warmup at the live shape, and the one no-warmup LR arm
+# lost 0.25 BPB (LR research, [M]). A fixed token count would give a 120 MB arm a
+# 16% warmup and make it incomparable to the ladder's no-warmup points.
+WARMUP=${WARMUP:-$((BYTES / 100))}
 TAG=${TAG:-budget}
 OUT=${OUT:-/home/sehaxe/dormouse/checkpoints/$TAG}
 MIX=${MIX:-configs/mix_refetch.toml}
