@@ -63,7 +63,20 @@ sources is a NEW number and must say so.
 | `data_local/mix/{code,math,ru}.bin` | ~210 MB each | fetch_mix_sources.py |
 | `data_local/parquet/*.parquet` | 3.0 GB | curl -L, then DuckDB local read (`--local-dir`) |
 
-**The recipe ladder is running** on it: `FAST=1 MIX=configs/mix_refetch.toml
+**The recipe ladder FINISHED (08:44).** Seven arms x 120 MB, 36-37 min each.
+Ranking at 120 MB: **all 1.4778**, cooldown 1.4870, vr 1.4878, clip 1.4889,
+control 1.4906, gate 1.4937, nope 1.4958. The combined arm is -0.0128 against
+control — at the top of the 0.008-0.011 seed band, from ONE seed, and larger
+than the sum of its parts; the honest verdict is "one candidate, not yet a
+result". **Queued: 2-3 seed control-vs-all replication**
+(`SEED=2 RUN_TAG=_s2 ONLY="control all"`, 37 min per arm) after the CSA run.
+Compression anchor on the same 196 608 B: bzip2 2.5878, xz 2.7134, zstd 2.7703
+bits/byte — the control is 1.10 b/B below the best of them.
+
+**The CSA artifact is TRAINING since 08:50** (`scripts/train_csa8k.sh`, 8K,
+102.7M, 8 000 steps, ~3 h 50 m) — gate A of the 1M protocol.
+
+**The ladder was running** on it: `FAST=1 MIX=configs/mix_refetch.toml
 RUN_TAG=_refetch`, 7 arms x 14648 steps x 8192 B = 120 MB each. First arm
 measured 49.8 kB/s (30 MB in ~10 min), so ~40 min/arm, ~5 h total. Numbers are
 NEW numbers: the old mix4 window is gone.
