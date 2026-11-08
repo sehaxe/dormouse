@@ -18,8 +18,11 @@ every number on record. `crates/` is the Rust/burn lane, **frozen since
 2026-11-07**: it compiles and its tests run, but no new work lands there until
 the Python lane's numbers settle. One RTX 5070 Ti (16 GB, sm_120).
 
-**Landing page:** [`site/index.html`](site/index.html) — two themes, a photograph
-through a halftone shader, and every number on it computed from the run logs.
+**Landing page:** **<https://sehaxe.github.io/dormouse/>** — two themes, a
+photograph through a halftone shader, and every number on it computed from the
+run logs. The knowledge base lives at
+[`/docs/`](https://sehaxe.github.io/dormouse/docs/). Source:
+[`site/index.html`](site/index.html).
 
 **One branch now.** `main` is this lane (2026-11-08: the old Rust-era
 `origin/main` was preserved as `archive/rust-lineage-2026-11-08` before the
