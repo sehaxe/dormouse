@@ -50,6 +50,43 @@ sources is a NEW number and must say so.
 
 **Do not merge or checkout while these paths exist.**
 
+## 2026-11-08 05:00 — after the artifact loss: the corpus is back, the ladder is running
+
+**Data recovery is DONE** (the incident report's ladder, steps 1-4):
+
+| file | bytes | how |
+|---|---:|---|
+| `data_local/best/fwedu_train.bin` | 933 743 230 | FineWeb-Edu shard 0, head |
+| `data_local/best/fwedu_eval.bin` | 8 386 155 | the tail from a document separator — a file no source reads |
+| `data_local/best/cosmo.bin` | 302 198 823 | Cosmopedia auto_math_text |
+| `data_local/best/finemath.bin` | 948 125 886 | FineMath 3plus (the first download was truncated; re-curl + size check) |
+| `data_local/mix/{code,math,ru}.bin` | ~210 MB each | fetch_mix_sources.py |
+| `data_local/parquet/*.parquet` | 3.0 GB | curl -L, then DuckDB local read (`--local-dir`) |
+
+**The recipe ladder is running** on it: `FAST=1 MIX=configs/mix_refetch.toml
+RUN_TAG=_refetch`, 7 arms x 14648 steps x 8192 B = 120 MB each. First arm
+measured 49.8 kB/s (30 MB in ~10 min), so ~40 min/arm, ~5 h total. Numbers are
+NEW numbers: the old mix4 window is gone.
+
+**The 1M context question has an artifact answer**
+(`docs/research/2026-11-08-long-context-eval.md`):
+
+- `flagship3` (the only 95M on disk) is a **1K dense control, no CSA** — it
+  cannot run a 1M test. The 1M design is the LoopBlock form, and the one trained
+  CSA checkpoint (`longctx1`, 102.7M, 8K) is **not on disk**.
+- No 95M long-context result exists in the literature; the closest measured
+  points are 300M Infini (passkey collapses past 4-8K), 0.5B SRRM, 1.24B
+  Llama-3.2-1B in HELMET (2.0 inftyBench / 24.6 HELMET at 128K).
+- NIAH correlates with real tasks at rho 0.44-0.76, so retrieval evidence buys a
+  **mechanism** claim: "exact retrieval at 1M", not reasoning.
+- State correction: 33 MiB is ONE CSA slot; the loop carries one per iteration
+  (3 slots = 99 MiB; 12 layers = 396 MiB). README and the site now say that.
+
+**Next on the 1M path** (needs the card, so it queues behind the ladder): train a
+CSA model at 8K on the refetched corpus (longctx1's recipe, 102.7M, ~500 MB
+seen), then run the S-NIAH-8 harness (`port/scripts/niah.py`, being built) for
+gate D.
+
 ## The GitHub divergence (found 2026-11-08 while pushing)
 
 `origin/main` is NOT this lane. Its tree is the Rust-era layout (`src/`,
