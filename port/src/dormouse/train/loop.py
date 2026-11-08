@@ -1766,17 +1766,6 @@ def train(
             f"and every ragged MoE dispatch) are LOUD before the first step; paper "
             f"LayerRoPE is allowed because its depth indices are fixed."
         )
-    if start >= cfg.steps:
-        # A resume that lands past the budget runs ZERO steps and then reports
-        # `last_loss`, which is still the NaN it was initialised with. Refuse
-        # instead of printing a number that no step produced (numerics audit,
-        # 2026-11-08).
-        loud(
-            f"resume: the checkpoint is at step {start} and the run asks for "
-            f"{cfg.steps}. Nothing would run, and the report would print the "
-            f"uninitialised loss (nan). Escape: raise --steps above {start}, or "
-            f"start a new run (a different ckpt_name)."
-        )
     for step in range(start, cfg.steps):
         # The step audit's bracket (`dormouse.stepaudit`, disarmed unless a
         # script installs it): every host read, allocation and instrumented
@@ -2144,7 +2133,11 @@ def train(
         log(line)
     return {
         "steps": cfg.steps,
-        "loss": last_loss,
+        # `None`, not `nan`: a resume at the finished step runs ZERO iterations,
+        # so `last_loss_dev` is still the NaN it was initialised with and
+        # printing it would claim a step that never ran (numerics audit,
+        # 2026-11-08). A real run always fills it.
+        "loss": last_loss if start < cfg.steps else None,
         "nan_skipped": nan_skipped,
         "counters": total,
         "opt_steps": opt.steps,
