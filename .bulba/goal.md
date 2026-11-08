@@ -34,13 +34,24 @@ Make this repo the best software it can be, measured — not asserted. In order:
 - Never delete a test to make a suite green; if the test's claim is wrong, say
   in the commit why the claim moved.
 
-## Queue
+## Queue (2026-11-08 05:15)
 
-- [ ] 22 red tests: classify and fix
-- [ ] LayerRoPE overflow guard
-- [ ] WSD edge refusal
-- [ ] KDA g_min floor (behind a flag, default off, with an A/B later)
-- [ ] C2 dead config fields
-- [ ] C7 vendor prune (+ cargo check)
-- [ ] claims ledger `--since` mode + CI job
-- [ ] README/site polish if time remains
+- [x] 22 red tests: classified and fixed — **CPU suite green, 2 194 tests, exit 0**
+  (five of the seven "reds" were card gates that skip without CUDA; the one real
+  defect was the AdamW bias-correction desync on the graph fallback)
+- [x] LayerRoPE overflow guard
+- [x] WSD edge refusal
+- [x] KDA g_min: written as a DECISION with a gate (no floor; a clamp on the
+  reference tail alone would split it from the FLA kernel)
+- [x] C2 dead config fields — **blocked, not skipped**: 153 snapshots carry
+  `jepa=false`; recorded in `.bulba/plan.md` with the `RETIRED_KEYS` way out
+- [ ] C7 vendor prune — skipped on purpose: the two crates are 60 KB of a FROZEN
+  lane and no root crate depends on them; it is cleanup, not a lever
+- [x] claims ledger: CI job + the two honest limits printed (`--no-params` is a
+  lower bound; "new" is a date window, so today's reports count as new)
+- [x] claims repair: 9 mismatches = 7 parser artifacts + 2 stale docs, all 10
+  drifted claims repaired or bannered
+- [x] README/site: the 1M stat says designed, 33 MiB/slot named, corpus provenance
+- [x] 1M path: artifact audit + protocol + `niah.py` runner + `train_csa8k.sh`
+- [x] fused-cluster review + fixes
+- [ ] recipe ladder: RUNNING (7 arms x 120 MB, ~08:40)
