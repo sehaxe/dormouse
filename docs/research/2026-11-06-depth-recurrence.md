@@ -16,6 +16,15 @@
 > hyperconnections (14.55). It is the first real iso-FLOP win for loops at our
 > scale.
 >
+> **CORRECTION 2026-11-08, part 2** (from `docs/research/2026-11-08-mor-cycle2.md`):
+> the "MoR cycle-2 135M" row this file cites is **not MoR** — it is a plain
+> recursive transformer with a *Cycle* scheme in Table 10 (no router, no
+> early-exit); the router in that paper's iso-FLOP grid LOSES to vanilla at
+> 135M. Read correctly, the row is +0.0251 NLL = **0.009–0.012 BPB** — about
+> 1σ at 120 MB — and the paper's own 360M row flips the sign (+0.0016). The
+> 116-run iso-depth law (+0.03…+0.06 nats at r=2) is the better-supported
+> number, and it points the other way.
+
 > **It does not revive OUR loop.** Hyperloop's cell is a prelude + a 4L middle
 > repeated + a coda = **8 unique layers** (its own shape ablation: 4L 14.40,
 > 3L 14.62, 2L 15.06; **1L is outside the table**). Our `loop_blocks=1,
