@@ -1,7 +1,31 @@
 # Dataset: what the trainer actually reads
 
-Three corpora live under `data_local/` (gitignored). Every number below is from a
-build run on 2026-10-22/23 and is re-derivable with `port/scripts/build_mix4.py`.
+> ## CURRENT STATE (2026-11-08): this is a refetch, not the corpus
+>
+> `git merge origin/main` deleted `data_local/` and `checkpoints/`
+> (`docs/reviews/2026-11-08-merge-incident.md`). The mount the build read from
+> is gone too. What is on disk now is what two scripts refetched:
+>
+> | path | bytes | how |
+> |---|---:|---|
+> | `data_local/best/fwedu_train.bin` | 933 743 230 | FineWeb-Edu shard 0, head |
+> | `data_local/best/fwedu_eval.bin` | 8 386 155 | the shard's tail from a document separator — **a file no source reads**, so the overlap gate holds |
+> | `data_local/best/cosmo.bin` | 302 198 823 | Cosmopedia `auto_math_text` shard 0 |
+> | `data_local/best/finemath.bin` | 948 125 886 | FineMath `finemath-3plus` shard 0 |
+> | `data_local/mix/{code,math,ru}.bin` | 209 7xx xxx each | `scripts/fetch_mix_sources.py --cap-mb 200` |
+> | `data_local/parquet/*.parquet` | 3.0 GB | one shard each, `curl -L` (the hub's parquet reader burns the anonymous quota — HTTP 429) |
+>
+> `port/configs/mix_refetch.toml` is the six-source plan that names them; the
+> ladder runs on it with `MIX=configs/mix_refetch.toml`. **Every number measured
+> on this data is a new number** — it is not comparable to the `mix4`/`mix_v7`
+> numbers below, which recorded a corpus that no longer exists. Re-fetch with
+> `port/scripts/refetch_pretrain.py --local-dir data_local/parquet`.
+>
+> Everything from here to the end of the file is the **historical** build record
+> (2026-10-22/23). It stays because it explains how those numbers were made.
+
+Three corpora lived under `data_local/` (gitignored). Every number below is from a
+build run on 2026-10-22/23 and was re-derivable with `port/scripts/build_mix4.py`.
 
 ## `mix4/` — the pretraining corpus (5.77 GB train, 52.9 MB held out)
 
