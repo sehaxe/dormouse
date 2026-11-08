@@ -149,7 +149,10 @@ for (const g of globs) {
 	};
 	const sorted = g.order === 'name-desc' ? files.sort().reverse() : files.sort().sort((a, b) => dateOf(a).localeCompare(dateOf(b)));
 	sorted.forEach((file, i) => {
-		const slug = g.slug ? g.slug(file) : file.replace(/\.md$/, '');
+		// Astro lowercases a content-collection route; a slug that keeps the
+		// filename's case (routing-collapse-CONFIRMED) links to a 404 even though
+		// the page exists. Lowercase matches what the build writes.
+		const slug = g.slug ? g.slug(file) : file.replace(/\.md$/, '').toLowerCase();
 		plan.push({
 			src: `${g.dir}/${file}`,
 			out: `${g.out}/${slug}`,

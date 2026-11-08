@@ -229,7 +229,7 @@ export const pages = [
 	// site's IA.md for which content moved where.
 	{ src: 'README.md', out: 'start-here/what-is-this', slice: { from: /^## What is this$/, to: /^## Results$/ }, title: 'What this is', nav: 'What this is' },
 	{ src: 'README.md', out: 'start-here/status', slice: { from: /^## Results$/, to: /^## Quick start$/ }, title: 'Status: the measured numbers', nav: 'Status' },
-	{ src: 'README.md', out: 'start-here/quick-start', slice: { from: /^## Quick start$/, to: /^## Architecture$/ }, title: 'Quick start' },
+	{ src: 'README.md', out: 'start-here/quick-start', slice: { from: /^## Quick start$/, to: /^## The audits/ }, title: 'Quick start' },
 	{ src: 'README.md', out: 'start-here/license', slice: { from: /^## License$/ }, title: 'License' },
 	{ src: 'AGENTS.md', out: 'start-here/agents', title: 'The agent rulebook', nav: 'The agent rulebook' },
 	// CONTRIBUTING.md is the practice-level companion to AGENTS.md §1: which
@@ -249,8 +249,7 @@ export const pages = [
 	// ── Architecture ─────────────────────────────────────────────────────────
 	{ src: 'CONTEXT.md', out: 'architecture/context', title: 'The system map', nav: 'The system map' },
 	{ src: 'docs/glossary.md', out: 'architecture/glossary' },
-	{ src: 'README.md', out: 'architecture/model', slice: { from: /^## Architecture$/, to: /^## The vendored kernel library/ }, title: 'The model walk', nav: 'The model walk' },
-	{ src: 'README.md', out: 'architecture/vendored-library', slice: { from: /^## The vendored kernel library/, to: /^## Documentation$/ }, title: 'The vendored kernel library', nav: 'The kernel library' },
+	{ src: 'docs/architecture/2026-11-08-training-step.md', out: 'architecture/model', title: 'The model walk: one training step', nav: 'The model walk' },
 	{ src: 'docs/architecture/design-minimal.md', out: 'architecture/design-minimal' },
 	{ src: 'docs/architecture/mixture-arms.md', out: 'architecture/mixture-arms' },
 	{ src: 'docs/architecture/tk-design-on-cubecl-2026-10-04.md', out: 'architecture/tk-design-on-cubecl', title: 'ThunderKittens design on cubecl', nav: 'TK design on cubecl' },

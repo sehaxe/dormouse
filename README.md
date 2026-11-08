@@ -147,3 +147,10 @@ window that overlapped training bytes. All are fixed with gates.
 - `docs/reviews/2026-11-08-data-eval-integrity.md` lists the claims that are
   still suspect; `docs/reviews/2026-11-08-deletion-audit.md` lists 10.8k lines
   that already have a verdict and 15.5k lines of Rust that duplicate the live path.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). The model weights and the corpus slices are a
+separate question: the code is MIT, while the data carries the licences listed in
+[`docs/guides/data-provenance.md`](docs/guides/data-provenance.md) and the code
+slice's licence is unresolved (40% of it is copyleft).

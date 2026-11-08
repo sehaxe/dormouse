@@ -13,8 +13,10 @@ const { repo } = manifest;
 
 export default defineConfig({
 	site: `${repo}`,
-	// GitHub Pages project site: served under /dormouse/ — without this every asset 404s.
-	base: '/dormouse',
+	// GitHub Pages project site. The LANDING owns /dormouse/ and the knowledge
+	// base lives under /dormouse/docs/ — the deploy step moves the built pages
+	// into dist/docs/ after `check` has walked them at this base.
+	base: '/dormouse/docs',
 	trailingSlash: 'always',
 	integrations: [
 		// Mermaid renders ```mermaid fences as SVG, client-side. The owner

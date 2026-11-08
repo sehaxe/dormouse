@@ -45,6 +45,16 @@ jobs:
           npm run ingest
           npm run build
           npm run check
+      # The landing (`site/`) is the product page; the knowledge base is its
+      # docs. The built pages move under dist/docs/ (their base is
+      # /dormouse/docs), then the landing takes the root it was designed for.
+      - name: landing at the root, docs under /docs
+        run: |
+          mkdir -p docs-site/dist/docs
+          find docs-site/dist -mindepth 1 -maxdepth 1 ! -name docs -exec mv {} docs-site/dist/docs/ \;
+          cp site/index.html docs-site/dist/index.html
+          cp -r site/media docs-site/dist/media
+          cp -r site/assets docs-site/dist/assets
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs-site/dist
