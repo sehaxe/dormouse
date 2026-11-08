@@ -27,6 +27,14 @@ residual. **N = 1,028,724,480**, of which Muon owns 1,027,604,480 and AdamW 1,12
    запас 0.4 GiB, то есть «не влезает» на практике). **b=8 не влезает ни при какой длине
    сегмента:** минимум без нового кода — 15.34 GiB (b8/s2048, ckpt, bf16 Muon), это
    выше рабочего потолка 15.0 и без запаса на фрагментацию. b8/s8192 — 27.4 GiB.
+> **Shape note (2026-11-08, checked against the VRAM ledger).** Every number below
+> is at `s=2048` unless the row says otherwise. At `s=1024` the SAME levers fit
+> more: `port/scripts/vram_ledger.py` reports 1B dense at `b≈22` (14.883 GiB) and
+> the 1.07B sparse `b1` preset at `b≈49` (14.983 GiB) with `ckpt=full` + bf16
+> Muon. The "b=8 does not fit" line is a statement about `s=2048` (15.34 GiB);
+> at `s=1024` it is 13.34 and fits. The ledger's own gate is within 9.4% of the
+> measured 7.2 GiB anchor.
+
 2. **b=8 — это не требование, а привычка.** b=1 + `grad_accum=8` даёт тот же поток байт и тот
    же optimizer step, память — как у b=1. Единственная потеря — чуть меньшая загрузка тензорных
    ядер на микро-шаге; при d=1792 и s=2048 GEMM всё равно большой. Так что «1B не влезает»

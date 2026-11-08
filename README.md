@@ -74,7 +74,7 @@ different mixtures.
 | byte-patch unit (8 bytes/position) | 4.6× fewer seconds per byte | **rejected on quality**: the interface, not the codec (equal steps 3.74 vs 2.55) |
 | `ns_steps=5`, `muon_state_dtype=bf16` | free | ships |
 | 1M context state | **33 MiB per CSA slot** (fine 32 + coarse 1) at `d=1024`, carried **once per iteration** — 99 MiB for the 3-slot loop, 396 MiB on a 12-layer stack; KDA adds ~0.4 MB/slot | segmented training required; a 1M forward has not been run |
-| 1B on this card | fits only at b=1: 11.84 GiB with checkpointing ([research](docs/research/2026-11-08-1b-on-one-card.md)) | planned |
+| 1B on this card | at `s=2048`: fits only at b=1, 11.84 GiB with checkpointing + bf16 Muon; at `s=1024` the same levers reach b≈22 (dense) / b≈49 (sparse) at 14.9 GiB ([research](docs/research/2026-11-08-1b-on-one-card.md), `scripts/vram_ledger.py`) | planned |
 
 The compute target: **275M @ 22 GB** is the Chinchilla point for that budget;
 1B needs 80 GB of bytes and ~5 days at the current speed.
