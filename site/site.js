@@ -158,7 +158,8 @@ void main(){
   const bestSafe = safe.reduce((a, b) => (!a || b.kbs > a.kbs ? b : a), null);
   const speedup = control && bestSafe ? bestSafe.kbs / control.kbs : null;
 
-  document.getElementById('rungs').innerHTML = rungs.map(r => {
+  const rungsBody = document.getElementById('rungs');
+  if (rungsBody) rungsBody.innerHTML = rungs.map(r => {
     const rel = control ? r.kbs / control.kbs : 1;
     const note = r.safe ? '' : ' <span class="bad">[rejected]</span>';
     const d2 = r.dbpb;
@@ -172,24 +173,26 @@ void main(){
       ${q}</tr>`;
   }).join('');
 
-  if (speedup) document.getElementById('sSpeed').textContent = fmt(speedup, 2) + '×';
-  document.getElementById('sRuns').textContent = d.stats.runs_on_record;
-  document.getElementById('sRunsSub').textContent = d.stats.runs_with_bpb + ' with a held-out BPB';
+  const put = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+  if (speedup) put('sSpeed', fmt(speedup, 2) + '×');
+  put('sRuns', d.stats.runs_on_record);
+  put('sRunsSub', d.stats.runs_with_bpb + ' with a held-out BPB');
 
   /* ------------------------------------------------------------- the curve */
   const pts = d.curve || [];
   if (pts.length) {
     const last = pts[pts.length - 1];
-    document.getElementById('curveMeta').textContent =
-      `${pts.length} held-out points over ${fmt(last.mb, 0)} MB of training bytes.`;
     const sBpb = document.getElementById('sBpb');
     if (sBpb) sBpb.innerHTML = fmt(last.bpb, 2);
-    document.getElementById('curveFinal').innerHTML =
-      `<span class="mono">${fmt(last.bpb, 3)}</span> bits per byte at ${fmt(last.mb, 0)} MB`;
+    const cf = document.getElementById('curveFinal');
+    if (cf) cf.textContent = fmt(last.bpb, 3);
+    const cm = document.getElementById('curveMeta');
+    if (cm) cm.textContent = `${pts.length} held-out points over ${fmt(last.mb, 0)} MB of training bytes.`;
   }
 
   /* ------------------------------------------------------------- the runs */
-  document.getElementById('runsBody').innerHTML = (d.runs || []).map(r => `<tr>
+  const runsBody = document.getElementById('runsBody');
+  if (runsBody) runsBody.innerHTML = (d.runs || []).map(r => `<tr>
     <td>${r.run}</td><td>${r.source || '—'}</td><td>${r.opt || '—'}</td>
     <td>${r.batch}×${r.seq}</td><td>${fmt(r.mb, 0)}</td><td class="ok">${fmt(r.bpb, 3)}</td>
   </tr>`).join('');
@@ -209,11 +212,55 @@ void main(){
       out += `<b class="${cls[band(bits[i])]}">${esc(sj.text[i])}</b>`;
       if ((i + 1) % cols === 0) out += '\n';
     }
-    document.getElementById('bytes').innerHTML = out.trimEnd();
+    document.getElementById('byteStrip').innerHTML = out.trimEnd();
     const mean = bits.reduce((a, b) => a + b, 0) / bits.length;
     document.getElementById('sMean').textContent = `mean ${mean.toFixed(3)} bits / byte`;
     document.getElementById('sMeta').textContent = `off=${sj.offset}`;
   }
 
   document.getElementById('built').textContent = `${d.stats.runs_on_record} log files`;
+
+  /* ------------------------------------------------------------- motion */
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!reduce) {
+    const items = document.querySelectorAll('.chapter, #curve > .wrap, #next > .wrap');
+    items.forEach((el) => el.classList.add('reveal'));
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
+    }, { rootMargin: '0px 0px -12% 0px', threshold: 0.12 });
+    items.forEach((el) => io.observe(el));
+
+    // count-up for the plain integers: 95M, 12, 256, 1, 16, 8h
+    const counters = document.querySelectorAll('.band .v, .stat .v');
+    const seen = new WeakSet();
+    const run = (el) => {
+      const raw = el.textContent.trim();
+      const m = raw.match(/^(\d+)(.*)$/);
+      if (!m) return;
+      const target = +m[1];
+      const suffix = m[2];
+      const t0 = performance.now();
+      const tick = (t) => {
+        const k = Math.min(1, (t - t0) / 900);
+        const eased = 1 - Math.pow(1 - k, 3);
+        el.textContent = Math.round(target * eased) + suffix;
+        if (k < 1) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    };
+    const io2 = new IntersectionObserver((entries) => {
+      entries.forEach((e) => { if (e.isIntersecting && !seen.has(e.target)) { seen.add(e.target); run(e.target); } });
+    }, { threshold: 0.5 });
+    counters.forEach((el) => { if (/^\d+$/.test(el.textContent.trim())) io2.observe(el); });
+
+    // the hero drifts a little as you scroll: 0.18x, capped
+    const hero = document.querySelector('header');
+    let raf = 0;
+    const drift = () => {
+      raf = 0;
+      const y = Math.min(window.scrollY, 900);
+      hero.style.setProperty('--drift', `${y * 0.18}px`);
+    };
+    addEventListener('scroll', () => { if (!raf) raf = requestAnimationFrame(drift); }, { passive: true });
+  }
 })();

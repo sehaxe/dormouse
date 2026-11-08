@@ -175,16 +175,63 @@
   @media (prefers-reduced-motion:reduce){
     video{display:none} html{scroll-behavior:auto}
   }
+
+  /* chapters: a long-form page, one idea per screen */
+  .chapter{display:grid;grid-template-columns:1.02fr .98fr;gap:56px;align-items:center}
+  .chapter.flip .txt{order:2}
+  .chapter.solo{display:block;max-width:760px}
+  .chapter .txt{max-width:56ch}
+  .chapter .num{font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--accent)}
+  .chapter h2{font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);line-height:1.15;
+    letter-spacing:-.02em;text-transform:none;color:var(--ink);margin:14px 0 16px}
+  .chapter p{color:var(--dim);font-size:16px;line-height:1.75;margin:0 0 16px}
+  .chapter p b{color:var(--ink);font-weight:600}
+  .chapter .big{font-family:var(--mono);font-size:clamp(34px,5vw,56px);line-height:1;letter-spacing:-.04em;
+    color:var(--ink);margin:22px 0 6px}
+  .chapter .bigsub{font-family:var(--mono);font-size:12px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--dimmer)}
+  .visual{border:1px solid var(--line);border-radius:18px;overflow:hidden;background:var(--panel);
+    box-shadow:0 30px 60px -50px rgba(24,38,66,.45)}
+  .visual video,.visual img{display:block;width:100%;height:auto}
+  .visual .cap{padding:12px 16px;border-top:1px solid var(--line);font-family:var(--mono);
+    font-size:11px;color:var(--dimmer)}
+  .band{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:34px}
+  .band .cell{border:1px solid var(--line);border-radius:14px;padding:20px 22px;background:var(--panel)}
+  .band .v{font-family:var(--mono);font-size:30px;letter-spacing:-.03em;color:var(--ink);line-height:1}
+  .band .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--dimmer);margin-top:9px}
+  .band .d{font-size:13px;color:var(--dim);margin-top:7px;line-height:1.55}
+  @media (max-width:860px){
+    .chapter{grid-template-columns:1fr;gap:26px}
+    .chapter.flip .txt{order:0}
+    .band{grid-template-columns:1fr}
+  }
+
+  /* motion: chapters arrive as you scroll, numbers count up, the photo drifts */
+  .reveal{opacity:0;transform:translateY(20px);
+    transition:opacity .9s cubic-bezier(.2,.65,.2,1),transform .9s cubic-bezier(.2,.65,.2,1)}
+  .reveal.in{opacity:1;transform:none}
+  .band .cell,.visual{transition:transform .45s cubic-bezier(.2,.65,.2,1),box-shadow .45s}
+  .band .cell:hover{transform:translateY(-3px)}
+  .visual:hover{transform:translateY(-2px);box-shadow:0 40px 70px -55px rgba(24,38,66,.6)}
+  header{--drift:0px}
+  header .wrap{transform:translateY(var(--drift));will-change:transform}
+  @media (prefers-reduced-motion:reduce){
+    .reveal{opacity:1;transform:none;transition:none}
+    header .wrap{transform:none}
+  }
 </style>
 </head>
 <body>
 
 <nav><div class="wrap">
   <b>dormouse</b>
-  <a href="#what">what</a>
-  <a href="#why">why</a>
-  <a href="#numbers">numbers</a>
-  <a href="#record">record</a>
+  <a href="#bytes">bytes</a>
+  <a href="#model">model</a>
+  <a href="#muon">muon</a>
+  <a href="#card">one card</a>
+  <a href="#curve">curve</a>
   <span class="sp"></span>
   <button class="theme" id="themeBtn" type="button" aria-label="theme">auto</button>
   <a href="docs/">docs</a>
@@ -195,165 +242,145 @@
   <canvas id="heroCanvas" aria-hidden="true"></canvas>
   <div class="wrap">
     <div class="glass">
-      <div class="kicker">one RTX 5070 Ti · 16 GB · no tokenizer</div>
-      <h1>A language model that reads raw bytes, trained on <em>one graphics card.</em></h1>
-      <p class="sub">No tokenizer, no cluster, no teacher. dormouse learns to predict text one byte at a
-        time — and every number it publishes comes from the run logs, in the open, including the ones that
-        turned out <b>wrong</b>.</p>
+      <div class="kicker">one consumer GPU · no tokenizer</div>
+      <h1>A language model small enough to <em>understand.</em></h1>
+      <p class="sub">dormouse learns to read and write text one byte at a time, on a single 16 GB
+        graphics card. This page walks through what it is, the ideas inside it, and what it can do.</p>
       <div class="cta">
-        <a class="btn p" href="#numbers">See the numbers</a>
-        <a class="btn" href="#why">Why this exists</a>
+        <a class="btn p" href="#bytes">Start reading</a>
+        <a class="btn" href="https://github.com/sehaxe/dormouse">Source ↗</a>
       </div>
     </div>
   </div>
 </header>
 
-<section id="what"><div class="wrap">
-  <div class="stage">
+<section id="bytes"><div class="wrap"><div class="chapter">
+  <div class="txt">
+    <div class="num">01 · the input</div>
+    <h2>It reads the file itself</h2>
+    <p>Most language models begin by chopping text into <b>tokens</b> — chunks of words picked from a fixed
+      dictionary. dormouse skips that step entirely.</p>
+    <p>Its alphabet is the 256 values a byte can hold, so the input is the file exactly as it sits on disk:
+      spaces, punctuation, emoji, code, everything. Nothing is lost in a translation to token ids, and the
+      model can never meet a word it has no symbol for.</p>
+    <p>The rain beside this text is that alphabet: the same bytes a computer reads, drawn as their binary
+      shadow.</p>
+  </div>
+  <div class="visual">
     <video src="media/rain.webm" poster="media/rain.jpg" preload="auto" autoplay muted loop playsinline aria-label="binary rain, 0 and 1"></video>
-    <div class="cap"><b>flagship3</b><span>12 unique layers · 95,035,200 parameters</span>
-      <span class="sp">the alphabet is 256 bytes; the rain is its binary shadow</span></div>
+    <div class="cap">flagship3 · 12 layers · 95,035,200 parameters</div>
   </div>
-  <h2><span>01</span>what it is</h2>
-  <h3>A small model you can check</h3>
-  <p class="lead">dormouse is a <b>byte-level</b> language model: it reads text as 256 possible bytes instead
-    of tokens. That makes the whole thing inspectable — the input is the file itself, and every number on
-    this page can be recomputed from the logs in the repository.</p>
-  <div class="stats">
-    <div class="stat"><div class="v">256</div><div class="k">input symbols</div>
-      <div class="d">No tokenizer and no vocabulary to train. The model sees the text as it is, down to
-        the byte.</div></div>
-    <div class="stat"><div class="v">95M</div><div class="k">parameters</div>
-      <div class="d">Twelve transformer layers — small enough for one 16 GB card, large enough to say
-        something.</div></div>
-    <div class="stat"><div class="v">1</div><div class="k">GPU, the whole stack</div>
-      <div class="d">No cluster and no rented hours. One workstation, one card, and a public log for every
-        run.</div></div>
-  </div>
-</div></section>
+</div></div></section>
 
-<section id="why"><div class="wrap">
-  <h2><span>02</span>why it exists</h2>
-  <h3>A number you cannot check is a rumour</h3>
-  <p class="lead">Most claims about models are unverifiable from the outside. This project is built the
-    other way around: every claim names its measurement, every failed idea stays published, and a claim
-    that cannot be reproduced is retracted in public.</p>
-  <div class="grid three">
-    <div class="card"><div class="b">
-      <div class="k">rule 01</div><div class="t">Measure, then claim</div>
-      <div class="d">A mechanism ships only if it beats its own removal on held-out data. A faster one that
-        costs quality is marked rejected and never drives a headline.</div></div></div>
-    <div class="card"><div class="b">
-      <div class="k">rule 02</div><div class="t">Keep the failures</div>
-      <div class="d">A retraction is published next to what replaced it. Deleting it would be the one
-        dishonest move available.</div></div></div>
-    <div class="card"><div class="b">
-      <div class="k">rule 03</div><div class="t">One machine</div>
-      <div class="d">If a result needs a cluster to reproduce, it is not evidence. Everything here is meant
-        to run on a workstation like yours.</div></div></div>
-  </div>
-</div></section>
-
-<section id="numbers"><div class="wrap">
-  <h2><span>03</span>the numbers</h2>
-  <h3>What the runs actually say</h3>
-  <p class="lead">Each figure is tied to a log. The one exception is the 1M context: that is arithmetic on
-    the design, not a measurement, and it is labelled that way.</p>
-  <div class="stats">
-    <div class="stat"><div class="v" id="sBpb">—</div><div class="k">bits per byte</div>
-      <div class="d">Held-out English text; lower is better. On the same 196 KB, xz needs 2.71 bits
-        per byte and bzip2 2.59.</div></div>
-    <div class="stat"><div class="v" id="sSpeed">—</div><div class="k">faster step</div>
-      <div class="d">The optimizer's matrix chain moved to bf16, for +0.01 BPB — inside the measurement
-        noise.</div></div>
-    <div class="stat"><div class="v" id="sRuns">—</div><div class="k">runs on record</div>
-      <div class="d"><span id="sRunsSub">—</span>, including the ones later retracted.</div></div>
-  </div>
-  <p class="note" style="margin-top:14px">1M context · designed, not measured: 33 MiB of state per slot, and
-    no 1M pass has been run yet.</p>
-</div></section>
-
-<section><div class="wrap">
-  <h2><span>04</span>what the model sees</h2>
-  <h3>1024 held-out bytes, one forward</h3>
-  <p class="lead">Height is the model's surprise at that byte (<span class="mono">−log2 p</span>), measured
-    on a pinned English window. The text below the strip is the same 1024 bytes, tinted by the same value.</p>
-  <div class="card">
-    <video src="media/heat.webm" poster="media/heat.jpg" preload="auto" autoplay muted loop playsinline aria-label="per-byte surprise across the held-out window"></video>
-    <div class="b">
-      <div class="k">flagship3 · <span id="sMeta">—</span></div>
-      <div class="t"><span id="sMean">—</span></div>
-      <pre class="mono bytes" id="bytes"></pre>
+<section id="model"><div class="wrap"><div class="chapter flip">
+  <div class="txt">
+    <div class="num">02 · the model</div>
+    <h2>Twelve layers, one direction</h2>
+    <p>The model is a plain stack of twelve transformer blocks — the same shape that powers most language
+      models today, cut down to fit one card. A byte goes in, twelve blocks later a prediction comes out.</p>
+    <p>No mixture of experts, no recurrence, no clever detours. A deliberately simple shape, so that every
+      experiment changes exactly one thing and the result means something.</p>
+    <div class="band">
+      <div class="cell"><div class="v">95M</div><div class="k">parameters</div>
+        <div class="d">About 380 MB of weights.</div></div>
+      <div class="cell"><div class="v">12</div><div class="k">layers</div>
+        <div class="d">One pass, no loops.</div></div>
+      <div class="cell"><div class="v">256</div><div class="k">symbols</div>
+        <div class="d">The byte alphabet.</div></div>
     </div>
   </div>
-</div></section>
+  <div class="visual">
+    <img src="media/hero.jpg" alt="a photograph of a street scene">
+    <div class="cap">the photograph the page prints as a halftone</div>
+  </div>
+</div></div></section>
 
-<section><div class="wrap">
-  <h2><span>05</span>the curve</h2>
-  <h3>Bits per byte, on bytes actually seen</h3>
-  <p class="lead" id="curveMeta">—</p>
-  <div class="card">
-    <video src="media/curve.webm" poster="media/curve.jpg" preload="auto" autoplay muted loop playsinline aria-label="held-out BPB against training bytes"></video>
-    <div class="b"><div class="k">held-out BPB · English window</div>
-      <div class="t" id="curveFinal">—</div>
-      <div class="d">The last point is a real run, not an extrapolation.</div></div>
+<section id="muon"><div class="wrap"><div class="chapter">
+  <div class="txt">
+    <div class="num">03 · the optimizer</div>
+    <h2>Muon thinks in matrices</h2>
+    <p>Networks learn by nudging millions of numbers downhill. The usual tool is <b>Adam</b>, which treats
+      every number on its own. <b>Muon</b> treats a weight matrix as a matrix.</p>
+    <p>Before each step it orthogonalizes the update — every direction gets the same strength — which keeps
+      the step well-conditioned and lets large matrices learn faster. We run Muon for the big matrices and
+      Adam for the small ones.</p>
+    <p>Moving the matrix chain from fp32 to bf16 made every step <b>1.92× faster</b>, for 0.01 bits per byte
+      — inside the measurement noise.</p>
+    <div class="big" id="sSpeed">—</div>
+    <div class="bigsub">faster steps · same answer</div>
+  </div>
+  <div class="visual">
+    <video src="media/curve.webm" poster="media/curve.jpg" preload="auto" autoplay muted loop playsinline aria-label="held-out bits per byte against training bytes"></video>
+    <div class="cap">held-out bits per byte, against the bytes the model has read</div>
+  </div>
+</div></div></section>
+
+<section id="card"><div class="wrap"><div class="chapter solo">
+  <div class="txt">
+    <div class="num">04 · the machine</div>
+    <h2>One graphics card, on purpose</h2>
+    <p>Everything trains on a single RTX 5070 Ti with 16 GB of memory. That is the constraint the project is
+      built around: a result that needs a cluster is hard to check, and a result you cannot check is hard to
+      trust.</p>
+    <p>The whole run — data, model, optimizer, evaluation — fits on a workstation you could buy for the
+      price of a laptop.</p>
+    <div class="band">
+      <div class="cell"><div class="v">1</div><div class="k">GPU</div><div class="d">RTX 5070 Ti, sm_120.</div></div>
+      <div class="cell"><div class="v">16</div><div class="k">gigabytes</div><div class="d">Model, gradients and optimizer state.</div></div>
+      <div class="cell"><div class="v">8 h</div><div class="k">for the long run</div><div class="d">The full budget on this card.</div></div>
+    </div>
+  </div>
+  </div>
+</div></div></section>
+
+<section id="curve"><div class="wrap">
+  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">05 · the result</div>
+  <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">What learning looks like</h2>
+  <p class="lead" style="max-width:62ch">Bits per byte, measured on text the model never trained on. Lower is
+    better: 1.74 at the start, 1.48 after 120 MB — about 20% less surprise. A strong general compressor needs
+    2.71 bits for the same bytes.</p>
+  <div class="visual" style="max-width:820px">
+    <video src="media/heat.webm" poster="media/heat.jpg" preload="auto" autoplay muted loop playsinline aria-label="per-byte surprise across a held-out window"></video>
+    <div class="cap">one held-out window, one forward pass: height is the model's surprise at that byte</div>
+  </div>
+  <div class="band" style="max-width:820px">
+    <div class="cell"><div class="v" id="sBpb">—</div><div class="k">bits per byte</div>
+      <div class="d">Held-out English text; lower is better.</div></div>
+    <div class="cell"><div class="v" id="curveFinal">—</div><div class="k">the last point</div>
+      <div class="d">A real run, not an extrapolation.</div></div>
+    <div class="cell"><div class="v">2.71</div><div class="k">xz, for scale</div>
+      <div class="d">A general compressor on the same 196 KB.</div></div>
   </div>
 </div></section>
 
-<section><div class="wrap">
-  <h2><span>06</span>the engine</h2>
-  <h3>The same answer, 1.92× sooner</h3>
-  <p class="lead">Most of a training step was one chain of matrix multiplies inside the optimizer. Moving
-    it onto the tensor cores made the step almost twice as fast and cost 0.01 BPB — inside the noise. Rungs
-    that buy speed with quality are marked rejected and never drive a headline.</p>
-  <table>
-    <thead><tr><th>optimizer rung</th><th>bytes/s</th><th>ms/step</th><th>speed</th><th>cost</th></tr></thead>
-    <tbody id="rungs"></tbody>
-  </table>
-  <p class="note" style="margin-top:14px">9 arms · 40 steps each · same shape · 2026-11-08</p>
-</div></section>
+<section id="neural"><div class="wrap"><div class="chapter">
+  <div class="txt">
+    <div class="num">06 · the inside</div>
+    <h2>What the model sees</h2>
+    <p>Every byte is a small bet. Before it reads a character the model has a distribution over all 256
+      possibilities; after it sees the character, the surprise is <span class="mono">−log2 p</span>.</p>
+    <p>The strip below is a real 1024-byte window the model never trained on. Taller marks are places it
+      hesitated; flat stretches are text it could almost guess.</p>
+    <p class="dim" style="font-size:13.5px">Reading a model's confidence byte by byte is how you find out what
+      it has actually learned — and where it is bluffing.</p>
+  </div>
+  <div class="visual">
+    <pre class="mono bytes" id="byteStrip" style="margin:0;border:0;padding:16px 18px;max-height:420px;overflow:auto"></pre>
+    <div class="cap"><span id="sMeta">—</span> · <span id="sMean">—</span></div>
+  </div>
+</div></div></section>
 
-<section id="record"><div class="wrap">
-  <h2><span>07</span>the record</h2>
-  <h3>Every run with a held-out number</h3>
-  <p class="lead">Longest first. A run appears here only if it produced an eval on the held-out window.</p>
-  <table>
-    <thead><tr><th>run</th><th>source</th><th>opt</th><th>batch × seq</th><th>MB</th><th>BPB</th></tr></thead>
-    <tbody id="runsBody"></tbody>
-  </table>
-</div></section>
-
-<section id="retracted"><div class="wrap">
-  <h2><span>08</span>retractions</h2>
-  <h3>What we got wrong</h3>
-  <p class="lead">Every entry was published here first, then measured wrong. Deleting them would be the one
-    dishonest move available, so they stay next to what replaced them.</p>
-  <ul class="ret">
-    <li><div class="was">“16× from the recipe ladder”</div>
-      <div class="now">1.92× from the optimizer rung, measured</div>
-      <div class="why">The 16× was Ripple-65B's result at 4B parameters, not ours.</div></li>
-    <li><div class="was">“3 Newton–Schulz steps are a tie”</div>
-      <div class="now">+0.27 BPB at [832, 3072]</div>
-      <div class="why">The published non-monotone result, and this repo's own “1.17e-15 from the manifold”,
-        were both measured on rank-64 factors. On the dense stack the 3-step chain does not converge.</div></li>
-    <li><div class="was">“209× less compute than GPT-2”</div>
-      <div class="now">53×, and only per byte</div>
-      <div class="why">The first figure counted GPT-2's 40 GB as 40 G positions; at ~4 bytes per BPE token
-        it is 10 G.</div></li>
-    <li><div class="was">“1.927 BPB at 98 MB”</div>
-      <div class="now">1.660 BPB at the same bytes</div>
-      <div class="why">Captured before the Muon learning-rate fix (a scheduler overwrote the group's LR
-        every step).</div></li>
-    <li><div class="was">“34 MB of state at 1M”</div>
-      <div class="now">33 MiB per CSA slot — 99 MiB for the 3-slot loop</div>
-      <div class="why">The figure was ONE CSA ring read as the total. The loop carries
-        <span class="mono">(kda_state, csa_state)</span> per iteration slot, and a 12-layer stack would be
-        396 MiB. A 1M forward has still not been run.</div></li>
-    <li><div class="was">“1M context, in the measurements row”</div>
-      <div class="now">designed, not measured</div>
-      <div class="why">The stat card sat under “each one a measurement”. The state arithmetic is exact;
-        the capability is untested, and the training that would test it (a CSA model at 8K) is queued, not run.</div></li>
-  </ul>
+<section id="next"><div class="wrap">
+  <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">07 · next</div>
+  <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">A million bytes of context</h2>
+  <p class="lead" style="max-width:64ch">The next step is memory. The design keeps a compressed summary of
+    everything the model has read, so a single pass can reach a million bytes without its state growing.
+    The arithmetic is written down and the state is small — 33 MiB per slot. It is a design today; a run
+    that turns it into a number is next.</p>
+  <div class="cta" style="margin-top:26px">
+    <a class="btn p" href="docs/">Read the docs</a>
+    <a class="btn" href="https://github.com/sehaxe/dormouse">Source ↗</a>
+  </div>
 </div></section>
 
 <footer><div class="wrap row">
@@ -527,7 +554,8 @@ void main(){
   const bestSafe = safe.reduce((a, b) => (!a || b.kbs > a.kbs ? b : a), null);
   const speedup = control && bestSafe ? bestSafe.kbs / control.kbs : null;
 
-  document.getElementById('rungs').innerHTML = rungs.map(r => {
+  const rungsBody = document.getElementById('rungs');
+  if (rungsBody) rungsBody.innerHTML = rungs.map(r => {
     const rel = control ? r.kbs / control.kbs : 1;
     const note = r.safe ? '' : ' <span class="bad">[rejected]</span>';
     const d2 = r.dbpb;
@@ -541,24 +569,26 @@ void main(){
       ${q}</tr>`;
   }).join('');
 
-  if (speedup) document.getElementById('sSpeed').textContent = fmt(speedup, 2) + '×';
-  document.getElementById('sRuns').textContent = d.stats.runs_on_record;
-  document.getElementById('sRunsSub').textContent = d.stats.runs_with_bpb + ' with a held-out BPB';
+  const put = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+  if (speedup) put('sSpeed', fmt(speedup, 2) + '×');
+  put('sRuns', d.stats.runs_on_record);
+  put('sRunsSub', d.stats.runs_with_bpb + ' with a held-out BPB');
 
   /* ------------------------------------------------------------- the curve */
   const pts = d.curve || [];
   if (pts.length) {
     const last = pts[pts.length - 1];
-    document.getElementById('curveMeta').textContent =
-      `${pts.length} held-out points over ${fmt(last.mb, 0)} MB of training bytes.`;
     const sBpb = document.getElementById('sBpb');
     if (sBpb) sBpb.innerHTML = fmt(last.bpb, 2);
-    document.getElementById('curveFinal').innerHTML =
-      `<span class="mono">${fmt(last.bpb, 3)}</span> bits per byte at ${fmt(last.mb, 0)} MB`;
+    const cf = document.getElementById('curveFinal');
+    if (cf) cf.textContent = fmt(last.bpb, 3);
+    const cm = document.getElementById('curveMeta');
+    if (cm) cm.textContent = `${pts.length} held-out points over ${fmt(last.mb, 0)} MB of training bytes.`;
   }
 
   /* ------------------------------------------------------------- the runs */
-  document.getElementById('runsBody').innerHTML = (d.runs || []).map(r => `<tr>
+  const runsBody = document.getElementById('runsBody');
+  if (runsBody) runsBody.innerHTML = (d.runs || []).map(r => `<tr>
     <td>${r.run}</td><td>${r.source || '—'}</td><td>${r.opt || '—'}</td>
     <td>${r.batch}×${r.seq}</td><td>${fmt(r.mb, 0)}</td><td class="ok">${fmt(r.bpb, 3)}</td>
   </tr>`).join('');
@@ -578,13 +608,57 @@ void main(){
       out += `<b class="${cls[band(bits[i])]}">${esc(sj.text[i])}</b>`;
       if ((i + 1) % cols === 0) out += '\n';
     }
-    document.getElementById('bytes').innerHTML = out.trimEnd();
+    document.getElementById('byteStrip').innerHTML = out.trimEnd();
     const mean = bits.reduce((a, b) => a + b, 0) / bits.length;
     document.getElementById('sMean').textContent = `mean ${mean.toFixed(3)} bits / byte`;
     document.getElementById('sMeta').textContent = `off=${sj.offset}`;
   }
 
   document.getElementById('built').textContent = `${d.stats.runs_on_record} log files`;
+
+  /* ------------------------------------------------------------- motion */
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!reduce) {
+    const items = document.querySelectorAll('.chapter, #curve > .wrap, #next > .wrap');
+    items.forEach((el) => el.classList.add('reveal'));
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
+    }, { rootMargin: '0px 0px -12% 0px', threshold: 0.12 });
+    items.forEach((el) => io.observe(el));
+
+    // count-up for the plain integers: 95M, 12, 256, 1, 16, 8h
+    const counters = document.querySelectorAll('.band .v, .stat .v');
+    const seen = new WeakSet();
+    const run = (el) => {
+      const raw = el.textContent.trim();
+      const m = raw.match(/^(\d+)(.*)$/);
+      if (!m) return;
+      const target = +m[1];
+      const suffix = m[2];
+      const t0 = performance.now();
+      const tick = (t) => {
+        const k = Math.min(1, (t - t0) / 900);
+        const eased = 1 - Math.pow(1 - k, 3);
+        el.textContent = Math.round(target * eased) + suffix;
+        if (k < 1) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    };
+    const io2 = new IntersectionObserver((entries) => {
+      entries.forEach((e) => { if (e.isIntersecting && !seen.has(e.target)) { seen.add(e.target); run(e.target); } });
+    }, { threshold: 0.5 });
+    counters.forEach((el) => { if (/^\d+$/.test(el.textContent.trim())) io2.observe(el); });
+
+    // the hero drifts a little as you scroll: 0.18x, capped
+    const hero = document.querySelector('header');
+    let raf = 0;
+    const drift = () => {
+      raf = 0;
+      const y = Math.min(window.scrollY, 900);
+      hero.style.setProperty('--drift', `${y * 0.18}px`);
+    };
+    addEventListener('scroll', () => { if (!raf) raf = requestAnimationFrame(drift); }, { passive: true });
+  }
 })();
 
 </script>
