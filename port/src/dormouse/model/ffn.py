@@ -20,6 +20,7 @@ from torch import nn
 from ..instrument import Counters
 from .act_quant import fake_quant_act
 from .experts import expert_glu
+from .glu_kernel import fused_swiglu_or_eager
 from .qat_cache import QuantCache
 from .tsct import dense_qat_weight
 
@@ -42,6 +43,9 @@ class DenseFFN(nn.Module):
         self.act_group = cfg.act_group
         self.dense_qat = cfg.dense_qat
         self.dense_qat_alpha = cfg.factor_qat_alpha
+        #: The fused `silu(g)·u` epilogue (`model/glu_kernel.py`). OFF is every
+        #: number on record; `validate_ffn` refuses it outside this form/silu.
+        self.fused_glu = bool(getattr(cfg, "fused_glu", False))
         self._qat_cache = QuantCache() if self.dense_qat != "none" else None
         #: The GLU's two d→f halves and the f→d write. The gate carries the
         #: hidden bias and `down` the output bias, which is exactly the
@@ -79,9 +83,23 @@ class DenseFFN(nn.Module):
     ) -> torch.Tensor:
         if self.act_quant != "none":
             x = fake_quant_act(x, self.act_quant, self.act_group)
-        g = self._linear(self.gate, x)
-        u = self._linear(self.up, x)
-        h = self._glu(g, u) if glu is None else glu(g, u)
+        if self.fused_glu and glu is None:
+            # One kernel: both fc1 dot products plus the epilogue; the
+            # `[tokens, 2·f]` intermediate never reaches HBM. Forward-only — a
+            # grad-enabled call falls back COUNTED to the same eager expression.
+            wg = dense_qat_weight(
+                self.gate.weight, self.dense_qat, self.dense_qat_alpha, cache=self._qat_cache
+            )
+            wu = dense_qat_weight(
+                self.up.weight, self.dense_qat, self.dense_qat_alpha, cache=self._qat_cache
+            )
+            h = fused_swiglu_or_eager(
+                x, wg, wu, self.gate.bias, dt=self.compute_dtype, counters=counters
+            )
+        else:
+            g = self._linear(self.gate, x)
+            u = self._linear(self.up, x)
+            h = self._glu(g, u) if glu is None else glu(g, u)
         y = self._linear(self.down, h)
         if counters is not None:
             counters.count("ffn_dense_forward", x.shape[0])
