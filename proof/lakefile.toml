@@ -1,0 +1,6 @@
+name = "proof"
+version = "0.1.0"
+defaultTargets = ["Tsct"]
+
+[[lean_lib]]
+name = "Tsct"
