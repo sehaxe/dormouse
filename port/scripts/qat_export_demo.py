@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--out-dir", default="checkpoints", help="checkpoint directory")
     p.add_argument("--out", default="", help="export path (default <out-dir>/<name>.qat.pt)")
-    p.add_argument("--mode", default="ternary", choices=["ternary", "mxfp4"])
+    p.add_argument("--mode", default="ternary", choices=["ternary"])
     p.add_argument("--device", default="cpu")
     p.add_argument(
         "--fresh",

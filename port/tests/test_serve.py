@@ -239,7 +239,7 @@ def test_missing_checkpoint_refuses_loudly(tmp_path: Path):
 def test_a_rung_checkpoint_serves(tmp_path: Path):
     """serve rides the same `load_model_half` as eval/decode (audit MAJOR 6).
 
-    The fixture above writes an UNPACKED model half; a `quant=fp8` file carries
+    The fixture above writes an UNPACKED model half; a `quant=ternary` file carries
     packed factor records and used to die in `load_state_dict` with a
     RuntimeError naming neither the rung nor the escape.
     """
@@ -250,13 +250,16 @@ def test_a_rung_checkpoint_serves(tmp_path: Path):
     d.mkdir()
     run = RunConfig(
         source="tiny",
-        model=tiny_cfg(quant="fp8"),
+        model=tiny_cfg(quant="ternary"),
         train=TrainConfig(ckpt_name=CKPT, out_dir=str(d)),
     )
     (d / f"{CKPT}.config.toml").write_text(run.snapshot_toml())
-    sd = tiny_model(quant="fp8").state_dict()
-    packed = {k: (pack_tsct(v, "fp8") if is_factor_key(k) else v) for k, v in sd.items()}
-    torch.save({"model": packed, "opt": {}, "step": 0, "model_quant_rung": "fp8"}, d / f"{CKPT}.pt")
+    sd = tiny_model(quant="ternary").state_dict()
+    packed = {k: (pack_tsct(v, "ternary") if is_factor_key(k) else v) for k, v in sd.items()}
+    torch.save(
+        {"model": packed, "opt": {}, "step": 0, "model_quant_rung": "ternary"},
+        d / f"{CKPT}.pt",
+    )
     model, _run, _dev = load_checkpoint(d, CKPT, device="cpu")
     assert all(p.dtype == torch.float32 for p in model.parameters())
 

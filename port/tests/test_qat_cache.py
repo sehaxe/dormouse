@@ -75,7 +75,7 @@ def test_refresh_is_detached_and_a_hit_reuses_the_tensor():
     assert cache.hits == 1
     # A different alpha or mode is a miss: the anneal moves every step.
     assert cache.refresh(w, "ternary", 0.5) is not q0
-    assert cache.refresh(w, "binary", 1.0) is not q0
+    assert cache.refresh(w, "ternary_s3t", 1.0) is not q0
     cache.invalidate()
     assert cache.refresh(w, "ternary", 1.0) is not q0, "invalidate must force a rebuild"
 
@@ -136,7 +136,7 @@ def test_none_switches_do_no_refresh_and_leave_the_model_bit_identical():
 def test_projector_cache_is_bit_identical_per_rung_and_alpha():
     torch.manual_seed(0)
     w = torch.randn(16, 32) * 0.2
-    for kind in ("ternary", "binary", "mxfp4"):
+    for kind in ("ternary",):
         for alpha in (0.25, 0.5, 1.0):
             cold = factor_qat_project(w, kind, alpha)
             cache = QuantCache()
@@ -158,7 +158,7 @@ def test_stacked_refresh_is_bit_identical_to_the_per_tensor_refresh():
     torch.manual_seed(0)
     stack = torch.randn(4, 16, 24) * 0.2  # 4 x (16, 24): both dims exercised
     slices = [stack[e] for e in range(stack.shape[0])]
-    for kind in ("ternary", "binary", "mxfp4"):
+    for kind in ("ternary",):
         for alpha in (0.0, 0.5, 1.0):
             stacked, per = QuantCache(), QuantCache()
             qs = stacked.refresh_stacked(stack, kind, alpha, dim=(1, 2))
@@ -185,8 +185,6 @@ def test_cached_model_logits_are_bit_identical_to_the_uncached_model():
     for over in (
         {"factor_qat": "ternary", "dense_qat": "ternary"},
         {"factor_qat": "ternary", "dense_qat": "ternary", "act_quant": "int4"},
-        {"factor_qat": "binary", "dense_qat": "binary"},
-        {"dense_qat": "mxfp4"},
     ):
         a, b = _pair(**over)
         x = torch.randint(0, 256, (2, 16))
@@ -248,7 +246,7 @@ def test_stacked_ste_gradient_matches_the_unbatched_path():
         load_preset("medium"), n_experts=8, factor_qat="ternary", dense_qat="ternary"
     )
     moe = SparseMoE(cfg)
-    for kind in ("ternary", "binary", "mxfp4"):
+    for kind in ("ternary",):
         for name in ("gate_u", "up_u", "v"):
             params = [getattr(ex, name) for ex in moe.experts]
             for p in params:
@@ -484,7 +482,7 @@ def test_refresh_path_never_syncs(monkeypatch):
         monkeypatch.setattr(torch.Tensor, name, boom)
     torch.manual_seed(0)
     stack = torch.randn(3, 8, 16) * 0.2
-    for kind in ("ternary", "binary", "mxfp4"):
+    for kind in ("ternary",):
         cache = QuantCache()
         cache.refresh_stacked(stack, kind, 1.0, dim=(1, 2))
         cache.refresh(stack[0], kind, 1.0)

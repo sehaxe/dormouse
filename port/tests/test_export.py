@@ -24,13 +24,10 @@ from dormouse.model.export import (
     export_plan,
     export_qat,
     load_qat,
-    pack_mxfp4,
     pack_ternary,
-    unpack_mxfp4,
     unpack_ternary,
     verify_roundtrip,
 )
-from dormouse.model.mxfp import fake_quant_mx
 from dormouse.model.ternary import ternarize
 from dormouse.model.tsct import factor_qat_project, is_factor_key
 
@@ -43,8 +40,6 @@ TINY_SCALE_KEYS = 12
 TINY_BF16_BYTES = 129_770  # 2 B/param over all 64 885 params
 #: measured 8.82e-3 on the tiny fixture; the stated bound keeps ~2x margin.
 LOGITS_BOUND = 2e-2
-#: measured 1.25e-2 for the mxfp4 rung.
-MXFP4_LOGITS_BOUND = 3e-2
 #: The load's two roundings: bf16 values (2^-8) + fp16 scale (2^-11).
 FACTOR_REL_BOUND = 2**-8 + 2**-11
 SCALE_LEAVES = ("s", "gate_s", "up_s")
@@ -253,41 +248,6 @@ def test_load_qat_refuses_a_key_set_mismatch_and_names_the_host_table_case(
     export_qat(host, host_path)
     with pytest.raises(LoudError, match="ngram"):
         load_qat(host_path, tiny_cfg())
-
-
-# ---------------------------------------------------------------------------
-# (d) the optional mxfp4 rung — the same report, the mxfp codec
-# ---------------------------------------------------------------------------
-
-
-def test_mxfp4_pack_is_the_projectors_values() -> None:
-    torch.manual_seed(4)
-    t = torch.randn(64, 8) * 0.3  # rank 8 exercises the 32-pad path
-    packed, scales, pad = pack_mxfp4(t)
-    assert pad == 24 and packed.dtype == torch.uint8 and scales.dtype == torch.uint8
-    got = unpack_mxfp4(packed, scales, tuple(t.shape), pad, dtype=torch.float32)
-    assert torch.equal(got, fake_quant_mx(t, "mxfp4"))
-
-
-def test_mxfp4_export_roundtrip_on_tiny(tmp_path: Path) -> None:
-    torch.manual_seed(0)
-    model = tiny_model()
-    path = tmp_path / "tiny.mxfp4.pt"
-    rep = export_qat(model, path, mode="mxfp4")
-    assert rep.mode == "mxfp4"
-    loaded = load_qat(path, model.cfg)
-    sd0, sd1 = model.state_dict(), loaded.state_dict()
-    # e2m1 magnitudes x power-of-two scales are bf16-exact, so the factor load
-    # is exact (unlike ternary's fp16 scale): the logits differ only through the
-    # bf16 non-factors.
-    for k, v in sd0.items():
-        if is_factor_key(k):
-            proj = factor_qat_project(v, "mxfp4", 1.0)
-            assert torch.equal(sd1[k], proj.to(sd1[k].dtype)), k
-    torch.manual_seed(5)
-    x = torch.randint(0, TINY["vocab"], (2, 16))
-    assert verify_roundtrip(model, path, (x,)) < MXFP4_LOGITS_BOUND
-
 
 # ---------------------------------------------------------------------------
 # (e) the preset and the demo — the CPU/CI path

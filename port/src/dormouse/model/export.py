@@ -24,16 +24,13 @@ THE CONTAINER (`torch.save`, `weights_only`-loadable, one dict):
     {
       "format":  "dormouse-qat-export",   # magic; a foreign file refuses
       "version": 1,
-      "mode":    "ternary" | "mxfp4",     # the rung the factors were packed at
+      "mode":    "ternary",            # the rung the factors were packed at
       "tensors": {key: record | tensor},  # state-dict keys, `_orig_mod.` stripped
     }
 
 `record` (a packed factor matrix):
     ternary: {"rung": "ternary", "codes": uint8 [n/4], "scale": fp16 0-dim,
               "shape": (d0, d1), "n": int}
-    mxfp4:   {"rung": "mxfp4", "codes": uint8 [padded_n/2],
-              "scales": uint8 e8m0 [padded_n/32], "shape": (d0, d1),
-              "pad": int, "n": int}
 tensor: fp16 for the diagonals, bf16 for every other float, unchanged for
 non-float buffers. A `record` never appears at a non-factor key, and this
 format is NOT the resume format: `load_ckpt` wants fp32 masters and the
@@ -62,11 +59,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import loud
-from .mxfp import BLOCK, bytes_per_elements_mxfp4, dequantize_mxfp4, quantize_mxfp4
 from .ternary import _alpha
 from .tsct import _ternary_dequant, _ternary_quant, is_factor_key
 
@@ -74,10 +69,8 @@ from .tsct import _ternary_dequant, _ternary_quant, is_factor_key
 FORMAT = "dormouse-qat-export"
 VERSION = 1
 
-#: The factor rungs this module packs. `ternary` is the release; `mxfp4` is the
-#: same report with `mxfp.quantize_mxfp4` as the codec (the `factor_qat=mxfp4`
-#: rung's storage).
-MODES = ("ternary", "mxfp4")
+#: The factor rungs this module packs: ternary only (the release).
+MODES = ("ternary",)
 
 #: The diag scales — fp16, never packed: they ARE the factorization's diagonal
 #: (`tsct.py`: `s` is the scale, and a quantized scale would multiply the whole
@@ -153,44 +146,6 @@ def unpack_ternary(
     return vals.reshape(shape).to(dtype)
 
 
-def pack_mxfp4(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """`factor_qat_project(t, "mxfp4", 1.0)`'s values as the MX codec's storage.
-
-    The rung's projector pads the LAST dim to a multiple of `mxfp.BLOCK` (32)
-    and slices back (`fake_quant_mx`), so this does the same and returns the pad
-    alongside the `(packed nibbles, e8m0 scales)`. The pad is per-row zeros, so
-    it never moves a real element's block scale — the padded round trip is
-    exactly the projector's values (pinned in `tests/test_export.py`).
-    """
-    t = t.detach()
-    if not t.is_floating_point():
-        loud(f"pack_mxfp4: masters are float tensors, got {t.dtype} (see pack_ternary)")
-    if t.dim() == 0 or t.shape[-1] == 0:
-        loud(
-            f"pack_mxfp4: MX blocks run along the LAST dim and this tensor is "
-            f"{tuple(t.shape)}. Escape: pass a factor matrix with a non-empty last dim."
-        )
-    pad = (-t.shape[-1]) % BLOCK
-    tp = F.pad(t, (0, pad)) if pad else t
-    packed, scales = quantize_mxfp4(tp)  # non-finite input refuses loudly there
-    return packed, scales, pad
-
-
-def unpack_mxfp4(
-    codes: torch.Tensor,
-    scales: torch.Tensor,
-    shape: tuple[int, ...],
-    pad: int = 0,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Inverse of [`pack_mxfp4`]: the e2m1 grid × e8m0 block scales, pad cut."""
-    padded = (*shape[:-1], shape[-1] + int(pad))
-    vals = dequantize_mxfp4(codes, scales, padded)
-    if pad:
-        vals = vals[..., : shape[-1]]
-    return vals.reshape(shape).to(dtype)
-
-
 def _kind(key: str) -> str:
     """The storage class of a state-dict key: factor | scale | plain.
 
@@ -208,15 +163,11 @@ def _kind(key: str) -> str:
 def _packed_bytes(kind: str, t: torch.Tensor, mode: str) -> int:
     """The bytes this key occupies in the file — the report's per-key arithmetic.
 
-    Factors: ternary is `n/4` code bytes + a 2-byte fp16 scale; mxfp4 is the
-    codec's own `17 B/32` over the PADDED width. Scales are fp16, other floats
-    bf16, non-floats as-is.
+    Factors: ternary is `n/4` code bytes + a 2-byte fp16 scale. Scales are
+    fp16, other floats bf16, non-floats as-is.
     """
     if kind == "factor":
-        if mode == "ternary":
-            return t.numel() // 4 + 2
-        rows = math.prod(t.shape[:-1]) if t.dim() > 1 else 1
-        return bytes_per_elements_mxfp4(t.numel() + rows * ((-t.shape[-1]) % BLOCK))
+        return t.numel() // 4 + 2
     if kind == "scale":
         return t.numel() * 2
     if t.is_floating_point():
@@ -336,22 +287,13 @@ def export_plan(model: nn.Module, mode: str = "ternary") -> ExportReport:
 
 def _record(t: torch.Tensor, mode: str) -> dict:
     """One factor matrix → its container record (see the module docstring)."""
-    if mode == "ternary":
-        codes, scale = pack_ternary(t)
-        return {
-            "rung": "ternary",
-            "codes": codes,
-            "scale": torch.tensor(scale, dtype=torch.float16),
-            "shape": tuple(t.shape),
-            "n": t.numel(),
-        }
-    packed, scales, pad = pack_mxfp4(t)
+    assert mode == "ternary", f"export mode {mode!r} has no factor record"
+    codes, scale = pack_ternary(t)
     return {
-        "rung": "mxfp4",
-        "codes": packed,
-        "scales": scales,
+        "rung": "ternary",
+        "codes": codes,
+        "scale": torch.tensor(scale, dtype=torch.float16),
         "shape": tuple(t.shape),
-        "pad": pad,
         "n": t.numel(),
     }
 
@@ -362,8 +304,6 @@ def _unpack_record(rec: dict, dtype: torch.dtype = torch.bfloat16) -> torch.Tens
     shape = tuple(rec["shape"])
     if rung == "ternary":
         return unpack_ternary(rec["codes"], float(rec["scale"]), shape, dtype)
-    if rung == "mxfp4":
-        return unpack_mxfp4(rec["codes"], rec["scales"], shape, int(rec["pad"]), dtype)
     loud(
         f"export record carries rung={rung!r}, which is not one of {list(MODES)}. "
         "Cause: the file was written by a different codec. Escape: re-export it "

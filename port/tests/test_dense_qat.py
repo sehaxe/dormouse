@@ -138,7 +138,7 @@ def test_none_is_the_master_untouched():
     assert dense_qat_project(w, "none", 1.0) is w  # not a copy — the same tensor
 
 
-@pytest.mark.parametrize("kind", ["ternary", "binary", "mxfp4"])
+@pytest.mark.parametrize("kind", ["ternary"])
 def test_dense_projector_is_the_factor_projector(kind):
     """SAME semantics, pinned per rung: the dense name IS the factor function."""
     torch.manual_seed(0)
@@ -242,7 +242,7 @@ def test_dense_qat_moves_the_logits_and_stays_finite():
     assert not torch.equal(la, lb), "a quantized dense forward must move the logits"
 
 
-@pytest.mark.parametrize("mode", ["binary", "mxfp4", "ternary_s3t"])
+@pytest.mark.parametrize("mode", ["ternary_s3t"])
 def test_each_dense_rung_runs_and_moves_the_logits(mode):
     set_factor_qat_seed(0)
     a = _model()
@@ -565,7 +565,6 @@ def test_config_refuses_a_bad_literal():
     # The legal pairs load.
     load_run("small", model_overrides={"dense_qat": "ternary"})
     load_run("small", model_overrides={"dense_qat": "ternary", "factor_qat": "ternary"})
-    load_run("small", model_overrides={"dense_qat": "mxfp4"})
 
 
 def test_config_refuses_dense_qat_with_byteflow():

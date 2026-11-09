@@ -265,18 +265,15 @@ EXPERT_ACTS = ("silu", "situ", "memglu")
 #: (arXiv:2402.17764 Eq. 1, `ternary.ternarize`, per-TENSOR absmean — the
 #: axis burn-bitnet uses) with the soft-to-hard annealing burn-spectral
 #: measured ("converges better than hard STE from step one", lib.rs:75-77);
-#: `binary` = LittleBit's sign factors (arXiv:2506.13771: `sign(W)·mean(|W|)`,
-#: `ternary.sign_binary`) under the same annealing; `mxfp4` = the OCP MX e2m1
-#: codec (MX spec §5.2 Table 1, `mxfp.fake_quant_mx` — per-32 e8m0 scales,
-#: RNE) under the same annealing, with the last dim zero-padded per row to a
-#: 32-multiple when it is not one; `ternary_s3t` = S3T stochastic rounding
-#: (arXiv:2412.04787, `ternary.stochastic_ternary`) under the same annealing,
-#: its Bernoulli mask drawn from a process-local generator seeded by
-#: `factor_qat_seed` (reproducible within a run, NOT across a resume —
+#: `ternary_s3t` = S3T stochastic rounding (arXiv:2412.04787,
+#: `ternary.stochastic_ternary`) under the same annealing, its Bernoulli mask
+#: drawn from a process-local generator seeded by `factor_qat_seed`
+#: (reproducible within a run, NOT across a resume —
 #: `tsct.factor_qat_project`'s docstring and the line `train/loop.py` prints).
-#: The compressed-forward sprint's arms; a new rung lands WITH its gold test
-#: (`tests/test_factor_qat.py`) before this tuple grows.
-FACTOR_QATS = ("none", "ternary", "binary", "mxfp4", "ternary_s3t")
+#: TSCT is TERNARY, full stop: the non-ternary arms were deleted 2026-11-09.
+#: A new rung lands WITH its gold test (`tests/test_factor_qat.py`) before
+#: this tuple grows.
+FACTOR_QATS = ("none", "ternary", "ternary_s3t")
 #: The `dense_qat` literals — the DENSE path's switch. It is `FACTOR_QATS`
 #: exactly, and deliberately: `tsct.dense_qat_project` IS `factor_qat_project`
 #: (one function object), so every rung the factor path implements is the same
@@ -694,8 +691,9 @@ class ModelConfig:
     #: kernel is fp32-only); the projection tail alone is not separately
     #: switchable, so the escape is `fused_kda_tail=false`.
     residual_dtype: str = "fp32"
-    #: TSCT factor format. `none` resolves to bf16 factors at init; every
-    #: ladder rung (fp8 → NVFP4 → LittleBit) is a REFUSAL, not a fallback.
+    #: TSCT factor format. `none` resolves to bf16 factors at init; `ternary` is
+    #: the ONE storage rung (checkpoint/bank compression). Any other name is a
+    #: REFUSAL, not a fallback.
     quant: str = "none"
 
     # --- arms -----------------------------------------------------------
@@ -1346,8 +1344,8 @@ class ModelConfig:
     #: What the FORWARD does to the TSCT factor masters — the compressed-model
     #: sprint's central knob (`FACTOR_QATS`, formulas in `tsct.factor_qat_project`):
     #: `none` = bf16 masters, every number on record; `ternary` = b1.58 STE with
-    #: burn-spectral's soft-to-hard annealing; `binary` = LittleBit sign factors +
-    #: the same annealing. Applies to EVERY TSCT pair the model owns: the loop
+    #: burn-spectral's soft-to-hard annealing; `ternary_s3t` = the S3T sampled
+    #: variant. Applies to EVERY TSCT pair the model owns: the loop
     #: block's projections and the MoE experts' dual-latent factors alike (the
     #: same `factor_qat_project` on both paths — one place, one test). `s` stays
     #: fp32 in all arms: it IS the scale the annealing needs.
@@ -4060,9 +4058,8 @@ def validate(model: ModelConfig) -> None:
         loud(
             f"factor_qat={model.factor_qat!r} is not an arm. Known: "
             f"{list(FACTOR_QATS)} — `none` bf16 masters, `ternary` b1.58 STE "
-            f"(arXiv 2402.17764), `binary` LittleBit signs (arXiv 2506.13771), "
-            f"`mxfp4` the OCP MX e2m1 codec (spec §5.2, mxfp.py), `ternary_s3t` "
-            f"S3T stochastic rounding (arXiv 2412.04787). Escape: name one of "
+            f"(arXiv 2402.17764), `ternary_s3t` S3T stochastic rounding "
+            f"(arXiv 2412.04787). Escape: name one of "
             f"those, or land the arm and its gold test (tests/test_factor_qat.py) "
             f"BEFORE the config can lie about it."
         )
@@ -4079,8 +4076,7 @@ def validate(model: ModelConfig) -> None:
             f"(`tsct.dense_qat_project` IS `factor_qat_project`), applied to "
             f"every plain nn.Linear/DenseLinear weight in the forward: `none` "
             f"the master untouched, `ternary` b1.58 STE (arXiv 2402.17764), "
-            f"`binary` LittleBit signs (arXiv 2506.13771), `mxfp4` the OCP MX "
-            f"e2m1 codec (spec §5.2, mxfp.py), `ternary_s3t` S3T stochastic "
+            f"`ternary_s3t` S3T stochastic "
             f"rounding (arXiv 2412.04787). Escape: name one of those, or land "
             f"the arm and its gold test (tests/test_dense_qat.py) BEFORE the "
             f"config can lie about it."
@@ -4751,15 +4747,15 @@ def _validate_byteflow(model: ModelConfig) -> None:
 
 
 def _refuse_ladder_rung(rung: str) -> str:
-    """The quant ladder: `fp8`/`nvfp4`/`ternary` are Storage rungs (they
-    compress the factor bank and the checkpoint, the fp32 masters stay the
+    """The quant ladder: `ternary` is the ONE Storage rung (it compresses the
+    factor bank and the checkpoint, the fp32 masters stay the
     optimizer's object — see `tsct.py` module doc); everything else refuses.
 
     GROUPED, not a fallback. What remains refused (`fp16/lbit`) is a
     TRAINING-time change — LittleBit's gates G-A..G-D
     (`docs/reviews/littlebit-design-2026-10-15.md`) must close first.
     """
-    storage = ("fp8", "nvfp4", "ternary")
+    storage = ("ternary",)
     if rung in storage:
         return rung
     known = {"fp16", "fp4", "int4", "int8", "lbit"}
@@ -4770,10 +4766,10 @@ def _refuse_ladder_rung(rung: str) -> str:
         else ""
     )
     loud(
-        f"quant={rung!r} is not supported{hint}: the implemented rungs are the "
-        f"STORE levels fp8/nvfp4 (checkpoint/bank compression; compute stays "
+        f"quant={rung!r} is not supported{hint}: the implemented rung is the "
+        f"STORE level ternary (checkpoint/bank compression; compute stays "
         f"bf16 factors with fp32 masters — docs/architecture/bf16-plan.md). "
-        f'Escape: `quant = "none"` (bf16), `quant = "fp8"`, `quant = "nvfp4"`, '
+        f'Escape: `quant = "none"` (bf16), `quant = "ternary"`, '
         f"or close the LittleBit gates."
     )
 

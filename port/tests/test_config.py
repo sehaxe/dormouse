@@ -278,16 +278,16 @@ def test_a_seq_len_below_the_patch_count_refuses(tmp_path):
 def test_quant_ladder_rungs_refuse_at_load(rung):
     """(e) The training-time rungs refuse per rung, by name, at LOAD.
 
-    fp8/nvfp4/ternary graduated to STORAGE rungs (2026-10-15, then the
-    ternary rung 2026-10-16, `tests/test_ladder_storage.py`): they pack the
-    factor bank and the checkpoint, fp32 masters stay the optimizer's object.
-    What still refuses is the TRAINING-time set — LittleBit's gates G-A..G-D
-    must close first.
+    `ternary` is the ONE STORAGE rung (`tests/test_ladder_storage.py`): it
+    packs the factor bank and the checkpoint, fp32 masters stay the optimizer's
+    object. The other storage names were deleted 2026-11-09 and now refuse
+    too, as does the TRAINING-time set — LittleBit's gates G-A..G-D must close
+    first.
     """
     with pytest.raises(LoudError) as e:
         parse_preset(f'd_model = 64\nn_heads = 4\nhead_dim = 16\nquant = "{rung}"\n')
     msg = str(e.value)
-    assert rung in msg and "implemented rungs are the STORE levels" in msg
+    assert rung in msg and "the implemented rung is the STORE level" in msg
     # And the shipped presets use only the ported rung.
     assert ModelConfig().quant == "none"
 

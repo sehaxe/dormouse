@@ -10,25 +10,27 @@ Newton-Schulz over `[64, f]` replaces "~40 s/step" over `[d, d]` (AGENTS §2.3).
 Precision (`docs/architecture/bf16-plan.md`): the factors are fp32 MASTERS;
 the forward casts to bf16, matmuls, and returns fp32 — softmax/loss/KDA state
 stay fp32 at the arm boundary. `quant = "none"` is the day-one format and it
-resolves to bf16 factors; the STORAGE rungs (`fp8`, `nvfp4`) exist since
-2026-10-15 and dequantize inside the forward (see below); every other rung
-(LittleBit semantics) is still refused at CONFIG load (see
+resolves to bf16 factors; `quant = "ternary"` is the ONE STORAGE rung
+(checkpoint/bank compression, unpacked inside the forward — see below); every
+other rung (LittleBit semantics) is still refused at CONFIG load (see
 `config._refuse_ladder_rung`), so a rung can never silently compute bf16
-while the config reads a name it did not implement. The activation side is a
+while the config reads a name it did not implement. 2026-11-09: the
+`fp8`/`nvfp4` storage rungs and the `binary`/`mxfp4` QAT rungs were deleted —
+TSCT is ternary, full stop. The activation side is a
 separate field (`config.act_quant`, `model/act_quant.py`), not a rung of this
 ladder: the factors stay bf16, only the activations the factor matmuls read are
 fake-quantized (with an STE), and the a4.8 attention rule is
 `act_quant.attn_format`.
 
-STORAGE rungs vs bf16, the exact mechanics (validated by test):
-* master fp32 factors are quantized elementwise to the storage format with
-  a per-tensor scale computed from the format's own max (E4M3 = 448,
-  e2m1/grid-max = 6) **at state dict save/load time** — the rung is a
+STORAGE rung vs bf16, the exact mechanics (validated by test):
+* master fp32 factors are projected to b1.58 ternary (2-bit codes + one fp32
+  absmean scale) **at state dict save/load time** — the rung is a
   checkpoint-compression device and a memory format for the bank; the fp32
   master floats stay the optimizer's object inside a live run.
 * the forward path never changes numerics within a run: the rung pins a
-  round trip `fp32 → storage → fp32 ≥` the test tolerance (1e-2 relative),
-  which is where the 8-bit/4-bit losses are allowed to live and no further.
+  round trip `fp32 → storage → fp32` that is BIT-EXACT to
+  `ternary.ternarize`, which is where the loss is allowed to live and no
+  further.
 * LittleBit is NOT the storage rung semantics above (it is a QAT ladder
   step: sign(U)s·sign(V)ᵀ + learned scales, G-A..G-D gates in
   `docs/reviews/littlebit-design-2026-10-15.md` — a training-time change,
@@ -41,14 +43,14 @@ Deviations from burn, both deliberate and listed in the port report:
   (AGENTS §2.2). torch has no such constraint, so the port drops the pad — the
   parameter count is the honest `r·(in + out + 1)` either way.
 * **the STE quantizer IS in the forward** (since 2026-10-16, `factor_qat`):
-  the b1.58 ternary / LittleBit-binary / MXFP4 quantizers with burn-spectral's
+  the b1.58 ternary quantizer with burn-spectral's
   annealed STE, applied to every TSCT factor through `factor_qat_project`.
   What the compression tournament MEASURED at 9.2M (3 seeds x 2k steps):
-  hard STE from step 0 loses +0.050 BPB (ternary) / +0.087 (binary) to bf16;
+  hard STE from step 0 loses +0.050 BPB to bf16;
   the annealed ramp (alpha 0->1 over 1000 steps) recovers only 0.010 of it
   (+0.040) with a tighter spread — so at THIS scale the arm is CLOSED for
-  training (the controls' spread is 0.006). The storage rungs (fp8/nvfp4/
-  ternary, checkpoint compression) are untouched by that verdict.
+  training (the controls' spread is 0.006). The ternary storage rung
+  (checkpoint compression) is untouched by that verdict.
 """
 
 from __future__ import annotations
@@ -87,7 +89,7 @@ MM_DTYPES = ("bf16", "fp8")
 #: otherwise: a fresh process, an eval, a decode and every test run the default.
 _MM_DTYPE = "bf16"
 
-#: E4M3's own signed max (`RUNG_MAX["fp8"]`) — the per-tensor scale's divisor.
+#: E4M3's own signed max — the per-tensor scale's divisor.
 _FP8_MAX = 448.0
 
 #: COUNTED fallbacks, reason → count, process-local. The `Counters` half is what
@@ -346,13 +348,9 @@ def qat_values(
     """
     if mode == "none":
         return w
-    if mode not in ("ternary", "binary", "mxfp4", "ternary_s3t"):
+    if mode not in ("ternary", "ternary_s3t"):
         raise AssertionError(f"factor_qat/dense_qat={mode!r} reached the projector with no mode")
     note_qat_values(w)  # one refresh call; `w.shape[0]` is how many tensors it covers
-    if mode == "mxfp4":
-        from .mxfp import fake_quant_mx
-
-        return fake_quant_mx(w, "mxfp4")
     if mode == "ternary_s3t":
         from .ternary import _check_finite, stochastic_ternary
 
@@ -374,25 +372,20 @@ def qat_values(
         )
         return (w.float().sign() * a * (keep_p > u)).to(w.dtype)
     if dim is None:
-        from .ternary import sign_binary, ternarize
+        from .ternary import ternarize
 
-        if mode == "ternary":
-            assert 0.0 <= alpha <= 1.0, (
-                f"annealing alpha={alpha} is a schedule position in [0, 1] "
-                "(1 = pure ternary, 0 = the master); refused, not clamped"
-            )
-            return ternarize(w)
-        return sign_binary(w)
-    # The per-slice axis (banks): the same formula as `ternary.ternarize` /
-    # `ternary.sign_binary`, transposed onto `dim` — the grid is ±mean(|W|),
+        assert 0.0 <= alpha <= 1.0, (
+            f"annealing alpha={alpha} is a schedule position in [0, 1] "
+            "(1 = pure ternary, 0 = the master); refused, not clamped"
+        )
+        return ternarize(w)
+    # The per-slice axis (banks): the same formula as `ternary.ternarize`,
+    # transposed onto `dim` — the grid is ±mean(|W|),
     # ε only guards the division (exactly `ternarize`'s convention: divide by
     # `α+ε`, scale back by `α`), so a banked expert and the same expert run
     # alone land on the SAME values.
     a = w.abs().mean(dim=dim, keepdim=True)
-    if mode == "ternary":
-        q = (w.float() / (a + 1e-5)).round().clamp(-1.0, 1.0) * a
-    else:
-        q = torch.sign(w) * a
+    q = (w.float() / (a + 1e-5)).round().clamp(-1.0, 1.0) * a
     return q.to(w.dtype)
 
 
@@ -408,18 +401,6 @@ def factor_qat_project(
     - `none` → the master untouched (bit-identical to every number on record);
     - `ternary` → b1.58 STE (`ternary.ste_ternary_annealed`, burn-spectral's
       measured "converges better than hard STE" annealing);
-    - `binary` → LittleBit sign factors under the SAME annealing:
-      `w → w + alpha·(sign_binary(w) − w).detach()` (the annealed STE is the
-      one mechanism here; sign vs roundclip is the entire difference);
-    - `mxfp4` → the OCP MX e2m1 codec (`mxfp.fake_quant_mx(w, "mxfp4")`: per-32
-      e8m0 power-of-two block scales, RNE onto the e2m1 grid, the `tsct.py`
-      grid itself) under the SAME annealing. `dim` is IGNORED for this rung and
-      that is a claim, not a shortcut: the MX grid is per-32 along the LAST dim
-      and `fake_quant_mx` pads PER ROW, so every block sits inside one `(E, d)`
-      row and the whole `[E, d, r]` stack quantizes to exactly what E separate
-      `[d, r]` slices get — banked == standalone, aligned `r` or padded `r`
-      (pinned by `tests/test_factor_qat.py`). A per-slice call would be E
-      launches producing the same bits;
     - `ternary_s3t` → S3T stochastic rounding (`ternary.stochastic_ternary`,
       arXiv:2412.04787) under the SAME annealing. `dim` IS honoured here (the
       per-slice absmean scale, exactly as `ternary` above), but the Bernoulli
@@ -496,8 +477,8 @@ def factor_qat_project(
 #: The dense path's projector — the SAME function object as
 #: [`factor_qat_project`], deliberately. What the owner's final-quantized
 #: recipe needs on a plain linear weight IS the factor rung's semantics
-#: (per-tensor absmean `ternarize` / LittleBit `sign_binary` / the MX e2m1
-#: codec, all under the annealed STE `w + alpha·(q(w) − w).detach()`, with
+#: (per-tensor absmean `ternarize` under the annealed STE
+#: `w + alpha·(q(w) − w).detach()`, with
 #: `alpha = 0` the master bit for bit), and one object means the two paths
 #: cannot drift apart. `dim=None` is the per-TENSOR axis — the BitNet
 #: convention for a weight matrix (b1.58 arXiv:2402.17764 Eq. 1).
@@ -709,76 +690,15 @@ class TSCTLinear(nn.Module):
 # STORAGE rungs: checkpoint/bank compression of the fp32 factor masters
 # ---------------------------------------------------------------------------
 
-#: The format's own signed max, by rung: E4M3 fn grid top = 448; NVFP4's e2m1
-#: grid top = 6 (0, .5, 1, 1.5, 2, 3, 4, 6 — LittleBit's grid, which is why the
-#: sign rung maps onto it exactly).
-RUNG_MAX = {"fp8": 448.0, "nvfp4": 6.0}
-
 #: The matrix-parameter names that ARE factor matrices (everything else —
 #: scales `.s`, router, engram, norms — stays fp32/goes bf16 untouched).
 _FACTOR_SUFFIXES = ("u", "v", "gate_u", "up_u")
 
-#: NVFP4 packing constants: ITU e2m1, magnitude grid ascending then two's-compl
-#: sign per code; two codes per byte, low nibble first.
+#: The e2m1 magnitude grid (0, .5, 1, 1.5, 2, 3, 4, 6). Declared here because
+#: `model/mxfp.py` and `model/act_quant.py` import it as THE grid definition;
+#: no TSCT rung reads it — those are ACTIVATION/checkpoint codecs, a different
+#: feature.
 _NVFP4_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
-def _e2m1_quant(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """Per-16-block NVFP4 quantize: codes u8 + e4m3 scales [n/16] + a global
-    fp32 correction.
-
-    NVIDIA's NVFP4 is TWO-LEVEL for exactly the underflow this would hit:
-    a block amax smaller than e4m3's min normal rounds the block scale to
-    zero and the block is lost entirely. So the tensor is first prescaled by
-    a global power of two that pushes block scales into e4m3's normal range,
-    and the global comes back on decode.
-
-    Encode = quotient by the block scale then nearest grid magnitude (the
-    grid is LittleBit's, so a later sign rung re-uses the same codes).
-    """
-    n = t.numel()
-    assert n % 16 == 0, f"nvfp4 quantizes blocks of 16, got numel={n}"
-    # Global prescale: aim the SMALLEST nonzero block scale at e4m3's min
-    # normal. A power of two moves nothing, and e4m3's normal range is
-    # [2^-6, 448] ≈ 4.5 decades, so a block-scale span wider than that still
-    # overflows at the top (the format's limit, not a second level's job).
-    min_normal = float(torch.finfo(torch.float8_e4m3fn).tiny)  # 2^-6
-    amaxs = t.float().abs().reshape(-1, 16).amax(dim=1)
-    amaxs = amaxs[amaxs > 0]
-    if amaxs.numel() == 0:
-        global_scale = 1.0
-    else:
-        scale_min = float(amaxs.min()) / 6.0
-        exponent = torch.ceil(torch.log2(torch.tensor(min_normal / scale_min)))
-        global_scale = float(2.0**exponent) if scale_min < min_normal else 1.0
-    t = t * global_scale
-
-    blocks = t.float().reshape(-1, 16)
-    amax = blocks.absolute().amax(dim=1)
-    scale = amax / 6.0
-    # A block of exact zeros scales to 0 → decode has to multiply by 1, not 0.
-    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-    # The scale itself is stored e4m3 (NVIDIA's NVFP4 layout): quantize it too.
-    s_fp8 = scale.to(torch.float8_e4m3fn)
-    q = blocks / s_fp8.float().unsqueeze(-1)
-    # Nearest-magnitude rounding: searchsorted over the MIDPOINTS of adjacent
-    # grid entries (bucketize alone rounds "≤ boundary", not nearest).
-    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=t.device)
-    mag_idx = torch.searchsorted(midpoints, q.absolute().reshape(-1)).reshape(blocks.shape)
-    sign = (q < 0) & (mag_idx > 0)  # zero codes carry no sign
-    codes = (sign.to(torch.int32) * 8 + mag_idx).reshape(-1)  # sign<<3 | mag, flat
-    packed = (codes[0::2] | (codes[1::2] << 4)).to(torch.uint8)
-    return packed, s_fp8, global_scale
-
-
-def _e2m1_dequant(packed: torch.Tensor, scale: torch.Tensor, global_scale: float) -> torch.Tensor:
-    lows = packed.to(torch.int32) & 0x0F
-    highs = (packed.to(torch.int32) >> 4) & 0x0F
-    codes = torch.stack((lows, highs), dim=-1).reshape(-1)
-    mags = torch.as_tensor(_NVFP4_MAGNITUDES, device=packed.device)
-    vals = mags[codes & 7] * torch.where(codes >= 8, -1.0, 1.0)
-    vals = vals[: scale.numel() * 16].reshape(-1, 16)
-    return (vals.float() * scale.float().unsqueeze(-1)).reshape(-1) * (1.0 / global_scale)
 
 
 def _ternary_quant(t: torch.Tensor) -> tuple[torch.Tensor, float]:
@@ -787,8 +707,8 @@ def _ternary_quant(t: torch.Tensor) -> tuple[torch.Tensor, float]:
     Stores the TERNARY PROJECTION of the master (`ternary.ternarize`, the same
     formula `factor_qat` trains against): codes 0/1/2 for {0, +α, −α}, four to
     a byte, α in fp32 beside them. Round-trip is bit-exact to `ternarize(t)`
-    for finite t — a storage rung may lose precision by its FORMAT'S OWN grid
-    (nvfp4 stores 4-bit values), never by an extra rounding.
+    for finite t — the rung adds no rounding of its own beyond
+    `ternarize`'s grid.
     """
     from .ternary import ternarize
 
@@ -817,8 +737,6 @@ def _ternary_dequant(packed: torch.Tensor, alpha: float, n: int) -> torch.Tensor
 
 
 FACTORS_QUANT = {
-    "fp8": None,  # native dtype; no packer needed
-    "nvfp4": (_e2m1_quant, _e2m1_dequant),
     "ternary": (_ternary_quant, _ternary_dequant),
 }
 
@@ -829,21 +747,6 @@ def pack_tsct(t: torch.Tensor, rung: str) -> dict[str, object]:
         loud(f"storage rungs quantize the fp32 masters, got dtype {t.dtype}")
     if not torch.isfinite(t).all():
         loud("storage: master factors must be finite (inf/NaN refuse, they encode wrong)")
-    if rung == "fp8":
-        scale = t.abs().amax() / RUNG_MAX["fp8"]
-        scale = float(scale) if scale != 0 else 1.0
-        packed = (t / scale).to(torch.float8_e4m3fn)
-        return {"rung": rung, "packed": packed.reshape(t.shape), "scale": scale, "shape": t.shape}
-    if rung == "nvfp4":
-        packed, scale, correction = _e2m1_quant(t)
-        return {
-            "rung": rung,
-            "codes": packed,
-            "scale": scale,
-            "global_scale": correction,
-            "shape": t.shape,
-            "n": t.numel(),
-        }
     if rung == "ternary":
         packed, alpha = _ternary_quant(t)
         return {
@@ -853,22 +756,15 @@ def pack_tsct(t: torch.Tensor, rung: str) -> dict[str, object]:
             "shape": t.shape,
             "n": t.numel(),
         }
-    loud(f"pack_tsct: rung {rung!r} is not a storage rung (fp8|nvfp4|ternary)")
+    loud(f"pack_tsct: rung {rung!r} is not a storage rung (ternary)")
 
 
 def unpack_tsct(rec: dict[str, object]) -> torch.Tensor:
     """Inverse of [`pack_tsct`] — master-precision dtype, rung-rounded values."""
     rung = rec["rung"]
-    if rung == "fp8":
-        # Encode was `packed = (t / scale)`; decode multiplies back up.
-        return rec["packed"].float() * rec["scale"]
-    if rung == "nvfp4":
-        packed, scale = rec["codes"], rec["scale"]
-        t = _e2m1_dequant(packed, scale, rec.get("global_scale", 1.0))
-        return t.reshape(rec["shape"])
     if rung == "ternary":
         return _ternary_dequant(rec["codes"], rec["alpha"], rec["n"]).reshape(rec["shape"])
-    loud(f"unpack_tsct: rung {rung!r} is not a storage rung (fp8|nvfp4)")
+    loud(f"unpack_tsct: rung {rung!r} is not a storage rung (ternary)")
 
 
 def is_factor_key(key: str) -> bool:

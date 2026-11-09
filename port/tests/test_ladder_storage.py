@@ -1,15 +1,12 @@
-"""The storage rungs: pack/unpack round-trips, sizes, the save→load path.
+"""The storage rung: pack/unpack round-trips, sizes, the save→load path.
 
-Round-trip tolerance is the rung's own greed: fp8 (E4M3, per-tensor scale)
-pins 2e-2 relative; nvfp4 (e2m1 grid + e4m3 per-16 scale) pins 6e-2 — the
-grid quantum is 1/6 of the block max, and a scale rounding adds its own
-step. Both are larger than the fp32-master test noise and smaller than
-anything training cares about (the masters stay live).
+TSCT is ternary, full stop (2026-11-09): `unpack_tsct(pack_tsct(t, "ternary"))`
+is BIT-EXACT to `ternary.ternarize(t)` — the format's own grid is the only
+loss, never an extra rounding.
 """
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import pytest
@@ -18,124 +15,10 @@ from conftest import tiny_cfg, write_corpus
 from typer.testing import CliRunner
 
 from dormouse.cli import app
-from dormouse.config import load_run
 from dormouse.model import DormouseModel
-from dormouse.model.tsct import is_factor_key, pack_tsct, unpack_tsct
-from dormouse.train.loop import load_ckpt, save_ckpt, unpack_state_dict
-from dormouse.train.optim import MixOptimizer
+from dormouse.model.tsct import is_factor_key
 
 runner = CliRunner()
-
-
-def test_fp8_round_trip_within_the_e4m3_bound():
-    torch.manual_seed(0)
-    t = torch.randn(4096, 64) * 0.05
-    rec = pack_tsct(t, "fp8")
-    get = unpack_tsct(rec)
-    rel = (get - t).norm() / t.norm()
-    # The format's own greed: e4m3 carries a 3-bit mantissa (half-step leq
-    # 6.25% per element); a norm-level relative of a few percent is the
-    # FORMAT, not implementation sludge — 4e-2 is the honest pin.
-    assert rel < 4e-2, rel.item()
-    assert get.dtype == torch.float32 and get.shape == t.shape
-    assert rec["packed"].numel() * 1 == rec["packed"].numel()  # 1 B/val
-    assert rec["packed"].nbytes == t.numel() and t.nbytes == 4 * t.numel()
-
-
-def test_nvfp4_round_trip_within_the_grid_bound():
-    torch.manual_seed(0)
-    t = torch.randn(64, 4096) * 0.05  # numel % 16 == 0
-    rec = pack_tsct(t, "nvfp4")
-    get = unpack_tsct(rec)
-    rel = (get - t).norm() / t.norm()
-    # The grid's own greed: half-step at the top magnitudes is 0.5/6 = 1/12
-    # of the block max, so a block with both a 6.0 and a 0.05 rounds the tail
-    # to 100% — the FORMAT. Norm-level honest pin: 1e-1, plus the exact-code
-    # fixture (values ∈ grid·scale) below, which is the real invariant.
-    assert rel < 1e-1, rel.item()
-    assert get.dtype == torch.float32 and get.shape == t.shape
-    # Exact-code invariant: each decoded value IS a grid entry × its block's
-    # EFFECTIVE scale (the e4m3 scale record is prescaled by the global power
-    # of two, which the decode divides back out).
-    blocks = get.reshape(-1, 16)
-    scales = (rec["scale"].float() / rec["global_scale"]).unsqueeze(-1)
-    grid = torch.tensor((0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0))
-    quot = (blocks / scales).abs()  # codes are signed; the grid is magnitudes
-    dist = (quot.unsqueeze(-1) - grid).abs().amin(-1).max()
-    assert dist.item() < 1e-6, (
-        f"a decoded value is not a grid×scale entry (max dist {dist.item():.2e})"
-    )
-
-
-def test_zero_block_stays_zero_and_does_not_inf():
-    t = torch.zeros(64)
-    rec = pack_tsct(t, "nvfp4")
-    assert unpack_tsct(rec).abs().max().item() == 0.0
-
-
-def test_nvfp4_small_block_prescales_instead_of_zeroing():
-    """A block below e4m3's min normal survives the two-level prescale.
-
-    Regression: the guard read `2.0 ** finfo(float8_e4m3fn).min` = 2^-448
-    (1.38e-135) instead of `finfo.tiny` = 2^-6, so it never fired. Block 0's
-    `amax/6 = 6.7e-4` underflowed the e4m3 block scale to 0.0, `q = blocks/0`
-    saturated, and every one of its 16 weights decoded as 0.0.
-    """
-    t = torch.zeros(2, 16)
-    t[0, 0] = 0.004  # amax/6 = 6.7e-4 < 2^-6
-    t[1, 0] = 0.30  # amax/6 = 0.05, already representable
-    rec = pack_tsct(t, "nvfp4")
-    get = unpack_tsct(rec)
-    global_scale = rec["global_scale"]
-    assert global_scale > 1.0, "the small block must have asked for a prescale"
-    assert math.log2(global_scale).is_integer(), f"prescale {global_scale} is not 2^k"
-    assert float(rec["scale"].float().min()) > 0.0, "a block scale underflowed to zero"
-    assert get[0, 0].item() != 0.0, "the small block was silently zeroed"
-    assert get[1, 0].item() != 0.0
-    # The first level is a power-of-two move: every decoded value is still
-    # within ONE e2m1 step of its source at that block's effective scale.
-    step = (rec["scale"].float() / global_scale).unsqueeze(-1)
-    assert ((get - t).abs() <= step + 1e-9).all(), (get - t).abs()
-
-
-def test_nvfp4_prescale_is_a_power_of_two_and_one_step_holds_across_mixed_blocks():
-    """Random per-block scales, with and without the prescale in play.
-
-    The second level is e4m3 (3 mantissa bits); the error bound is the e2m1
-    step at the PRESCALED block scale, divided back by the global. `mult=1e-5`
-    pushes every block below e4m3's min normal, so the guard must fire and
-    still keep every block alive.
-    """
-    gen = torch.Generator().manual_seed(7)
-    base = torch.randn(256 * 16, generator=gen).reshape(256, 16)
-    block_scales = torch.exp(torch.randn(256, generator=gen) * 0.8).unsqueeze(-1)
-    source = base * block_scales
-    for mult in (1.0, 1e-5):
-        t = (source * mult).reshape(16, 256)
-        rec = pack_tsct(t, "nvfp4")
-        get = unpack_tsct(rec)
-        global_scale = rec["global_scale"]
-        assert math.log2(global_scale).is_integer(), f"prescale {global_scale} is not 2^k"
-        assert (get.reshape(-1, 16).abs().sum(dim=1) > 0).all(), "a block decoded to zero"
-        step = (rec["scale"].float() / global_scale).unsqueeze(-1)
-        too_far = ((get.reshape(-1, 16) - t.reshape(-1, 16)).abs() > step + 1e-9).sum()
-        assert too_far == 0, f"{int(too_far)} element(s) beyond one e2m1 step at {mult=}"
-
-
-def test_nvfp4_block_at_the_e4m3_subnormal_boundary_round_trips():
-    """The boundary is e4m3's own grid, not an accident of the prescale."""
-    tiny = float(torch.finfo(torch.float8_e4m3fn).tiny)  # 2^-6 = min normal
-    # amax = 6·2^-9 -> the block scale is e4m3's smallest SUBNORMAL.
-    t = torch.zeros(16)
-    t[0] = 6.0 * 2.0**-9
-    get = unpack_tsct(pack_tsct(t, "nvfp4"))
-    assert get[0].item() != 0.0
-    # amax = 6·tiny -> the scale is exactly the min normal, no prescale needed.
-    t = torch.zeros(16)
-    t[0] = 6.0 * tiny
-    rec = pack_tsct(t, "nvfp4")
-    assert rec["global_scale"] == 1.0
-    assert unpack_tsct(rec)[0].item() == t[0].item()
 
 
 def test_non_factor_key_refuses_to_pack_implicitly():
@@ -145,40 +28,6 @@ def test_non_factor_key_refuses_to_pack_implicitly():
     assert not is_factor_key("loop.moe.router.weight")
     assert is_factor_key("loop.moe.experts.0.gate_u")
     assert is_factor_key("loop.tsct.v")
-
-
-def test_checkpoint_with_fp8_rung_is_smaller_and_loads_to_fp32(tmp_path: Path):
-    from dormouse.config import RunConfig, TrainConfig
-
-    run = RunConfig(
-        source="t",
-        model=tiny_cfg(quant="fp8"),
-        train=TrainConfig(
-            steps=2,
-            batch=2,
-            seq_len=8,
-            ckpt_name="rung",
-            out_dir=str(tmp_path / "ck"),
-            data=str(tmp_path / "c.bin"),
-        ),
-    )
-    model = DormouseModel(run.model)
-    opt = MixOptimizer(model, lr=0.001, wd=0.0, opt="mix")
-    ck_path, _snap = save_ckpt(run, model, opt, step=2)
-    import torch
-
-    raw = torch.load(ck_path, weights_only=False)
-    assert raw.get("model_quant_rung") == "fp8"
-    assert any(isinstance(v, dict) and v.get("rung") == "fp8" for v in raw["model"].values()), (
-        "a rung run must have packed factor records in the FILE"
-    )
-    ck, _ = load_ckpt(run)
-    sd = unpack_state_dict(ck["model"], ck["model_quant_rung"])
-    for k, v in model.state_dict().items():
-        assert sd[k].dtype == v.dtype, k  # masters reload fp32, shapes intact
-        if is_factor_key(k):
-            rel = (sd[k] - v).norm() / v.norm()
-            assert rel < 5e-2, f"{k}: rung rel {rel.item():.3e}"
 
 
 def test_the_refusals_still_refuse():
@@ -191,12 +40,11 @@ def test_the_refusals_still_refuse():
         load_run("small", model_overrides={"quant": "lbit"})  # training-time rung
     with pytest.raises(LoudError):
         load_run("small", model_overrides={"quant": "int3"})  # not a rung at all
-
-
-def test_fp8_and_nvfp4_resolve_from_a_preset():
-    assert load_run("small").model.quant == "none"
-    assert load_run("small", model_overrides={"quant": "fp8"}).model.quant == "fp8"
-    assert load_run("small", model_overrides={"quant": "nvfp4"}).model.quant == "nvfp4"
+    # The deleted storage rungs must refuse, not silently resolve to bf16.
+    with pytest.raises(LoudError):
+        load_run("small", model_overrides={"quant": "fp8"})
+    with pytest.raises(LoudError):
+        load_run("small", model_overrides={"quant": "nvfp4"})
 
 
 def test_ternary_round_trip_is_bit_exact_to_the_projection():
@@ -293,6 +141,7 @@ def test_ternary_refusal_update():
 def _save_rung_checkpoint(tmp_path: Path, quant: str) -> Path:
     """A 1-step tiny run saved with a storage rung; returns the corpus path."""
     from dormouse.config import RunConfig, TrainConfig
+    from dormouse.train.loop import save_ckpt
     from dormouse.train.optim import MixOptimizer
 
     corpus = write_corpus(tmp_path / "corpus.bin", n_bytes=4096)
@@ -314,12 +163,12 @@ def _save_rung_checkpoint(tmp_path: Path, quant: str) -> Path:
     return corpus
 
 
-@pytest.mark.parametrize("quant", ["fp8", "none"])
+@pytest.mark.parametrize("quant", ["ternary", "none"])
 def test_cli_eval_and_decode_load_a_rung_checkpoint(tmp_path: Path, quant: str):
     """`dormouse eval`/`decode` on a checkpoint whose factors are PACKED.
 
     `cli.py`'s eval and decode read the model half with a raw `torch.load` +
-    `load_state_dict`, so a checkpoint written with `quant=fp8` — a config the
+    `load_state_dict`, so a checkpoint written with `quant=ternary` — a config the
     validator accepts and `save_ckpt` packs — died there with a RuntimeError
     naming neither the rung nor the escape (audit MAJOR 6, 2026-10-17). Both now
     ride `load_model_half`; `quant="none"` is the unpaced control that must keep

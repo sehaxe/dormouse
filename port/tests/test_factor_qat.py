@@ -11,16 +11,12 @@ The property under test is NOT "does it quantize" (that is
   so a banked expert and the same expert run alone agree;
 - the config refusals are LOUD.
 
-The rungs added 2026-10-16 (`mxfp4`, `ternary_s3t`) have two extra properties
-each, and both are the reason their tests exist rather than re-using
-`test_mxfp.py`/`test_ternary.py` (which own the FORMATS):
-  * `mxfp4` pads a factor whose last dim is not a multiple of 32 PER ROW, and
-    that per-row pad is exactly what makes the `[E, d, r]` bank agree with E
-    standalone `[d, r]` factors — a 5461-wide `v` is the case on record;
-  * `ternary_s3t` is the one rung whose mask is a drawn stream, so its
-    determinism (same seed ⇒ same bits, within one run) and its limit (a new
-    seed differs; the bank and the standalone path agree on the SCALE, never on
-    the mask) are tested rather than described.
+The rung added 2026-10-16 (`ternary_s3t`) has an extra property, and it is
+the reason its tests exist rather than re-using `test_ternary.py` (which owns
+the FORMAT): `ternary_s3t` is the one rung whose mask is a drawn stream, so
+its determinism (same seed ⇒ same bits, within one run) and its limit (a new
+seed differs; the bank and the standalone path agree on the SCALE, never on
+the mask) are tested rather than described.
 """
 
 from __future__ import annotations
@@ -32,8 +28,6 @@ from dormouse.config import load_run
 from dormouse.instrument import LoudError
 from dormouse.model import DormouseModel
 from dormouse.model.experts import DualLatentGLU, SparseMoE
-from dormouse.model.mxfp import BLOCK as MX_BLOCK
-from dormouse.model.mxfp import fake_quant_mxfp4
 from dormouse.model.tsct import TSCTLinear, factor_qat_project, set_factor_qat_seed
 
 
@@ -69,15 +63,6 @@ def test_ternary_factors_are_on_the_ternary_grid():
     zero = u.abs() < 1e-7
     assert bool((hit | zero).all()), "every factor value must be {−α, 0, +α}"
     assert bool(zero.any()), "a random master must produce real zeros"
-
-
-def test_binary_factors_are_pm_alpha():
-    lin = _tsct("binary")
-    u, _ = lin._factors()
-    alpha = float(lin.u.abs().mean())
-    expect = torch.full_like(u, alpha)
-    assert bool((((u - expect).abs() < 1e-6) | ((u + expect).abs() < 1e-6)).all())
-    assert not bool((u.abs() < 1e-7).any()), "binary has no zero level on randn"
 
 
 def test_annealing_is_the_exact_lerp_between_master_and_projection():
@@ -176,91 +161,7 @@ def test_config_refusals_are_loud():
         load_run("small", model_overrides={"factor_qat": "none", "factor_qat_alpha": 0.5})
     # The legal pairs load.
     load_run("small", model_overrides={"factor_qat": "ternary", "factor_qat_alpha": 0.3})
-    load_run("small", model_overrides={"factor_qat": "binary"})
-
-
-# ---------------------------------------------------------------------------
-# mxfp4 — the MX codec as a factor rung (pad rule + bank parity)
-# ---------------------------------------------------------------------------
-
-
-def _mxfp4_ref(w: torch.Tensor) -> torch.Tensor:
-    """The pad rule spelled out, built from the module's own pieces.
-
-    That is the point: this test pins the RULE (zero-pad the last dim per row up
-    to a multiple of 32, quantize the padded view, slice back), not a second
-    copy of the e2m1 grid — which `tests/test_mxfp.py` already owns against its
-    own scalar reference.
-    """
-    n = w.shape[-1]
-    pad = (-n) % MX_BLOCK
-    if pad:
-        w = torch.nn.functional.pad(w, (0, pad))
-    return fake_quant_mxfp4(w)[..., :n]
-
-
-def test_mxfp4_factors_are_the_padded_mx_projection():
-    """`u [32, 8]` is padded (8 % 32 != 0), `v [8, 32]` is aligned: one rule."""
-    lin = _tsct("mxfp4", alpha=1.0)
-    u, v = lin._factors()
-    assert torch.equal(u, _mxfp4_ref(lin.u))
-    assert torch.equal(v, _mxfp4_ref(lin.v))
-    assert not torch.equal(u, lin.u), "the arm must quantize, not pass through"
-
-
-def test_mxfp4_annealing_is_the_exact_lerp():
-    """The annealing is the ONE mechanism here; mxfp4 rides it like ternary."""
-    lin = _tsct("mxfp4", alpha=0.5)
-    u, _ = lin._factors()
-    q = factor_qat_project(lin.u, "mxfp4", 1.0)
-    assert torch.allclose(u, lin.u + 0.5 * (q - lin.u), atol=0, rtol=0)
-
-
-def test_mxfp4_pads_the_5461_wide_factor_and_the_raw_module_still_refuses():
-    """The real `v [r, f]` shape: f = 5461 = 170·32 + 21.
-
-    Two claims at once: the rung runs (padded per row, finite, rule-exact), and
-    `fake_quant_mxfp4` itself still LOUD-refuses a partial block — the pad is
-    the CALLER's decision (`mxfp._blocks`), taken in one place for both MX
-    consumers, not a change to the codec's contract.
-    """
-    torch.manual_seed(0)
-    lin = TSCTLinear(32, 5461, 8, dtype=torch.float32, factor_qat="mxfp4")
-    u, v = lin._factors()
-    assert u.shape == (32, 8) and v.shape == (8, 5461)
-    assert bool(torch.isfinite(v).all())
-    assert torch.equal(v, _mxfp4_ref(lin.v))
-    # The pad is PER ROW, so row-by-row == all-rows-at-once (bit for bit).
-    per_row = torch.cat([_mxfp4_ref(lin.v[i : i + 1]) for i in range(8)])
-    assert torch.equal(v, per_row)
-    with pytest.raises(LoudError, match="divisible by 32"):
-        fake_quant_mxfp4(lin.v)
-
-
-def test_mxfp4_bank_equals_standalone_expert_aligned_and_padded():
-    """The aligned-grid claim, in both regimes.
-
-    MX's scale grid is per-32 along the LAST dim and `fake_quant_mx` pads per
-    ROW, so a block never mixes two rows and the `[E, d, r]` stack quantizes to
-    exactly what E separate `[d, r]` slices get. Tiny's `rank = 8` is the
-    PADDED regime (8 % 32 != 0); the `[3, 16, 64]` stack below is the ALIGNED
-    one. If the pad ever moves to a flat tail, this test fails on the padded
-    case and says why.
-    """
-    cfg = _moe_cfg(factor_qat="mxfp4")
-    model = DormouseModel(cfg)
-    moe = next(m for m in model.modules() if isinstance(m, SparseMoE))
-    assert moe.experts[0].rank % MX_BLOCK != 0, "tiny's rank is the padded regime"
-    mats = moe._banks(torch.float32)
-    for e, expert in enumerate(moe.experts):
-        assert torch.equal(mats[0][e], factor_qat_project(expert.gate_u, "mxfp4", 1.0))
-        assert torch.equal(mats[1][e], factor_qat_project(expert.up_u, "mxfp4", 1.0))
-        assert torch.equal(mats[2][e], factor_qat_project(expert.v, "mxfp4", 1.0))
-    torch.manual_seed(3)
-    stack = torch.randn(3, 16, 64) * 0.2
-    whole = factor_qat_project(stack, "mxfp4", 1.0, dim=(1, 2))
-    for i in range(3):
-        assert torch.equal(whole[i], factor_qat_project(stack[i], "mxfp4", 1.0))
+    load_run("small", model_overrides={"factor_qat": "ternary_s3t"})
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +221,7 @@ def test_s3t_bank_and_standalone_share_the_scale_not_the_mask():
     assert not torch.equal(gates[0], mine), "the mask differs; the scale is the claim"
 
 
-@pytest.mark.parametrize("mode", ["mxfp4", "ternary_s3t"])
+@pytest.mark.parametrize("mode", ["ternary_s3t"])
 def test_each_new_factor_rung_runs_is_finite_and_moves_the_logits(mode):
     a = DormouseModel(_moe_cfg())
     b = DormouseModel(_moe_cfg(factor_qat=mode))
@@ -333,7 +234,7 @@ def test_each_new_factor_rung_runs_is_finite_and_moves_the_logits(mode):
     assert not torch.equal(la, lb), f"{mode} left the logits untouched"
 
 
-@pytest.mark.parametrize("mode", ["mxfp4", "ternary_s3t"])
+@pytest.mark.parametrize("mode", ["ternary_s3t"])
 def test_new_factor_rungs_keep_the_gradient_on_the_master(mode):
     set_factor_qat_seed(0)
     lin = _tsct(mode)
@@ -343,13 +244,10 @@ def test_new_factor_rungs_keep_the_gradient_on_the_master(mode):
         assert g is not None and bool(torch.isfinite(g).all()) and g.abs().sum() > 0, name
 
 
-def test_config_new_factor_rungs_and_the_seed_inertness():
-    load_run("small", model_overrides={"factor_qat": "mxfp4"})
+def test_config_ternary_s3t_and_the_seed_inertness():
     load_run("small", model_overrides={"factor_qat": "ternary_s3t"})
     load_run("small", model_overrides={"factor_qat": "ternary_s3t", "factor_qat_seed": 7})
     with pytest.raises(LoudError, match="inert"):
         load_run("small", model_overrides={"factor_qat": "ternary", "factor_qat_seed": 7})
-    with pytest.raises(LoudError, match="inert"):
-        load_run("small", model_overrides={"factor_qat": "mxfp4", "factor_qat_seed": 3})
     with pytest.raises(LoudError, match="factor_qat"):
         load_run("small", model_overrides={"factor_qat": "mxfp3"})
