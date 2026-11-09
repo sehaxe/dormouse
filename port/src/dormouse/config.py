@@ -581,6 +581,20 @@ class ModelConfig:
     #: visible, not to silently upgrade the model. `use_tsct` is a DIFFERENT
     #: axis (which linears elsewhere are spectral); it never selected the FFN.
     ffn_form: str = "bank"
+    #: Fuse the dense FFN's `silu(gate)·up` into ONE fc1 GEMM epilogue, so the
+    #: `[tokens, 2·d_ffn]` intermediate is never written and `fc2` reads
+    #: `[tokens, d_ffn]` (`model/glu_kernel.py`). DEFAULT OFF, so every existing
+    #: state dict, number and log line is unchanged; the field only reaches code
+    #: on `ffn_form="dense"` with `expert_act="silu"`, and any other form or
+    #: activation is LOUDLY refused (`validate_ffn`) rather than left inert.
+    #: FORWARD-ONLY: with grad enabled the eager expression runs, COUNTED
+    #: (`glu_kernel_fallback`), because a training step saves gate and up for
+    #: silu's backward anyway — so a training number cannot move. Measured at the
+    #: dense FFN's live-recipe shape (24·1024 tokens, d=832, f=3072, bf16) by
+    #: `scripts/bench_glu.py`; see that file for the fwd table and the verdict.
+    #: NOTE: the live `configs/flagship3_dense.toml` is `block_form="transformer"`
+    #: (the control's GELU FFN), which has no `silu(g)·u` and never reads this.
+    fused_glu: bool = False
     #: The `tsct` form's gate/up rank `r_g`. `0` = `rank`. The same rank is
     #: used for gate and up because they are the two halves of one d→f GLU.
     #: Refused on the other forms (a rank knob on a form with no factors is an
@@ -2078,6 +2092,21 @@ class TrainConfig:
     #: 8e-3 absolute. 1.0 = the historical behaviour, bit-identical.
     muon_lr_mult: float = 1.0
 
+    #: Stiefel QR retraction of the TSCT factors after every optimizer step
+    #: (SCT Eq. 5, arXiv:2604.00733): `Q,R = QR(U); U ← Q·sign(diag(R))`, same
+    #: for V (`train/stiefel.py`). Orthonormal columns stop the factors drifting
+    #: into a near-degenerate basis and make the ternary projection meaningful —
+    #: the sign of an orthonormal vector codes a direction, while the sign of an
+    #: arbitrary vector is only its sparsity.
+    #:
+    #: `false` (the default) is every number on record and changes no bit. Cost
+    #: is `O(n·r²)` per factor: a rounding error at this repo's `d=832, r=64`,
+    #: but 41-88 % of a STEP at the paper's `8192×32` [T, SCT Table 2] — hence a
+    #: flag and an A/B, not a default. Refused with `opt_graph=true` (a `copy_`
+    #: into a parameter cannot be replayed by the captured stage) and on a model
+    #: with no TSCT factors (the flag would be inert).
+    stiefel_qr: bool = False
+
     #: How the Muon half's step is scaled per matrix shape (`optim.Muon._muon_scale`).
     #: `shape_fair` multiplies by `sqrt(cols)` so
     #: that `RMS(dW) = lr` on EVERY shape. The old rule, `sqrt(max(1, rows/cols))`,
@@ -2771,6 +2800,21 @@ def validate_ffn(model: ModelConfig) -> None:
             f"one plain GLU with no rank, `tsct` all three matrices factorised. "
             f"Escape: name one of those."
         )
+    if getattr(model, "fused_glu", False):
+        if model.ffn_form != "dense":
+            loud(
+                f"fused_glu=true with ffn_form={model.ffn_form!r}: the fused kernel "
+                f"removes a [tokens, 2·d_ffn] fc1 write, and only the `dense` form "
+                f"has one (the bank's GLU sits at the latent rank; the tsct form's "
+                f"factors are its own). Escape: ffn_form='dense' (n_experts=1, "
+                f"moe_topk=0), or fused_glu=false."
+            )
+        if model.expert_act != "silu":
+            loud(
+                f"fused_glu=true with expert_act={model.expert_act!r}: the kernel "
+                f"computes silu(gate)·up, and the other activations have no epilogue "
+                f"here. Escape: expert_act='silu', or fused_glu=false."
+            )
     if model.ffn_rank_gate < 0 or model.ffn_rank_down < 0:
         loud(
             f"ffn_rank_gate={model.ffn_rank_gate} / ffn_rank_down="

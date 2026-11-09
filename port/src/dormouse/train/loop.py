@@ -1893,6 +1893,42 @@ def _train_impl(
             clip_grads(model.parameters(), cfg.grad_clip)
         opt.step(flag_dev)
 
+    cfg_stiefel_qr = bool(getattr(cfg, "stiefel_qr", False))
+    if cfg_stiefel_qr:
+        from ..model.tsct import is_factor_key
+    factor_params = [
+        p
+        for name, p in model.named_parameters()
+        if cfg_stiefel_qr and is_factor_key(name.removeprefix("_orig_mod."))
+    ]
+    if cfg_stiefel_qr and not factor_params:
+        loud(
+            "stiefel_qr=true on a model with no TSCT factors: the flag would run "
+            "no retraction at all, i.e. a config that claims a mechanism it never "
+            "executes. Escape: use_tsct=true, or stiefel_qr=false."
+        )
+    if cfg_stiefel_qr and cfg.opt_graph:
+        loud(
+            "stiefel_qr=true with opt_graph=true: the retraction is a `copy_` into "
+            "each factor after the step, and the captured optimizer stage cannot "
+            "carry it — the graph would replay a step without the retraction and "
+            "the run would silently measure a different algorithm. Escape: "
+            "opt_graph=false, or stiefel_qr=false."
+        )
+
+    def retract_stage() -> None:
+        """Stiefel QR retraction of the TSCT factors (SCT Eq. 5), off by default.
+
+        Runs AFTER the optimizer step, OUTSIDE any capture (the combination is
+        refused above), over a list built once, so there is no host read in the
+        step. Two factors per TSCT module at `O(n·r²)` each: cheap at this
+        repo's shapes, 41-88 % of the step at the paper's 8192×32 [SCT Table 2].
+        """
+        from .stiefel import stiefel_retract_
+
+        for p in factor_params:
+            stiefel_retract_(p)
+
     #: The CUDA-graph arm (`train/graph.py`, `train.opt_graph`). `None` is the
     #: default path and it is untouched: the LR stays a host float in the group
     #: dict, `opt_stage()` is called directly, and `zero_grad` keeps
@@ -2254,6 +2290,8 @@ def _train_impl(
                 graph.step()
             else:
                 opt_stage()
+            if cfg_stiefel_qr:
+                retract_stage()
         timer.tick()
         # COUNTED as a device counter, drained with the window's other counters
         # at the log cadence (the `Counters.count_device` 0-sync rule). OUTSIDE

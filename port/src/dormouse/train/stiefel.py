@@ -32,25 +32,54 @@ import torch
 
 
 def stiefel_retract_(w: torch.Tensor) -> None:
-    """Retract `w [n, r]` in place to `Q · sign(diag(R))` (SCT Eq. 5).
+    """Retract `w` in place onto the Stiefel manifold along its RANK axis.
 
-    `r > n` (a rank larger than the ambient dimension) is a config lie: the
-    columns cannot all be independent, so the call is refused rather than
-    silently returning a rank-deficient factor.
+    Two layouts reach this function and both must work:
+
+    * `u [d, r]` — the rank is the COLUMN axis; orthonormal columns are the
+      retraction (`Q·sign(diag(R))`);
+    * `v [r, f]` — the rank is the ROW axis (this repo stores `V` transposed
+      against SCT's `V ∈ ℝ^{n×k}`); the retraction is the same one applied to
+      `w.T`, i.e. orthonormal ROWS. Refusing here would make the flag
+      unusable on half the factors; picking the wrong axis would silently
+      orthonormalise across the feature dimension.
+
+    The rule is therefore geometric, not nominal: retract along whichever axis
+    is the SMALLER one (the rank), which is also the only axis that can be
+    orthonormal when `r < min(d, f)`.
     """
-    n, r = w.shape
-    if r > n:
-        raise ValueError(f"stiefel_retract: rank {r} > rows {n}: the columns cannot be orthonormal")
-    q, rr = torch.linalg.qr(w.float(), mode="reduced")
+    n, c = w.shape
+    if c <= n:
+        _retract_cols_(w)
+    else:
+        _retract_cols_(w.t().contiguous().view(c, n), write_back=w)
+
+
+def _retract_cols_(view: torch.Tensor, write_back: torch.Tensor | None = None) -> None:
+    """QR-retract the COLUMNS of `view`; copy back into `write_back` if given."""
+    q, rr = torch.linalg.qr(view.float(), mode="reduced")
     # `sign(0) = 0` would zero a whole column; a zero pivot is a sign of its own,
     # and `1` keeps the factor's norm instead of annihilating it.
     sgn = torch.sign(torch.diagonal(rr)).clamp(min=-1.0, max=1.0)
     sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
-    w.copy_((q * sgn.unsqueeze(0)).to(w.dtype))
+    out = (q * sgn.unsqueeze(0)).to(view.dtype)
+    # `no_grad` because the caller passes a PARAMETER: an in-place write to a
+    # leaf that requires grad is refused outside it, and the retraction is a
+    # projection of the weights, not a differentiable op on them.
+    with torch.no_grad():
+        if write_back is None:
+            view.copy_(out)
+        else:
+            write_back.copy_(out.t())
 
 
 def orthonormality_error(w: torch.Tensor) -> float:
-    """`‖WᵀW − I‖_max` — the quantity the retraction is supposed to hold."""
-    g = w.float().t() @ w.float()
+    """`‖WᵀW − I‖_max` on the RANK axis (rows when the tensor is wide).
+
+    Both TSCT layouts are handled: a `[d, r]` factor is judged on its columns, a
+    `[r, f]` factor on its rows — the same axis `stiefel_retract_` projects.
+    """
+    x = w.float() if w.shape[1] <= w.shape[0] else w.float().t()
+    g = x.t() @ x
     eye = torch.eye(g.shape[0], dtype=g.dtype, device=g.device)
     return float((g - eye).abs().max())

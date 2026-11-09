@@ -433,6 +433,10 @@ def _noop_ctx():
 #: Functions whose loops are NOT part of a step body. The value is the reason,
 #: printed by the census so an excuse cannot hide in a docstring.
 EXCUSED_FUNCTIONS = {
+    "_train_impl.retract_stage": (
+        "stiefel arm only (stiefel_qr=true): a fixed per-factor list built once at "
+        "startup, one QR per TSCT factor, no host read"
+    ),
     "DormouseModel.set_iter_checkpoint": "setup, once per run",
     "DormouseModel.set_factor_qat_alpha": "anneal arm only (factor_qat_anneal_steps>0)",
     "DormouseModel._forward_byte_lm": (

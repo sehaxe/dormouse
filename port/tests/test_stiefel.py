@@ -48,9 +48,19 @@ def test_it_is_idempotent():
     assert torch.allclose(w, once, atol=1e-6)
 
 
-def test_a_rank_above_the_row_count_is_refused():
-    with pytest.raises(ValueError, match="cannot be orthonormal"):
-        stiefel_retract_(_rand(4, 8))
+def test_a_wide_factor_is_retracted_along_its_rank_axis():
+    """`v [r, f]` (the repo's layout) must come out with orthonormal ROWS.
+
+    SCT stores `V ∈ R^{n×k}`; this repo stores it transposed. Choosing the axis
+    by position instead of by geometry would orthonormalise across the FEATURE
+    dimension and silently destroy the factor, which is what this gate catches.
+    """
+    w = _rand(8, 64)  # rank 8, feature 64 — the `v [r, f]` layout
+    before = orthonormality_error(w)
+    stiefel_retract_(w)
+    after = orthonormality_error(w)
+    assert after <= 1e-5, after
+    assert after < before
 
 
 def test_a_zero_pivot_does_not_annihilate_a_column():
