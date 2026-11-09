@@ -253,7 +253,7 @@ def _checkpoint_half(sd: dict, rung: str) -> dict:
     from ..model.tsct import is_factor_key, pack_tsct
 
     sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
-    if rung and rung in ("fp8", "nvfp4", "ternary"):
+    if rung and rung == "ternary":
         sd = {k: (pack_tsct(v, rung) if is_factor_key(k) else v) for k, v in sd.items()}
     return sd
 
