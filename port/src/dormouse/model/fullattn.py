@@ -56,7 +56,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from ..instrument import Counters
+from ..instrument import Counters, loud
+from .transformer import apply_rope, rope_tables
 from .tsct import dense_qat_kind, qat_linear
 
 __all__ = ["FullAttention", "window_mac_per_byte"]
@@ -111,6 +112,16 @@ class FullAttention(nn.Module):
         )
         self.window = int(window)
         self.query_chunk = int(query_chunk)
+        #: `attn_pos` ("none" | "rope"): without position this arm cannot see
+        #: token ORDER, and the 2026-11-09 A/B measured exactly that — 3.66 BPB,
+        #: the zeros-branch signature. See `ModelConfig.attn_pos`.
+        self.attn_pos = str(getattr(cfg, "attn_pos", "none"))
+        if self.attn_pos not in ("none", "rope"):
+            loud(
+                f"attn_pos={self.attn_pos!r} is not a positional arm. Known: "
+                f"'none' (the arm as written, order-blind) and 'rope' (rotary on "
+                f"q/k, the pair TransformerBlock uses). Escape: name one of those."
+            )
         #: `dense_qat`'s per-site rule, the same call shape KDA makes: all four
         #: projections are ATTENTION sites (`tsct.DENSE_QAT_ATTN_SITES`), so the
         #: default `dense_qat_skip_attn` keeps them bf16 and an explicitly
@@ -251,10 +262,19 @@ class FullAttention(nn.Module):
         if dt != x.dtype:
             q, k, v = q.to(dt), k.to(dt), v.to(dt)
         # [b, t, h, hd] → [b, h, t, hd]: SDPA's query/key/value layout.
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if self.attn_pos == "rope":
+            # The stack's own rotary (transformer.py), applied on the layout the
+            # transformer applies it to: [b, h, t, hd].
+            cos, sin = rope_tables(t, self.head_dim, x.device, q.dtype)
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+            counters.count("attn_pos_rope")
         y = self._sdpa(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
+            q,
+            k,
+            v,
             counters,
             causal=True,
         )

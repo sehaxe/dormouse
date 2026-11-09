@@ -72,7 +72,7 @@ PROGRESS_KEYS = (
     # state. The CPU parity gate (`tests/test_torch_compile.py`) pins the
     # compiled loss and gradients to the eager ones at fp32 round-off, which is
     # what makes the flip a resume rather than a new experiment: an existing
-    # run buys the measured 1.20x without restarting its step count, and a
+    # run buys the measured compile win without restarting its step count, and a
     # compiled arm whose live-shape measurement does not pay can be reverted.
     "torch_compile",
     "steps",
@@ -728,6 +728,21 @@ class ModelConfig:
     #: causal attention over those latents is well-defined — the same sequence
     #: KDA already attends over, uncompressed).
     attn_kind: str = "kda"
+    #: ---- POSITIONAL ENCODING FOR THE `full` ARM ----
+    #: `"none"` (the default) is the arm as written: SDPA with `is_causal=True`
+    #: and NO rotation, so the arm cannot see token ORDER — it is a bag of the
+    #: prefix, not a transformer. MEASURED 2026-11-09 at 30 MB, b24, lr 3e-4:
+    #: `loop4x4` with `attn_kind=full` read **3.66 BPB** where the same loop with
+    #: `kda` read **2.199** and the 95M dense control read **1.905**, and it was
+    #: indistinguishable from the zeros branch (3.73) — the exact signature of an
+    #: order-blind attention. KDA survives without a flag because its decay is
+    #: itself positional.
+    #: `"rope"` applies the stack's own `rope_tables`/`apply_rope` (rotary, the
+    #: same pair `TransformerBlock` uses) to `q` and `k` before SDPA. It is a
+    #: SEPARATE value, not the new default, because it changes the arm's numbers
+    #: and `tests/test_fullattn.py`'s exactness gate pins `"none"` against a
+    #: hand-written reference.
+    attn_pos: str = "none"
     #: ---- an EXACT LOCAL WINDOW beside whatever arm `attn_kind` names ----
     #: `model/fullattn.py`'s `FullAttention` restricted to the last `attn_window`
     #: positions (`0` = OFF, no module, no parameter, every hash unchanged):

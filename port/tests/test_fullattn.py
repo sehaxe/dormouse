@@ -180,6 +180,40 @@ def test_gate_4_full_attention_equals_the_hand_written_softmax():
 # --- 5. the refusals are LOUD, the legal pairs run -------------------------
 
 
+def test_gate_4b_attn_pos_rope_is_wired_and_positional():
+    """`attn_pos="rope"` applies the stack's rotary to q and k, exactly.
+
+    The `none` arm cannot see token ORDER (measured 2026-11-09: 3.66 BPB, the
+    zeros-branch signature), so the flag exists and must be provably wired:
+    (a) it equals a hand-written rope+SDPA reference, and (b) a same-multiset
+    PERMUTATION of the input changes the output, which is the property the flag
+    buys.
+    """
+    from dormouse.model.transformer import apply_rope, rope_tables
+
+    torch.manual_seed(0)
+    cfg = dataclasses.replace(tiny_cfg(), attn_pos="rope")
+    attn = FullAttention(cfg)
+    x = torch.randn(BATCH, 16, cfg.d_model)
+    q, k, v = attn.projections(x)
+    qh, kh, vh = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    cos, sin = rope_tables(16, cfg.head_dim, x.device, qh.dtype)
+    qh, kh = apply_rope(qh, cos, sin), apply_rope(kh, cos, sin)
+    scores = (qh @ kh.transpose(-1, -2)) * (1.0 / (cfg.head_dim**0.5))
+    mask = torch.triu(torch.ones(16, 16, dtype=torch.bool), diagonal=1)
+    scores = scores.masked_fill(mask, float("-inf"))
+    ref = (torch.softmax(scores, dim=-1) @ vh).transpose(1, 2).reshape(BATCH, 16, cfg.d_model)
+    ref = torch.nn.functional.linear(ref, attn.o_proj.weight)
+    err = float((attn(x) - ref).detach().abs().max())
+    assert err <= 1e-5, err
+    # (b) order sensitivity: the same tokens in a different order must move the
+    # output by more than the rope-vs-none gap could hide.
+    perm = torch.randperm(16)
+    a = attn(x).detach()
+    b = attn(x[:, perm]).detach()
+    assert not torch.allclose(a, b, atol=1e-3), "the rope arm is order-blind"
+
+
 def test_gate_5_unsupported_combinations_are_loud():
     with pytest.raises(LoudError, match="attn_kind"):
         validate(tiny_cfg(attn_kind="flash"))
