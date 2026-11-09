@@ -1040,6 +1040,21 @@ def train_cmd(
             f" lr={run.train.lr} opt={run.train.opt}",
         )
     )
+    # The Muon LR landmine, made visible on the user's own screen. `muon_lr_mult=1.0`
+    # is the historical default and stays bit-identical for resumption, but at a
+    # shared LR the Muon half's step is 8x-52x smaller than AdamW's on this model's
+    # shapes (0.7 %-17 % of its first-order decrease, docs/reviews/2026-11-06-
+    # optimizer-audit.md). Every architecture verdict in the archive before
+    # 2026-11-07 was measured in that regime. Printed here rather than in the
+    # trainer so the `log` callback keeps carrying only step/eval lines (five test
+    # files read `lines[0]` as a step line).
+    if run.train.opt == "mix" and float(run.train.muon_lr_mult) == 1.0:
+        console.print(
+            "[bold yellow]loud:[/] opt=mix with [bold]muon_lr_mult=1.0[/] — the Muon half "
+            "runs 8x-52x below AdamW's step. The measured optimum is 12: pass "
+            "--set muon_lr_mult=12 unless you are reproducing a pre-2026-11-07 run "
+            "bit-for-bit."
+        )
     report = _train(
         model,
         run,
