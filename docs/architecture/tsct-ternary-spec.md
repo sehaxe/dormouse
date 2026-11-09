@@ -21,8 +21,12 @@ A weight matrix is replaced by **r ternary rank-1 terms, one scale each**:
 Storage per term: `d + f` ternary elements (log₂3 = 1.585 bit each) + one FP16
 scale. Training keeps FP32 masters of the latents and applies the ternary
 projection through a straight-through estimator (`tsct.py`, `factor_qat` rungs
-`ternary`, `binary`, `mxfp4`, `ternary_s3t`; the last is the Bernoulli S3T
-sampler).
+`ternary` and `ternary_s3t`, the Bernoulli S3T sampler).
+
+**2026-11-09:** the `binary`, `mxfp4`, `fp8` and `nvfp4` rungs were deleted from
+the code (`config.FACTOR_QATS`/`_refuse_ladder_rung`, `tsct.py`'s projectors and
+storage ladder, `model/export.py`'s `mxfp4` mode) with their tests — the
+twenty lines above are now the code's behaviour, not a plan.
 
 **The forward never materialises `d·f`.** `tsct.py:681` computes
 `y = ((x @ u) * s) @ v` in the factor dtype with FP32 accumulate. That is the
@@ -110,10 +114,15 @@ Proved in Lean 4 (core + Std, no Mathlib), over `Rat`/`LinearOrderedField`:
 2. **Per-rank scales dominate one shared scale** (the reason `diag(s)` exists).
 3. **Term stacking cannot hurt** (triangle inequality on the Frobenius norm) —
    this is what licenses the residual branch in §6.3.
-4. **Capacity.** The number of distinct ternary rank-1 matrices is `3^(d+f−1)`
-   — the honest limit on "how many function shapes one bank can store", and the
-   arithmetic that stops the "1.06B stored = 23B dense" claim from being read as
-   an information-capacity claim.
+4. **Capacity.** The number of DISTINCT nonzero ternary rank-1 matrices is
+   `(3^d − 1)(3^f − 1)/2`, plus the zero matrix — the honest limit on "how many
+   function shapes one bank can store". **This corrects an error in the first
+   draft of this spec, which claimed `3^(d+f−1)`**: that figure is right only at
+   `d = 1` (or `f = 1`); at `d = f = 2` the true count is 33 against `3^3 = 27`,
+   because the pair `(−u,−v)` is a 2-to-1 fibre on the NONZERO factors while the
+   zero matrix absorbs `3^d + 3^f − 1` address pairs. The Lean file proves the
+   fibre structure and the partition `3^(d+f) = 2·((3^d−1)(3^f−1)/2) +
+   (3^d+3^f−1)` rather than restating the false identity.
 
 **What Lean does not prove, and must not be reported as proved:** that a
 ternary-trained model reaches a given BPB; that the STE gradient is unbiased
