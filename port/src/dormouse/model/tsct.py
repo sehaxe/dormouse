@@ -588,6 +588,7 @@ class TSCTLinear(nn.Module):
         act_group: int = 0,
         attn_path: bool = False,
         device: torch.device | str = "cpu",
+        weight_std: float | None = None,
     ) -> None:
         super().__init__()
         if rank > min(in_features, out_features):
@@ -605,9 +606,20 @@ class TSCTLinear(nn.Module):
         # unit-ish output scale at any width, which matters because ReZero's
         # residual_scale is initialised to 1.0 (not 0 — at 0 the block body
         # gets no gradient at all, the 2026-09-27 burn bug).
+        # `weight_std` REPLACES that scale when the call site has a denser
+        # contract (the transformer block: the dense arm's `nn.init.normal_`).
+        # With `u ~ N(0, 1/sqrt(in))`, `s = 1` and `v ~ N(0, weight_std·sqrt(in/rank))`
+        # each entry of `U diag(s) V` is a sum of `rank` products, std
+        # `sqrt(rank)·(1/sqrt(in))·weight_std·sqrt(in/rank) = weight_std`.
         self.u = nn.Parameter(init_u(in_features, rank, device))
         self.s = nn.Parameter(torch.ones(rank, device=device))
-        self.v = nn.Parameter(torch.randn(rank, out_features, device=device) / math.sqrt(rank))
+        if weight_std is None:
+            v = torch.randn(rank, out_features, device=device) / math.sqrt(rank)
+        else:
+            v = torch.randn(rank, out_features, device=device) * (
+                weight_std * math.sqrt(in_features / rank)
+            )
+        self.v = nn.Parameter(v)
         self.bias = nn.Parameter(torch.zeros(out_features, device=device)) if bias else None
         #: The compressed-forward sprint's switch (`factor_qat_project`): the
         #: forward reads quantized factors with STE while the masters stay

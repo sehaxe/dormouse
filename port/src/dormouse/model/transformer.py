@@ -222,6 +222,14 @@ class TransformerBlock(nn.Module):
         #: always made.
         self.act_qat = cfg.act_qat
         self.r_gate = self.r_down = 0
+        #: The dense arm's init contract (`nn.init.normal_` below): every
+        #: projection N(0, 0.02), then the two writes into the residual stream
+        #: shrunk by sqrt(2·L). The `TSCTLinear`s read the SAME numbers as their
+        #: composed `U·diag(s)·V` entry std, so a fresh factorised block writes
+        #: the dense gated block's distribution — without that the A/B would
+        #: measure init scale (13.3x at the live shape), not rank-64
+        #: factorisation.
+        std = 0.02
         if self.ffn_gated:
             # The runtime seam a hand-built config reaches, the same rule
             # `config.validate_ffn` applies on the loader path: the gated bill
@@ -252,9 +260,11 @@ class TransformerBlock(nn.Module):
                     factor_qat_alpha=cfg.factor_qat_alpha,
                     device=device,
                 )
-                self.gate_proj = TSCTLinear(d, ffn, self.r_gate, **kw)
-                self.up_proj = TSCTLinear(d, ffn, self.r_gate, **kw)
-                self.fc2 = TSCTLinear(ffn, d, self.r_down, **kw)
+                self.gate_proj = TSCTLinear(d, ffn, self.r_gate, weight_std=std, **kw)
+                self.up_proj = TSCTLinear(d, ffn, self.r_gate, weight_std=std, **kw)
+                self.fc2 = TSCTLinear(
+                    ffn, d, self.r_down, weight_std=std / math.sqrt(2 * n_layers), **kw
+                )
             else:
                 self.gate_proj = nn.Linear(d, ffn, bias=False, device=device)
                 self.up_proj = nn.Linear(d, ffn, bias=False, device=device)
@@ -292,7 +302,6 @@ class TransformerBlock(nn.Module):
         # shrunk by sqrt(2·L) so the stream does not grow with depth. LayerNorm
         # keeps torch's (weight=1, bias=0), and the embedding is the port's
         # shared one, not re-drawn.
-        std = 0.02
         nn.init.normal_(self.qkv.weight, std=std)
         if self.ffn_gated and not self.ffn_tsct:
             nn.init.normal_(self.gate_proj.weight, std=std)

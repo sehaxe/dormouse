@@ -17,7 +17,10 @@ c. rank 64 is `3·(d·r + r + r·f)` per FFN, hand-computed, at the live 275M
 d. flag OFF is bit-identical to the HEAD fixture (`names`, RNG order, logits);
 e. a rank-1 FFN whose output is arithmetic written in this file;
 f. no host sync in the forward, and every factor name is one `stiefel_qr`
-   retracts (`tsct.is_factor_key`), so the trainer's retraction composes.
+   retracts (`tsct.is_factor_key`), so the trainer's retraction composes;
+h. a fresh tsct block writes the DENSE gated block's distribution at the live
+   shape (FFN write std and last-block output std within 5%): without it the
+   running A/B measures init scale (13.3x), not rank-64 factorisation.
 """
 
 from __future__ import annotations
@@ -285,6 +288,77 @@ def test_no_host_sync_in_the_tsct_forward_or_backward(monkeypatch):
         monkeypatch.setattr(torch.Tensor, name, boom)
     _, loss, _ = model(x, x)
     loss.backward()
+
+
+# ---------------------------------------------------------------------------
+# h. the init is matched to the dense gated arm (the A/B's control)
+# ---------------------------------------------------------------------------
+
+
+def _init_stds(model: DormouseModel, ids: torch.Tensor, monkeypatch) -> tuple[float, float]:
+    """(last block's FFN write std, last block's output std) of one FRESH model.
+
+    The write is `_ffn`'s return, captured by wrapping the block method the
+    real forward calls (hooking `fc2` would miss the tag: `_qmm` calls
+    `mm_mixed`, not the module). The write std is POOLED over the whole stack:
+    one block's `64×2848` factor draw alone swings ±8% on sampling noise, while
+    the pooled estimate is the block's scale (three seeds: 0.999–1.024x).
+    """
+    writes: list[torch.Tensor] = []
+    outputs: list[torch.Tensor] = []
+    orig = TransformerBlock._ffn
+
+    def rec(self, h2, counters=None):
+        out = orig(self, h2, counters)
+        writes.append(out.detach().float())
+        return out
+
+    monkeypatch.setattr(TransformerBlock, "_ffn", rec)
+    handle = model.transformer_blocks[-1].register_forward_hook(
+        lambda _m, _i, out: outputs.append(out.detach().float())
+    )
+    model.eval()
+    try:
+        with torch.no_grad():
+            model(ids, ids)
+    finally:
+        handle.remove()
+    return torch.cat(writes).std().item(), outputs[0].std().item()
+
+
+def test_tsct_init_matches_the_dense_gated_arm(monkeypatch):
+    """GATE: both arms of the 275M A/B start from the same FFN write scale.
+
+    The dense arm's contract is `nn.init.normal_(w, 0.02)` on gate/up and
+    `0.02/sqrt(2L)` on the write. The tsct arm must produce the SAME composed
+    `U·diag(s)·V` entry std — it does that through `weight_std`, since `u` and
+    `s` keep their shapes/scheme. LIVE shape: the two presets as they ship.
+
+    Both stds are computed from two freshly built models, never recorded.
+    """
+    torch.manual_seed(1234)
+    dense = DormouseModel(dataclasses.replace(load_preset("arch_dense275"), bf16=False))
+    torch.manual_seed(1234)
+    tsct = DormouseModel(dataclasses.replace(load_preset("arch_tsct275"), bf16=False))
+
+    # The arithmetic `weight_std` relies on: the composed entry std IS the target.
+    with torch.no_grad():
+        blk = tsct.transformer_blocks[0]
+        shrink = 0.02 / (2 * tsct.cfg.n_layers) ** 0.5
+        for mod, target in (("gate_proj", 0.02), ("up_proj", 0.02), ("fc2", shrink)):
+            got = getattr(blk, mod).effective_weight().std().item()
+            assert abs(got / target - 1) <= 0.05, (mod, got, target)
+
+    torch.manual_seed(7)
+    ids = torch.randint(0, 256, (2, 16))
+    dw, do = _init_stds(dense, ids, monkeypatch)
+    tw, to = _init_stds(tsct, ids, monkeypatch)
+    print(
+        f"[tsct] init: FFN write std dense={dw:.4f} tsct={tw:.4f} ({tw / dw:.2f}x); "
+        f"last-block out std dense={do:.4f} tsct={to:.4f} ({to / do:.2f}x)"
+    )
+    assert abs(tw / dw - 1) <= 0.05, f"tsct FFN write {tw:.4f} vs dense {dw:.4f}"
+    assert abs(to / do - 1) <= 0.05, f"tsct last-block out {to:.4f} vs dense {do:.4f}"
 
 
 # ---------------------------------------------------------------------------

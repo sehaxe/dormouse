@@ -96,6 +96,37 @@ Measured params: 5,537,792 → 5,591,040 per layer (+0.96% at align-64).
   scoring peak plus the 78 MiB accumulator), it is not yet shown to fit.
 - Tests: `port/tests/test_attnres_full.py` (10, CPU).
 
+### T7 — tsct FFN init is matched to the dense gated arm (2026-11-11) — DONE
+- Defect (adversarial review, reproduced): `TransformerBlock.__init__` skips
+  the dense `nn.init.normal_` for the tsct branch and substituted nothing, so
+  `TSCTLinear`'s unit-scale scheme (`u ~ N(0,1/√in)`, `s = 1`,
+  `v ~ N(0,1/√rank)`, the KDA loop's contract) initialised the 275M arm. At the
+  live shape the FFN write was **13.3x** the control's — the A/B would have
+  measured init scale, not rank-64 factorisation.
+- Fix: `TSCTLinear(weight_std=σ)` gives the composed `U·diag(s)·V` entry std
+  exactly `σ` (`u ~ N(0,1/√in)`, `s = 1`, `v ~ N(0, σ·√(in/rank))`, since
+  `√r·(1/√in)·σ√(in/r) = σ`). The block passes the dense arm's own numbers:
+  `0.02` for gate/up, `0.02/√(2L)` for the write. Default `None` keeps the
+  old scheme bit for bit (same draw shape, same RNG order; the default path
+  still DIVIDES by `√rank`, a multiply would have moved the low bits and
+  failed the four hash-pinned tsct/off gates).
+- Measured (fp32, `configs/arch_{dense,tsct}275.toml`, b2×t16, seed 1234,
+  `/tmp/opencode/probe_init.py`):
+
+  | | dense | tsct before | tsct after |
+  |---|---|---|---|
+  | FFN write std | 0.0458 | 0.6101 (13.32x) | 0.0458 (1.00x) |
+  | last-block out std | 1.0253 | 2.7064 (2.64x) | 1.0257 (1.00x) |
+
+- GATE (fails without the fix): `test_tsct_init_matches_the_dense_gated_arm`
+  builds both presets fresh and asserts the pooled FFN write std and the
+  last-block output std are within 5% (pooled over the stack: one block's
+  `64×2848` draw alone swings ±8% on sampling noise, three seeds 0.999–1.024x).
+- Nothing else moved: flag OFF still bit-identical to
+  `tests/fixtures/transformer_off_prechange.pt`; full-rank reparameterisation
+  still `9.5e-07`; `test_tsct2`/`test_tsct_packed`/`test_ffn_form`/
+  `test_block_form` bit-identical gates green.
+
 ## A/B protocol (after T1 lands, GPU is free)
 120 MB / 120M bytes, 3 seeds, arms: `control` (GELU 4d) vs `gated_silu`
 (2.67d) vs `gated_situ` (2.67d). KEEP a gated arm only if it is ≥0.01 BPB better
