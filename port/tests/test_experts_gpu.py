@@ -41,7 +41,7 @@ def _routing(moe: SparseMoE, x: torch.Tensor, seed: int = 0):
     return index, weight / weight.sum(dim=-1, keepdim=True)
 
 
-@pytest.mark.parametrize("bf16,bound", [(False, 1e-5), (True, 2e-3)])
+@pytest.mark.parametrize("bf16,bound", [(False, 1e-5), (True, 1e-2)])
 def test_padded_and_naive_agree_on_the_same_routing(bf16, bound):
     moe = _moe(bf16=bf16)
     x = torch.randn(64, 64, device=DEV)
@@ -54,6 +54,11 @@ def test_padded_and_naive_agree_on_the_same_routing(bf16, bound):
     d = (padded - naive).detach().abs()
     scale = float(naive.detach().abs().max())
     m = {"max_abs": float(d.max()), "max_rel": float(d.max()) / scale, "scale": scale}
+    # bf16's bound is 1e-2 since 2026-11-10: the bank applies the router weight in
+    # rank space (`SparseMoE._bank_dispatch`), i.e. one extra bf16 rounding the
+    # loop does in fp32 after the GEMM. Measured 4.7e-3 there, and
+    # `tests/test_moe_batched.py` gate (a4) shows it is bf16 noise (the bank is
+    # 0.8-0.9x the loop's OWN error against float64).
     print(f"[moe parity] bf16={bf16} E={moe.n_experts} rows={x.shape[0]} dropped={dropped} {m}")
     assert m["max_rel"] <= bound, f"{m} exceeds {bound}"
 

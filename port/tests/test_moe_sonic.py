@@ -522,8 +522,13 @@ def test_the_bf16_seam_arms_agree():
     """Gate (f): padded vs naive on the same bf16 rows and banks.
 
     `_triton_dispatch` is CUDA-only (the card gate below covers it); on CPU the
-    two arms that can run must agree to the file's bf16 bound (2e-3, two
-    rounding orders: batched `bmm` vs per-expert matmul). The max is printed.
+    two arms that can run must agree to the file's bf16 bound. The bound moved
+    from 2e-3 to 1e-2 on 2026-11-10 with the router-weight layout
+    (`SparseMoE._bank_dispatch` scales `h` in rank space instead of a `[n·k, f]`
+    fp32 product, so the bank rounds `h·w` once in bf16 where the loop rounds
+    after the GEMM in fp32). Measured here 4.7e-3, and
+    `tests/test_moe_batched.py`'s gate (a4) proves that is bf16 noise: against a
+    float64 reference the bank is 0.8-0.9x the loop's OWN error.
     """
     moe, x, weight, index, order, keep, _d = _cpu_setup(bf16=True, capacity=1.0)
     dt = moe._bank_dtype()
@@ -531,8 +536,8 @@ def test_the_bf16_seam_arms_agree():
     ref = moe._naive_dispatch(xb, weight, index, order, keep, Counters())
     pad = moe._padded_dispatch(xb, weight, index, order, keep)
     rel = _rel(pad, ref)
-    print(f"[bf16 arms] padded vs naive rows={int(keep.sum())} max_rel={rel:.3e} bound=2e-3")
-    assert rel <= 2e-3, f"{rel:.3e} exceeds the bf16 bound"
+    print(f"[bf16 arms] padded vs naive rows={int(keep.sum())} max_rel={rel:.3e} bound=1e-2")
+    assert rel <= 1e-2, f"{rel:.3e} exceeds the bf16 bound"
 
 
 def test_the_fused_abi_is_the_gather_the_pass_already_does():
@@ -863,9 +868,15 @@ def test_the_bf16_seam_arms_agree_on_the_card():
     rel_pad, rel_tri = _rel(pad, ref), _rel(tri, ref)
     print(
         f"[bf16 seam on the card] bf16={bf16} rows={int(keep.sum())} "
-        f"padded={rel_pad:.3e} triton={rel_tri:.3e} bound=2e-3"
+        f"padded={rel_pad:.3e} triton={rel_tri:.3e} bounds=1e-2/2e-3"
     )
-    assert rel_pad <= 2e-3 and rel_tri <= 2e-3
+    # The padded arm's bound is 1e-2 since 2026-11-10 (rank-space router weight:
+    # one extra bf16 rounding the loop does in fp32 after the GEMM, measured
+    # 4.7e-3). `triton` still takes the weight in fp32 after the GEMM, so its
+    # bound stays the file's 2e-3 — loosening a bound that did not move is how a
+    # real regression hides.
+    assert rel_pad <= 1e-2, f"padded {rel_pad:.3e} exceeds 1e-2"
+    assert rel_tri <= 2e-3, f"triton {rel_tri:.3e} exceeds 2e-3"
 
 
 # --------------------------------------------------------------------------

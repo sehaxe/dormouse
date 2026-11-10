@@ -108,9 +108,20 @@ class _BankGrab(TorchFunctionMode):
 
 
 # --------------------------------------------------------------- a. parity
-@pytest.mark.parametrize("bf16,bound", [(False, 1e-6), (True, 1e-6)])
+#: The layout's price, MEASURED at this fixture and printed below: the bank now
+#: applies the router weight in the GEMM's dtype (rank space) instead of
+#: scaling the `[n·k, f]` fp32 output, so it is no longer bit-identical to the
+#: loop in a bf16 run. Measured here: fp32 max|Δ| 1.43e-6 absolute / 2.4e-7
+#: relative (1.08e-6 against fp64, the loop's own 7.6e-7); bf16 4.7e-3 relative
+#: — and 0.8× the loop's own fp64 error, i.e. the difference is bf16 rounding,
+#: not a wiring change. The bounds are the contract; a fp32-exact match after
+#: the GEMM is the very buffer the layout removes.
+PARITY_BOUND = {False: 1e-5, True: 1e-2}
+
+
 @pytest.mark.parametrize("capacity", [0.0, 1.0])
-def test_batched_matches_the_current_path(bf16, bound, capacity):
+@pytest.mark.parametrize("bf16", [False, True])
+def test_batched_matches_the_current_path(bf16, capacity):
     """Gate (a): the bank and the loop on the same rows, dtype and cap.
 
     `capacity=1.0` also exercises the drop path: both arms get the same `keep`,
@@ -124,12 +135,78 @@ def test_batched_matches_the_current_path(bf16, bound, capacity):
     with torch.no_grad():
         batched = moe._batched_dispatch(x, weight, index, order, keep)
         loop = moe._naive_dispatch(x, weight, index, order, keep, Counters())
+    bound = PARITY_BOUND[bf16]
     delta = float((batched - loop).abs().max())
+    rel = _rel(batched, loop)
     print(
         f"[parity] bf16={bf16} capacity={capacity} E={moe.n_experts} "
-        f"rows={x.shape[0]} max|Δ|={delta:.3e} bound={bound:.0e}"
+        f"rows={x.shape[0]} max|Δ|={delta:.3e} rel={rel:.3e} bound={bound:.0e}"
     )
-    assert delta <= bound, f"{delta:.3e} exceeds {bound:.0e}"
+    assert rel <= bound, f"{rel:.3e} exceeds {bound:.0e}"
+
+
+# ------------------------------------------- a2. the layout, not just the bits
+class _WideMul(TorchFunctionMode):
+    """Flag any `mul` whose operand is one `[rows, f]` fp32 buffer."""
+
+    def __init__(self, rows: int, f: int) -> None:
+        super().__init__()
+        self.shape = (rows, f)
+        self.hits: list[tuple[str, tuple]] = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        name = getattr(func, "__name__", "")
+        if name in ("mul", "mul_", "__mul__", "__rmul__"):
+            for a in args:
+                if (
+                    isinstance(a, torch.Tensor)
+                    and a.dtype == torch.float32
+                    and tuple(a.shape) == self.shape
+                ):
+                    self.hits.append((name, tuple(a.shape)))
+        return func(*args, **(kwargs or {}))
+
+
+def test_the_router_weight_rides_the_bank_layout():
+    """Gate (a2): the weight is applied in rank space — no `[n·k, f]` fp32 product.
+
+    The defect this pins is the BUFFER, not the bits: scaling the gathered
+    output in fp32 needs `4·n·k·f` bytes per layer (327 MB at the b24 /
+    rank-832 / f-1664 arm), which is half of why b16 and b24 OOMed. On the same
+    routing the rank-space form must still equal the loop within its dtype
+    bound; gate (e) owns the exactly-zero half (padding and dumped rows).
+    """
+    torch.manual_seed(12)
+    moe = _moe(bf16=False, moe_capacity=1.0, moe_kernel="batched")
+    x = torch.randn(48, moe.d)
+    index, weight = _routing(moe, x)
+    order, keep, _ = moe._permute(index)
+    n, k = index.shape
+    spy = _WideMul(rows=n * k, f=moe.f)
+    with torch.no_grad(), spy:
+        out = moe._batched_dispatch(x, weight, index, order, keep)
+    with torch.no_grad():
+        loop = moe._naive_dispatch(x, weight, index, order, keep, Counters())
+    print(
+        f"[rank-space w] rows={n * k} f={moe.f} wide_fp32_muls={len(spy.hits)} "
+        f"rel={_rel(out, loop):.3e}"
+    )
+    assert spy.hits == [], f"the wide fp32 product is back: {spy.hits}"
+    assert _rel(out, loop) <= PARITY_BOUND[False]
+
+
+def test_the_bank_layout_is_counted():
+    """Gate (a3): the layout is COUNTED once per dispatch (ADR-0011)."""
+    torch.manual_seed(14)
+    moe = _moe(moe_capacity=0.0, moe_kernel="batched")
+    x = torch.randn(32, moe.d)
+    index, weight = _routing(moe, x)
+    counters = Counters()
+    with torch.no_grad():
+        moe._dispatch(x, weight, index, counters)
+    print(f"[counted] {dict(counters)}")
+    assert counters["moe_w_in_bank"] == 1
+    assert counters["moe_batched_calls"] == 1
 
 
 # --------------------------------------------- b. float64 reference, gradients
@@ -201,6 +278,30 @@ def test_batched_matches_a_float64_per_expert_reference():
     print(f"[fp64] worst={worst:.3e} bound=1e-5 {shown}")
     assert worst <= 1e-5, f"{worst:.3e} exceeds 1e-5"
     assert keep.all(), "the dropless reference must keep every assignment"
+
+
+def test_the_bf16_bank_is_no_noisier_than_the_loop():
+    """Gate (a4): the bf16 delta in gate (a) is rounding, not a wiring defect.
+
+    A bf16-vs-bf16 delta cannot separate a layout change from bf16's own
+    rounding — both arms round. So measure each arm against the float64
+    reference and require the bank to be NO WORSE. Measured 0.81x the loop's
+    own error: the 4.7e-3 relative difference in gate (a) sits inside bf16
+    noise. A wiring defect shows up as a ratio above 1.
+    """
+    torch.manual_seed(13)
+    moe = _moe(bf16=True, moe_capacity=0.0, moe_kernel="batched")
+    x = torch.randn(64, moe.d)
+    index, weight = _routing(moe, x)
+    order, keep, _ = moe._permute(index)
+    with torch.no_grad():
+        bank = moe._batched_dispatch(x, weight, index, order, keep)
+        loop = moe._naive_dispatch(x, weight, index, order, keep, Counters())
+    ref, _, _ = _fp64_reference(moe, x, weight, index, order, torch.ones(64, moe.f))
+    e_bank = float((bank.double() - ref).abs().max())
+    e_loop = float((loop.double() - ref).abs().max())
+    print(f"[bf16 quality] vs fp64 bank={e_bank:.3e} loop={e_loop:.3e} ratio={e_bank / e_loop:.2f}")
+    assert e_bank <= e_loop, f"the bank is {e_bank / e_loop:.2f}x the loop's own fp64 error"
 
 
 # -------------------------------------------------- c. unequal block sizes

@@ -3115,25 +3115,33 @@ class SparseMoE(nn.Module):
         # D2H read and a row count that changes with the routing — neither is
         # legal in a CUDA graph (measured: `t[mask]` aborts a capture, and a
         # graph replays the FIRST call's shapes). `n · k` assignments is the
-        # static bound, and a dropped row is routed to one dump slot that no
-        # kept row can own (`e·cap`) and multiplied by the constant 0 mask, so
-        # it contributes exactly 0.0 to the scatter and exactly 0 to both
-        # gradients — the eager semantics, not an approximation of them.
+        # static bound, and a dropped row is routed to a slot no kept row can
+        # own (`e·cap` in the bank lookup, token row `n` in the scatter) with
+        # the constant-0 router weight, so it contributes exactly 0.0 to the
+        # output and exactly 0 to both gradients — the eager semantics, not an
+        # approximation of them.
         owner = order // k  # the token each assignment belongs to
         # The padded-bank slot of each sorted row: expert-major, capacity-padded.
         starts = torch.cumsum(counts, 0) - counts
         eid = flat_e[order]
         pos = torch.arange(n * k, device=index.device) - starts[eid]
         dump = e * cap
-        if keep is None:
-            # `_permute` always returns a mask; a direct caller may omit it, and
-            # `None` then means "every assignment is kept" (the pre-cap
-            # behaviour), which is the only reading that keeps the two arms'
-            # row sets equal.
+        if counters is not None:
+            # COUNTED: the bank rows this pass RUNS. `dump = E·cap` is a Python int
+            # (a shape, not a read), so the capacity waste is a number on the log
+            # line: at `capacity=2.0` it is 2·topk·tokens, at dropless it is
+            # `E · max group`.
+            counters.count("moe_bank_rows", dump)
+        # `_permute` always returns a mask; a direct caller may omit it, and
+        # `None` then means "every assignment is kept" (the pre-cap behaviour),
+        # which is the only reading that keeps the two arms' row sets equal. It
+        # also selects the STATIC scatter (`owner` directly, no `where`).
+        static_keep = keep is None
+        if static_keep:
             keep = torch.ones_like(owner, dtype=torch.bool)
         slots = torch.where(keep, eid * cap + pos, dump)
         # Zero-filled, not `empty`: a row past capacity is never read, but a
-        # zero row keeps the bank finite, and inf-garbage × 0 is NaN in the
+        # zero row keeps the bank finite, and inf-garbage x 0 is NaN in the
         # backward (the spike measured exactly that — `probe_moe_variants.py`).
         # The bank the GEMM sees is EXACTLY the eager `[e, cap, ·]` — the dump
         # row is sliced off, so the expert pass keeps its shape, its kernel and
@@ -3160,22 +3168,46 @@ class SparseMoE(nn.Module):
             g = torch.bmm(bank, gate_u) * gate_s[:, None, :]
             u = torch.bmm(bank, up_u) * up_s[:, None, :]
         h = F.silu(g) * u if self._glu is None else self._glu(g, u)
+        # THE ROUTER WEIGHT GOES INTO RANK SPACE, before the wide `@ v`. The old
+        # tail scaled the `[n·k, f]` OUTPUT in fp32, which materializes a
+        # `4·n·k·f` byte buffer per layer just to scale ROWS (at b24, rank 832,
+        # f 1664: 327 MB), on top of its own cast. Here `w_bank` is `[dump + 1]`
+        # with the constant 0 at the dump slot, so a dropped assignment's bank
+        # row is exactly 0 and its `@ v` is exactly 0, and the wide write is a
+        # `[E, cap, rank]` multiply in the GEMM's own dtype — half the bytes the
+        # fp32 `[n·k, f]` product took at this sizing (f = 2·rank), with no
+        # second pass over it and no fp32 cast of its input.
+        #
+        # NUMERICS: the multiply now happens in the GEMM's dtype instead of in
+        # fp32 after the GEMM, so the bank is no longer bit-identical to the
+        # naive loop in a bf16 run. That is the price of the layout, and it is
+        # MEASURED, not assumed: `tests/test_moe_batched.py` holds the two
+        # bounds (1e-5 in fp32, 1e-2 relative in bf16) with the delta printed.
+        # A fp32-exact match after the GEMM is exactly the buffer this removes.
+        w = flat_w[order]
+        if not static_keep:
+            # The exact-0 weight a dropped row needs (`keep` is a bool CONSTANT
+            # of the graph, so `dL/dw` there is exactly 0).
+            w = w * keep.to(w.dtype)
+        w_bank = torch.zeros(dump + 1, dtype=w.dtype, device=x.device)
+        w_bank.index_put_((slots,), w)
+        h = h * w_bank.narrow(0, 0, dump).view(e, cap, 1).to(dt)
         y = torch.bmm(h, v).reshape(dump, self.f)
-        y = torch.cat((y, torch.zeros(1, self.f, dtype=dt, device=x.device)))
-        y = y[slots]  # [n·k, f], the dumped rows read the constant zero
-        # The router weight is applied in fp32, exactly where the naive path
-        # applies it: a bf16 multiply would put a 2^-8 relative step between the
-        # two arms that the parity gate could not tell from a wiring error.
-        # `keep` is a bool CONSTANT of the graph, so a dropped row's weight is
-        # exactly 0 and `dL/dw` there is exactly 0 — the eager gradient.
-        # ponytail: it may move to rank-space (w ⊙ h before `@ v`, the spike's
-        # −8 % on the expert pass) once a b1-shape profile says the [R, f]
-        # multiply matters.
-        w = flat_w[order].unsqueeze(-1) * keep.to(flat_w.dtype).unsqueeze(-1)
-        y = y.to(torch.float32) * w
-        out = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
-        out.index_add_(0, owner, y)
-        return out
+        # The dumped rows read a REAL bank row (clamped) and are scattered to
+        # token row `n`, which the return slices off: their value is discarded
+        # and their gradient is exactly 0 (the slice's backward zeroes that
+        # row), so the `[dump + 1, f]` zero-row `cat` the old tail needed to make
+        # the lookup index-legal is gone too.
+        rows = slots if static_keep else slots.clamp(max=dump - 1)
+        y = y[rows]  # [n·k, f], in the GEMM's dtype
+        # The ONE fp32 buffer the exact-sum contract needs: the accumulation
+        # target (row `n` is the sentinel and is sliced off below).
+        out = torch.zeros(n + 1, self.f, dtype=torch.float32, device=x.device)
+        dest = owner if static_keep else torch.where(keep, owner, n)
+        out.index_add_(0, dest, y.to(torch.float32))
+        if counters is not None:
+            counters.count("moe_w_in_bank")
+        return out[:n]
 
     @torch.compiler.disable
     def _naive_dispatch(

@@ -88,8 +88,15 @@ IDS = torch.arange(2 * 64).reshape(2, 64) * 7 % 256
 
 #: Captured on clean `907b3b5` BEFORE the field existed (the first pin script in
 #: this worktree): params, sha256(logits+loss+every grad), sha256(state dict).
+#: RE-CAPTURED 2026-11-10 for `SparseMoE._bank_dispatch`'s router-weight layout
+#: (the weight is applied in rank space before `@ v` instead of scaling a
+#: `[n·k, f]` fp32 product). That is a deliberate change to the OFF forward's
+#: rounding, so the GRAD digest moved (`state` and `loss` did not: no init and no
+#: logits bit moved). The semantics the change must keep are gated in
+#: `tests/test_moe_batched.py` (1e-5 fp32 / 1e-2 relative bf16 vs the loop, plus
+#: `moe_w_in_bank`) — this pin's job is to catch FUTURE drift.
 GOLDEN_PARAMS = 55_025
-GOLDEN_GRAD = "6dc65f98c70bbba3ba3f6be0477530344cc634446d35b21af20ead8cf027d6e0"
+GOLDEN_GRAD = "256f0dde88fc62d086cf906a6268e30fa73756586ac3d8822451dc05a3df9227"
 GOLDEN_STATE = "537126066f1b70c4f40b05773be323a27221690e74a6cfd1040408493a18460b"
 GOLDEN_LOSS = 5.939486026763916
 

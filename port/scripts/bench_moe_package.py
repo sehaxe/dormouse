@@ -15,17 +15,27 @@ ARMS (each `--steps` optimizer steps, median + min, same seed, the live recipe):
                  dense — this is the arm that separates "the bank costs" from
                  "the KDA block costs"
     bank         block_form="kda", `ffn_form="bank"`, n_experts=8, topk=2,
-                 capacity=2.0, rank=832 (=d_model), d_ffn=1664 — 299.2M total,
-                 99.7M active per token
+                 rank=832 (=d_model), d_ffn=1664 — 299.2M total, 99.7M active
+                 per token. Dispatch: `moe_kernel="batched"` + `moe_capacity=0.0`
+                 (DROPLESS: the cap is this batch's largest group, not
+                 `capacity x the mean`), and `--moe-capacities 1.0,1.25,2.0`
+                 sweeps the capacity rule so the waste is a number per row.
 
 WHY `rank` IS THE SIZING KNOB, NOT `d_ffn`. The bank's expert is a rank-`rank`
 dual-latent GLU plus ONE shared `down [f, d]`; the shared down and the shared
 expert are always on, so total/active is NOT `E/topk`. At the preset's `rank=64`
-the ratio is 1.02-1.06 over every `d_ffn` (a 299M-total bank would be ~280M
-ACTIVE), and no `d_ffn` reaches 299M/100M. At `rank=d_model=832` nine expert
-copies run against three active ones and the ratio is 3.0 by construction, which
-is what makes `299M total / 100M active` expressible at all. `--check` asserts
-the two counts without a GPU.
+the ratio is 1.34 over every `d_ffn` (a 299M-total bank would be 222M ACTIVE),
+and no `d_ffn` reaches 299M/100M. At `rank=d_model=832` nine expert copies run
+against three active ones and the ratio is 3.0 by construction, which is what
+makes `299M total / 100M active` expressible at all. `--check` asserts the two
+counts and `--rank-scan` prints the whole table without a GPU.
+
+TWO LAYOUT FIXES THIS HARNESS NOW MEASURES (2026-11-10, after the first run's
+b24/b16 OOM): the bank applies the router weight in RANK SPACE before `@ v`
+instead of scaling a `[n·k, f]` fp32 product, and the padded bank's
+`capacity x mean` rows are replaced by the dropless arm's `largest group` cap.
+Both are layout changes with identical math, gated in
+`tests/test_moe_batched.py` (1e-5 fp32, 1e-2 relative bf16).
 
 PROTOCOL. Real corpus bytes (`data_local/best/fwedu_train.bin`, the flat
 `ByteStream` the trainer reads, not a mix plan), seq 1024, grad_accum 1, the
@@ -94,12 +104,18 @@ KDA = {
     "bf16": True,
 }
 #: 299.15M total / 99.67M active, counted (`--check` pins both).
+#: `moe_kernel="batched"` + `moe_capacity=0.0` is the DROPLESS bank: its cap is
+#: THIS batch's largest group, not `capacity x the mean`, so no expert computes
+#: rows the router did not assign. The 2026-11-10 OOM was measured with the
+#: padded arm at `capacity=2.0` (2x the mean) on top of the old `[n·k, f]` fp32
+#: router-weight product; both are gone (`SparseMoE._bank_dispatch`).
 BANK = dict(
     KDA,
     ffn_form="bank",
     n_experts=8,
     moe_topk=2,
-    moe_capacity=2.0,
+    moe_kernel="batched",
+    moe_capacity=0.0,
     rank=832,
     d_ffn=1664,
     shared_rank=192,
@@ -163,6 +179,12 @@ def _free(device: torch.device) -> None:
         torch.cuda.empty_cache()
 
 
+def _graphs() -> int:
+    """`torch.compile`'s unique-graph count — a recompile per step shows up here."""
+    stats = torch._dynamo.utils.counters.get("stats") or {}
+    return int(stats.get("unique_graphs", 0))
+
+
 def _optimizer(model: torch.nn.Module, run) -> MixOptimizer:
     c = run.train
     return MixOptimizer(
@@ -196,6 +218,7 @@ def measure(name: str, overrides: dict, batch: int, *, device, steps: int, warm:
         model = DormouseModel(run.model, device=device).train()
         total, active = active_params(model)
         opt = _optimizer(model, run)
+        graphs0 = _graphs()
         target: torch.nn.Module = model
         if run.train.torch_compile:
             target = torch.compile(model, dynamic=False, mode="max-autotune-no-cudagraphs")
@@ -248,6 +271,7 @@ def measure(name: str, overrides: dict, batch: int, *, device, steps: int, warm:
             steady_gib=torch.cuda.memory_allocated(device) / 2**30,
             bytes_per_step=batch * SEQ,
             counters=dict(counter),
+            graphs=_graphs() - graphs0,
         )
         stream.close()
         del opt, target
@@ -269,20 +293,20 @@ def measure(name: str, overrides: dict, batch: int, *, device, steps: int, warm:
 def _table(rows: list[dict]) -> str:
     head = (
         "| arm | batch | ms/step (median) | ms/step (min) | peak GiB | steady GiB "
-        "| B/step | params total | params active |"
+        "| B/step | params total | params active | graphs |"
     )
-    out = [head, "|---|---|---|---|---|---|---|---|---|"]
+    out = [head, "|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         if r["status"] != "ok":
             out.append(
                 f"| {r['arm']} | {r['batch']} | {r['status']} | — | — | — | "
-                f"{r['batch'] * SEQ:,} | — | — |"
+                f"{r['batch'] * SEQ:,} | — | — | — |"
             )
             continue
         out.append(
             f"| {r['arm']} | {r['batch']} | {r['ms_median']:.1f} | {r['ms_min']:.1f} "
             f"| {r['peak_gib']:.2f} | {r['steady_gib']:.2f} | {r['bytes_per_step']:,} "
-            f"| {r['total'] / 1e6:.2f}M | {r['active'] / 1e6:.2f}M |"
+            f"| {r['total'] / 1e6:.2f}M | {r['active'] / 1e6:.2f}M | {r['graphs']} |"
         )
     return "\n".join(out)
 
@@ -382,6 +406,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--check", action="store_true", help="no GPU: assert the two param counts")
     ap.add_argument("--rank-scan", action="store_true", help="no GPU: the sizing table")
+    ap.add_argument(
+        "--moe-kernel",
+        default="batched",
+        choices=("padded", "batched", "triton", "naive"),
+        help="the bank arm's dispatch (default: dropless `batched`)",
+    )
+    ap.add_argument(
+        "--moe-capacities",
+        default="0.0",
+        help="comma list of moe_capacity for the bank arm; 0.0 = DROPLESS",
+    )
     a = ap.parse_args(argv)
 
     if a.check:
@@ -402,6 +437,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"--arms: unknown {unknown}. Known: {', '.join(ARMS)}", file=sys.stderr)
         return 2
     batches = [int(b) for b in a.batch_sizes.split(",") if b.strip()]
+    caps = [float(c) for c in a.moe_capacities.split(",") if c.strip()]
+    #: `(label, model overrides)` — the bank arm expands into one row per capacity
+    #: so a sweep is ONE command and every row names its own cap in the label.
+    plan: list[tuple[str, dict]] = []
+    for name in names:
+        if name != "bank":
+            plan.append((name, ARMS[name]))
+            continue
+        for cap in caps:
+            label = "bank" if cap == 0.0 else f"bank-c{cap:g}"
+            plan.append((label, {**BANK, "moe_kernel": a.moe_kernel, "moe_capacity": cap}))
 
     free_mib = (torch.cuda.mem_get_info()[0] / 2**20) if device.type == "cuda" else 0.0
     print(
@@ -410,12 +456,13 @@ def main(argv: list[str] | None = None) -> int:
         f"steps={a.steps} warm={a.warm} seq={SEQ} seed={a.seed}"
     )
     print(f"corpus {DATA} ({DATA.stat().st_size:,} B); warmup_tokens={WARMUP_TOKENS:,}")
+    print(f"bank: moe_kernel={a.moe_kernel} capacities={caps} (0.0 = dropless)")
     rows: list[dict] = []
     for batch in batches:
-        for name in names:
+        for name, overrides in plan:
             row = measure(
                 name,
-                ARMS[name],
+                overrides,
                 batch,
                 device=device,
                 steps=a.steps,
@@ -428,7 +475,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"[{name} b{batch}] {row['ms_median']:.1f} ms/step (min "
                     f"{row['ms_min']:.1f}) peak {row['peak_gib']:.2f} GiB "
                     f"{row['bytes_per_step'] / (row['ms_median'] / 1e3):,.0f} B/s "
-                    f"params {row['total'] / 1e6:.2f}M/{row['active'] / 1e6:.2f}M",
+                    f"params {row['total'] / 1e6:.2f}M/{row['active'] / 1e6:.2f}M "
+                    f"graphs {row['graphs']}",
                     flush=True,
                 )
                 print(f"  counters {row['counters']}", flush=True)

@@ -5,15 +5,22 @@ Lane `port/`, plan `.bulba/plan.md` §T4. One question, numbers only: does a
 `moe_topk=2`, `moe_capacity=2.0`) cost the same step time and VRAM as the 95M
 dense control, or does it force the batch down?
 
-**Verdict. It forces the batch down.** At 299.15M total / 99.67M active the bank
-**OOMs at both b24 and b16** — the two batches the control runs at 10.80 GiB and
-7.53 GiB — and its largest measured working batch is **12** (b13, b14, b15 and
-b16 OOM); at b12 the bank pays
-**372.6 ms/step against 148.4 ms for the same-block dense control (2.51×) and
-12.60 GiB against 6.15 GiB (2.05×)** for the same 12,288 bytes. The active count
-buys compute, not memory: the bank's 100M active weights still need 3.15× the
-checkpoint state (2.92 vs 1.01 GiB) and 1.9× the activation bytes per batch
-element (0.81 vs 0.43 GiB), for 2.05× the peak at equal batch.
+**Verdict (2026-11-10, after §7 — READ THAT FIRST). The original verdict below
+measured OUR layout, not MoE's physics: the padded bank ran 2× the rows the
+router assigned and materialised two `[·, f]` buffers per layer just to scale
+rows (624 MiB/layer at b24). Both are fixed in `SparseMoE._bank_dispatch` with
+identical math (fp32 2.4e-7 relative, bf16 4.7e-3 relative and 0.92× the
+reference loop's OWN fp64 error), the bench defaults to the dropless arm, and the
+`b24 does not fit` claim is WITHDRAWN pending the re-measure §7.4 — which could
+not run because another lane's 3-seed A/B held `/tmp/dormouse-gpu.lock` for the
+whole window.**
+
+The numbers below stand as the measurement of the PRE-FIX arm (padded,
+`capacity=2.0`, fp32 router-weight product): at 299.15M total / 99.67M active it
+OOMs at b24 and b16 — the batches the control runs at 10.80 GiB and 7.53 GiB —
+and its largest working batch was **12**, where it paid **372.6 ms/step against
+148.4 ms for the same-block dense control (2.51×) and 12.60 GiB against 6.15
+(2.05×)** for the same 12,288 bytes.
 
 Marks: **[M]** measured here, command named · **[C]** arithmetic over [M] inputs ·
 **[S]** inference with the check that settles it.
@@ -180,3 +187,124 @@ every preset runs it".
 * Logs of the four runs: `/tmp/opencode/bench_moe_package*.log` (ephemeral).
 * No model code, no preset and no checkpoint was modified: the arms are config
   overrides built inside the script.
+
+---
+
+## 7. REVISED 2026-11-10 (owner's challenge): two layout wastes, fixed
+
+The numbers in §2 are the arm AS CONFIGURED AND CODED, and both of its costs were
+ours, not the package's:
+
+1. **`moe_capacity=2.0` sized the `[E, cap, ·]` bank to 2× the mean group.** At
+   b24 that is `E·cap = 98,304` rows for `R = n·k = 49,152` assignments, so every
+   expert computed twice the rows the router assigned — by construction
+   (`cap = ceil(capacity·tokens·k/E)`), not by routing skew.
+2. **The router weight was applied to the `[R, f]` output in fp32**, so the pass
+   materialised a `4·R·f` byte buffer per layer purely to scale rows (312 MiB at
+   b24), on top of a bf16 zero-row `cat` of the same size that existed only to
+   make the dump slot index-legal. The code's own `ponytail:` note had already
+   named the fix.
+
+### 7.1 What changed (code, `SparseMoE._bank_dispatch`)
+
+* The weight rides the BANK layout, before `@ v`: `w_bank [E·cap+1]` (exactly 0
+  at the dump slot) → `h * w_bank` in the GEMM's dtype → ONE `bmm(h, v)`. The
+  `[R, f]` fp32 product never exists.
+* The `[E·cap+1, f]` zero-row `cat` is gone: dumped rows gather a clamped bank row
+  and are scattered to token row `n`, which the return slices off. Their value is
+  discarded and their gradient is exactly 0 (the slice's backward zeroes that
+  row), so no zero row is needed and no wide mask multiply is added.
+* The one fp32 buffer that stays is the accumulation target `[n+1, f]` — the
+  exact k-way sum requires it.
+* COUNTED (ADR-0011): `moe_w_in_bank` once per dispatch, and `moe_bank_rows` =
+  `E·cap` — the capacity waste is now a number on the log line.
+* Nothing reads the host: `zeros`/`index_put_`/`clamp`/`where`/`index_select`/
+  `index_add_` are all shape-stable ops the file already uses, and the
+  `keep`-as-mask rule (§2's comment block) is intact — rows are still never
+  compressed, so `t[mask]` never enters the graph.
+
+### 7.2 Parity (measured; `tests/test_moe_batched.py`, CPU)
+
+| gate | fixture | measured | bound |
+|---|---|---|---|
+| bank vs naive, fp32 | 64 rows, d 64, f 128, E 4, k 2, cap 0 & 1.0 | max\|Δ\| **1.431e-06**, rel **2.392e-07** | 1e-5 |
+| bank vs naive, bf16 | same | max\|Δ\| 2.843e-02, rel **4.730e-03** | 1e-2 |
+| bank vs float64, bf16 | same | **1.992e-02 vs the loop's own 2.159e-02 = 0.92×** | ≤ 1× |
+| wide `[R, f]` fp32 `mul` in the dispatch | 48 rows, cap 1.0 | **0 hits**, rel 1.612e-07 | 0 hits |
+| `moe_w_in_bank` per dispatch | 32 rows, dropless | **1** | 1 |
+
+Row 3 is the one that answers "is the bf16 delta a defect": a bf16-vs-bf16
+comparison cannot separate a layout change from bf16's own rounding, so it
+measures each arm against float64. The new bank is 0.81-0.92× the loop's own
+error across two fixtures, i.e. the 4.7e-3 is noise the loop pays too.
+
+The bf16 bound moved 2e-3 → 1e-2 in exactly the gates that compare a
+pre-GEMM-weight arm with a post-GEMM-weight one (`test_moe_batched`,
+`test_moe_sonic` ×2, `test_experts_gpu`, `test_moe_kernel`'s triton-vs-padded;
+`triton`'s own bound stays 2e-3 because its weight is still post-GEMM). Two more
+pins moved and are named here rather than buried:
+
+* `test_moe_buckets`'s one-bucket **bit-equality** became the same dtype bound,
+  and its fixture weight moved off `0.5` — an exact bf16 scaling that would have
+  hidden the difference while `bucketed` still carries the old tail.
+* `test_tsct_packed`'s OFF digest was re-captured (grad moved; **state and loss
+  did not**: no init and no logits bit moved).
+
+### 7.3 The per-layer bill (exact shapes; b24: R 49,152, E·cap 98,304, f 1,664, rank 832, bf16)
+
+| buffer, per layer | before | after |
+|---|---|---|
+| fp32 router-weight product `[R, f]` | 312 MiB | **0** |
+| bf16 zero-row `cat` `[E·cap+1, f]` | 312 MiB | **0** |
+| bf16 `h·w` `[E, cap, rank]` | 0 | 156 MiB (kept: `w`'s gradient) |
+| fp32 scatter source `[R, f]` | 312 MiB | 312 MiB |
+| bank tensors `xg, g, u, h, y` | 936 MiB at cap 12,288 | 936·C/12,288 MiB |
+| fp32 accumulate `[n, f]` | 156 MiB | 156 MiB |
+
+**−468 MiB per layer that no batch size moves** (−234 MiB at b12), plus the 2.0×
+cap's rows. This is a buffer census, not a peak: only part of twelve layers'
+transients is live at once (the measured b12 peak of 12.60 GiB against ~1.6 GiB
+of buffers per layer is the proof), which is why the number that settles the
+question has to come from the run.
+
+### 7.4 The re-measure: BLOCKED by the guard, not skipped
+
+At 12:13-13:00 on 2026-11-10 another lane's 3-seed A/B held the card:
+`scripts/arch_sweep.sh` with `ARMS="gated_silu gated_situ"`, `BATCH=24`,
+`BYTES=120MB` (4,882 steps per arm), wrapped in ONE `scripts/gpu_lock.sh` that
+holds `/tmp/dormouse-gpu.lock` across all six 23-minute arms (~14:30); the card
+sat at 14.1 GiB, PID 897686. The bench was queued behind that lock (relaunched
+twice on this side: once for a code edit after the first queue, once because the
+other lane's driver had queued ahead) and was still waiting when this was
+written; the guard's own `flock -w 1800` would have exited **75 — nothing was
+measured** at ~13:14. Nothing was killed and no guard was bypassed.
+
+Ready to run, in this order (each re-execs itself through `gpu_lock.sh`):
+
+```bash
+uv run --python .venv/bin/python python scripts/bench_moe_package.py \
+    --arms control,bank --batch-sizes 24,16,20 --steps 20 --warm 3
+uv run --python .venv/bin/python python scripts/bench_moe_package.py \
+    --arms bank --batch-sizes 24 --moe-capacities 1.0,1.25,2.0 --steps 20 --warm 3
+```
+
+What it decides: whether the b24 peak now lands under the control's 10.80 GiB
+(the question §0's original verdict answered "no" for the pre-fix arm), and what
+the capacity rule costs per row (`moe_bank_rows` prints the cap actually run).
+
+### 7.5 Follow-ups this lane did not take
+
+* **`_bucketed_dispatch` still has the old tail** (`[n·k, f]` fp32 product and the
+  zero-row `cat`). Same layout, different arm; the OOM was the padded/batched
+  arm, so it is out of this fix's scope and its gate now records the difference.
+* **`_triton_dispatch`'s non-fused route** applies the weight in fp32 after the
+  GEMM through `moe_kernels.combine`; moving it into rank space is a kernel-side
+  change with its own parity gate.
+* The CUDA halves of the adjusted gates (`test_experts_gpu`,
+  `test_moe_kernel`'s triton pair, `test_moe_sonic`'s card gate) were **not
+  re-run** — the card was held — so their new bounds are the same measured
+  4.7e-3 argument, not a local observation.
+* The fp32 scatter source `[R, f]` (312 MiB/layer at b24) is now the largest
+  buffer in the pass. A chunked `index_add_` (static row blocks, ~6× fewer bytes)
+  would cut it further; it is not taken here because the two named wastes were
+  the fix and the peak is unmeasured, so there is no evidence it is needed.

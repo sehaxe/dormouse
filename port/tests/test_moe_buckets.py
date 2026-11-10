@@ -9,8 +9,12 @@ bucket holds at most `MOE_BUCKET_ROWS` rows (an expert past it gets its own).
 
 What is claimed here, in the order the task lists it:
 
-a. one bucket (uniform routing) is bit-identical to the `batched` arm, dropless
-   and capacity-bound;
+a. one bucket (uniform routing) is the `batched` arm's arithmetic to the dtype's
+   bound, dropless and capacity-bound. It was BIT-identical until 2026-11-10:
+   the batched arm now applies the router weight in rank space (the OOM fix in
+   `SparseMoE._bank_dispatch`), so the two tails round `h·w` differently. The
+   fixture's weights are deliberately NOT powers of two — `0.5` scales exactly
+   in bf16 and would hide the difference `bucketed` still carries;
 b. a pathological routing (one expert owns 90% of the assignments) matches the
    per-expert loop to 1e-6 in fp32 while staying inside `MOE_BUCKET_BYTES` —
    and the single bank REFUSES the same routing (the cliff this arm removes);
@@ -76,7 +80,10 @@ def test_one_bucket_is_the_batched_arm(bf16, capacity):
     moe = _moe(bf16=bf16, moe_capacity=capacity)
     n, k = 64, 2
     index = (torch.arange(n * k) % moe.n_experts).reshape(n, k)
-    weight = torch.ones(n, k) / k
+    # NOT `ones/k` (=0.5, an exact bf16 scaling that hides the tail difference):
+    # the routing above is what makes the plan one bucket, the weight is free.
+    weight = torch.rand(n, k)
+    weight = weight / weight.sum(-1, keepdim=True)
     order, keep, _ = moe._permute(index)
     counts = torch.bincount(index.reshape(-1), minlength=moe.n_experts)
     assert counts.tolist() == [32, 32, 32, 32]
@@ -90,11 +97,18 @@ def test_one_bucket_is_the_batched_arm(bf16, capacity):
     itemsize = 2 if bf16 else 4
     assert counters["moe_buckets"] == 1
     assert counters["moe_bank_bytes"] == 4 * 32 * moe.d * itemsize
+    # Bit-equality held while BOTH arms scaled the `[n·k, f]` output in fp32. The
+    # batched arm now applies the router weight in rank space (2026-11-10, the
+    # OOM fix in `SparseMoE._bank_dispatch`), so the two tails round `h·w`
+    # differently; the bound here is that gate's bound, not a new one. `bucketed`
+    # still carries the old tail — giving it the same layout is a follow-up, and
+    # this gate is the record that the two are no longer bit-identical.
+    bound = 1e-2 if bf16 else 1e-5
     print(
         f"[one bucket] bf16={bf16} capacity={capacity} buckets=1 "
-        f"bank={counters['moe_bank_bytes']} B equal={torch.equal(got, ref)}"
+        f"bank={counters['moe_bank_bytes']} B rel={_rel(got, ref):.3e}"
     )
-    assert torch.equal(got, ref), f"max|Δ|={float((got - ref).abs().max()):.3e} at one bucket"
+    assert _rel(got, ref) <= bound, f"rel={_rel(got, ref):.3e} exceeds {bound}"
 
 
 # ------------------------------------------- b. pathological routing / budget
