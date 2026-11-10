@@ -77,6 +77,13 @@ arm loop8x8_rope   "${LOOPB[@]}" --set loop_blocks=8 --set max_iter=8 --set attn
 arm loop4x4_wide   "${LOOPB[@]}" --set loop_blocks=4 --set max_iter=4 --set attn_kind=full --set attn_pos=rope --set d_model=1792 --set n_heads=28 --set head_dim=64
 arm tsct         --set use_tsct=true
 arm moe32        --set n_experts=32 --set moe_topk=2 --set moe_capacity=2.0 --set ffn_form=bank
+# Gated FFN (2026-11-10). Param-NEUTRAL against the control's `d_ffn=3072`:
+# `3·d·2048 == 2·d·3072` exactly, so the only variable is the FFN's form.
+# `d_ffn_gelu` is what the parity check compares against; without it the guard
+# falls back to `4·d` and refuses 2048 (correctly — that would be a smaller
+# model, not a different FFN).
+arm gated_silu   --set ffn_gated=true --set expert_act=silu --set d_ffn=2048 --set d_ffn_gelu=3072
+arm gated_situ   --set ffn_gated=true --set expert_act=situ --set d_ffn=2048 --set d_ffn_gelu=3072
 
 $PY - "$OUT" "$TAG" <<'PY'
 import json, sys
