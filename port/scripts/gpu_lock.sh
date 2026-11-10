@@ -21,7 +21,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IDLE_MIB=${GPU_IDLE_MIB:-2000}
+IDLE_MIB=${GPU_IDLE_MIB:-4000}
+# 4000, not 2000: a resident desktop app is not a compute job. `/usr/bin/hex`
+# idles at ~2.6 GiB on this machine and blocked two real runs for 20 minutes
+# each (`exit 75`, "nothing was measured"). The flock above is what actually
+# serialises compute; this check exists to catch a STRAY context from another
+# lane, and a desktop app that has been alive for hours is not that. Override
+# with GPU_IDLE_MIB when a real second job is expected.
 TIMEOUT=${GPU_TIMEOUT:-900}
 IDLE_WAIT=${GPU_IDLE_TIMEOUT:-300}
 LOCK=${GPU_LOCK_FILE:-/tmp/dormouse-gpu.lock}
@@ -43,6 +49,9 @@ while :; do
   [ "$used" -le "$IDLE_MIB" ] && break
   if [ "$waited" -ge "$IDLE_WAIT" ]; then
     echo "loud: card held ${used} MiB > ${IDLE_MIB} for ${IDLE_WAIT}s (another lane is running); nothing was measured" >&2
+    # Name the holder: the last two blocks were diagnosed only by hand-pulling
+    # this table, and one of them was a desktop service, not a job.
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader >&2 || true
     exit 75
   fi
   sleep 10
