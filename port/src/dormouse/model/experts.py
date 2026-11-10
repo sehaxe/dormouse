@@ -313,6 +313,14 @@ def _bincount(x: torch.Tensor, minlength: int) -> torch.Tensor:
     return out
 
 
+#: Quantile Balancing's histogram resolution (`moe_qb`): each expert's router
+#: scores are bucketed into this many bins over the batch's own score range, so
+#: the target quantile is located to `1/_QB_BINS` of that range without a sort
+#: and without a host read. 256 bins put the error at 0.4% of the range — well
+#: inside the ±10% load band the mechanism is held to (`tests/test_router_qb.py`).
+_QB_BINS = 256
+
+
 def switch_aux_loss(probs: torch.Tensor, index: torch.Tensor, n_experts: int) -> torch.Tensor:
     """Switch/GShard load-balance term, weight-free: `E · Σ_e f_e · P_e`.
 
@@ -1002,6 +1010,40 @@ class SparseMoE(nn.Module):
                     f"width above the bank cannot be filled. Escape: k_max <= n_experts."
                 )
         self.capacity = cfg.moe_capacity
+        #: QUANTILE BALANCING (Kimi K3 §2.3.3, arXiv 2607.24653): the bias
+        #: controller that sets each expert's bias from the score quantile its
+        #: target load names, instead of taking a fixed-rate step. Read with
+        #: `getattr` because `config.py` is another lane's file; the refusals
+        #: live HERE beside the other runtime seams a hand-built config reaches
+        #: without `validate` (ADR-0019: an arm asked for and silently not run
+        #: is a defect).
+        self.qb = bool(getattr(cfg, "moe_qb", False))
+        #: The routed assignment share each expert is held to: `topk/E`, the
+        #: mean of every expert's load under a uniform router. The quantile this
+        #: names is `1 - qb_target` (one expert's share of the TOKENS is
+        #: `p_i`; each token takes `topk` experts, so the assignments sum to
+        #: `topk·n` and each expert's is `p_i·n`).
+        self.qb_target = cfg.moe_topk / self.n_experts if self.n_experts else 0.0
+        if self.qb:
+            if self.ffn_form != "bank":
+                loud(
+                    f"moe_qb=true with ffn_form={self.ffn_form!r}: Quantile "
+                    f"Balancing moves the ROUTED bank's `lfb_bias`, and this form "
+                    f"has no such router. Escape: ffn_form='bank', or moe_qb=false."
+                )
+            if self.n_experts == 1:
+                loud(
+                    "moe_qb=true with n_experts=1: there is no router to "
+                    "balance (one expert IS the FFN). Escape: n_experts >= 2, "
+                    "or moe_qb=false."
+                )
+            if cfg.moe_topk == 0:
+                loud(
+                    "moe_qb=true with moe_topk=0: that is the dense blend, "
+                    "which runs every expert for every token — there is no "
+                    "routing decision for a quantile to make. Escape: "
+                    "moe_topk >= 1, or moe_qb=false."
+                )
         #: The FFN form's own modules. `bank` continues into the historical
         #: constructor below; the other two build ONLY their expert slot and
         #: return, so no router/shared/down parameter exists for them to lie
@@ -1715,10 +1757,15 @@ class SparseMoE(nn.Module):
             # `tests/test_step_audit.py`, and an unconditional bincount here
             # pushed it over (measured: 30 vs the bound 27).
             aux_armed = self.lb_mode == "aux" and self.training and torch.is_grad_enabled()
-            need = self.lb_active != 0.0 or self.health or aux_armed
+            # `moe_qb` reads the histogram too: its controller still keeps
+            # `lfb_counts` (the LR/revive seam) and the health counters honest.
+            need = self.lb_active != 0.0 or self.health or aux_armed or (self.qb and self.training)
             counts = _bincount(real.reshape(-1), self.n_experts) if need else None
             self._last_counts = counts
-            self._lfb_step(real, counters, counts)
+            if self.qb and self.training:
+                self._qb_step(counts, counters, logits)
+            else:
+                self._lfb_step(real, counters, counts)
             if counts is not None and self.health:
                 self._route_health(counts, counters)
             if counts is not None and aux_armed:
@@ -1847,6 +1894,11 @@ class SparseMoE(nn.Module):
         size, and the clamp keeps the controller inside the router's own logit
         scale instead of the ±200 the sign arm reached. `aux` returns here: that
         arm's controller is the loss term.
+
+        `moe_qb` does not come through here (`_qb_step` replaces the step with
+        the score quantile); `lfb_counts` is still accumulated there —
+        `expert_lr_scales` and `revive_experts` read it and are not `moe_qb`'s
+        to switch off.
         """
         if not self.training or self.lb_mode == "aux":
             return
@@ -1870,6 +1922,71 @@ class SparseMoE(nn.Module):
                     self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean())
                 )
         counters.count("moe_lfb_updates")
+
+    def _qb_step(
+        self, counts: torch.Tensor | None, counters: Counters, logits: torch.Tensor
+    ) -> None:
+        """Quantile Balancing's per-forward seam: state, counters, then the bias.
+
+        `_lfb_step` is not called: QB has no rate, so nothing there describes
+        it. `lfb_counts` still accumulates (the LR/revive seam reads it).
+        """
+        if counts is None:
+            loud(
+                "moe_qb=true ran a routed forward without its histogram: the "
+                "`need` gate in `forward` must include `moe_qb`. Escape: fix "
+                "the gate, or moe_qb=false."
+            )
+        with torch.no_grad():
+            self.lfb_counts.add_(counts.float())
+            self._qb_set_bias(logits)
+        counters.count("moe_qb")
+        note = f"qb: bias = score quantile (p={self.qb_target:.4f}, bins={_QB_BINS})"
+        prev = getattr(counters, "why", None)
+        if note not in (prev or ""):
+            counters.why = f"{prev}; {note}" if prev else note  # type: ignore[attr-defined]
+
+    def _qb_set_bias(self, logits: torch.Tensor) -> None:
+        """Quantile Balancing (Kimi K3 §2.3.3): bias from the score quantile.
+
+        For expert `i` with target load `p_i = topk/E`, `q_i` is the score above
+        which a `p_i` fraction of THIS forward's tokens lie — the target
+        quantile `1 − p_i`. The router ADDS the bias to the score, so the bias
+        that puts expert `i`'s target quantile on a common level is
+        `b_i = τ − q_i`; `τ` is the mean over the bank, and any common `τ` is
+        invisible to a top-k (it shifts every expert's score of a token by the
+        same amount), so the mean is used to keep a saved `lfb_bias` centred
+        instead of parked at `−q_i`'s offset. The rule is STATELESS: `q_i`
+        depends on the raw scores only, so the next forward with the same
+        scores writes the same bias — the drift `sign`/`prop` show (a
+        cumulative integrator that has no equilibrium under a bang-bang step)
+        cannot happen, and an already-balanced batch moves the bias by 0.
+
+        The histogram is built on DEVICE, per expert, over the batch's own
+        score range: `round((s − min)/(max − min)·BINS)`, one `scatter_add_`,
+        one `cumsum`, and the target bin is `(cdf < p_i·n).sum()`. No sort (the
+        quantile of `[n,E]` would be `E` sorts) and no host round trip — not a
+        scalar extraction, not a list conversion, not a CPU copy — so the
+        update is capturable by a CUDA graph.
+        """
+        scores = logits.detach().float()  # bf16 scores would lose the bins
+        n, e = scores.shape
+        lo = scores.min(dim=0).values
+        hi = scores.max(dim=0).values
+        span = (hi - lo).clamp_min(1e-12)  # a constant column: all in bin 0
+        idx = ((scores - lo) * (float(_QB_BINS) / span)).to(torch.int64)
+        idx.clamp_(0, _QB_BINS - 1)
+        hist = torch.zeros(_QB_BINS, e, dtype=torch.float32, device=scores.device)
+        hist.scatter_add_(0, idx, torch.ones((), device=scores.device).expand_as(idx))
+        # First bin whose cumulative count reaches `p_i·n`: the value at the
+        # target quantile, as the bin's UPPER edge (so the count at or above it
+        # is not above the target). `cdf` is non-decreasing, so `(cdf < target)`
+        # counts the bins strictly below the crossing and the sum IS the bin.
+        cdf = hist.cumsum(dim=0)
+        target = torch.full((1, e), self.qb_target * n, device=scores.device)
+        j = (cdf < target).sum(dim=0).clamp_(0, _QB_BINS - 1)
+        q = lo + (j.to(lo.dtype) + 1.0) * span / float(_QB_BINS)
+        self.lfb_bias.copy_(q.mean() - q)
 
     def expert_lr_scales(self) -> torch.Tensor:
         """TSCT-2's per-expert LR multiplier, `[E]`, PURE from the device counts.
