@@ -220,6 +220,46 @@ def test_the_fallback_names_itself_and_its_reason():
     assert nvfp4_fallbacks(), "the process-local tally must see the call too"
 
 
+def test_a_non_contracting_weight_is_refused_by_name_not_by_the_fallback():
+    """The MEASURED failure: `nvfp4_mm(x[24576,832], w[832,2048])` raised a raw
+    torch shape error from inside `_dequant_mm`.
+
+    A `[K, N]` weight cannot be packed (`quantize_nvfp4` packs the contraction,
+    which is the LAST axis), so `_reason` called the pair "the operands do not
+    contract" — a fallback REASON — and the emulated lane, whose whole job is to
+    be what the kernel would have computed, then transposed a weight that is
+    already `[K, N]` into `[N, K]`. Both halves are bugs: a lane that runs on a
+    shape it cannot mean silently changes what "emulated" means. This gate is
+    the exact pair, and it asserts nothing was emulated.
+    """
+    c = Counters()
+    before = nvfp4_fallbacks()
+    with pytest.raises(AssertionError, match=r"\[N, K\]"):
+        nvfp4_mm(torch.randn(24576, 832), torch.randn(832, 2048), torch.float32, c)
+    assert c.get("nvfp4_emulated", 0) == 0, "the fallback ran on an impossible pair"
+    assert nvfp4_fallbacks() == before, "the refusal must not be counted as a fallback"
+    # ... and the same pair, contractible, is accepted: the gate is the SHAPE.
+    out = nvfp4_mm(torch.randn(8, 832), torch.randn(2048, 832), torch.float32, Counters())
+    assert out.shape == (8, 2048)
+
+
+def test_the_16_e2m1_levels_are_hit_exactly():
+    """Hand-picked values: every magnitude of the grid, both signs, one block.
+
+    The block's amax is 6.0, so the scale is exactly 1.0 and each value must
+    come back bit-identical — a codec that rounds onto a shifted ladder fails
+    here even though a random round-trip looks fine (the measured 2.0-for-6.0
+    bug in a kernel-side magnitude table did exactly that).
+    """
+    vals = torch.tensor([0.0, *GRID, *[-v for v in GRID[1:]]], dtype=torch.float32)
+    x = torch.zeros(1, 16)
+    x[0, : vals.numel()] = vals
+    packed, scales, g = quantize_nvfp4(x)
+    assert float(g) == 1.0 and scales.float()[0, 0] == 1.0
+    got = dequantize_nvfp4(packed, scales, torch.float32, global_scale=g)
+    assert torch.equal(got[0, : vals.numel()], vals), (got[0].tolist(), vals.tolist())
+
+
 def test_the_scale_swizzle_is_the_512_byte_tile():
     """One 128-row x 4-column tile: element (m, k) sits at `(m%32)*16 + (m//32)*4 + k%4`.
 
@@ -244,6 +284,86 @@ def test_the_scale_swizzle_is_the_512_byte_tile():
 # ---------------------------------------------------------------------------
 
 HAS_FP4 = hasattr(torch, "float4_e2m1fn_x2") and torch.cuda.is_available()
+
+
+def triton_ok() -> bool:
+    from dormouse.model import nvfp4
+
+    return nvfp4._HAS_TRITON
+
+
+#: The fused lane needs the card AND triton; the CPU lane is the reference it is
+#: compared against, so every gate below is a CROSS-LANE equality, not a golden.
+HAS_FUSED = HAS_FP4 and triton_ok()
+
+
+@pytest.mark.skipif(not HAS_FUSED, reason="needs the CUDA fused pack kernel")
+def test_the_fused_pack_and_unpack_are_bit_identical_to_the_cpu_lane():
+    """The CUDA lane IS the CPU lane: same bytes, same scales, same values.
+
+    37x96 on purpose — rows do not tile `BLOCK_M` (4) and K does not tile
+    `BLOCK_K` (128), so the masked tail is exercised, and the CPU body is the
+    reference the hand-computed gates above pin (a second codebook in the kernel
+    would show up here and nowhere else).
+    """
+    torch.manual_seed(0)
+    x = (torch.randn(37, 96) * 3.0).bfloat16()
+    pc, sc, gc = quantize_nvfp4(x)
+    ph, sh, gh = quantize_nvfp4(x.cuda())
+    assert torch.equal(ph.cpu(), pc), "packed bytes differ from the CPU lane"
+    assert torch.equal(sh.view(torch.uint8).cpu(), sc.view(torch.uint8))
+    assert float(gh) == float(gc)
+    a = dequantize_nvfp4(ph, sh, torch.float32, global_scale=gh)
+    b = dequantize_nvfp4(pc, sc, torch.float32, global_scale=gc)
+    assert torch.equal(a.cpu(), b), "dequantized values differ from the CPU lane"
+
+
+@pytest.mark.skipif(not HAS_FUSED, reason="needs the CUDA fused pack kernel")
+def test_the_fused_dequant_agrees_with_the_pack_it_came_from():
+    """`deq_dtype` is the SAME pass, so it must equal the unpack of the bytes."""
+    torch.manual_seed(1)
+    x = (torch.randn(129, 128, device="cuda") * 2.0).bfloat16()
+    packed, scales, g, deq = quantize_nvfp4(x, deq_dtype=torch.bfloat16)
+    assert torch.equal(deq, dequantize_nvfp4(packed, scales, torch.bfloat16, global_scale=g))
+    # Relative to the UNQUANTIZED input: a 4-bit block format's own error band.
+    rel = ((deq.float() - x.float()).norm() / x.float().norm()).item()
+    assert rel < 0.2, f"rms relative error {rel:.3f} is outside the format's band"
+
+
+@pytest.mark.skipif(not HAS_FUSED, reason="needs the CUDA fused swizzle kernel")
+def test_the_fused_swizzle_is_the_same_512_byte_tile():
+    """833x55: both paddings (128 rows, 4 scale columns) are exercised.
+
+    A wrong swizzle "succeeds" and returns a 46%-error GEMM, so this is pinned
+    as bytes against the torch body, not through a GEMM.
+    """
+    from dormouse.model.nvfp4 import _blocked_scale
+
+    s = ((torch.arange(833 * 55, dtype=torch.float32).reshape(833, 55) % 200) + 1.0).to(
+        torch.float8_e4m3fn
+    )
+    want = _blocked_scale(s).view(torch.uint8)
+    got = _blocked_scale(s.cuda()).view(torch.uint8)
+    assert torch.equal(got.cpu(), want)
+    assert got.numel() == -(-833 // 128) * -(-55 // 4) * 512
+
+
+@pytest.mark.skipif(not HAS_FUSED, reason="needs the CUDA fused lane")
+def test_the_fused_lane_reads_nothing_back(monkeypatch):
+    """ADR-0018 rule 2: a training-path call may not sync to the host.
+
+    Covers the fused pack (with its dequantized output) AND the emulated latn's
+    unpack — the two functions `packed_acts` calls four times per layer.
+    """
+
+    def boom(*_a, **_k):
+        raise AssertionError("host read in the fused lane")
+
+    x = torch.randn(8, 32, device="cuda", dtype=torch.bfloat16)
+    for name in ("item", "tolist", "cpu", "numpy", "__float__", "__int__"):
+        monkeypatch.setattr(torch.Tensor, name, boom)
+    packed, scales, g, deq = quantize_nvfp4(x, deq_dtype=torch.bfloat16)
+    dequantize_nvfp4(packed, scales, torch.bfloat16, global_scale=g)
 
 
 @pytest.mark.skipif(not HAS_FP4, reason="needs a CUDA fp4 `_scaled_mm` (sm_120, torch >= 2.13)")
@@ -271,6 +391,25 @@ def test_a_tile_that_the_kernel_refuses_emulates_counted():
     assert out.shape == (64, 3)
     assert c.get("nvfp4_emulated", 0) == 1 and c.get("nvfp4_gemm", 0) == 0
     assert "N % 16" in getattr(c, "why", ""), getattr(c, "why", "")
+
+
+@pytest.mark.skipif(not HAS_FP4, reason="needs a CUDA fp4 `_scaled_mm` (sm_120, torch >= 2.13)")
+def test_a_nonsquare_weight_cannot_hide_an_orientation_bug():
+    """N != K, so `x @ W.T` and `x @ W` are different shapes, not just values.
+
+    Checked against the FP32 EMULATED result, never a bf16 GEMM: a bf16 reference
+    agrees with a wrong scale swizzle to 46% (measured) and would pass here.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(129, 128, device="cuda", dtype=torch.bfloat16) * 2.0
+    w = torch.randn(96, 128, device="cuda", dtype=torch.bfloat16) * 0.1
+    c = Counters()
+    fast = nvfp4_mm(x, w, torch.bfloat16, c)
+    assert fast.shape == (129, 96)
+    assert c.get("nvfp4_gemm", 0) == 1, getattr(c, "why", "")
+    emu = emulated_mm(x, w, torch.bfloat16)
+    rel = ((fast.float() - emu.float()).norm() / emu.float().norm()).item()
+    assert rel < 1e-2, f"kernel vs emulated relative error {rel:.4f}"
 
 
 @pytest.mark.skipif(not HAS_FP4, reason="needs a CUDA fp4 `_scaled_mm` (sm_120, torch >= 2.13)")

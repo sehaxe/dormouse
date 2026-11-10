@@ -28,7 +28,12 @@ the two gradients. Quantizing in the forward is what makes the backward the STE
 of the forward that ran, instead of the gradient of a different function.
 
 THE FORMAT IS `nvfp4.py`'s, never a second codec: two e2m1 nibbles per byte and
-one e4m3 scale per 16 columns, 0.5625 B/element against bf16's 2 (3.56x). On the
+one e4m3 scale per 16 columns, 0.5625 B/element against bf16's 2 (3.56x).
+The PACKING is `nvfp4.quantize_nvfp4`'s fused CUDA kernel, called with
+`deq_dtype` so the packed bytes the backward saves and the dequantized value
+the GEMM reads come out of ONE pass (the eager quantizer was 13.57 ms at
+`[24576, 832]` against 0.31 for the pair) — the STE is unchanged: the
+forward's value and the backward's `xq` are still the same bytes. On the
 live arm (`configs/arch_gated_swiglu.toml`, b24×1024, 12 layers, d=832, f=2048)
 the FFN's bf16 saves are 462.0 MiB per layer — the gate/up input TWICE
 (`mm_mixed` casts it per call), `g`, `silu(g)`, `u` and fc2's input — against
@@ -73,8 +78,11 @@ class _PackedActMM(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, dt, *weights):
-        packed, scales, g = quantize_nvfp4(x)
-        xq = dequantize_nvfp4(packed, scales, dt, global_scale=g)
+        # ONE pass: the packed bytes the backward needs AND the dequantized value
+        # the GEMM reads. The eager quantizer measured 13.57 ms at the live
+        # `[24576, 832]` and this is 0.31, and a second `dequantize_nvfp4` pass
+        # is not paid at all (`deq_dtype`).
+        packed, scales, g, xq = quantize_nvfp4(x, deq_dtype=dt)
         ctx.save_for_backward(packed, scales, g, *weights)
         return tuple(xq @ w.to(dt).t() for w in weights)
 
@@ -104,10 +112,8 @@ class _PackedGLU(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, g, u, act, beta1, beta2):
-        pg, sg, gg = quantize_nvfp4(g)
-        pu, su, gu = quantize_nvfp4(u)
-        dg = dequantize_nvfp4(pg, sg, g.dtype, global_scale=gg)
-        du = dequantize_nvfp4(pu, su, u.dtype, global_scale=gu)
+        pg, sg, gg, dg = quantize_nvfp4(g, deq_dtype=g.dtype)
+        pu, su, gu, du = quantize_nvfp4(u, deq_dtype=u.dtype)
         ctx.save_for_backward(pg, sg, gg, pu, su, gu)
         ctx.glu = (act, beta1, beta2)
         return expert_glu(act, dg, du, beta1=beta1, beta2=beta2)

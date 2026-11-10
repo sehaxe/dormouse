@@ -21,6 +21,25 @@ THE GEMM: `torch._scaled_mm` on `float4_e2m1fn_x2` operands with e4m3 scale
  tensors `[M, K/16]` / `[N, K/16]`. Torch has no `.to(fp4)` cast, which is why
 the packing lives here.
 
+THE PACKING IS A KERNEL ON CUDA, and it is the reason this lane is usable.
+The eager body below measured 13.57 ms at `[24576, 832]` — 42x the GEMM it
+feeds — because it is `x.float()` + 7 `where`s + a `searchsorted` + two
+strided nibble gathers over 20M elements. `_pack_kernel` does it in one pass
+(0.10 ms), `_amax_kernel` one more (0.09), `_swizzle_kernel` replaces an
+eager permutation that was launch-bound at 0.10 ms for 1.3 MB, and
+`_unpack_kernel` is the dequantize `packed_acts`' BACKWARD calls three times a
+layer (0.10 vs 3.72 ms). The eager body is kept as the CPU lane and as the
+REFERENCE: `tests/test_nvfp4.py` asserts the CUDA lane is bit-identical to it,
+so the format is still defined in exactly one place.
+
+THE WEIGHT IS `[N, K]` (`nn.Linear`), and that is forced, not a preference:
+the scale is one per 16 along the LAST axis, so only `[N, K]` can be packed
+with the CONTRACTION axis tiled, which is what the GEMM reads after the
+`.t()`. A `[K, N]` weight is refused LOUD by `_contraction` — passing one to
+the fallback used to raise `mat1 and mat2 shapes cannot be multiplied
+(24576x832 and 2048x832)` from inside the emulated lane, i.e. a shape no lane
+could mean was being counted as "the kernel could not run it".
+
 THE SHAPE RULES ARE MEASURED, not assumed (torch 2.13.0+cu129, sm_120, 20
 shapes bisected): `K % 32 == 0` (the packed operand's trailing BYTE dim must
 tile 16) and `N % 16 == 0`; `M` is FREE. Outside them the op raises, so the
@@ -52,6 +71,14 @@ from .act_quant import _e2m1_round
 from .mxfp import E4M3_MAX
 from .tsct import _NVFP4_MAGNITUDES
 
+try:  # the fused pack/unpack kernels; the eager code below is the reference
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:  # pragma: no cover - a torch-only box keeps the eager lane
+    _HAS_TRITON = False
+
 #: Logical elements per scale — NVFP4's own layout. `mxfp.py`'s MXFP4 uses 32
 #: with an e8m0 scale and the fp4 kernel refuses it; this is not a knob.
 GROUP = 16
@@ -75,7 +102,250 @@ def nvfp4_fallbacks() -> dict[str, int]:
     return dict(_NVFP4_FALLBACKS)
 
 
-def quantize_nvfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+if _HAS_TRITON:
+
+    @triton.jit
+    def _mag(idx):
+        """`_NVFP4_MAGNITUDES[idx]` for idx in 0..7, computed instead of gathered.
+
+        The grid is 0, 0.5, 1, 1.5, 2, 3, 4, 6 — `(1 + ½·mantissa)·2^exponent`
+        from idx 2 up (`exponent = (idx-2) // 2`, `mantissa = (idx-2) & 1`), but
+        NOT a clean bit ladder: e2m1's own encoding would put 0.75 at idx 1 and
+        the codebook skips it, so 0.5 is its own case. Writing it as one formula
+        over the whole range measured 2.0 for `6.0` (idx 6) — a quarter of the
+        grid wrong, and invisible unless the check is against the EAGER dequant.
+        """
+        return tl.where(
+            idx == 0,
+            0.0,
+            tl.where(
+                idx == 1,
+                0.5,
+                (1.0 + 0.5 * ((idx - 2) & 1).to(tl.float32))
+                * tl.exp2(((idx - 2) >> 1).to(tl.float32)),
+            ),
+        )
+
+    @triton.jit
+    def _swizzle_kernel(S, OUT, MN, SFK, RK, BLOCK: tl.constexpr):
+        """One 512-byte tile per (128 rows, 4 scale columns), bytes copied as-is.
+
+        The tile's own order is `(m%32)*16 + (m//32)*4 + j` — `_blocked_scale`'s
+        closed form, and the one `tests/test_nvfp4.py` checks arithmetically.
+        """
+        t = tl.program_id(0)
+        k = tl.program_id(1)
+        p = tl.arange(0, BLOCK)
+        row = t * 128 + ((p // 4) % 4) * 32 + (p // 16) % 32
+        col = k * 4 + p % 4
+        v = tl.load(S + row * SFK + col, mask=(row < MN) & (col < SFK), other=0)
+        tl.store(OUT + (t * RK + k) * BLOCK + p, v)
+
+    @triton.jit
+    def _amax_kernel(
+        X, OUT, K, NROWS, GROUP: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr
+    ):
+        """`[rows, K]` -> the per-16 block amax `[rows, K/16]`, one pass, exact.
+
+        torch's `view(..., 16).abs().amax(-1)` measures 0.45 ms here against 0.09:
+        a 16-wide innermost reduce is the shape TensorIterator is worst at, and
+        the `.abs()` temp is a second 20M-element pass.
+        """
+        rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        kb = tl.program_id(1)
+        BG: tl.constexpr = BLOCK_K // GROUP
+        cols = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        rm = rows < NROWS
+        x = tl.load(
+            X + rows[:, None].to(tl.int64) * K + cols[None, :],
+            mask=rm[:, None] & (cols < K)[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        m = tl.max(tl.abs(tl.reshape(x, (BLOCK_M, BG, GROUP))), axis=2)
+        ocol = kb * BG + tl.arange(0, BG)
+        tl.store(
+            OUT + rows[:, None].to(tl.int64) * (K // GROUP) + ocol[None, :],
+            m,
+            mask=rm[:, None] & (ocol < K // GROUP)[None, :],
+        )
+
+    @triton.jit
+    def _pack_kernel(
+        X,
+        S,
+        G,
+        OUT,
+        DEQ,
+        K,
+        NROWS,
+        HAS_DEQ: tl.constexpr,
+        GROUP: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """One pass: `x / (s·g)` -> e2m1 code, two nibbles per byte, optional dequant.
+
+        `S` holds the e4m3 block scales as FLOATS already (torch rounded them, so
+        the scale is the format's own value, not a second rounding here), and the
+        per-tensor `g` is loaded from device memory — never read on the host.
+        The code rule is `_e2m1_round`'s midpoint ladder as arithmetic: ties go to
+        the EVEN code, so even midpoints use `>=` and odd ones `>`. A byte is
+        `code[2i] | code[2i+1] << 4` (element 0 in the LOW nibble).
+
+        The DIVISION is `div_rn`, not `/`: Triton's default fp32 divide is a
+        2-ulp approximation, and on an exact midpoint (1.25, 2.5, 5.0 — the ties
+        the format's rule is about) one ulp decides a different code. Measured:
+        6 wrong codes in 8192 without it, 0 with it.
+        """
+        rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        kb = tl.program_id(1)
+        BG: tl.constexpr = BLOCK_K // GROUP
+        sk = K // GROUP
+        cols = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        scol = kb * BG + tl.arange(0, BG)
+        rm = rows < NROWS
+        x = tl.load(
+            X + rows[:, None].to(tl.int64) * K + cols[None, :],
+            mask=rm[:, None] & (cols < K)[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        s = tl.load(
+            S + rows[:, None].to(tl.int64) * sk + scol[None, :],
+            mask=rm[:, None] & (scol < sk)[None, :],
+            other=1.0,
+        ).to(tl.float32)
+        s = tl.reshape(
+            tl.broadcast_to((s * tl.load(G))[:, :, None], (BLOCK_M, BG, GROUP)),
+            (BLOCK_M, BLOCK_K),
+        )
+        norm = tl.math.div_rn(x, s)
+        a = tl.abs(norm)
+        idx = (
+            (a > 0.25).to(tl.int32)
+            + (a >= 0.75).to(tl.int32)
+            + (a > 1.25).to(tl.int32)
+            + (a >= 1.75).to(tl.int32)
+            + (a > 2.5).to(tl.int32)
+            + (a >= 3.5).to(tl.int32)
+            + (a > 5.0).to(tl.int32)
+        )
+        # The sign bit rides bit 3, and a zero magnitude keeps the code 0 — the
+        # same rule as `_e2m1_round`'s `q < 0` (-0.0 is not negative there).
+        code = idx.to(tl.uint8) + ((norm < 0) & (idx > 0)).to(tl.uint8) * 8
+        pair = tl.reshape(code, (BLOCK_M, BLOCK_K // 2, 2)).to(tl.int32)
+        hi = tl.where(tl.arange(0, 2)[None, None, :] == 1, 16, 1)
+        byte = tl.sum(pair * hi, axis=2)
+        pcols = kb * (BLOCK_K // 2) + tl.arange(0, BLOCK_K // 2)
+        tl.store(
+            OUT + rows[:, None].to(tl.int64) * (K // 2) + pcols[None, :],
+            byte.to(tl.uint8),
+            mask=rm[:, None] & (pcols < K // 2)[None, :],
+        )
+        if HAS_DEQ:
+            val = _mag(idx) * s * tl.where(norm < 0, -1.0, 1.0)
+            tl.store(
+                DEQ + rows[:, None].to(tl.int64) * K + cols[None, :],
+                val.to(DEQ.dtype.element_ty),
+                mask=rm[:, None] & (cols < K)[None, :],
+            )
+
+    @triton.jit
+    def _unpack_kernel(
+        P,
+        S,
+        G,
+        OUT,
+        K,
+        NROWS,
+        GROUP: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """`dequantize_nvfp4` as ONE pass: nibble -> grid value × block scale × g."""
+        rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        kb = tl.program_id(1)
+        BG: tl.constexpr = BLOCK_K // GROUP
+        sk = K // GROUP
+        cols = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+        scol = kb * BG + tl.arange(0, BG)
+        rm = rows < NROWS
+        byte = tl.load(
+            P + rows[:, None].to(tl.int64) * (K // 2) + (cols // 2)[None, :],
+            mask=rm[:, None] & (cols < K)[None, :],
+            other=0,
+        ).to(tl.int32)
+        code = tl.where(cols[None, :] % 2 == 0, byte & 0xF, byte >> 4)
+        s = tl.load(
+            S + rows[:, None].to(tl.int64) * sk + scol[None, :],
+            mask=rm[:, None] & (scol < sk)[None, :],
+            other=1.0,
+        ).to(tl.float32)
+        s = tl.reshape(
+            tl.broadcast_to((s * tl.load(G))[:, :, None], (BLOCK_M, BG, GROUP)),
+            (BLOCK_M, BLOCK_K),
+        )
+        val = _mag(code & 0x7) * s * tl.where((code & 0x8) != 0, -1.0, 1.0)
+        tl.store(
+            OUT + rows[:, None].to(tl.int64) * K + cols[None, :],
+            val.to(OUT.dtype.element_ty),
+            mask=rm[:, None] & (cols < K)[None, :],
+        )
+
+
+#: The tile the three kernels above run at. Measured at `[24576, 832]`: a
+#: `BLOCK_M` of 4 is 0.14 ms for pack+dequant against 0.22 at one row per
+#: program (the launch count, not the arithmetic, is what was costing).
+_BLOCK_M, _BLOCK_K = 4, 128
+
+
+def _launch(fn, rows: int, k: int, **kwargs: object) -> None:
+    """The one place the launch shape lives (`BLOCK_M` rows × `BLOCK_K` columns)."""
+    fn[(-(-rows // _BLOCK_M), -(-k // _BLOCK_K))](
+        K=k, NROWS=rows, GROUP=GROUP, BLOCK_M=_BLOCK_M, BLOCK_K=_BLOCK_K, **kwargs
+    )
+
+
+def _fused_quantize(
+    x: torch.Tensor, deq_dtype: torch.dtype | None = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`quantize_nvfp4`'s CUDA lane: torch rounds the scale, one Triton pass packs.
+
+    The scale stays in torch on purpose — it is 1/32 of the elements, and the
+    e4m3 rounding is the one place a kernel-side re-implementation would drift
+    from the format for no speed. The pack itself is one pass over `x`, and with
+    `deq_dtype` the same pass also writes the DEQUANTIZED values, so a caller
+    that needs both does not pay a second kernel (`packed_acts`' forward).
+    """
+    k = x.shape[-1]
+    rows = x.numel() // k
+    x2 = x.reshape(rows, k).contiguous()
+    amax = torch.empty((rows, k // GROUP), dtype=torch.float32, device=x.device)
+    _launch(_amax_kernel, rows, k, X=x2, OUT=amax)
+    scale = (amax / E2M1_MAX).clamp_min(_EPS)
+    g = (scale.amax() / E4M3_MAX).clamp_min(1.0)
+    s8 = (scale / g).to(_SCALE_DTYPE)
+    packed = torch.empty((rows, k // 2), dtype=torch.uint8, device=x.device)
+    deq = None if deq_dtype is None else torch.empty((rows, k), dtype=deq_dtype, device=x.device)
+    _launch(
+        _pack_kernel,
+        rows,
+        k,
+        X=x2,
+        S=s8,
+        G=g,
+        OUT=packed,
+        DEQ=x2 if deq is None else deq,
+        HAS_DEQ=deq is not None,
+    )
+    packed, scales = packed.view(*x.shape[:-1], k // 2), s8.view(*x.shape[:-1], k // GROUP)
+    if deq is None:
+        return packed, scales, g
+    return packed, scales, g, deq.view(*x.shape[:-1], k)  # type: ignore[return-value]
+
+
+def quantize_nvfp4(
+    x: torch.Tensor, *, deq_dtype: torch.dtype | None = None
+) -> tuple[torch.Tensor, ...]:
     """Pack `x [..., K]` (fp32/bf16) → `(packed uint8 [..., K/2], e4m3 scales [..., K/16], g)`.
 
     `g` is the fp32 per-tensor second-level scale (1.0 in every ordinary case),
@@ -86,6 +356,11 @@ def quantize_nvfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
     `K` must be a multiple of 16 — that is the format's scale width, not a
     convenience: a partial block would need a different (padded) scale rule and
     every number would then describe a different format.
+
+    `deq_dtype` (CUDA + Triton only) appends the DEQUANTIZED values to the tuple
+    — `dequantize_nvfp4`'s result, from the same one pass. The CUDA lane is the
+    fused kernel; the CPU/`--no-triton` lane is the eager reference right here,
+    which the gates compare against.
     """
     assert x.is_floating_point(), f"NVFP4 packs float tensors, got {x.dtype}"
     k = x.shape[-1]
@@ -93,6 +368,8 @@ def quantize_nvfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
         f"NVFP4 needs K % {GROUP} == 0 (one e4m3 scale per {GROUP} elements), "
         f"got K={k}. Escape: a width that tiles {GROUP}, or the bf16 lane."
     )
+    if _HAS_TRITON and x.is_cuda:
+        return _fused_quantize(x, deq_dtype)
     xf = x.float()
     blocks = xf.reshape(*xf.shape[:-1], k // GROUP, GROUP)
     scale = (blocks.abs().amax(dim=-1) / E2M1_MAX).clamp_min(_EPS)
@@ -105,7 +382,9 @@ def quantize_nvfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
     codes = codes.to(torch.uint8) | ((q < 0).to(torch.uint8) * 8)  # sign bit = nibble 8
     codes = codes.reshape(*x.shape)
     packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
-    return packed, scales, g
+    if deq_dtype is None:
+        return packed, scales, g
+    return packed, scales, g, dequantize_nvfp4(packed, scales, deq_dtype, global_scale=g)
 
 
 def dequantize_nvfp4(
@@ -121,6 +400,8 @@ def dequantize_nvfp4(
     arithmetic is fp32 (the grid values are exact there) and the result is cast
     to `dtype` — the caller's, never a format the caller did not ask for.
     """
+    if _HAS_TRITON and packed.is_cuda:
+        return _fused_dequantize(packed, scales, dtype, global_scale)
     n = packed.shape[-1]
     low = (packed & 0x0F).to(torch.long)
     high = (packed >> 4).to(torch.long)
@@ -134,6 +415,39 @@ def dequantize_nvfp4(
     if global_scale is not None:
         vals = vals * global_scale
     return vals.to(dtype)
+
+
+def _fused_dequantize(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    dtype: torch.dtype,
+    global_scale: torch.Tensor | float | None,
+) -> torch.Tensor:
+    """`dequantize_nvfp4`'s CUDA lane: one pass, no int64 code tensor.
+
+    The eager body builds `(low, high)` as int64 (8 B per element), stacks, and
+    gathers the codebook — 3.7 ms at `[24576, 832]` against 0.2 ms here, and it
+    sits in `packed_acts`' BACKWARD three times per layer.
+    """
+    n = packed.shape[-1]
+    k = 2 * n
+    rows = packed.numel() // n
+    g = global_scale
+    if g is None:
+        g = torch.ones((), dtype=torch.float32, device=packed.device)
+    elif not torch.is_tensor(g):
+        g = torch.tensor(float(g), dtype=torch.float32, device=packed.device)
+    out = torch.empty((rows, k), dtype=dtype, device=packed.device)
+    _launch(
+        _unpack_kernel,
+        rows,
+        k,
+        P=packed.reshape(rows, n).contiguous(),
+        S=scales.reshape(rows, k // GROUP).float(),
+        G=g.float(),
+        OUT=out,
+    )
+    return out.view(*packed.shape[:-1], k)
 
 
 def _reason(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> tuple[str, str] | None:
@@ -207,9 +521,19 @@ def _blocked_scale(scale: torch.Tensor) -> torch.Tensor:
     128 multiple and columns to 4 with ZEROS. Verified end to end by the
     kernel-vs-emulated gate: the unswizzled matrix is accepted (the op checks
     the ELEMENT COUNT) and silently reads the wrong scale, 46% relative error.
+
+    One 512-byte byte-shuffle either way; the CUDA lane is a kernel because the
+    eager chain measured 0.10 ms for `[24576, 52]` and 0.11 ms for `[832, 128]`
+    — both launch-bound, so a plain permutation cost the same as 20x its size.
     """
     mn, sf_k = scale.shape
     rm, rk = -(-mn // 128), -(-sf_k // 4)
+    out = torch.empty(rm * rk * 512, dtype=torch.uint8, device=scale.device)
+    if _HAS_TRITON and scale.is_cuda:
+        _swizzle_kernel[(rm, rk)](
+            scale.detach().contiguous().view(torch.uint8), out, mn, sf_k, rk, BLOCK=512
+        )
+        return out.view(_SCALE_DTYPE)
     u8 = scale.detach().contiguous().view(torch.uint8)
     padded = torch.zeros(rm * 128, rk * 4, dtype=torch.uint8, device=scale.device)
     padded[:mn, :sf_k] = u8
@@ -229,14 +553,44 @@ def _dequant_mm(
     gb: torch.Tensor,
     dt: torch.dtype,
 ) -> torch.Tensor:
-    """`dequant(a) @ dequant(b)ᵀ` in fp32, cast to `dt` — the emulated lane."""
+    """`dequant(a) @ dequant(b)ᵀ` in fp32, cast to `dt` — the emulated lane.
+
+    The `.t()` here is NOT redundant with the kernel lane's `.t()`, and it is
+    the reason `_contraction` exists: `quantize_nvfp4` packs the LAST axis, and
+    the fp4 GEMM needs the CONTRACTION axis packed, so a weight is only
+    packable as `[N, K]` and both lanes transpose it to `[K, N]` afterwards.
+    A `[K, N]` weight here would be packed along N and then transposed into a
+    `[N/2, K]` operand — the fallback would ``succeed'' on a shape the kernel
+    refuses and stop being an emulation of anything.
+    """
     xd = dequantize_nvfp4(a, sa, torch.float32, global_scale=ga)
     wd = dequantize_nvfp4(b, sb, torch.float32, global_scale=gb)
     return (xd @ wd.t()).to(dt)
 
 
+def _contraction(x: torch.Tensor, weight: torch.Tensor, who: str) -> None:
+    """LOUD on a pair NEITHER lane can mean: `x [M, K]`, weight `[N, K]`.
+
+    `[N, K]` is `nn.Linear`'s layout and the only one this module can pack
+    (the scale is one per 16 along the last axis, and the GEMM contracts over
+    K). The measured failure this guards: `nvfp4_mm(x[24576, 832],
+    w[832, 2048])` — a `[K, N]` weight — passed `_reason` as ``the operands do
+    not contract'' (a REASON, which the fallback then treated as runnable) and
+    surfaced as `mat1 and mat2 shapes cannot be multiplied (24576x832 and
+    2048x832)` from inside the emulated lane. A shape no lane can mean is not
+    a fallback reason; it is a caller error, and it is named as one.
+    """
+    assert weight.dim() == 2 and weight.shape[-1] == x.shape[-1], (
+        f"{who}: x{tuple(x.shape)} does not contract with W{tuple(weight.shape)}; "
+        "the weight is [N, K] (`nn.Linear`, contraction LAST) — the layout the "
+        "packer can pack along K. A [K, N] weight is `W.T` here, and "
+        f"`x @ W` is not the GEMM this module computes ({who}(x, W) = x @ W.T)."
+    )
+
+
 def emulated_mm(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     """The emulated lane alone: pack both operands, dequantize, bf16-class GEMM."""
+    _contraction(x, weight, "emulated_mm")
     a, sa, ga = quantize_nvfp4(x)
     b, sb, gb = quantize_nvfp4(weight)
     return _dequant_mm(a, sa, ga, b, sb, gb, dt)
@@ -250,6 +604,10 @@ def nvfp4_mm(
 ) -> torch.Tensor:
     """`x @ Wᵀ` on NVFP4: the fp4 kernel where it runs, the emulated lane otherwise.
 
+    `x` is `[M, K]` and `W` is `[N, K]` (`nn.Linear`'s weight, contraction
+    last). A `[K, N]` weight is refused LOUD by `_contraction` rather than
+    packed along the wrong axis — see that function for the measured failure.
+
     Both operands are packed from their live values (the masters are not read
     back, so this is a COMPUTE rung). The return dtype is `dt` in both lanes,
     and the path that ran is on the counters: `nvfp4_gemm` or `nvfp4_emulated`
@@ -259,6 +617,7 @@ def nvfp4_mm(
     rule). The PACKING above it is plain torch and outside that handler: a
     failure there is a bug in this module and stays LOUD.
     """
+    _contraction(x, weight, "nvfp4_mm")
     a, sa, ga = quantize_nvfp4(x)
     b, sb, gb = quantize_nvfp4(weight)
     why = _reason(x, weight, dt)

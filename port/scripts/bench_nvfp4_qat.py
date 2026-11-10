@@ -28,7 +28,6 @@ import argparse
 import dataclasses
 import gc
 import json
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -46,18 +45,24 @@ LIVE_ARM = PORT / "configs" / "arch_gated_swiglu.toml"
 GEMM_M, GEMM_N, GEMM_K = 24576, 2048, 832
 
 
-def _median_ms(fn, *, warmup: int = 3, iters: int = 10) -> float:
+def _median_ms(fn, *, warmup: int = 5, iters: int = 50, reps: int = 3) -> float:
+    """Batched-loop timing: N calls between syncs, best of `reps`.
+
+    A per-call `synchronize()` measures the idle-clock startup of the next kernel,
+    not the kernel: the same `_scaled_mm` call read 1.75 ms that way and 0.20 ms
+    batched, on an otherwise idle card.
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-    times = []
-    for _ in range(iters):
-        torch.cuda.synchronize()
+    best = float("inf")
+    for _ in range(reps):
         t0 = time.perf_counter()
-        fn()
+        for _ in range(iters):
+            fn()
         torch.cuda.synchronize()
-        times.append((time.perf_counter() - t0) * 1e3)
-    return statistics.median(times)
+        best = min(best, (time.perf_counter() - t0) / iters * 1e3)
+    return best
 
 
 def bench_gemm() -> dict:
@@ -156,12 +161,28 @@ def bench_arms(batches: list[int], *, seq: int, steps: int) -> dict:
     return rows
 
 
+def _table(arms: dict) -> str:
+    """The answer in one block: the ceiling batch and bytes/s at it, per arm."""
+    rows = ["  arm    max_batch  ms/step  bytes/s   peak_GiB"]
+    for arm, r in arms.items():
+        if not r["fits"]:
+            rows.append(f"  {arm:6s} {'none fits':>9s}")
+            continue
+        last = r["fits"][-1]
+        rows.append(
+            f"  {arm:6s} {last['batch']:9d} {last['ms_per_step']:8.1f} "
+            f"{last['bytes_per_s']:8.0f} {last['peak_GiB']:9.2f}"
+        )
+    return "\n".join(rows)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--seq", type=int, default=1024)
     ap.add_argument("--steps", type=int, default=3, help="timed steps per point")
     ap.add_argument("--batches", type=str, default="4,8,12,16,20,24,28,32")
     ap.add_argument("--skip-gemm", action="store_true")
+    ap.add_argument("--gemm-only", action="store_true", help="skip the batch sweep")
     args = ap.parse_args(argv)
 
     if not torch.cuda.is_available():
@@ -181,8 +202,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     batches = [int(b) for b in args.batches.split(",")]
+    if args.gemm_only:
+        print("\n" + json.dumps(out, indent=2))
+        return 0
     print("\nmax-batch sweep (live arm, dense_qat=ternary, forward+backward+step):", flush=True)
     out["arms"] = bench_arms(batches, seq=args.seq, steps=args.steps)
+    print("\n" + _table(out["arms"]))
 
     print("\n" + json.dumps(out, indent=2))
     return 0
