@@ -22,6 +22,8 @@ arm to run first).
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -47,12 +49,26 @@ from .halt import HaltHead, halt_loss
 from .jepa import JepaHead
 from .layerrope import LayerRoPEGains, LayerRoPENorm, LayerRoPEPaperGains
 from .loopblock import LoopBlock, masked_ce_mean
+from .mhc import MHCMix
 from .mtp import MTPHead
 from .prelude import UniqueLayer
 from .qat_cache import QuantCache, attach_qat_caches, take_qat_refresh_counts
 from .sigreg import sigreg_loss, stride_sample
 from .transformer import TransformerBlock
 from .tsct import make_projection, set_factor_qat_seed
+
+
+def mhc_readout(streams: torch.Tensor, compose: bool) -> torch.Tensor:
+    """The mHC lane readout — the loop form's two expressions, verbatim.
+
+    `streams [b, t, K, d]` → `[b, t, d]`. The mHC-ONLY arm reads the
+    UNNORMALISED sum (the loop's historical convention, pinned by
+    `test_mhc.py`); the composition applies the paper's `1/K` (2409.19606
+    §2.1). On `block_form="transformer"` the lane scale `c` is chosen per arm
+    (`_forward_transformer`) so BOTH of these are the plain residual state.
+    """
+    h = streams.float().sum(dim=-2)
+    return h / streams.shape[-2] if compose else h
 
 
 class DormouseModel(nn.Module):
@@ -339,6 +355,38 @@ class DormouseModel(nn.Module):
             # `dense_qat` is refused on this form (`validate_block_form`), so the
             # only cache to collect is a `use_tsct` head's own.
             self._qat_caches = attach_qat_caches(self, dense=False)
+            # mHC (`use_mhc`, `model/mhc.py`): the K-lane residual across the
+            # LAYERS. ONE mixer for the stack — the lane state belongs to the
+            # stack, not to a block, exactly as `LoopBlock._window` carries ONE
+            # per body across its iterations. A mixer PER BLOCK would leave the
+            # first block's `H_res` mixing the replicated lanes the stack starts
+            # with (a row-stochastic mix of identical lanes is the identity), a
+            # permanently dead parameter; one shared operator always sees lanes
+            # a previous layer has already split. Built LAST so every base
+            # draw (blocks, norm, head) is the OFF model's, RNG order included.
+            if cfg.use_mhc:
+                self.mhc_full = MHCMix(
+                    d, cfg.mhc_streams, device=device, sinkhorn=cfg.mhc_sinkhorn
+                )
+                # Lane representation scale `c` (see `_forward_transformer`):
+                # the composition's readout divides by K, so its lanes carry
+                # the state (`c = 1`); the mHC-ONLY readout is the raw sum, so
+                # its lanes carry `1/K` of it and the sum IS the state
+                # (`c = 1/K`). Either way the value handed to `_readout` is the
+                # plain residual state at step 0 — the identity the arm owes.
+                # `H_post`'s K weights are rescaled to sum to `K·c` per token
+                # (`MHCMix.forward(post_sum=...)`): a random `φ_post` would
+                # otherwise split the replicated lanes on the first write and
+                # move the read-out's increment off `y`. The crate's
+                # `N(0, 0.01)` draws are kept. `b_pre` is the ONE init this arm
+                # changes: `σ(10)` saturates the read gate (~1 per lane), which
+                # makes the convex combination constant to ~1e-7 and leaves the
+                # gate's gradient on σ's flat top; the uniform read `1/K` puts
+                # it in the responsive region, so the arm can learn WHICH lane
+                # to read (the loop's pinned `b_pre = 10` is untouched).
+                self._mhc_lane_scale = 1.0 if cfg.use_attnres else 1.0 / cfg.mhc_streams
+                with torch.no_grad():
+                    self.mhc_full.b_pre.fill_(math.log(1.0 / (cfg.mhc_streams - 1.0)))
             # The attributes `DormouseModel.forward` reads before it dispatches,
             # and the ones the trainer's eval/checkpoint readers expect.
             self.bf = None
@@ -1372,33 +1420,65 @@ class DormouseModel(nn.Module):
         is the number `breakdown` reports for a looped model — one readout, so
         `per_iter` is empty. No aux term, no L_Rec, no per-iteration CE: those
         are loop-only and `validate_block_form` refuses their weights.
+
+        THE mHC LANE SEAM (`use_mhc`). The loop carries its K lanes across
+        ITERATIONS (`loopblock._window`); this form carries the same K
+        full-width lanes across LAYERS, one write per block:
+
+            x_l    = the K lanes (the stack state, `c·P` initialised that way)
+            ctx    = H_pre x_l                 # Eq. 3's read, convex / c
+            y      = block(ctx) - ctx          # the block's own write
+            a      = y                         # mHC only
+                   | AttnRes([0, y])           # the composition: WHICH update
+            x_l'   = H_res x_l + H_postᵀ a     # Eq. 3, unchanged
+
+        READOUT, copied from the loop form exactly: the mHC-ONLY arm reads the
+        unnormalised SUM of the lanes; the composition applies the paper's
+        `1/K` (2409.19606 §2.1). The loop's lanes carry the state and its sum
+        is `K×`, which the composition's `1/K` undoes; this form's mHC-only
+        lanes carry `1/K` so its raw sum IS the state, and the composition's
+        lanes carry the state so its `1/K` read is the state. Same two
+        expressions, and both arms hand `_readout` the plain residual state at
+        step 0 — the identity `test_mhc_transformer.py` asserts (a `K×` state
+        would fail the final RMSNorm's `1e-3` eps).
+
+        The composition is `loopblock.py`'s: mHC owns the lane STATE, AttnRes
+        owns WHICH UPDATE the write carries. The update set is `S = 2` —
+        `u_0 = 0` (the embedding is already in the lanes) and `u_1 = y` — and
+        `FullDepthAttnRes`'s per-layer zero query makes it exactly `y` at init.
         """
         h = self.embed(input_ids)
         mod_aux = None
-        v_first = None
-        # `use_attnres` only: the update history the blocks mix. `None` keeps
-        # the plain call signature and allocation-free path of the control.
         attnres = getattr(self, "attnres_full", None)
-        updates: list[torch.Tensor] | None = [] if attnres is not None else None
-        for block in stepaudit.iterations("forward.transformer_blocks", self.transformer_blocks):
-            if updates is None:
-                h = block(h, counters, v_first=v_first)
-            else:
-                # `len(updates)` IS this block's layer index: one entry per
-                # completed block, so block 0 sees an empty history.
-                h = block(
-                    h,
-                    counters,
-                    v_first=v_first,
-                    attnres=attnres,
-                    layer_idx=len(updates),
-                    updates=updates,
-                )
-            v_first = block.last_v
-            counters.count("transformer_block")
-            aux = getattr(block, "last_aux", None)
-            if aux is not None:
-                mod_aux = aux if mod_aux is None else mod_aux + aux
+        mhc = getattr(self, "mhc_full", None)
+        if mhc is not None:
+            h, mod_aux = self._forward_transformer_mhc(h, counters, attnres)
+        else:
+            v_first = None
+            # `use_attnres` only: the update history the blocks mix. `None` keeps
+            # the plain call signature and allocation-free path of the control.
+            updates: list[torch.Tensor] | None = [] if attnres is not None else None
+            for block in stepaudit.iterations(
+                "forward.transformer_blocks", self.transformer_blocks
+            ):
+                if updates is None:
+                    h = block(h, counters, v_first=v_first)
+                else:
+                    # `len(updates)` IS this block's layer index: one entry per
+                    # completed block, so block 0 sees an empty history.
+                    h = block(
+                        h,
+                        counters,
+                        v_first=v_first,
+                        attnres=attnres,
+                        layer_idx=len(updates),
+                        updates=updates,
+                    )
+                v_first = block.last_v
+                counters.count("transformer_block")
+                aux = getattr(block, "last_aux", None)
+                if aux is not None:
+                    mod_aux = aux if mod_aux is None else mod_aux + aux
         self.last_mod_aux = None
         if mod_aux is not None:
             # The arm's BCE value is ONE number per forward: the mean over the
@@ -1412,6 +1492,60 @@ class DormouseModel(nn.Module):
             # `mod_aux` stays attached so the router learns from it.
             loss = loss + self.cfg.mod_aux_weight * mod_aux
         return logits, loss
+
+    def _forward_transformer_mhc(
+        self,
+        h: torch.Tensor,
+        counters: Counters,
+        attnres: FullDepthAttnRes | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The K-lane stack (`use_mhc`, `_forward_transformer`'s docstring).
+
+        `h` is the embedding; returns the read-out residual state and the MoD
+        aux value (or `None`). Every lane write is ONE `MHCMix.forward`, the
+        same Eq. 3 statement the loop runs, and the readout is the loop's two
+        expressions (sum, or `/K` in the composition).
+        """
+        mhc = self.mhc_full
+        k = mhc.n_streams
+        # `c`: the state each lane carries (`1` composing, `1/K` mHC-only).
+        c = self._mhc_lane_scale
+        compose = attnres is not None
+        b, t, d = h.shape
+        # Replicated from the embedding, as the loop does (`2409.19606 §2.1`).
+        streams = (h * c).unsqueeze(-2).expand(b, t, k, d)
+        v_first = None
+        mod_aux = None
+        layer = 0
+        for block in stepaudit.iterations(
+            "forward.transformer_blocks", self.transformer_blocks
+        ):
+            # Eq. 3's `H_pre x_l`, applied by the caller (`mhc.py`): a convex
+            # mix over the K lanes, divided by `c` so the block reads the state.
+            ctx = mhc.pre_mix(streams, convex=True, scale=1.0 / c)
+            plain = block(ctx, counters, v_first=v_first)
+            # The block's write is its residual DELTA — the same `F(H_pre x_l)`
+            # the loop's body emits (its two residual adds live inside `_block`).
+            y = plain - ctx.to(plain.dtype)
+            # The composition scores the write UPDATES `[u_0 = 0, u_1 = y]`
+            # with this layer's pseudo-query; at the zero-query init every
+            # weight is 1, so `a` is `y` bit for bit.
+            a = attnres([y], layer) if compose else y
+            # `post_sum = K·c`: the K deposits re-sum to the lane scale, so the
+            # write adds exactly `y` to the read-out state (see `MHCMix.forward`).
+            streams = mhc(streams, a, post_sum=float(k) * c)
+            # The loop's readout, expression for expression.
+            h = mhc_readout(streams, compose)
+            v_first = block.last_v
+            counters.count("transformer_block")
+            counters.count("mhc")
+            if compose:
+                counters.count("mhc_attnres_write")
+            aux = getattr(block, "last_aux", None)
+            if aux is not None:
+                mod_aux = aux if mod_aux is None else mod_aux + aux
+            layer += 1
+        return h, mod_aux
 
     def _readout(
         self,

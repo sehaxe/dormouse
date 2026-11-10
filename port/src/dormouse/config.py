@@ -993,10 +993,15 @@ class ModelConfig:
     #: exactly the "deeper loops stop paying" wall we hit at iteration 4.
     #: `false` (the default) leaves the model bit-identical. Composes with
     #: `use_attnres` (see the field above); `loom` and `use_byteflow` stay
-    #: refused alongside it.
+    #: refused alongside it. On `block_form="transformer"` the SAME K lanes are
+    #: carried across LAYERS by ONE `MHCMix` (`_forward_transformer_mhc`), and
+    #: `use_mhc` is refused with `byte_patch`, whose patch channel threads no
+    #: lane state.
     use_mhc: bool = False
-    #: Lanes. Only K=2 ships: it is the configuration the paper measured and
-    #: the one the review wires; `validate` refuses anything else.
+    #: Lanes. On the loop form only K=2 ships: it is the configuration the paper
+    #: measured and the one the review wires; `validate` refuses anything else.
+    #: On `block_form="transformer"` K is the dense lane count and any K >= 2 is
+    #: legal (`mhc_streams < 2` is refused on every form).
     mhc_streams: int = 2
     #: Eq. 9's Sinkhorn normaliser (`model/mhc.sinkhorn_knopp`). `"logsumexp"`
     #: is the shipped arithmetic, bit for bit (`m -= logsumexp(m)`).
@@ -3060,7 +3065,7 @@ def validate_ffn(model: ModelConfig) -> None:
 #: The knobs that only the KDA loop reads. `block_form="transformer"` builds no
 #: `LoopBlock`, so any one of these being on is a config that lies about what
 #: the run computes — refused LOUDLY, never silently dropped.
-_KDA_ONLY_FORM_FLAGS = ("use_kda", "use_csa", "use_mhc", "use_engram", "layerrope")
+_KDA_ONLY_FORM_FLAGS = ("use_kda", "use_csa", "use_engram", "layerrope")
 #: The training terms defined on the loop's per-iteration readout. The vanilla
 #: decoder has no loop, no per-iteration CE and no `last_mtp`/`last_halt`; a
 #: nonzero weight would build a head that no forward reaches.
@@ -3183,6 +3188,14 @@ def _validate_hybrid(model: ModelConfig) -> None:
             f"re-scores the loop's ITERATION history, and a hybrid block sees one "
             f"iteration, so the mechanism would reach no history while the config "
             f"reported it on. Escape: use_attnres=false, or block_stack='uniform'."
+        )
+    if model.use_mhc:
+        loud(
+            f"block_stack={model.block_stack!r} with use_mhc=true: the hybrid stack "
+            f"runs each unique block ONCE and threads no K-lane residual state "
+            f"between them (`_forward_hybrid`), so the lanes would be per-block and "
+            f"the placement a different experiment. Escape: use_mhc=false, or "
+            f"block_stack='uniform' (the loop or the dense stack both carry lanes)."
         )
     if model.prelude_layers or model.coda_layers:
         loud(
@@ -3319,6 +3332,20 @@ def validate_block_form(model: ModelConfig) -> None:
             f"`use_byteflow` alone, so this flag would be inert. Escape: "
             f"block_form='transformer', or byte_patch=false."
         )
+    if model.mhc_streams < 2:
+        loud(
+            f"mhc_streams={model.mhc_streams}: the mHC residual is K >= 2 full-width "
+            f"lanes — one lane has nothing to mix and its Sinkhorn matrix is 1x1, so "
+            f"the arm would be exactly the plain residual while the config reported "
+            f"it on. Escape: mhc_streams >= 2 (the loop form ships K=2)."
+        )
+    if model.use_mhc and model.byte_patch:
+        loud(
+            "byte_patch=true with use_mhc=true: the patch channel runs the dense "
+            "blocks over the codec's patch positions and threads no K-lane residual "
+            "state (`_forward_channel`), so the lanes would never exist while the "
+            "snapshot reported the arm on. Escape: use_mhc=false, or byte_patch=false."
+        )
     if model.block_form == "kda":
         if model.n_layers:
             loud(
@@ -3421,9 +3448,17 @@ def validate_block_form(model: ModelConfig) -> None:
     if bad:
         loud(
             f"block_form='transformer' refuses {bad}: the vanilla decoder has no "
-            f"KDA, CSA, mHC, Engram or LayerRoPE, so the flag(s) would reach no "
+            f"KDA, CSA, Engram or LayerRoPE, so the flag(s) would reach no "
             f"code while the snapshot reported them on. Escape: "
             f"{', '.join(f'{name}=false' for name in bad)}, or block_form='kda'."
+        )
+    if model.fused_residual or model.fused_epilogue:
+        loud(
+            f"block_form='transformer' with fused_residual={model.fused_residual}/"
+            f"fused_epilogue={model.fused_epilogue}: those kernels fuse the LOOP's "
+            f"lane chain (`LoopBlock._step`), and the dense stack's seam is the "
+            f"eager `MHCMix` (`_forward_transformer_mhc`). Escape: "
+            f"fused_residual=false and fused_epilogue=false, or block_form='kda'."
         )
     aux = [name for name in _LOOP_ONLY_LOSS_WEIGHTS if getattr(model, name) != 0.0]
     if aux:
@@ -4353,13 +4388,13 @@ def validate(model: ModelConfig) -> None:
                     f"axis at a time, and AttnRes (`use_attnres`) is the only "
                     f"partner it composes with (scripts/ab_mhc_attnres.py)."
                 )
-        if model.mhc_streams != 2:
+        if model.block_form != "transformer" and model.mhc_streams != 2:
             loud(
-                f"mhc_streams={model.mhc_streams}: only K=2 ships. It is the K the "
-                f"φ evidence used (2604.21106 §5.2) and 2409.19606 Tab. 1's knee; "
-                f"mHC's own App. A.1 default of 4 is the named follow-up row, not a "
-                f"shipped rung. Escape: mhc_streams=2, or land the n=4 arm and its "
-                f"gate BEFORE the config can lie about it."
+                f"mhc_streams={model.mhc_streams}: only K=2 ships on the loop form. It "
+                f"is the K the φ evidence used (2604.21106 §5.2) and 2409.19606 Tab. "
+                f"1's knee; mHC's own App. A.1 default of 4 is the named follow-up row, "
+                f"not a shipped rung. Escape: mhc_streams=2, or block_form='transformer' "
+                f"(whose K is the dense lane count and accepts any K >= 2)."
             )
     elif model.mhc_streams != 2:
         loud(

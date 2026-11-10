@@ -217,26 +217,59 @@ class MHCMix(nn.Module):
             sinkhorn_knopp(res, impl=self.sinkhorn),
         )
 
-    def pre_mix(self, x_streams: torch.Tensor) -> torch.Tensor:
+    def pre_mix(
+        self,
+        x_streams: torch.Tensor,
+        *,
+        convex: bool = False,
+        scale: float = 1.0,
+    ) -> torch.Tensor:
         """`H_pre x_l`: Eq. 3's layer input, applied by the CALLER — `block.rs:189`.
 
         `H_pre` is `[1, n]`, so this aggregates the `n` full-width lanes into
         the body's `d`-wide input. Not part of [`forward`] on purpose
-        (`lib.rs:43-48`).
+        (`lib.rs:43-48`). The two keyword arguments are the TRANSFORMER arm's
+        identity lever; the loop calls the method with neither, so its bits do
+        not move:
+
+        * `convex=True` divides the gate by its own sum, making the read a
+          convex combination of the lanes. On the transformer arm the K lanes
+          are full-width replicas, so `Σ H_pre` would otherwise scale the
+          block's input by K (the same "K copies re-sum" correction the
+          readout applies); the normalised read reads the lane value itself.
+        * `scale` multiplies the result. That arm stores `1/K` of the state in
+          each lane for the mHC-ONLY readout (whose raw sum must be the state),
+          so its read multiplies the convex mix back by K. `1.0` skips the
+          multiply, keeping the fused/eager loop paths byte-for-byte.
         """
         # burn: block.rs:189 — H_pre = σ(H̃_pre), [B,T,1,n].
         h_pre = torch.sigmoid(self._pre_tilde(x_streams)).unsqueeze(-2)  # [b,t,1,n]
-        return (h_pre.transpose(-1, -2) * x_streams).sum(-2)
+        if convex:
+            h_pre = h_pre / h_pre.sum(-1, keepdim=True)
+        out = (h_pre.transpose(-1, -2) * x_streams).sum(-2)
+        return out if scale == 1.0 else out * scale
 
-    def forward(self, x_streams: torch.Tensor, x_in: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x_streams: torch.Tensor, x_in: torch.Tensor, *, post_sum: float | None = None
+    ) -> torch.Tensor:
         """Eq. 3: `x_{l+1} = H_res x_l + H_postᵀ F(H_pre x_l)` — `block.rs:197-227`.
 
         `x_streams [b, t, n, d]` are the lanes `x_l`; `x_in [b, t, d]` is the
         caller's branch output `F(H_pre x_l, W)`. Lane `j` receives
         `Σ_i H_res[j,i]·x_l[i] + H_post[j]·x_in`.
+
+        `post_sum` is the TRANSFORMER arm's "K full-width deposits re-sum"
+        correction: the K `H_post` weights are rescaled so they SUM to this
+        value (its `<target>/Σ H_post`) per token. The loop passes nothing, so
+        its Eq. 8 expression is byte-for-byte. Without it a random `φ_post`
+        splits the replicated lanes on the first write and the arm's read no
+        longer returns the state at step 0; the rescale keeps the deposit's
+        total exact (its per-lane split — the learnable signal — still moves).
         """
         post, res = self._post_res_tilde(x_streams)
         h_post = (2.0 * torch.sigmoid(post)).unsqueeze(-2)  # [b, t, 1, n]
+        if post_sum is not None:
+            h_post = h_post * (post_sum / h_post.sum(-1, keepdim=True))
         h_res = sinkhorn_knopp(res, impl=self.sinkhorn)
         # burn: block.rs:213-226 — H_res x_l, then H_postᵀ F added per lane.
         # The MIX is a reduction against the fp32 Sinkhorn matrix, so the lanes

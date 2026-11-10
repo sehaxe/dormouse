@@ -17,12 +17,10 @@ from __future__ import annotations
 
 import math
 
-import pytest
 import torch
 from conftest import tiny_cfg
 
 from dormouse.config import ModelConfig
-from dormouse.instrument import LoudError
 from dormouse.model import DormouseModel, param_count
 from dormouse.model.attnres import full_depth_attend, full_depth_weights
 
@@ -181,8 +179,11 @@ def test_off_path_has_no_attnres_and_on_adds_exactly_l_d_plus_l():
 # --- refusals ---------------------------------------------------------------
 
 
-def test_use_attnres_still_refuses_the_kda_composition_on_transformer():
-    """mHC owns the K-lane residual on the loop form; the two do not mix here."""
-    with pytest.raises(LoudError) as e:
-        _cfg(use_attnres=True, use_mhc=True)
-    assert "use_mhc" in str(e.value) and "Escape:" in str(e.value)
+def test_use_attnres_composes_with_mhc_on_transformer():
+    """mHC owns the lanes, AttnRes owns the update — legal on this form too."""
+    cfg = _cfg(use_attnres=True, use_mhc=True)
+    assert cfg.use_attnres and cfg.use_mhc
+    model = _build(5, use_attnres=True, use_mhc=True)
+    with torch.no_grad():
+        logits, _, _ = model(_batch())
+    assert torch.isfinite(logits).all()
