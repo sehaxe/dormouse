@@ -51,9 +51,8 @@ from torch import nn
 
 from ..config import check_gated_ffn_bill
 from ..instrument import Counters, loud
-from .act_quant import fake_quant_act
 from .experts import expert_glu
-from .nvfp4 import GROUP as NVFP4_GROUP
+from .packed_acts import packed_act_mm, packed_glu
 from .tsct import dense_qat_kind, dense_qat_weight, mm_mixed
 
 __all__ = [
@@ -204,11 +203,12 @@ class TransformerBlock(nn.Module):
             "transformer.up_proj",
         )
         #: The 4-bit ACTIVATION arm (`act_qat`, `ACT_QATS`): the FFN GEMM inputs
-        #: are fake-quantized to e2m1 with one block scale per 16 columns — the
-        #: NVFP4 layout, i.e. the width the fp4 `_scaled_mm` kernel reads
-        #: (`nvfp4.GROUP`). Attention stays at >= 8 bits (a4.8's rule), and the
-        #: quantizer is skipped entirely when the flag is off, so the off forward
-        #: is the same calls it has always made.
+        #: AND the GLU operands are fake-quantized to e2m1 with one e4m3 scale per
+        #: 16 columns — the NVFP4 layout (`model/packed_acts.py`) — and SAVED in
+        #: that packed form, which is what drops the step's VRAM. Attention stays
+        #: at >= 8 bits (a4.8's rule), and the packed path is skipped entirely
+        #: when the flag is off, so the off forward is the same calls it has
+        #: always made.
         self.act_qat = cfg.act_qat
         if self.ffn_gated:
             # The runtime seam a hand-built config reaches, the same rule
@@ -347,41 +347,74 @@ class TransformerBlock(nn.Module):
         # fp32 stream (mm_mixed's contract, widened back here).
         x = x + self._qmm(y, self.proj, self._qat_attn, counters).to(x.dtype)
         h2 = self.ln2(x)
+        packed = self.act_qat != "none"
         if self.ffn_gated:
-            a = self._qat_act(h2)
-            g = self._qmm(a, self.gate_proj, self._qat_ffn, counters)
-            u = self._qmm(a, self.up_proj, self._qat_ffn, counters)
-            h = expert_glu(self.expert_act, g, u, beta1=self.beta1, beta2=self.beta2)
+            if packed:
+                # ONE pack feeds gate and up; `packed_glu` then owns the GLU so
+                # its three `[T, f]` saves become two packed `[T, f/2]`.
+                g, u = packed_act_mm(
+                    h2,
+                    self.compute_dtype,
+                    self._qat_weight(self.gate_proj, self._qat_ffn),
+                    self._qat_weight(self.up_proj, self._qat_ffn),
+                    counters=counters,
+                )
+                h = packed_glu(
+                    self.expert_act,
+                    g,
+                    u,
+                    beta1=self.beta1,
+                    beta2=self.beta2,
+                    counters=counters,
+                )
+            else:
+                g = self._qmm(h2, self.gate_proj, self._qat_ffn, counters)
+                u = self._qmm(h2, self.up_proj, self._qat_ffn, counters)
+                h = expert_glu(self.expert_act, g, u, beta1=self.beta1, beta2=self.beta2)
+        elif packed:
+            h = F.gelu(
+                packed_act_mm(
+                    h2,
+                    self.compute_dtype,
+                    self._qat_weight(self.fc, self._qat_ffn),
+                    counters=counters,
+                )[0]
+            )
         else:
-            h = F.gelu(self._qmm(self._qat_act(h2), self.fc, self._qat_ffn, counters))
+            h = F.gelu(self._qmm(h2, self.fc, self._qat_ffn, counters))
         if self.ffn_clip > 0.0:
             h = h.clamp(max=self.ffn_clip)
-        h = self._qmm(self._qat_act(h), self.fc2, self._qat_ffn, counters)
+        if packed:
+            h = packed_act_mm(
+                h,
+                self.compute_dtype,
+                self._qat_weight(self.fc2, self._qat_ffn),
+                counters=counters,
+            )[0]
+        else:
+            h = self._qmm(h, self.fc2, self._qat_ffn, counters)
         return x + h.to(x.dtype)
 
-    def _qmm(
-        self, x: torch.Tensor, linear: nn.Linear, kind: str, counters: Counters | None
-    ) -> torch.Tensor:
-        """`mm_mixed(x, W)` with `dense_qat` projected onto `W` — the master when off.
+    def _qat_weight(self, linear: nn.Linear, kind: str) -> torch.Tensor:
+        """`dense_qat` projected onto `linear`'s weight — the master when off.
 
         ONE call shape for the six projections: `dense_qat_weight` short-circuits
         `kind == "none"` (no projector call at all, the gate
         `tests/test_dense_qat.py` requires), and the per-step `QuantCache` lives
         on the `nn.Linear` itself (`attach_qat_caches`).
         """
-        w = dense_qat_weight(
+        return dense_qat_weight(
             linear.weight,
             kind,
             self.dense_qat_alpha,
             cache=getattr(linear, "_qat_cache", None),
         )
-        return mm_mixed(x, w, self.compute_dtype, counters)
 
-    def _qat_act(self, x: torch.Tensor) -> torch.Tensor:
-        """e2m1 fake-quant (block `nvfp4.GROUP`) — the identity when `act_qat` is off."""
-        if self.act_qat == "none":
-            return x
-        return fake_quant_act(x, self.act_qat, NVFP4_GROUP)
+    def _qmm(
+        self, x: torch.Tensor, linear: nn.Linear, kind: str, counters: Counters | None
+    ) -> torch.Tensor:
+        """`mm_mixed(x, W)` in the compute dtype — the bf16 (unpacked) lane."""
+        return mm_mixed(x, self._qat_weight(linear, kind), self.compute_dtype, counters)
 
     def _forward_mod(
         self,

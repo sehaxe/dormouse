@@ -232,27 +232,37 @@ def test_skip_attn_keeps_qkv_and_proj_on_their_master():
 # ---------------------------------------------------------------------------
 
 
-def test_act_qat_quantizes_the_ffn_gemm_inputs_with_block_16(monkeypatch):
+def test_act_qat_packs_the_ffn_gemm_inputs_and_the_glu_operands(monkeypatch):
+    """The seam is `packed_acts`, not `fake_quant_act`'s value-only wrapper.
+
+    `4c53190` fake-quantized the GEMM inputs in bf16; that is a value change, not
+    a byte change. The arm now enters through `packed_act_mm` (the quantizer AND
+    the GEMM, so the bf16 operand is not saved) and `packed_glu` (the GLU's
+    `g`/`u` are packed instead of three bf16 `[T, f]` saves) — pinned here on the
+    CALL SITES; the byte claim is `tests/test_packed_acts.py`'s.
+    """
     import dormouse.model.transformer as tr
 
-    seen: list[tuple[str, int, torch.Tensor]] = []
-    real = tr.fake_quant_act
+    mm: list[int] = []  # the weight count per fused GEMM call
+    glu: list[str] = []
+    real_mm, real_glu = tr.packed_act_mm, tr.packed_glu
 
-    def spy(x, fmt, group=0):
-        out = real(x, fmt, group)
-        seen.append((fmt, group, out.detach()))
-        return out
+    def mm_spy(x, dt, *w, counters=None):
+        mm.append(len(w))
+        return real_mm(x, dt, *w, counters=counters)
 
-    monkeypatch.setattr(tr, "fake_quant_act", spy)
+    def glu_spy(act, g, u, **kw):
+        glu.append(act)
+        return real_glu(act, g, u, **kw)
+
+    monkeypatch.setattr(tr, "packed_act_mm", mm_spy)
+    monkeypatch.setattr(tr, "packed_glu", glu_spy)
     model = _model(act_qat="e2m1")
     x = _input()
     _, _, cnt = model(x, x)
-    assert {f for f, _, _ in seen} == {"e2m1"}
-    assert {g for _, g, _ in seen} == {16}
-    # 3 GEMM inputs per block (h2 once, the post-activation twice? no: gate/up
-    # share h2's quantized copy) — the count is per SITE, and every one of them
-    # lands on the 16-wide scale grid.
-    assert len(seen) == 2 * 2, f"{len(seen)} activation quantizations for 2 blocks"
+    assert mm.count(2) == 2, "one gate/up pair per block: ONE pack, two GEMMs"
+    assert mm.count(1) == 2, "fc2 input packed once per block"
+    assert glu == ["silu", "silu"], "one fused GLU per block"
     assert cnt.get("act_qat_arms") == 2, "one counter per block forward"
 
 
