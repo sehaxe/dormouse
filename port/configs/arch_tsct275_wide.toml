@@ -1,0 +1,47 @@
+# arch_tsct275_wide — the REINVESTMENT arm: same parameter budget and same
+# FLOPs per token as arch_dense275, but spent on depth/width instead of dense
+# matrices, with the FFN factorised at rank 64.
+#
+# The mechanism test (arch_tsct275) answers "what does rank-64 cost at the same
+# shape". This arm answers the question the project actually cares about: if the
+# freed parameters are reinvested, does the factorised model beat the dense one
+# at the SAME compute budget? Memory #52's reinvestment rule.
+#
+# Arithmetic (r = 64, f = 2.46·d):
+#   params = 2·256·d + L·(4d² + 3·(d·r + r + r·f))
+#   d = 1536, L = 26, f = 3776  ->  ~272.7M   (dense control: 273.4M)
+#   FLOPs/token = 2·L·(4d² + 3·(d·r + r·f)) = 544M  (dense control: 545M)
+# Both budgets match the control to <1%, so a delta is the representation, not
+# more compute.
+
+d_model = 1536
+n_heads = 24
+head_dim = 64
+d_ffn = 3776
+rank = 64
+ffn_rank_gate = 0
+ffn_rank_down = 0
+d_ffn_gelu = 5664
+vocab = 256
+max_seq_len = 1024
+max_iter = 1
+loop_blocks = 1
+n_layers = 26
+
+block_form = "transformer"
+use_kda = false
+use_csa = false
+use_mhc = false
+use_attnres = false
+use_engram = false
+layerrope = false
+
+n_experts = 1
+moe_topk = 0
+use_tsct = false
+ffn_form = "tsct"
+
+ffn_gated = true
+expert_act = "silu"
+
+bf16 = true
