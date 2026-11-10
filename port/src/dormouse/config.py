@@ -972,13 +972,18 @@ class ModelConfig:
     #: generator seeded `(run seed + step)`.
     tsct_revive_noise: float = 0.01
     use_engram: bool = True
-    #: AttnRes (`2603.15031`): the loop-boundary write becomes a softmax
-    #: mixture over the depth sources with one learned pseudo-query per
-    #: iteration slot (`loopblock.depth_attend`; the paper's score form).
-    #: COMPOSES with `use_mhc`: with both on, mHC owns the K-lane state
-    #: (`H_pre` reads it, `H_post`/`H_res` write it) and AttnRes owns WHICH
-    #: UPDATE the write carries (`loopblock`'s "THE COMPOSITION"). Alone, it
-    #: replaces ReZero exactly as it always did.
+    #: AttnRes (`2603.15031`). On `block_form="kda"` the loop-boundary write
+    #: becomes a softmax mixture over the depth sources with one learned
+    #: pseudo-query per iteration slot (`loopblock.depth_attend`; the paper's
+    #: score form). COMPOSES with `use_mhc`: with both on, mHC owns the K-lane
+    #: state (`H_pre` reads it, `H_post`/`H_res` write it) and AttnRes owns
+    #: WHICH UPDATE the write carries (`loopblock`'s "THE COMPOSITION"). Alone,
+    #: it replaces ReZero exactly as it always did.
+    #: On `block_form="transformer"` the flag selects the FULL variant (N = L,
+    #: no blocks): one pseudo-query per layer, every layer reads all previous
+    #: updates (`model/attnres.py`). It is identity at init (the write is the
+    #: plain residual) and refused with `byte_patch`, whose patch channel does
+    #: not thread the history.
     use_attnres: bool = False
     #: mHC (`2512.24880`, DeepSeek 2025): the residual becomes TWO streams
     #: mixed by a doubly-stochastic (Sinkhorn-projected) matrix, at the LOOP
@@ -3055,7 +3060,7 @@ def validate_ffn(model: ModelConfig) -> None:
 #: The knobs that only the KDA loop reads. `block_form="transformer"` builds no
 #: `LoopBlock`, so any one of these being on is a config that lies about what
 #: the run computes — refused LOUDLY, never silently dropped.
-_KDA_ONLY_FORM_FLAGS = ("use_kda", "use_csa", "use_mhc", "use_attnres", "use_engram", "layerrope")
+_KDA_ONLY_FORM_FLAGS = ("use_kda", "use_csa", "use_mhc", "use_engram", "layerrope")
 #: The training terms defined on the loop's per-iteration readout. The vanilla
 #: decoder has no loop, no per-iteration CE and no `last_mtp`/`last_halt`; a
 #: nonzero weight would build a head that no forward reaches.
@@ -3267,9 +3272,11 @@ def validate_block_form(model: ModelConfig) -> None:
     `dataclasses.replace` and a hand-built config all pass through it),
     `validate`, and `DormouseModel.__init__` (the runtime seam a hand-built
     config reaches). The `transformer` form is `scripts/control_transformer.py`'s
-    block: it has no KDA, CSA, mHC, AttnRes, Engram, LayerRoPE, loop, prelude,
-    coda, aux head or host memory, so every flag that names one is refused
-    rather than left inert.
+    block: it has no KDA, CSA, mHC, Engram, LayerRoPE, loop, prelude, coda, aux
+    head or host memory, so every flag that names one is refused rather than
+    left inert. `use_attnres` is the exception: the transformer form runs the
+    FULL AttnRes variant (`model/attnres.py`) and the refusal below names it no
+    more.
     """
     if model.block_form not in BLOCK_FORMS:
         loud(
@@ -3414,8 +3421,8 @@ def validate_block_form(model: ModelConfig) -> None:
     if bad:
         loud(
             f"block_form='transformer' refuses {bad}: the vanilla decoder has no "
-            f"KDA, CSA, mHC, AttnRes, Engram or LayerRoPE, so the flag(s) would "
-            f"reach no code while the snapshot reported them on. Escape: "
+            f"KDA, CSA, mHC, Engram or LayerRoPE, so the flag(s) would reach no "
+            f"code while the snapshot reported them on. Escape: "
             f"{', '.join(f'{name}=false' for name in bad)}, or block_form='kda'."
         )
     aux = [name for name in _LOOP_ONLY_LOSS_WEIGHTS if getattr(model, name) != 0.0]
@@ -3446,6 +3453,15 @@ def validate_block_form(model: ModelConfig) -> None:
         # runs EVERY patch (K = P), because a K < P global top-k would make the
         # selection depend on future bytes and break the strict
         # `logits[:, :q]` invariance the codec's causality gate pins.
+        if model.use_attnres:
+            loud(
+                "byte_patch=true with use_attnres=true: the patch channel runs "
+                "the dense blocks over the codec's patch positions and does not "
+                "thread the layer-update history the AttnRes mixture reads, so "
+                "the flag would reach no code. (The KDA loop's own AttnRes write "
+                "is a different, legal arm beside `use_byteflow` with "
+                "byte_patch=false.) Escape: use_attnres=false, or byte_patch=false."
+            )
         if model.byteflow_codec != "conv":
             loud(
                 f"byte_patch=true with byteflow_codec={model.byteflow_codec!r}: "

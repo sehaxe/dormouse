@@ -31,6 +31,7 @@ from ..config import ModelConfig, block_kinds, hybrid_ratio, validate_block_form
 from ..instrument import Counters, loud
 from ..losses import fixed_cross_entropy, logit_softcap
 from .act_mem import ActivationOffload
+from .attnres import FullDepthAttnRes
 from .byteflow import (
     BfChannel,
     ByteFlowNet,
@@ -319,6 +320,16 @@ class DormouseModel(nn.Module):
                     for i in range(n_layers)
                 ]
             )
+            # Full depth AttnRes (`use_attnres`, `model/attnres.py`): one shared
+            # module, one pseudo-query per layer + the per-distance log-prior.
+            # Built only when the flag is on, so the off tree — parameter names,
+            # count, RNG order — is the control's. `byte_patch` is refused
+            # alongside the flag (`validate_block_form`): that channel runs the
+            # blocks over patches and does not thread the history.
+            if cfg.use_attnres:
+                self.attnres_full = FullDepthAttnRes(
+                    d, n_layers, eps=cfg.norm_eps, device=device
+                )
             self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
             if cfg.tie_embeddings:
                 self.lm_head = TiedHead(self.embed)
@@ -1365,8 +1376,24 @@ class DormouseModel(nn.Module):
         h = self.embed(input_ids)
         mod_aux = None
         v_first = None
+        # `use_attnres` only: the update history the blocks mix. `None` keeps
+        # the plain call signature and allocation-free path of the control.
+        attnres = getattr(self, "attnres_full", None)
+        updates: list[torch.Tensor] | None = [] if attnres is not None else None
         for block in stepaudit.iterations("forward.transformer_blocks", self.transformer_blocks):
-            h = block(h, counters, v_first=v_first)
+            if updates is None:
+                h = block(h, counters, v_first=v_first)
+            else:
+                # `len(updates)` IS this block's layer index: one entry per
+                # completed block, so block 0 sees an empty history.
+                h = block(
+                    h,
+                    counters,
+                    v_first=v_first,
+                    attnres=attnres,
+                    layer_idx=len(updates),
+                    updates=updates,
+                )
             v_first = block.last_v
             counters.count("transformer_block")
             aux = getattr(block, "last_aux", None)

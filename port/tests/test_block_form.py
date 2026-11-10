@@ -147,7 +147,8 @@ def test_kda_form_is_bit_identical_to_clean_main():
         ({"use_kda": True}, "use_kda"),
         ({"use_csa": True}, "use_csa"),
         ({"use_mhc": True}, "use_mhc"),
-        ({"use_attnres": True}, "use_attnres"),
+        # `use_attnres` left this list on 2026-11-10: the transformer form runs
+        # the full N = L variant (`tests/test_attnres_full.py`).
         ({"use_engram": True}, "use_engram"),
         ({"layerrope": True}, "layerrope"),
         ({"jepa": True, "jepa_weight": 0.1}, "jepa_weight"),

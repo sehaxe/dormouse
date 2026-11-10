@@ -247,16 +247,36 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         counters: Counters | None = None,
         v_first: torch.Tensor | None = None,
+        *,
+        attnres=None,
+        layer_idx: int = 0,
+        updates: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """`x [b, t, d]` in the residual dtype → `[b, t, d]` in the same dtype.
 
         `v_first` is block 0's value when `value_residual` is on (the caller
         threads it through `last_v`); `None` on the first block and on every
         default run.
+
+        `attnres` is the model's `FullDepthAttnRes` when `use_attnres` is on
+        (`model/attnres.py`): the block computes its body as usual, takes the
+        residual delta `plain − x` as this layer's update, and writes the
+        mixture instead of the delta. `updates` is the history the model threads
+        across layers (oldest first). All three are `None`/unused on the default
+        path, so the flag-off forward is the same calls it has always made.
         """
         if self.router is None:
-            return self._block(x, counters, v_first=v_first)
-        return self._forward_mod(x, counters, v_first=v_first)
+            plain = self._block(x, counters, v_first=v_first)
+        else:
+            plain = self._forward_mod(x, counters, v_first=v_first)
+        if attnres is None:
+            return plain
+        assert updates is not None, "AttnRes needs the model's update history"
+        current = plain - x.to(plain.dtype)
+        sources = [current] + [updates[k] for k in range(len(updates) - 1, -1, -1)]
+        a = attnres(sources, layer_idx)
+        updates.append(current)
+        return x.to(plain.dtype) + a
 
     def _block(
         self,
