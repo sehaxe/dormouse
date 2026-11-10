@@ -48,6 +48,22 @@ what makes the identity exact, and it grows with the source count by constructio
 
 The stores are fp32 (the residual dtype) so the score reduction and the softmax
 never run in bf16 — the same rule `loopblock.depth_attend` follows.
+
+WHY THE LOOP. The first cut stacked every RMSNorm'd source into one
+`[b, t, n, d]` fp32 key tensor, contracted it against the query in one
+broadcast, and did the same to the values. At the live shape (b24×1024 → 24576
+tokens, d = 832, n = 12) that buffer is 936 MiB and its product with the query
+another 936 MiB — 1.87 GiB live at the score step, and again at the value step
+— against a 468 MiB bf16 history. Measured: the call allocates 7.58 GiB of
+churn and its largest single block is 936 MiB. The arm OOMed at b24, b20 AND
+b16 because of it. The loop below touches one `[T, d]` at a time: the scores
+are `T·(n+1)·4` bytes (1,277,952 B = 1.22 MiB at S = 13) and the weighted sum
+is one `[T, d]` fp32 accumulator. Same softmax over the same `n+1` scalars,
+same order of accumulation: the result is not merely comparable to the stack,
+the test finds it EQUAL (`max|Δ| = 0.0`, gated at ≤1e-6 against the old
+expression written out in `test_attnres_full.py`). The new binding tensor is
+the fp32 `[T, d]` RMSNorm transient — 78.0 MiB, ≤3 live at one instant, 234 MiB
+— plus the 78 MiB accumulator; measured largest single block 78.0 MiB.
 """
 
 from __future__ import annotations
@@ -68,17 +84,21 @@ def _rms_no_gain(x: torch.Tensor, eps: float) -> torch.Tensor:
 def _logits(
     sources: list[torch.Tensor], query: torch.Tensor, prior: torch.Tensor, eps: float
 ) -> torch.Tensor:
-    """`[b, t, n+1]` logits: the zero source first, then the updates.
+    """`[b, t, n+1]` fp32 logits: the zero source first, then the updates.
 
     `sources` is newest-first (`sources[0]` is the current layer's update), so
     `prior[0]` scores it and `prior[k]` scores the update `k` layers back.
+
+    One `[b, t]` column per source, written into the `[b, t, n+1]` matrix: no
+    `[b, t, n, d]` key tensor ever exists (module docstring, WHY THE LOOP).
     """
     n = len(sources)
-    keys = torch.stack([_rms_no_gain(s.float(), eps) for s in sources], dim=-2)
-    scores = (keys * query.float()).sum(-1)
-    upd = scores + prior[:n].float()
-    zero = upd.new_full(upd.shape[:-1] + (1,), math.log(n))
-    return torch.cat([zero, upd], dim=-1)
+    q = query.float()
+    logits = sources[0].new_empty(sources[0].shape[:-1] + (n + 1,), dtype=torch.float32)
+    logits[..., 0] = math.log(n)
+    for j, s in enumerate(sources):
+        logits[..., j + 1] = (_rms_no_gain(s.float(), eps) * q).sum(-1) + prior[j].float()
+    return logits
 
 
 def full_depth_weights(
@@ -95,11 +115,15 @@ def full_depth_attend(
     """`a = Σ_j w_j u_j` for sources ordered newest-first (`u_0 = 0` first).
 
     The zero source is implicit: its value is zero, so only its weight (which
-    the softmax needs) is computed, never its product.
+    the softmax needs) is computed, never its product. The sum accumulates in
+    place, one `[b, t]` weight column against one `[T, d]` source, so neither
+    the `[b, t, n, d]` value stack nor its `[b, t, n, d]` product is built.
     """
     w = full_depth_weights(sources, query, prior, eps)
-    vals = torch.stack([s.float() for s in sources], dim=-2)
-    return (w[..., 1:].unsqueeze(-1) * vals).sum(-2)
+    a = sources[0].new_zeros(sources[0].shape, dtype=torch.float32)
+    for j, u in enumerate(sources):
+        a += w[..., j + 1].unsqueeze(-1) * u.float()
+    return a
 
 
 class FullDepthAttnRes(nn.Module):

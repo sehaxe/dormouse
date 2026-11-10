@@ -1,6 +1,6 @@
 """Full depth AttnRes (N = L) on `block_form="transformer"` — CPU only.
 
-The six gates the variant owes an A/B:
+The gates the variant owes an A/B:
 
 1. identity at init: the flag ON reproduces the flag OFF logits (the weight sits
    on the most recent update, so the write IS the plain residual);
@@ -10,7 +10,12 @@ The six gates the variant owes an A/B:
 4. a hand-computed two-source case, arithmetic written in the test;
 5. no `.item()`/host sync in the forward;
 6. the flag OFF path is untouched: no AttnRes parameters/keys, the ON model is
-   exactly `L·(d+1)` parameters larger.
+   exactly `L·(d+1)` parameters larger;
+7. the memory refactor changed no arithmetic: the source LOOP equals the
+   `[b, t, n, d]` STACK it replaced (reference written in this file) ≤1e-6;
+8. and it is flat: no `[b, t, n, d]` buffer is allocated at all;
+9. dynamo traces the loop into ONE graph, so a compiled A/B is not silently
+   running eager.
 """
 
 from __future__ import annotations
@@ -19,6 +24,8 @@ import math
 
 import torch
 from conftest import tiny_cfg
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
 
 from dormouse.config import ModelConfig
 from dormouse.model import DormouseModel, param_count
@@ -76,7 +83,9 @@ def test_the_arm_is_the_plain_residual_at_init():
         logits_off, _, _ = off(ids)
     assert torch.isfinite(logits_on).all()
     diff = (logits_on - logits_off).abs().max().item()
-    assert diff < 1e-5, f"AttnRes at init moved the logits by {diff:.3e}"
+    # EXACTLY zero, not "small": the write is the plain residual, not a mixture
+    # near it (the zero source absorbs `log n`, `w_i = 1`).
+    assert diff == 0.0, f"AttnRes at init moved the logits by {diff:.3e}"
     print(f"[attnres] identity at init: max|Δlogits| = {diff:.3e}")
 
 
@@ -168,12 +177,109 @@ def test_off_path_has_no_attnres_and_on_adds_exactly_l_d_plus_l():
     on = _build(3, use_attnres=True)
     assert not hasattr(off, "attnres_full"), "the OFF model grew an attribute"
     assert not any(k.startswith("attnres_full.") for k in off.state_dict())
-    extra = {
-        k: v for k, v in on.state_dict().items() if k.startswith("attnres_full.")
-    }
+    extra = {k: v for k, v in on.state_dict().items() if k.startswith("attnres_full.")}
     assert set(extra) == {"attnres_full.query", "attnres_full.prior"}
     n_layers, d = off.cfg.n_layers, off.cfg.d_model
     assert param_count(on) - param_count(off) == n_layers * (d + 1)
+
+
+# --- 7-8. the memory refactor, gated ----------------------------------------
+
+
+def _stacked_attend(sources, query, prior, eps=1e-6):
+    """THE REPLACED EXPRESSION: the `[b, t, n, d]` stack path, arithmetic intact.
+
+    Kept as the reference the loop must reproduce — including its own RMSNorm,
+    so a shared helper bug cannot cancel itself out.
+    """
+    n = len(sources)
+
+    def rms(x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+    keys = torch.stack([rms(s) for s in sources], dim=-2)
+    upd = (keys * query.float()).sum(-1) + prior[:n].float()
+    zero = upd.new_full(upd.shape[:-1] + (1,), math.log(n))
+    w = (n + 1) * torch.softmax(torch.cat([zero, upd], dim=-1), dim=-1)
+    vals = torch.stack([s.float() for s in sources], dim=-2)
+    return (w[..., 1:].unsqueeze(-1) * vals).sum(-2)
+
+
+@torch.no_grad()
+def test_the_source_loop_equals_the_stack_it_replaced():
+    """S = 2..6, fp32: the loop is the stack's arithmetic, ≤1e-6 (measured 0.0)."""
+    torch.manual_seed(1101)
+    worst = 0.0
+    for n in range(1, 7):
+        sources = [torch.randn(BATCH, SEQ, 64) for _ in range(n)]
+        for prior, q in (
+            (torch.zeros(n), torch.zeros(64)),  # the init: the identity lever
+            (torch.randn(n), torch.randn(64)),
+            (torch.tensor([0.0] + [-30.0] * (n - 1)), torch.randn(64)),
+        ):
+            new, old = full_depth_attend(sources, q, prior), _stacked_attend(sources, q, prior)
+            worst = max(worst, (new - old).abs().max().item())
+            torch.testing.assert_close(new, old, atol=1e-6, rtol=0)
+    print(f"[attnres] loop vs stack (S=2..7): max|Δ| = {worst:.3e}")
+
+
+class _Allocations(TorchDispatchMode):
+    """Every tensor the dispatched call allocates, by `numel`."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.numel: list[int] = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        self.numel.extend(
+            leaf.numel() for leaf in tree_leaves(out) if isinstance(leaf, torch.Tensor)
+        )
+        return out
+
+
+@torch.no_grad()
+def test_no_btnd_buffer_is_ever_allocated():
+    """The binding tensor is `[T, d]` or `[T, S]`, never `[b, t, n, d]`.
+
+    That stack is what OOMed the arm at b24/b20/b16 (936 MiB fp32 of keys at the
+    live shape, plus its 936 MiB product, plus the same pair again for the
+    values). The largest allocation of the whole call must be a single `[T, d]`
+    or `[T, S]` — with `n = 5` here, any `[b, t, n, d]` is 5x the bound.
+    """
+    n, d = 5, 64
+    sources = [torch.randn(BATCH, SEQ, d) for _ in range(n)]
+    prior = torch.randn(n)
+    with _Allocations() as rec:
+        a = full_depth_attend(sources, torch.randn(d), prior)
+    biggest = max(rec.numel)
+    assert BATCH * SEQ * n * d not in rec.numel, "the [b, t, n, d] stack is back"
+    assert biggest <= BATCH * SEQ * d, f"allocated {biggest} elems, bound {BATCH * SEQ * d}"
+    assert a.shape == (BATCH, SEQ, d)
+    print(f"[attnres] largest allocation: {biggest} elems; the old stack: {BATCH * SEQ * n * d}")
+
+
+# --- 9. torch.compile -------------------------------------------------------
+
+
+def test_dynamo_traces_the_source_loop_into_one_graph():
+    """A Python loop over a list of tensors must not graph-break.
+
+    The trainer wraps the model in `torch.compile`; a Python loop dynamo cannot
+    trace would silently leave the scoring in eager (a COUNTED fallback nobody
+    counts). Measured: 0 graph breaks, 1 graph, and the compiled call is the
+    eager call bit for bit. This gate fails LOUD if that stops being true.
+    """
+    sources = [torch.randn(BATCH, SEQ, 64) for _ in range(3)]
+    q, prior = torch.randn(64), torch.tensor([0.0, -30.0, -30.0])
+    torch._dynamo.reset()
+    expl = torch._dynamo.explain(full_depth_attend)(sources, q, prior)
+    assert expl.graph_break_count == 0, expl.break_reasons
+    assert expl.graph_count == 1, expl.graph_count
+    fc = torch.compile(full_depth_attend, backend="eager", dynamic=False)
+    assert torch.equal(fc(sources, q, prior), full_depth_attend(sources, q, prior))
+    print(f"[attnres] dynamo: {expl.graph_count} graph, {expl.graph_break_count} breaks")
 
 
 # --- refusals ---------------------------------------------------------------

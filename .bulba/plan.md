@@ -72,6 +72,30 @@ Measured params: 5,537,792 → 5,591,040 per layer (+0.96% at align-64).
   arms (+4·t·d MAC/token/layer: 84.9M at t=1024).
 - Tests: `port/tests/test_tsct_transformer.py` (15, CPU).
 
+### T6 — AttnRes full-depth scoring is memory-flat (2026-11-10) — DONE
+- `use_attnres=true` (N = L) OOMed at b24, b20 AND b16 (at b16 it asked for
+  48 MiB). Cause: `full_depth_attend` stacked every source into `[T, n, d]` —
+  keys + their query product 936 MiB each (1.87 GiB live at the score step, and
+  again at the value step; the whole call allocates 7.58 GiB of churn) against
+  a 468 MiB bf16 history. The arm had NO verdict.
+- Now one `[T]` score column per source, written into a `[T, S]` fp32 matrix
+  (1,277,952 B = 1.22 MiB at S=13), and `a += w_j·u_j` in place: the binding
+  tensor is the fp32 `[T, d]` RMSNorm/accumulation transient, 78.0 MiB each,
+  ≤3 live at any instant (234 MiB) plus the 78 MiB accumulator.
+- Math unchanged, MEASURED bit-for-bit: the loop equals the stack expression at
+  `max|Δ| = 0.0` for S = 2..7 (fp32, three prior/query sets) — the gate is the
+  ≤1e-6 assertion against the stack written out in the test.
+- Identity at init still exactly `0.0` (tightened from `< 1e-5` to `== 0.0`);
+  order sensitivity still fails a fixed average; no host sync; dynamo traces the
+  loop into 1 graph with 0 breaks and a bit-identical compiled call (so the
+  compiled A/B is not silently eager — the gate fails LOUD if it ever is).
+- CPU probe at the live shape (`/tmp/opencode/attnres_peak.py`, old vs new in
+  separate processes): largest single allocation 936.0 MiB → 78.0 MiB, CPU wall
+  694 ms → 505 ms. Not a GPU measurement: b24 is now *plausible* (the old path
+  held 1.87 GiB of transient live where the new holds ≤312 MiB — the 234 MiB
+  scoring peak plus the 78 MiB accumulator), it is not yet shown to fit.
+- Tests: `port/tests/test_attnres_full.py` (10, CPU).
+
 ## A/B protocol (after T1 lands, GPU is free)
 120 MB / 120M bytes, 3 seeds, arms: `control` (GELU 4d) vs `gated_silu`
 (2.67d) vs `gated_situ` (2.67d). KEEP a gated arm only if it is ≥0.01 BPB better
