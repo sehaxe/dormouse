@@ -51,8 +51,10 @@ from torch import nn
 
 from ..config import check_gated_ffn_bill
 from ..instrument import Counters, loud
+from .act_quant import fake_quant_act
 from .experts import expert_glu
-from .tsct import mm_mixed
+from .nvfp4 import GROUP as NVFP4_GROUP
+from .tsct import dense_qat_kind, dense_qat_weight, mm_mixed
 
 __all__ = [
     "TransformerBlock",
@@ -185,6 +187,29 @@ class TransformerBlock(nn.Module):
         self.expert_act = cfg.expert_act
         self.beta1 = float(cfg.expert_beta1)
         self.beta2 = float(cfg.expert_beta2)
+        #: The dense-QAT seam (`dense_qat`, `DENSE_QATS`): the SAME projector the
+        #: loop form's dense path runs, on this block's six `nn.Linear` weights.
+        #: `dense_qat_skip_attn` (the BitNet b1.58 rule) keeps `qkv`/`proj` on
+        #: their masters; the site names are the ones `DENSE_QAT_ATTN_SITES`
+        #: lists, so the skip rule and this class cannot disagree. `alpha` rides
+        #: `factor_qat_alpha` — `DormouseModel.set_factor_qat_alpha` walks every
+        #: module carrying `dense_qat_alpha`, so ONE schedule drives both forms.
+        self.dense_qat_alpha = float(cfg.factor_qat_alpha)
+        self._qat_attn = dense_qat_kind(cfg, "transformer.qkv", "transformer.proj")
+        self._qat_ffn = dense_qat_kind(
+            cfg,
+            "transformer.fc",
+            "transformer.fc2",
+            "transformer.gate_proj",
+            "transformer.up_proj",
+        )
+        #: The 4-bit ACTIVATION arm (`act_qat`, `ACT_QATS`): the FFN GEMM inputs
+        #: are fake-quantized to e2m1 with one block scale per 16 columns — the
+        #: NVFP4 layout, i.e. the width the fp4 `_scaled_mm` kernel reads
+        #: (`nvfp4.GROUP`). Attention stays at >= 8 bits (a4.8's rule), and the
+        #: quantizer is skipped entirely when the flag is off, so the off forward
+        #: is the same calls it has always made.
+        self.act_qat = cfg.act_qat
         if self.ffn_gated:
             # The runtime seam a hand-built config reaches, the same rule
             # `config.validate_ffn` applies on the loader path: the gated bill
@@ -293,8 +318,10 @@ class TransformerBlock(nn.Module):
             x = x.to(pdt)
         b, t, _ = x.shape
         d = self.d
+        if self.act_qat != "none" and counters is not None:
+            counters.count("act_qat_arms")
         h1 = self.ln1(x)
-        qkv = mm_mixed(h1, self.qkv.weight, self.compute_dtype, counters)
+        qkv = self._qmm(h1, self.qkv, self._qat_attn, counters)
         q, k, v = qkv.split(d, dim=-1)
         q = q.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
@@ -318,18 +345,43 @@ class TransformerBlock(nn.Module):
         y = y.transpose(1, 2).reshape(b, t, d)
         # Every projection runs in the compute dtype; the residual add is the
         # fp32 stream (mm_mixed's contract, widened back here).
-        x = x + mm_mixed(y, self.proj.weight, self.compute_dtype, counters).to(x.dtype)
+        x = x + self._qmm(y, self.proj, self._qat_attn, counters).to(x.dtype)
         h2 = self.ln2(x)
         if self.ffn_gated:
-            g = mm_mixed(h2, self.gate_proj.weight, self.compute_dtype, counters)
-            u = mm_mixed(h2, self.up_proj.weight, self.compute_dtype, counters)
+            a = self._qat_act(h2)
+            g = self._qmm(a, self.gate_proj, self._qat_ffn, counters)
+            u = self._qmm(a, self.up_proj, self._qat_ffn, counters)
             h = expert_glu(self.expert_act, g, u, beta1=self.beta1, beta2=self.beta2)
         else:
-            h = F.gelu(mm_mixed(h2, self.fc.weight, self.compute_dtype, counters))
+            h = F.gelu(self._qmm(self._qat_act(h2), self.fc, self._qat_ffn, counters))
         if self.ffn_clip > 0.0:
             h = h.clamp(max=self.ffn_clip)
-        h = mm_mixed(h, self.fc2.weight, self.compute_dtype, counters)
+        h = self._qmm(self._qat_act(h), self.fc2, self._qat_ffn, counters)
         return x + h.to(x.dtype)
+
+    def _qmm(
+        self, x: torch.Tensor, linear: nn.Linear, kind: str, counters: Counters | None
+    ) -> torch.Tensor:
+        """`mm_mixed(x, W)` with `dense_qat` projected onto `W` — the master when off.
+
+        ONE call shape for the six projections: `dense_qat_weight` short-circuits
+        `kind == "none"` (no projector call at all, the gate
+        `tests/test_dense_qat.py` requires), and the per-step `QuantCache` lives
+        on the `nn.Linear` itself (`attach_qat_caches`).
+        """
+        w = dense_qat_weight(
+            linear.weight,
+            kind,
+            self.dense_qat_alpha,
+            cache=getattr(linear, "_qat_cache", None),
+        )
+        return mm_mixed(x, w, self.compute_dtype, counters)
+
+    def _qat_act(self, x: torch.Tensor) -> torch.Tensor:
+        """e2m1 fake-quant (block `nvfp4.GROUP`) — the identity when `act_qat` is off."""
+        if self.act_qat == "none":
+            return x
+        return fake_quant_act(x, self.act_qat, NVFP4_GROUP)
 
     def _forward_mod(
         self,

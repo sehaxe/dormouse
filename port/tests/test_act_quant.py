@@ -657,10 +657,18 @@ def test_config_new_act_rungs_their_inert_combinations_and_the_2k_rule():
         "int8",
         "int4",
         "fp4",
+        "e2m1",
         "mxfp8",
         "v2_int4",
         "v2_int8",
     }
+    # `e2m1` is the format's OWN name for the same grid `fp4` has always been:
+    # one codebook, two labels, so the two spellings must agree bit for bit.
+    x = torch.randn(4, 32) * 2.0
+    assert torch.equal(quantize_act(x, "e2m1"), quantize_act(x, "fp4"))
+    assert torch.equal(fake_quant_act(x, "e2m1", 16), fake_quant_act(x, "fp4", 16))
+    assert max_value("e2m1") == max_value("fp4") == 6.0
+    assert attn_format("e2m1") == attn_format("fp4") == "int8"
     assert max_value("mxfp8") == 448.0 and max_value("v2_int4") == 7.0
 
 

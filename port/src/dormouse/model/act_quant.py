@@ -105,7 +105,17 @@ from .tsct import _NVFP4_MAGNITUDES as _E2M1
 #: fp4, then the two families that bring their own scale rule — the OCP MX
 #: codec (`mxfp8`, per-32 e8m0 blocks) and BitNet v2's rotated integer arms
 #: (`v2_int4`/`v2_int8`, per-token absmax after the FWHT).
-ACT_FORMATS = ("none", "int8", "int4", "fp4", "mxfp8", "v2_int4", "v2_int8")
+#: `e2m1` is the format's OWN name for the same 4-bit grid `fp4` has always
+#: been (the element type is `float4_e2m1fn_x2` in torch, e2m1 in the OCP
+#: spec); both spellings are accepted and `_canon` is the one place they are
+#: reconciled. One codebook, two labels — never two implementations.
+ACT_FORMATS = ("none", "int8", "int4", "fp4", "e2m1", "mxfp8", "v2_int4", "v2_int8")
+
+
+def _canon(fmt: str) -> str:
+    """`e2m1` → `fp4`: the one alias in this module (see `ACT_FORMATS`)."""
+    return "fp4" if fmt == "e2m1" else fmt
+
 
 #: The formats whose scale is NOT `block_max / max_value(...)`: they carry
 #: their own grid (`mxfp8`: 32-wide e8m0 blocks, `mxfp.fake_quant_mx`) or their
@@ -134,6 +144,7 @@ def max_value(fmt: str) -> float:
     so the table stays complete and a reader asking "how big can this format
     get" gets one answer.
     """
+    fmt = _canon(fmt)
     if fmt == "fp4":
         return _E2M1[-1]
     if fmt == "int8":
@@ -169,6 +180,7 @@ def attn_format(fmt: str) -> str:
     to the unrelated plain `int8` would measure a different arm on the attention
     path than the one the rung names.
     """
+    fmt = _canon(fmt)
     if fmt == "none":
         return "none"
     if fmt in ("int8", "mxfp8", "v2_int8"):
@@ -287,6 +299,7 @@ def quantize_act(x: torch.Tensor, fmt: str, group: int = 0) -> torch.Tensor:
     those modules end in `x + (dq − x).detach()` their gradient through this
     function is the identity too: same contract, one estimator per family.
     """
+    fmt = _canon(fmt)
     if fmt == "none":
         return x
     _check(x, fmt, group)
@@ -349,6 +362,7 @@ def fake_quant_act(x: torch.Tensor, fmt: str, group: int = 0) -> torch.Tensor:
     expression), and wrapping it twice would compute the same value while
     hiding which layer owns the estimator. One STE, one place.
     """
+    fmt = _canon(fmt)
     if fmt == "none":
         return x
     if fmt in _OWN_GRID_FORMATS:

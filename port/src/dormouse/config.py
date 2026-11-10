@@ -302,7 +302,16 @@ DENSE_QATS = FACTOR_QATS
 #: refuse a non-zero `act_group`: their grid is not the caller's to choose.
 #: A new format lands WITH its gold test (`tests/test_act_quant.py`) before
 #: this tuple grows.
-ACT_QUANTS = ("none", "int8", "int4", "fp4", "mxfp8", "v2_int4", "v2_int8")
+ACT_QUANTS = ("none", "int8", "int4", "fp4", "e2m1", "mxfp8", "v2_int4", "v2_int8")
+#: The `act_qat` literals — the DENSE-transformer block's 4-bit activation arm
+#: (`model/transformer.py`). It is NOT a second `act_quant`: `act_quant` is the
+#: loop form's fake-quant seam (fp32 block scale, no packing), while this names
+#: the activations as the INFERENCE format lays them out — e2m1 elements with
+#: an e4m3 scale per 16 columns, the NVFP4 layout (`model/nvfp4.py`). The
+#: forward runs the STE form at that width (`act_quant.fake_quant_act(x,
+#: "e2m1", 16)`); the packed kernel is the bench/inference lane and is COUNTED.
+#: Two activation quantizers on one forward is refused (see `validate`).
+ACT_QATS = ("none", "e2m1")
 #: The `ns_kind` literals — the Newton–Schulz arms the Muon group runs
 #: (`optim.NS_KINDS`, which is where they are executed; the list is duplicated
 #: here the way `MOE_KERNELS` is, so the config layer does not import the
@@ -1711,6 +1720,18 @@ class ModelConfig:
     #: and a non-divisor fails on the first forward, far from the flag (`validate`
     #: refuses it, mirroring `config/validation.rs:220-231`).
     act_group: int = 0
+    #: The DENSE transformer block's activation arm (`ACT_QATS`,
+    #: `model/transformer.py`): the GEMM inputs of every quantized FFN projection
+    #: are fake-quantized to e2m1 with ONE e4m3 block scale per 16 columns — the
+    #: NVFP4 layout (`model/nvfp4.py`), so the forward trains the shape the fp4
+    #: `_scaled_mm` kernel reads. `none` (the default) is every number on record,
+    #: bit for bit. Wired ONLY on `block_form="transformer"` (the block whose
+    #: GEMMs this seam owns) and refused elsewhere, with `act_quant` (two
+    #: activation quantizers on one forward) and with `torch_compile` (the packed
+    #: lane is not compiler-safe: `torch._scaled_mm` graph-breaks dynamo, so a
+    #: compiled run would silently ride the eager fallback). The ATTENTION path
+    #: stays >= 8 bits (a4.8's rule): `qkv`/`proj` are never e2m1 inputs.
+    act_qat: str = "none"
 
     # --- hashed n-gram memory (Engram) ---------------------------------
     #: Rows PER ORDER, rounded UP to a power of two when the table is built
@@ -3548,13 +3569,12 @@ def validate_block_form(model: ModelConfig) -> None:
                 "would reach no module. Escape: use_tsct=false, or "
                 "byte_patch=false."
             )
-    if model.dense_qat != "none":
-        loud(
-            f"block_form='transformer' with dense_qat={model.dense_qat!r}: the "
-            f"transformer block's projections are plain `nn.Linear` and do not "
-            f"read the dense-QAT projector, so the arm would be silently absent. "
-            f"Escape: dense_qat='none', or block_form='kda'."
-        )
+    # `dense_qat` IS wired on this form since the QAT-transformer lane landed:
+    # `TransformerBlock` reads `dense_qat_kind` on its six projections and
+    # `DormouseModel.__init__` attaches the per-step `qat_cache`. The former
+    # refusal here ("the transformer block's projections are plain nn.Linear and
+    # do not read the dense-QAT projector") named a wiring gap that is closed;
+    # the coverage gate is `tests/test_qat_transformer.py`.
 
 
 def validate(model: ModelConfig) -> None:
@@ -4353,6 +4373,47 @@ def validate(model: ModelConfig) -> None:
             f"quantizer is off, so there is no block to group. Escape: set "
             f"act_quant, or leave act_group at 0."
         )
+    if model.act_qat not in ACT_QATS:
+        loud(
+            f"act_qat={model.act_qat!r} is not an activation arm. Known: "
+            f"{list(ACT_QATS)} — `none` off, `e2m1` the NVFP4-layout 4-bit "
+            f"activation (e2m1 elements, one e4m3 scale per 16 columns, "
+            f"`model/nvfp4.py`). Escape: name one of those, or land the arm and "
+            f"its gold test (tests/test_qat_transformer.py, tests/test_nvfp4.py) "
+            f"BEFORE the config can lie about it."
+        )
+    if model.act_qat != "none" and model.block_form != "transformer":
+        loud(
+            f"act_qat={model.act_qat!r} with block_form={model.block_form!r}: the "
+            f"4-bit activation seam is the DENSE transformer block's FFN GEMMs "
+            f"(`TransformerBlock._block`), and no other block form was wired to "
+            f"it — the flag would be silently absent from the forward. Escape: "
+            f"block_form='transformer', or act_qat='none' (the loop form's "
+            f"fake-quant activation switch is `act_quant`)."
+        )
+    if model.act_qat != "none" and model.act_quant != "none":
+        loud(
+            f"act_qat={model.act_qat!r} with act_quant={model.act_quant!r} names "
+            f"TWO activation quantizers on one forward: they are different "
+            f"formats with different scale rules (act_qat: e2m1 + e4m3 per-16 "
+            f"blocks, the NVFP4 layout; act_quant: the a4.8 fake-quant seam), and "
+            f"stacking them would quantize an already-quantized tensor with "
+            f"nothing in the log saying which one set the value. Escape: one of "
+            f"them at 'none'."
+        )
+    if model.act_qat != "none":
+        # The format's own tiling, refused at LOAD: `fake_quant_act` would refuse
+        # a non-divisor on the first forward, a long way from the flag (the same
+        # rule `act_group`'s `d_model` check exists for).
+        for name, width in (("d_model", model.d_model), ("d_ffn", model.d_ffn)):
+            if width % 16:
+                loud(
+                    f"act_qat={model.act_qat!r} needs {name}={width} to tile 16: "
+                    f"one e4m3 scale covers 16 activation columns (the NVFP4 "
+                    f"layout the fp4 kernel reads), so a width that is not a "
+                    f"multiple of 16 has no legal scale grid. Escape: a width "
+                    f"that tiles 16, or act_qat='none'."
+                )
     if model.mhc_sinkhorn not in ("logsumexp", "log_softmax"):
         loud(
             f"mhc_sinkhorn={model.mhc_sinkhorn!r} is not a Sinkhorn normaliser. "
@@ -5519,6 +5580,16 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"none, Option B runs it over K patch latents), so there is no iteration "
             f"to wrap and the arm would be inert. Escape: use_byteflow=false, or "
             f"activation_recompute='none'."
+        )
+    if model.act_qat != "none" and tcfg.torch_compile:
+        loud(
+            f"act_qat={model.act_qat!r} with torch_compile=true: the packed NVFP4 "
+            f"lane (`model/nvfp4.py`) is not compiler-safe — `torch._scaled_mm` "
+            f"on `float4_e2m1fn_x2` graph-breaks dynamo, so a compiled run would "
+            f"silently ride the eager fallback while reporting a compiled step, "
+            f"and the counter that names the path would be the only evidence. "
+            f"The STE forward itself is compiler-safe; it is the measured kernel "
+            f"that is not. Escape: torch_compile=false, or act_qat='none'."
         )
     if model.block_form == "transformer" and tcfg.segment_len:
         loud(

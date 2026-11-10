@@ -352,9 +352,12 @@ class DormouseModel(nn.Module):
             else:
                 head_rank = min(cfg.rank, d, cfg.vocab)
                 self.lm_head = make_projection(d, cfg.vocab, cfg, rank=head_rank, device=device)
-            # `dense_qat` is refused on this form (`validate_block_form`), so the
-            # only cache to collect is a `use_tsct` head's own.
-            self._qat_caches = attach_qat_caches(self, dense=False)
+            # `dense_qat` IS wired on this form (the blocks read
+            # `dense_qat_kind`/`dense_qat_weight`, `act_qat` rides the same GEMM
+            # inputs), so the plain `nn.Linear` sites — the block projections —
+            # get the per-step cache. `dense=False` would leave them re-quantizing
+            # every forward (the 2.4x waste `qat_cache`'s docstring measured).
+            self._qat_caches = attach_qat_caches(self, dense=cfg.dense_qat != "none")
             # mHC (`use_mhc`, `model/mhc.py`): the K-lane residual across the
             # LAYERS. ONE mixer for the stack — the lane state belongs to the
             # stack, not to a block, exactly as `LoopBlock._window` carries ONE

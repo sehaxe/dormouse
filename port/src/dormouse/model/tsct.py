@@ -493,12 +493,13 @@ dense_qat_project = factor_qat_project
 
 #: The attention sites `dense_qat_skip_attn` leaves in bf16 — ONE list, read by
 #: `dense_qat_kind` below AND by `tests/test_dense_qat.py`'s coverage gate, so a
-#: site cannot join the quantized set by accident. KDA's five projections and
-#: the MSA pair + its selector: BitNet b1.58 (arXiv:2402.17764) quantizes the
-#: FFN weight matrices, not attention, and our `act_quant` already upgrades the
-#: attention path to >= 8 bits. Projecting these ten measured +0.198 BPB
-#: (+6.5%) against the bf16 control (2026-10-21, medium b8 s512, 2000 steps,
-#: one 81 920 B eval window, 3 seeds).
+#: site cannot join the quantized set by accident. KDA's five projections, the
+#: MSA pair + its selector, and the dense transformer block's packed `qkv` +
+#: `proj` (the `transformer.*` names, `model/transformer.py`): BitNet b1.58
+#: (arXiv:2402.17764) quantizes the FFN weight matrices, not attention, and our
+#: `act_quant` already upgrades the attention path to >= 8 bits. Projecting
+#: these measured +0.198 BPB (+6.5%) against the bf16 control (2026-10-21,
+#: medium b8 s512, 2000 steps, one 81 920 B eval window, 3 seeds).
 DENSE_QAT_ATTN_SITES = (
     "loop.attn.q_proj",
     "loop.attn.k_proj",
@@ -511,6 +512,8 @@ DENSE_QAT_ATTN_SITES = (
     "loop.msa.v_proj",
     "loop.msa.selector.q_idx",
     "loop.msa.selector.k_idx",
+    "transformer.qkv",
+    "transformer.proj",
 )
 
 

@@ -372,7 +372,11 @@ def test_coverage_every_dense_weight_is_classified(monkeypatch, attn_kind):
         "the covered-module list moved: a dense weight was added or removed"
     )
     assert set(ATTN_SITES) - set(sites) == (
-        {"loop.attn.g_proj", "loop.attn.beta_proj"} if attn_kind == "full" else {"loop.attn.o_proj"}
+        # The dense transformer block owns `transformer.qkv`/`transformer.proj`
+        # (`model/transformer.py`); a LOOP tree owns neither, in either arm.
+        {"loop.attn.g_proj", "loop.attn.beta_proj"} | {"transformer.qkv", "transformer.proj"}
+        if attn_kind == "full"
+        else {"loop.attn.o_proj", "transformer.qkv", "transformer.proj"}
     ), "an arm's attention sites moved: kda owns g/beta, full owns o_proj"
     assert not set(COVERED) & set(sites), "a site cannot be both classes"
     projected = _projected_names(model, seen)
