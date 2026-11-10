@@ -1174,6 +1174,14 @@ class ModelConfig:
     #: with the static row-block bound and the kernels' on-device empty-block
     #: exit (`moe_dropless` + `moe_triton_gemm`), and the reference loop is the
     #: COUNTED fallback (`moe_naive_dispatch` + the reason).
+    #: **RECOMMENDED (`docs/reviews/2026-11-10-moe-package-bench.md` §8):** the
+    #: padded arm's bill is exactly `E·cap` bank rows against `n·k` assignments,
+    #: so `1.25` computes 1.25x the assigned rows and `2.0` computes 2x. Use
+    #: **1.25 with `moe_qb=true`** — Quantile Balancing (Kimi K3 §2.3.3) holds
+    #: each expert's load within ±5% of `topk/E`, so a 25% pad covers the spread —
+    #: and keep **2.0 as the un-balanced default** (a fresh or un-balanced router
+    #: needs the headroom). `moe_bank_ratio_x100` / `moe_pad_waste_rows` print
+    #: which of the two a run actually paid.
     #: Tie-breaking noise on the router logits, Switch-Transformer style
     #: (`std` in logit units). Measured 2026-11-04: with a fresh bank of 512
     #: near-identical experts and NO jitter, one expert took 3 800 of 8 192

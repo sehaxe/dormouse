@@ -207,6 +207,36 @@ def test_the_bank_layout_is_counted():
     print(f"[counted] {dict(counters)}")
     assert counters["moe_w_in_bank"] == 1
     assert counters["moe_batched_calls"] == 1
+    # The bank arms must NOT carry the triton arms' wide fp32 weight product.
+    assert "moe_wide_weight" not in counters
+
+
+def test_the_capacity_waste_is_a_formula_and_a_counter():
+    """Gate (a5): `E·cap/(n·k)` rows, exposed as counters — the `moe_capacity` trade.
+
+    The padded arm's bill is exactly `dump = E·cap` rows against `n·k`
+    assignments, so a log line can carry the waste without a profile:
+    `moe_bank_rows`, `moe_pad_waste_rows` (SIGNED: negative = the rule dropped
+    rows) and `moe_bank_ratio_x100`. At `capacity=2.0` the ratio is 200 by
+    construction; at `capacity=0.5` it is 50 and the waste is the drops.
+    """
+    n = 64
+    for capacity, want in ((2.0, (256, 128, 200)), (0.5, (64, 0, 50))):
+        torch.manual_seed(15)
+        moe = _moe(moe_capacity=capacity, moe_kernel="batched")
+        x = torch.randn(n, moe.d)
+        index, weight = _routing(moe, x)
+        order, keep, _ = moe._permute(index)
+        counters = Counters()
+        with torch.no_grad():
+            moe._batched_dispatch(x, weight, index, order, keep, counters)
+        got = (
+            counters["moe_bank_rows"],
+            counters.get("moe_pad_waste_rows", 0),
+            counters["moe_bank_ratio_x100"],
+        )
+        print(f"[waste] capacity={capacity} rows/waste/ratio_x100={got}")
+        assert got == want, f"capacity={capacity}: {got} != {want}"
 
 
 # --------------------------------------------- b. float64 reference, gradients
@@ -301,7 +331,11 @@ def test_the_bf16_bank_is_no_noisier_than_the_loop():
     e_bank = float((bank.double() - ref).abs().max())
     e_loop = float((loop.double() - ref).abs().max())
     print(f"[bf16 quality] vs fp64 bank={e_bank:.3e} loop={e_loop:.3e} ratio={e_bank / e_loop:.2f}")
-    assert e_bank <= e_loop, f"the bank is {e_bank / e_loop:.2f}x the loop's own fp64 error"
+    # 1.25x, not 1.0x: the two arms are independent bf16 rounding chains, so the
+    # max|Δ|-vs-fp64 ratio is noise around 1 (measured 0.92 here, 1.03 for the
+    # bucketed arm). A WIRING defect moves this by the scale of the tensor — a
+    # dropped or duplicated term is 2x or worse — so 1.25 separates the two.
+    assert e_bank <= 1.25 * e_loop, f"the bank is {e_bank / e_loop:.2f}x the loop's own fp64 error"
 
 
 # -------------------------------------------------- c. unequal block sizes

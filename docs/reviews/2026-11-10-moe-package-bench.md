@@ -308,3 +308,138 @@ the capacity rule costs per row (`moe_bank_rows` prints the cap actually run).
   buffer in the pass. A chunked `index_add_` (static row blocks, ~6× fewer bytes)
   would cut it further; it is not taken here because the two named wastes were
   the fix and the peak is unmeasured, so there is no evidence it is needed.
+
+---
+
+## 8. The reimplementation (2026-11-10, same day): the other two kernel arms
+
+§7.5's follow-ups were taken as the task, with one constraint from the owner that
+was respected rather than improved: **per-step shapes are frozen under CUDA
+graphs, so a permutation-only (cap = this batch's max group) layout is not
+capturable** — the padding stays, and the job is to make it as cheap as the
+arithmetic allows. No dynamic-shape dispatch was built.
+
+### 8.1 `_bucketed_dispatch` — moved to the bank's tail
+
+The weight now rides the flat scratch before each bucket's `@ v`:
+`w_flat [dump+1]` (0 at the dump slot) → `h * w_flat[offset:offset+n_b·cap_b]` →
+one `bmm(h, v_b)` per bucket. The `[R, f]` fp32 product and the zero-row `cat`
+are gone, and the dropped rows go to the same clamped-row/token-`n` sentinel.
+
+**A by-product worth recording: the one-bucket bit-identity is BACK.**
+`test_one_bucket_is_the_batched_arm` asserts `torch.equal` again (measured
+`equal=True` in fp32 and bf16, cap 0 and 1.0): with both arms scaling `h` in rank
+space, one bucket IS the same tensors in the same order. Between §7 and this
+change the gate had to fall back to a dtype bound — that fallback is deleted, not
+kept as a looser gate.
+
+| `bucketed` vs the per-expert loop | measured | bound |
+|---|---|---|
+| fp32, 2 buckets, dropless | rel **1.608e-07** | 1e-5 |
+| fp32, 2 buckets, capacity 1.0 | rel **1.755e-07** | 1e-5 |
+| bf16, 2 buckets, dropless | rel **4.940e-03** | 1e-2 |
+| bf16, 2 buckets, capacity 1.0 | rel **5.382e-03** | 1e-2 |
+| bf16 vs float64 (2 buckets) | **2.271e-02 vs the loop's 2.204e-02 = 1.03×** | ≤1.25× |
+
+The 1.25× on the last row (and on the bank arm's 0.92×) is a *separation*, not a
+tolerance: both arms are independent bf16 rounding chains, so the ratio is noise
+around 1, while a dropped or duplicated term moves it by the tensor's scale (2×
+or worse).
+
+### 8.2 The Triton arms — COUNTED, not rewritten
+
+`moe_kernels.expert_gemm_glu` computes `h @ v` inside a kernel whose GLU output
+never reaches a graph the caller can scale, and the rewrite is not local: the
+router weight's own gradient is `dw = ⟨dout, h @ v⟩`, i.e. the **unscaled** expert
+output — the very `[R, f]` tensor this fix removes from the bank arm. The split
+GLU path (`E < FUSED_GLU_MIN_E`, our E=8 arm) does materialise `[R, rank] h`, but
+inside `_ExpertGemmGlu`'s autograd Function, so scaling it from the caller would
+silently drop `dw`.
+
+So the Triton arms keep the wide product and SAY SO:
+
+| arm | wide `[R, f]` fp32 product | counter |
+|---|---|---|
+| `moe_kernel="padded"`/`"batched"` | no (rank-space `h·w`) | `moe_w_in_bank = 1` |
+| `moe_kernel="bucketed"` | no (rank-space, per bucket) | `moe_w_in_bank = 1` |
+| `triton`, `moe_combine="torch"` (default) | **yes** — `_Combine.forward`'s `y.to(fp32) * w` | `moe_wide_weight = 1` |
+| `triton`, `moe_combine="fused"` | no — the kernel reads the bank-dtype `y` and scales in registers | `moe_wide_weight` absent |
+| `triton`, `fused_bwd=False` (the reference adjoint) | **yes** — `_triton_dispatch`'s own `y.to(fp32) * w` | `moe_wide_weight = 1` |
+| `moe_gather="kernel"` | same as its combine arm | `moe_wide_weight` when `combine != fused` |
+
+`_count_wide_weight` carries that reasoning at the call site. No arm is silently
+on the wrong side: the bank/bucketed arms assert the counter's ABSENCE
+(`test_moe_batched` gate a3) and the Triton arm asserts its PRESENCE
+(`test_moe_kernel`'s CUDA gate).
+
+### 8.3 The capacity waste, as a formula and a counter
+
+The padded arm's bill is exactly
+
+```
+rows_run   = E · cap            (bucketed: Σ n_b · cap_b)
+waste_rows = rows_run − n·k     (counted only when > 0: a cap below the mean
+                                 DROPS rows instead — `moe_dropped_assignments`)
+ratio_x100 = round(100 · rows_run / (n·k))
+```
+
+Measured on the bench's own fixture (E=4, k=2, n=64, so `n·k = 128`):
+
+| `moe_capacity` | rows_run | `moe_pad_waste_rows` | `moe_bank_ratio_x100` |
+|---|---|---|---|
+| 2.0 | 256 | 128 | 200 |
+| 1.0 | 128 | 0 | 100 |
+| 0.5 | 64 | 0 (64 rows dropped) | 50 |
+| dropless (`0`) | `E · max group` | `E·max − n·k` | ≥100 |
+
+`config.ModelConfig.moe_capacity` now carries the recommendation: **1.25 with
+`moe_qb=true`** (Quantile Balancing holds each expert within ±5% of `topk/E`, so a
+25% pad covers the spread) and **2.0 as the un-balanced default**, with those two
+counters naming what a run actually paid. `tests/test_moe_batched.py` gate (a5)
+pins the three rows of that table.
+
+### 8.4 The per-layer census after the fix (b24: R=49,152, E·cap=98,304, f=1,664, rank=832)
+
+| buffer, per layer | before §7 | after §7 | after §8 |
+|---|---|---|---|
+| fp32 router-weight product `[R, f]` | 312 MiB | 0 (bank) | 0 (bank **and** bucketed) |
+| bf16 zero-row `cat` `[E·cap+1, f]` | 312 MiB | 0 (bank) | 0 (bank **and** bucketed) |
+| bf16 `h·w` `[E, cap, rank]` | 0 | 156 MiB | 156 MiB (bucket: per bucket, same total) |
+| fp32 scatter source `[R, f]` | 312 MiB | 312 MiB | 312 MiB |
+| bank tensors `xg, g, u, h, y` | 936 MiB at cap 12,288 | 936·C/12,288 MiB | same |
+| fp32 accumulate `[n, f]` | 156 MiB | 156 MiB | same |
+| **Triton arms** | 312 MiB product | 312 MiB product | **312 MiB product (COUNTED)** |
+
+### 8.5 The CUDA half of the gates
+
+The CPU suite is green (full run, `CUDA_VISIBLE_DEVICES=""`, 476 s). The GPU
+half is the part §7 could not run, and it is **still blocked by the guard**: the
+owner's 3-seed A/B (`scripts/arch_sweep.sh`, 2 arms/seed, b24, 4,882 steps)
+holds `/tmp/dormouse-gpu.lock` from 11:41 with one `timeout 16000` around all
+six arms — seed 3 started 14:16, so the card is booked past 15:00. Two queued
+attempts through `scripts/gpu_lock.sh` (queued 13:04 and 14:01) both expired with
+**75 — nothing was measured** at 13:34 and 14:31, with the guard's own words in
+the log (`loud: another GPU job held the lock for 30 min`). Nothing was killed
+and no guard was bypassed.
+
+What is queued, exactly (one command, ~10 min of card):
+
+```bash
+GPU_TIMEOUT=3600 bash scripts/gpu_lock.sh env PYTHONPATH=src .venv/bin/python -m pytest \
+  tests/test_experts_gpu.py tests/test_moe_kernel.py tests/test_moe_sonic.py \
+  tests/test_moe_batched.py tests/test_moe_dropless.py tests/test_compile_moe_gpu.py \
+  -q -p no:logging
+```
+
+Every gate it covers, and the bound each one carried into this change:
+`test_experts_gpu::test_padded_and_naive_agree_on_the_same_routing` (bf16 2e-3 →
+1e-2), `test_moe_kernel::test_triton_and_padded_agree_on_the_same_rows` (2e-3 →
+1e-2) plus the new `moe_wide_weight` gate, `test_moe_sonic`'s two card gates
+(padded 2e-3 → 1e-2, triton kept at 2e-3), `test_moe_batched`'s capture gate,
+`test_moe_dropless`, and `test_compile_moe_gpu` (the compile gate over the arm
+whose dispatch changed).
+
+The CUDA bounds moved on the measured CPU deltas (4.73e-3 bank, 4.94e-3
+bucketed, both ≤1e-2) and the float64 closeness gate — not on a guess — but they
+have NOT been observed on the card. That is the one claim in this document that
+is [S] and not [M].

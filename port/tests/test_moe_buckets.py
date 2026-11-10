@@ -9,12 +9,11 @@ bucket holds at most `MOE_BUCKET_ROWS` rows (an expert past it gets its own).
 
 What is claimed here, in the order the task lists it:
 
-a. one bucket (uniform routing) is the `batched` arm's arithmetic to the dtype's
-   bound, dropless and capacity-bound. It was BIT-identical until 2026-11-10:
-   the batched arm now applies the router weight in rank space (the OOM fix in
-   `SparseMoE._bank_dispatch`), so the two tails round `h·w` differently. The
-   fixture's weights are deliberately NOT powers of two — `0.5` scales exactly
-   in bf16 and would hide the difference `bucketed` still carries;
+a. one bucket (uniform routing) is BIT-IDENTICAL to the `batched` arm, dropless
+   and capacity-bound — it was not between 2026-11-10 morning (the batched arm
+   moved the router weight into rank space first) and the same day's
+   `bucketed` fix, and both now scale `h` in rank space with one `bmm` per
+   bucket, so the equality is back and this gate holds it;
 b. a pathological routing (one expert owns 90% of the assignments) matches the
    per-expert loop to 1e-6 in fp32 while staying inside `MOE_BUCKET_BYTES` —
    and the single bank REFUSES the same routing (the cliff this arm removes);
@@ -34,7 +33,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from conftest import tiny_cfg
-from test_moe_batched import _rel, _SyncCalls
+from test_moe_batched import _fp64_reference, _rel, _SyncCalls
 
 from dormouse.instrument import Counters, LoudError
 from dormouse.model import experts
@@ -97,18 +96,69 @@ def test_one_bucket_is_the_batched_arm(bf16, capacity):
     itemsize = 2 if bf16 else 4
     assert counters["moe_buckets"] == 1
     assert counters["moe_bank_bytes"] == 4 * 32 * moe.d * itemsize
-    # Bit-equality held while BOTH arms scaled the `[n·k, f]` output in fp32. The
-    # batched arm now applies the router weight in rank space (2026-11-10, the
-    # OOM fix in `SparseMoE._bank_dispatch`), so the two tails round `h·w`
-    # differently; the bound here is that gate's bound, not a new one. `bucketed`
-    # still carries the old tail — giving it the same layout is a follow-up, and
-    # this gate is the record that the two are no longer bit-identical.
-    bound = 1e-2 if bf16 else 1e-5
+    # BOTH arms now scale `h` in rank space (2026-11-10), and with one bucket the
+    # bank, the weight slice and the `bmm` are the same tensors in the same
+    # order — so the bit-identity this gate was written for is BACK, not relaxed.
     print(
         f"[one bucket] bf16={bf16} capacity={capacity} buckets=1 "
-        f"bank={counters['moe_bank_bytes']} B rel={_rel(got, ref):.3e}"
+        f"bank={counters['moe_bank_bytes']} B equal={torch.equal(got, ref)}"
+    )
+    assert torch.equal(got, ref), f"max|Δ|={float((got - ref).abs().max()):.3e} at one bucket"
+
+
+# ------------------------------------------------- a2. two buckets, the loop
+@pytest.mark.parametrize("bf16,bound", [(False, 1e-5), (True, 1e-2)])
+@pytest.mark.parametrize("capacity", [0.0, 1.0])
+def test_the_bucketed_tail_is_the_bank_tail(bf16, bound, capacity):
+    """Gate (a2): `bucketed` scales `h` in rank space too — no `[R, f]` fp32 product.
+
+    Two buckets on purpose (counts `[48, 48, 16, 16]`), parity against the
+    per-expert loop at the dtype's bound, and the waste/ratio counters asserted
+    on the same call. `capacity=1.0` puts the rule BELOW the busiest bucket
+    (rule 32 against 48), so the same fixture also proves the counters carry the
+    DROPS (negative waste), not only padding.
+    """
+    torch.manual_seed(21)
+    moe = _moe(bf16=bf16, moe_capacity=capacity)
+    n, k = 64, 2
+    index = torch.zeros(n, k, dtype=torch.long)
+    index[:48, 0], index[:48, 1] = 0, 1
+    index[48:, 0], index[48:, 1] = 2, 3
+    weight = torch.rand(n, k)
+    weight = weight / weight.sum(-1, keepdim=True)
+    order, keep, _ = moe._permute(index)
+    x = torch.randn(n, moe.d)
+    counters = Counters()
+    with torch.no_grad():
+        got = moe._bucketed_dispatch(x, weight, index, order, keep, counters)
+        ref = moe._naive_dispatch(x, weight, index, order, keep, Counters())
+    rows, waste = counters["moe_bank_rows"], counters.get("moe_pad_waste_rows", 0)
+    ratio = counters["moe_bank_ratio_x100"]
+    # The formula, asserted on the counters themselves: rows run = sum(n_b*cap_b),
+    # ratio = 100*rows/assignments, and the waste is counted only when positive
+    # (a cap below the mean DROPS rows, so there is nothing to pad).
+    assert ratio == round(100 * rows / (n * k)), (rows, ratio)
+    assert waste == max(0, rows - n * k), (rows, waste)
+    assert counters["moe_w_in_bank"] == 1 and "moe_wide_weight" not in counters
+    if capacity == 0.0:
+        assert (rows, waste, ratio) == (128, 0, 100), (rows, waste, ratio)
+    else:
+        # cap = ceil(1.0 * 64 * 2 / 4) = 32 < 48, so the two 48-row experts lose
+        # 16 each: rows = 2*32 + 2*16 = 96, i.e. 32 assignments dropped.
+        assert (rows, waste, ratio) == (96, 0, 75), (rows, waste, ratio)
+    print(
+        f"[bucketed tail] bf16={bf16} capacity={capacity} buckets={counters['moe_buckets']} "
+        f"rows={rows} waste={waste} ratio_x100={ratio} rel={_rel(got, ref):.3e}"
     )
     assert _rel(got, ref) <= bound, f"rel={_rel(got, ref):.3e} exceeds {bound}"
+    if bf16 and capacity == 0.0:
+        # bf16-vs-bf16 cannot separate rounding from rewiring: compare each arm
+        # with float64 and require the bucket to be no worse (gate a4's rule).
+        ref64, _, _ = _fp64_reference(moe, x, weight, index, order, torch.ones(n, moe.f))
+        e_got = float((got.double() - ref64).abs().max())
+        e_ref = float((ref.double() - ref64).abs().max())
+        print(f"[bucketed quality] vs fp64 got={e_got:.3e} loop={e_ref:.3e}")
+        assert e_got <= 1.25 * e_ref, f"{e_got:.3e} > 1.25x the loop's own {e_ref:.3e}"
 
 
 # ------------------------------------------- b. pathological routing / budget

@@ -2909,6 +2909,57 @@ class SparseMoE(nn.Module):
         rows = sum(len(members) * cap for members, cap in plan)
         return rows * self.d * dt.itemsize
 
+    def _count_bank_rows(self, counters: Counters | None, dump: int, assignments: int) -> None:
+        """COUNTED: the bank rows a padded pass RUNS, their waste, and the ratio.
+
+        `dump = E·cap` (or `Σ n_b·cap_b` for the bucketed arm) is a Python int —
+        a SHAPE, not a device read — so the padded arm's bill is arithmetic the
+        log line can carry:
+
+            rows_run    = dump
+            ratio_x100  = round(100 · dump / assignments)
+            waste_rows  = dump − assignments      # counted only when > 0
+
+        With `moe_capacity=2.0` and a balanced router `dump = 2·assignments`, so
+        `ratio_x100 = 200` and `waste_rows = assignments`; the dropless arm
+        (`moe_capacity=0`, `cap` = the largest group) pays only `E·max − n·k`.
+        A capacity BELOW the mean (`ratio_x100 < 100`) drops rows instead of
+        padding: there is no waste to count (`Counters.count` refuses 0 and
+        negatives by contract), the ratio says so, and `moe_dropped_assignments`
+        owns the dropped count.
+        This is the number `moe_capacity` is a trade on: see the recommended
+        1.25-with-QB line in `config.ModelConfig.moe_capacity`.
+        """
+        if counters is None:
+            return
+        counters.count("moe_bank_rows", dump)
+        if assignments <= 0:
+            return
+        counters.count("moe_bank_ratio_x100", round(100 * dump / assignments))
+        if dump > assignments:
+            counters.count("moe_pad_waste_rows", dump - assignments)
+
+    def _count_wide_weight(self, counters: Counters | None) -> None:
+        """COUNTED: this arm still scales a `[R, f]` fp32 product with the weight.
+
+        The Triton arms compute `h @ v` inside a kernel whose GLU output never
+        leaves registers, so the router weight cannot ride the rank axis without
+        a kernel rewrite — and the rewrite is not local: the weight's own
+        gradient is `dw = <dout, h @ v>`, i.e. the UNSCALED expert output, which
+        is exactly the wide tensor this fix removes from the bank arm. The split
+        GLU path (`E < moe_kernels.FUSED_GLU_MIN_E`) does materialise `[R, rank]
+        h`, but inside `_ExpertGemmGlu`'s autograd Function — not on a graph the
+        caller can scale without moving the weight gradient into the kernel too.
+
+        So the arms that pay the wide fp32 buffer SAY SO here: `moe_combine`
+        "torch" (the default; `_Combine.forward`'s `y.to(fp32) * w`) and the
+        non-fused adjoint route (`_triton_dispatch`'s own `y.to(fp32) * w`).
+        `moe_combine="fused"` does not: its kernel reads the bank-dtype `y` and
+        accumulates the scaled rows in registers, so nothing wide is written.
+        """
+        if counters is not None:
+            counters.count("moe_wide_weight")
+
     def _bucketed_dispatch(
         self,
         x: torch.Tensor,
@@ -2977,6 +3028,7 @@ class SparseMoE(nn.Module):
         eid = flat_e[order]
         pos = torch.arange(n * k, device=index.device) - starts[eid]
         dump = sum(len(members) * cap for members, cap in plan)
+        self._count_bank_rows(counters, dump, n * k)
         # The per-expert base in the flat scratch: bucket offset + local index *
         # cap. `groups` covers the adaptive-width sentinel (never kept, its
         # `base` entry is 0 and unused — the same computed-but-masked slot the
@@ -2989,9 +3041,19 @@ class SparseMoE(nn.Module):
             base.index_copy_(0, idx, offset + torch.arange(len(members), device=index.device) * cap)
             local.append((idx, cap))
             offset += len(members) * cap
-        if keep is None:
+        static_keep = keep is None
+        if static_keep:
             keep = torch.ones_like(owner, dtype=torch.bool)
         slots = torch.where(keep, base[eid] + pos, dump)
+        # THE ROUTER WEIGHT IN THE BANK LAYOUT, before each bucket's `@ v` — the
+        # same fix `_bank_dispatch` carries, so `bucketed` no longer materializes
+        # a `[R, f]` fp32 product just to scale rows. `w_flat` is `[dump + 1]`
+        # with the constant 0 at the dump slot; a bucket reads its own slice.
+        w = flat_w[order]
+        if not static_keep:
+            w = w * keep.to(w.dtype)
+        w_flat = torch.zeros(dump + 1, dtype=w.dtype, device=x.device)
+        w_flat.index_put_((slots,), w)
         xg = torch.zeros(dump + 1, self.d, dtype=dt, device=x.device)
         xg = xg.index_put((slots,), self._gather_rows(x, owner, dt))
         flat = xg.narrow(0, 0, dump)
@@ -3006,16 +3068,19 @@ class SparseMoE(nn.Module):
             )
             u = torch.bmm(bank, up_u.index_select(0, idx)) * up_s.index_select(0, idx)[:, None, :]
             h = F.silu(g) * u if self._glu is None else self._glu(g, u)
-            ys.append(torch.bmm(h, v.index_select(0, idx)).reshape(idx.numel() * cap, self.f))
+            wb = w_flat.narrow(0, offset, idx.numel() * cap).view(idx.numel(), cap, 1).to(dt)
+            ys.append(torch.bmm(h * wb, v.index_select(0, idx)).reshape(idx.numel() * cap, self.f))
             offset += idx.numel() * cap
         y = ys[0] if len(ys) == 1 else torch.cat(ys)
-        y = torch.cat((y, torch.zeros(1, self.f, dtype=dt, device=x.device)))
-        y = y[slots]
-        w = flat_w[order].unsqueeze(-1) * keep.to(flat_w.dtype).unsqueeze(-1)
-        y = y.to(torch.float32) * w
-        out = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
-        out.index_add_(0, owner, y)
-        return out
+        # Same sentinel as `_bank_dispatch`: a dropped row reads a clamped bank
+        # row and lands on token row `n`, which the return slices off.
+        rows = slots if static_keep else slots.clamp(max=dump - 1)
+        y = y[rows]
+        out = torch.zeros(n + 1, self.f, dtype=torch.float32, device=x.device)
+        dest = owner if static_keep else torch.where(keep, owner, n)
+        out.index_add_(0, dest, y.to(torch.float32))
+        counters.count("moe_w_in_bank")
+        return out[:n]
 
     def _batched_dispatch(
         self,
@@ -3126,12 +3191,7 @@ class SparseMoE(nn.Module):
         eid = flat_e[order]
         pos = torch.arange(n * k, device=index.device) - starts[eid]
         dump = e * cap
-        if counters is not None:
-            # COUNTED: the bank rows this pass RUNS. `dump = E·cap` is a Python int
-            # (a shape, not a read), so the capacity waste is a number on the log
-            # line: at `capacity=2.0` it is 2·topk·tokens, at dropless it is
-            # `E · max group`.
-            counters.count("moe_bank_rows", dump)
+        self._count_bank_rows(counters, dump, n * k)
         # `_permute` always returns a mask; a direct caller may omit it, and
         # `None` then means "every assignment is kept" (the pre-cap behaviour),
         # which is the only reading that keeps the two arms' row sets equal. It
@@ -3726,6 +3786,11 @@ class SparseMoE(nn.Module):
             # fp32 weight applied where the padded arm applies it (see the note
             # there): a bf16 multiply would be a 2^-8 step the parity gate could
             # not tell from a wiring error.
+            # NOTE (2026-11-10): the padded/batched/bucketed arms apply the
+            # router weight in RANK space before `@ v`; this kernel cannot, so
+            # the fp32 product stands here and is COUNTED (`moe_wide_weight` —
+            # `_count_wide_weight` carries the why).
+            self._count_wide_weight(counters)
             y = y.to(torch.float32) * weight.reshape(-1)[rows].unsqueeze(-1)
             out = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
             out.index_add_(0, owner, y)
@@ -3764,6 +3829,10 @@ class SparseMoE(nn.Module):
         # inside `combine` keeps the kernel's own `w.dtype == torch.float32`
         # assert LOUD: a future caller that hands it a non-fp32 weight still
         # fails instead of being silently coerced.
+        if self.moe_combine != "fused":
+            # The torch combine materialises `y.to(fp32) * w` (`[R, f]`); the
+            # fused kernel reads the bank-dtype `y` and scales in registers.
+            self._count_wide_weight(counters)
         return moe_kernels.combine(
             y,
             weight.reshape(-1)[rows].float(),
@@ -3797,10 +3866,10 @@ class SparseMoE(nn.Module):
         the kernel's read of that copy).
 
         Everything after the kernel is `_triton_dispatch`'s, deliberately: the
-        weights are applied as fp32 where the padded arm applies them, the
-        `rowmap` is the combine backward's own int32 map, and the workspace is
-        the same grow-only `BwdWorkspace`. A different scatter here would make
-        the parity gate compare two changes at once.
+        weights are applied as fp32 (COUNTED `moe_wide_weight` unless
+        `moe_combine="fused"`), the `rowmap` is the combine backward's own int32
+        map, and the workspace is the same grow-only `BwdWorkspace`. A different
+        scatter here would make the parity gate compare two changes at once.
 
         The FORWARD is the only fused half (`moe_sonic._GatherGlu` recomputes the
         grouped pass for its backward), so the fwd→bwd cache is `x`, `toks` and
@@ -3836,6 +3905,10 @@ class SparseMoE(nn.Module):
             seg=seg,
             ws=ws,
         )
+        if self.moe_combine != "fused":
+            # The torch combine materialises `y.to(fp32) * w` (`[R, f]`); the
+            # fused kernel reads the bank-dtype `y` and scales in registers.
+            self._count_wide_weight(counters)
         return moe_kernels.combine(
             y,
             weight.reshape(-1)[rows].float(),

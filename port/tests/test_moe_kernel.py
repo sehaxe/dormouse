@@ -106,6 +106,29 @@ def test_triton_and_padded_agree_on_the_same_rows(bf16, bound):
     assert rel <= bound, f"{rel:.3e} exceeds {bound}"
 
 
+@CUDA
+def test_the_triton_arm_counts_the_wide_weight_it_still_pays():
+    """The triton arms cannot ride the rank axis, and they SAY so (ADR-0011).
+
+    `_count_wide_weight` is the record: the kernel's GLU output never reaches a
+    graph the caller can scale, and the weight's own gradient needs the UNSCALED
+    `h @ v`, so the `[R, f]` fp32 scaling stays here. The bank/bucketed arms have
+    the rank-space tail and must NOT carry this counter (gate a3 in
+    `tests/test_moe_batched.py` asserts the absence on the CPU side).
+    """
+    moe = _moe(bf16=True)
+    x = torch.randn(64, moe.d, device=DEV)
+    index, weight = _routing(moe, x)
+    order, keep, _ = moe._permute(index)
+    counters = Counters()
+    with torch.no_grad():
+        moe._triton_dispatch(x, weight, index, order, keep, counters=counters)
+    print(f"[wide weight] combine={moe.moe_combine} {dict(counters)}")
+    # `moe_combine="torch"` (the default) materializes `y.to(fp32) * w`.
+    assert counters["moe_wide_weight"] == 1
+    assert "moe_w_in_bank" not in counters
+
+
 @pytest.mark.parametrize("bf16,bound", [(False, 1e-4), (True, 2e-2)])
 @CUDA
 def test_triton_backward_matches_the_padded_autograd(bf16, bound):
