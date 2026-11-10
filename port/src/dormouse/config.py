@@ -585,6 +585,14 @@ class ModelConfig:
     #:   of `tsct` experts (dense blend at `moe_topk = 0`, top-k dispatch at
     #:   `moe_topk > 0` with `moe_capacity = 0` — the TSCT path is dropless).
     #:
+    #:   On `block_form="transformer"` the SAME form factorises the LIVE
+    #:   block's gated FFN (`model/transformer.py`): `gate_proj`/`up_proj`/`fc2`
+    #:   become `TSCTLinear`s. It requires `ffn_gated=true`, `n_experts=1` and
+    #:   `moe_topk=0`, and every OTHER value here is REFUSED on that form
+    #:   (`validate_block_form`): the block builds its own FFN, so a form it
+    #:   never reads priced 273.4M parameters identical to the dense control
+    #:   while the log line said `tsct` (the `arch_tsct275` defect).
+    #:
     #: The default is `bank` ON PURPOSE: a new default would move every
     #: existing run and checkpoint, and this field's job is to make the choice
     #: visible, not to silently upgrade the model. `use_tsct` is a DIFFERENT
@@ -3336,6 +3344,16 @@ def validate_block_form(model: ModelConfig) -> None:
         # that pair generates live in one function. It returns HERE because the
         # `kda` branch below refuses `n_layers`, which IS the hybrid depth.
         _validate_hybrid(model)
+        if model.ffn_form == "tsct":
+            loud(
+                f"ffn_form='tsct' with block_stack={model.block_stack!r}: only "
+                f"the attention half of the hybrid stack is a `TransformerBlock`, "
+                f"and only that block was wired to the factorised FFN — the KDA "
+                f"half runs the loop's own expert slot, so the arm would factor "
+                f"part of the model while the config named the whole of it. "
+                f"Escape: block_stack='uniform' with block_form='transformer', or "
+                f"ffn_form='bank'."
+            )
         return
     if model.byte_patch and not model.use_byteflow:
         loud(
@@ -3473,6 +3491,56 @@ def validate_block_form(model: ModelConfig) -> None:
             f"code while the snapshot reported them on. Escape: "
             f"{', '.join(f'{name}=false' for name in bad)}, or block_form='kda'."
         )
+    # ---- the FFN form on the UNIQUE stack -------------------------------
+    # `ffn_form` selects the loop's expert slot; this block builds its own FFN
+    # from `ffn_gated`. Only `tsct` has been wired into it, so any other NAME
+    # builds the block's GELU/GLU while the config reports a form — the
+    # `arch_tsct275` defect (273,393,792 parameters, identical to the dense
+    # control, ZERO `TSCTLinear` modules). `bank` is the field's DEFAULT, not
+    # an arm: every transformer preset on disk omits the key, so refusing the
+    # default would outlaw them all.
+    if model.ffn_form not in ("tsct", ModelConfig.ffn_form):
+        loud(
+            f"ffn_form={model.ffn_form!r} with block_form='transformer': the "
+            f"vanilla block builds its own FFN from `ffn_gated`, and only the "
+            f"`tsct` form is wired into it (three `TSCTLinear` matrices) — "
+            f"{model.ffn_form!r} would run that FFN while the config named a "
+            f"form it does not build. Escape: ffn_form='tsct' (with "
+            f"ffn_gated=true), or leave the default {ModelConfig.ffn_form!r}."
+        )
+    if model.ffn_form == "tsct":
+        if not model.ffn_gated:
+            loud(
+                "ffn_form='tsct' with ffn_gated=false: the factorised form "
+                "replaces the GATED FFN's gate/up/down, and the plain "
+                "`gelu(fc)` block has no factorised arm. Escape: "
+                "ffn_gated=true, or ffn_form='bank'."
+            )
+        if model.n_experts != 1 or model.moe_topk:
+            loud(
+                f"ffn_form='tsct' with n_experts={model.n_experts}/"
+                f"moe_topk={model.moe_topk} on block_form='transformer': the "
+                f"block has ONE FFN and no router, so a bank of tsct experts or "
+                f"a top-k dispatch would never be built. Escape: n_experts=1 and "
+                f"moe_topk=0, or ffn_form='bank'."
+            )
+        if model.act_qat != "none":
+            loud(
+                f"ffn_form='tsct' with act_qat={model.act_qat!r}: the packed "
+                f"4-bit activation seam reads an `nn.Linear` weight, and this "
+                f"form's FFN weights are `U`/`s`/`V` — the arm would be "
+                f"silently absent. Escape: act_qat='none', or ffn_form='bank' "
+                f"(the default, i.e. the block's own FFN)."
+            )
+        if model.dense_qat != "none":
+            loud(
+                f"ffn_form='tsct' with dense_qat={model.dense_qat!r}: the "
+                f"dense projector applies to plain `nn.Linear` weights, and this "
+                f"form's FFN has factors — their knob is `factor_qat` (wired "
+                f"through `TSCTLinear`). Escape: dense_qat='none' (use "
+                f"factor_qat for the factors), or ffn_form='bank' (the "
+                f"default, i.e. the block's own FFN)."
+            )
     if model.fused_residual or model.fused_epilogue:
         loud(
             f"block_form='transformer' with fused_residual={model.fused_residual}/"

@@ -104,7 +104,6 @@ def _transformer_cfg(**over) -> ModelConfig:
         use_kda=False,
         use_engram=False,
         use_tsct=False,
-        ffn_form="dense",
         n_experts=1,
         moe_topk=0,
         bf16=False,

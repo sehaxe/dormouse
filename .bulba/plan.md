@@ -1,233 +1,86 @@
-# Plan: the live queue
+# PLAN — gated FFN in the live block + the K3 stabilisers (2026-11-10)
 
-STATUS: ACTIVE. Superseded plan (2026-09-27, Rust minimal core) is frozen with
-the lane — see `docs/PLAN-minimal-core.md`.
+Owner: "делай все". Four parallel lanes, all DEFAULT OFF, no preset used by an
+A/B on record may move.
 
-## What is true now
+## Why
+The live `block_form="transformer"` block is a plain `gelu(fc(x))@fc2^T`
+(`model/transformer.py:276`), `d_ffn = 4·d`. Every frontier 2026 model is gated
+(LLaMA/Qwen SwiGLU; Kimi K3 SiTU-GLU). At matched width a GLU is FREE:
+`f = 8d/3` costs `3·d·f = 8d²` = exactly the `2·d·4d` of the GELU block.
+Measured params: 5,537,792 → 5,591,040 per layer (+0.96% at align-64).
 
-- One RTX 5070 Ti, 16 GiB. Python lane live (`port/`), Rust lane frozen.
-- 95M dense byte model, 12 unique layers, BPB 1.49–1.52 on a held-out English
-  window after 0.25 GB of bytes.
-- Muon runs in bf16 Newton–Schulz at 5 steps: 1.92× the step for +0.01 BPB.
-  3 steps is REJECTED: +0.27 BPB at [832, 3072] shapes.
-- E1 (bytes vs patch-8) is running; it decides whether the patch unit ships.
-- 1M context: state is 34 MB, the segment/CSA boundary contract is merged.
+## Acceptance criteria (per task)
 
-## Queue, in order
+### T1 — gated FFN in `TransformerBlock` (Lane A) — DONE, commit 96509cd
+- `ffn_gated=true` + `expert_act ∈ {silu, situ}` builds gate/up/down and runs
+  `down(expert_glu(act)(gate(x), up(x)))`; `ffn_gated=false` path unchanged.
+- Param parity vs the `4d` GELU block within 2%, else LOUD refusal.
+- LOUD refusals: not `block_form="transformer"`; `expert_act` outside
+  `{silu, situ}`; combined with `fused_glu`.
+- Tests (CPU): param parity; SiTU anchor computed from the PAPER formula
+  `β1·tanh(x/β1)·σ(x) ⊙ β2·tanh(u/β2)` at x∈{0,1,4,10,-10} in the TEST (never a
+  golden captured from our own run); bound `|f| ≤ β1·β2 = 100`; near-origin
+  ≈ SiLU (|x|<1e-2, 1e-2 rel); a gate that FAILS if the activation is swapped
+  back to SiLU (situ(10)=3.946 vs silu(10)=9.9995); fp32 parity vs a hand-written
+  reference GLU ≤ 1e-5.
 
-1. **E1 verdict** — patch BPB within +0.02 of bytes at matched bytes. If no, the
-   patch unit becomes speed-only and the 16× story drops to ~6×.
-2. **Recipe ladder** (`scripts/recipe_ladder.sh`): value residuals, sigmoid gate,
-   FFN clip, tail NoPE, cooldown-to-zero. Budget 120 MB per arm.
-3. **Warmup/LR** (`scripts/warmup_lr_ab.sh`): the 6e-4 arm measured 0.27 BPB
-   WORSE than 3e-4 — the LR sweep is confounded by `warmup_tokens=0`.
-4. **Batch sweep** (`scripts/batch_sweep.sh`): the model step is at ~52% of bf16
-   peak with b=8; a bigger batch is the remaining throughput lever.
-5. **MoD A/B** at capacity 0.5 — 1.6× FLOPs is unmeasured here.
-6. **1M probe** (`port/scripts/probe_1m.py`) once a checkpoint with CSA coarse
-   is on disk: forward memory, prefill ms, needle recall.
-7. **275M @ 22 GB** — the Chinchilla-optimal point for that budget (~9 h at 16×),
-   then 1B @ 80 GB (~5 days) after the memory work.
+### T2 — per-head Muon (Lane B) — DONE, commit 6826bf6
+- Flag `muon_per_head`; `n_heads == 1` bit-identical to the full-matrix step
+  (`torch.equal`), and the split of one block counts nothing.
+- NS split on the attention Q/K/V projections (`q_proj`/`k_proj`/`v_proj`, and
+  the packed `qkv` of `block_form="transformer"` as `3·n_heads` blocks); the tail
+  after the polar is the full-matrix one, so nothing else moves.
+- Measured on one `[512, 64]` momentum with head 3 at 10×: per-head update norm
+  spread **2.1%** (< 5%) against the full matrix's **223%** (> 50%).
+- LOUD refusals: `opt="adamw"` (no Muon), no `n_heads`/`head_dim`, a head axis
+  the split cannot tile (GQA `k_proj`), and a flag that marks no projection.
+  COUNTED `muon_per_head`, once per chunk.
+- Tests (CPU): `port/tests/test_muon_per_head.py`, 13 tests.
 
-## Codebase work (in flight)
+### T3 — Quantile Balancing (Lane C) — DONE, commit 3978c7b
+- `moe_qb=true` sets each expert's bias from the router-score quantile matching
+  its target load; no `.item()`, no host sync in the step path; COUNTED.
+- Tests: synthetic scores → every expert's load within ±10% of target after 50
+  updates; already-balanced loads leave the bias unchanged; `n_experts == 1`
+  refused LOUD.
 
-- Deletion audit (`docs/reviews/2026-11-08-deletion-audit.md`) — agent running.
-- 1B-on-one-card research (`docs/research/2026-11-08-1b-on-one-card.md`).
-- Post-training research (`docs/research/2026-11-08-post-training-at-1b.md`).
+### T4 — MoE step/VRAM bench (Lane D)
+- `scripts/bench_moe_package.py`: 20 steps, real corpus slice, ms/step + peak
+  VRAM for (a) dense 95M control, (b) bank with `n_experts=8` sized so total
+  ≈299M (active ≈100M), at b24 and b16. Report whether b24 fits under 16 GiB.
+- **Numbers only, no architecture change**: latent routing does not exist yet;
+  the bench measures what the current bank does and says so in the report.
 
-## INCIDENT 2026-11-08: 94 GB of artifacts deleted by the merge
+### T5 — `ffn_form="tsct"` reaches the live `TransformerBlock` (Lane A) — DONE
+- `ffn_form="tsct"` + `block_form="transformer"` + `ffn_gated=true` builds the
+  gated FFN's three matrices as `TSCTLinear` (`U[d,r]·diag(s)·V[r,f]`, ranks
+  `ffn_rank_gate`/`ffn_rank_down`, `0` = `rank`), COUNTED as `ffn_tsct`.
+- The defect it closes: `configs/arch_tsct275.toml` loaded at **273,393,792**
+  parameters — bit-for-bit the dense control, ZERO `TSCTLinear` modules —
+  because the form only reached the KDA loop. Wired, the arm is
+  **110,052,864** (−163,340,928 = 18 × 9,074,496 per layer).
+- `validate_block_form` refuses every form the block does not build (`dense`,
+  and any future literal; `bank` is the field's DEFAULT, not an arm) and
+  refuses `tsct` without `ffn_gated`, with `n_experts != 1`/`moe_topk`, with
+  `act_qat`/`dense_qat`, and on the hybrid stack.
+- Exactness: at `r = min(d, f)` the factorised GLU IS the dense GLU — SVD the
+  dense weights into the factors and the logits agree to **9.5e-07** (fp32).
+  Flag OFF is bit-identical to the `b7c2f72` fixture (names, RNG, logits).
+- FLOPs/token (projections + FFN, 18 layers): **545.4M dense vs 218.8M tsct**;
+  the FFN alone 19.69M → 1.54M FLOPs/token (12.8×). SDPA is identical on both
+  arms (+4·t·d MAC/token/layer: 84.9M at t=1024).
+- Tests: `port/tests/test_tsct_transformer.py` (15, CPU).
 
-`data_local/` (80 GB corpus) and `checkpoints/` (14 GB) are gone — `origin/main`
-tracks both as SYMLINKS over the local ignored directories, and the merge
-checkout removed the directories to write the links. Full report:
-`docs/reviews/2026-11-08-merge-incident.md`.
+## A/B protocol (after T1 lands, GPU is free)
+120 MB / 120M bytes, 3 seeds, arms: `control` (GELU 4d) vs `gated_silu`
+(2.67d) vs `gated_situ` (2.67d). KEEP a gated arm only if it is ≥0.01 BPB better
+than the control on 3 seeds; otherwise the flag stays off and the result is
+recorded as a measured refusal. Single-seed noise on record: 0.008–0.011 BPB.
 
-Recovered so far: `flagship3.pt` copied out of /tmp into
-`checkpoints/flagship3/`; `port/scripts/fetch_mix_sources.py` refetched 600 MB of
-code/math/RU; `port/scripts/refetch_pretrain.py` is fetching fwedu/cosmo/finemath
-(1.2 GB each). The EVAL WINDOW is gone with the corpus: any run on the refetched
-sources is a NEW number and must say so.
-
-**Do not merge or checkout while these paths exist.**
-
-## 2026-11-08 05:00 — after the artifact loss: the corpus is back, the ladder is running
-
-**Data recovery is DONE** (the incident report's ladder, steps 1-4):
-
-| file | bytes | how |
-|---|---:|---|
-| `data_local/best/fwedu_train.bin` | 933 743 230 | FineWeb-Edu shard 0, head |
-| `data_local/best/fwedu_eval.bin` | 8 386 155 | the tail from a document separator — a file no source reads |
-| `data_local/best/cosmo.bin` | 302 198 823 | Cosmopedia auto_math_text |
-| `data_local/best/finemath.bin` | 948 125 886 | FineMath 3plus (the first download was truncated; re-curl + size check) |
-| `data_local/mix/{code,math,ru}.bin` | ~210 MB each | fetch_mix_sources.py |
-| `data_local/parquet/*.parquet` | 3.0 GB | curl -L, then DuckDB local read (`--local-dir`) |
-
-**The recipe ladder FINISHED (08:44).** Seven arms x 120 MB, 36-37 min each.
-Ranking at 120 MB: **all 1.4778**, cooldown 1.4870, vr 1.4878, clip 1.4889,
-control 1.4906, gate 1.4937, nope 1.4958. The combined arm is -0.0128 against
-control — at the top of the 0.008-0.011 seed band, from ONE seed, and larger
-than the sum of its parts; the honest verdict is "one candidate, not yet a
-result". **Queued: 2-3 seed control-vs-all replication**
-(`SEED=2 RUN_TAG=_s2 ONLY="control all"`, 37 min per arm) after the CSA run.
-Compression anchor on the same 196 608 B: bzip2 2.5878, xz 2.7134, zstd 2.7703
-bits/byte — the control is 1.10 b/B below the best of them.
-
-**CSA artifact 1 (legacy `sign`) trained in 1 h 59 m, and the protocol REFUSED
-it at gate C** — see `docs/reviews/2026-11-08-night.md` §5b. Gate A passes, gate
-B passes under a scale-free rule, gate C fails: the selector ranks the needle
-~119/128 (chance) when the needle sits in the first ~50 bytes, while the same
-976-byte distance ranks 17.5/256 and 7/10 in top-32 mid-document. **No 1M number
-is claimed.** The artifact's LFB controller also DIVERGED (bias ±95, routing
-collapsed — the known 2026-11-04 `sign` failure), so `train_csa8k.sh` now pins
-`moe_lb_mode=prop`, and **a corrected run is on the card since 11:20**.
-
-**The ladder was running** on it: `FAST=1 MIX=configs/mix_refetch.toml
-RUN_TAG=_refetch`, 7 arms x 14648 steps x 8192 B = 120 MB each. First arm
-measured 49.8 kB/s (30 MB in ~10 min), so ~40 min/arm, ~5 h total. Numbers are
-NEW numbers: the old mix4 window is gone.
-
-**The 1M context question has an artifact answer**
-(`docs/research/2026-11-08-long-context-eval.md`):
-
-- `flagship3` (the only 95M on disk) is a **1K dense control, no CSA** — it
-  cannot run a 1M test. The 1M design is the LoopBlock form, and the one trained
-  CSA checkpoint (`longctx1`, 102.7M, 8K) is **not on disk**.
-- No 95M long-context result exists in the literature; the closest measured
-  points are 300M Infini (passkey collapses past 4-8K), 0.5B SRRM, 1.24B
-  Llama-3.2-1B in HELMET (2.0 inftyBench / 24.6 HELMET at 128K).
-- NIAH correlates with real tasks at rho 0.44-0.76, so retrieval evidence buys a
-  **mechanism** claim: "exact retrieval at 1M", not reasoning.
-- State correction: 33 MiB is ONE CSA slot; the loop carries one per iteration
-  (3 slots = 99 MiB; 12 layers = 396 MiB). README and the site now say that.
-
-**Next on the 1M path** (needs the card, so it queues behind the ladder): train a
-CSA model at 8K on the refetched corpus (longctx1's recipe, 102.7M, ~500 MB
-seen), then run the S-NIAH-8 harness (`port/scripts/niah.py`, being built) for
-gate D.
-
-## Claims ledger: what the nine mismatches actually were (2026-11-08 05:20)
-
-The claims-repair review found that **seven of nine were ledger parser artifacts**
-(reading the wrong column of a table), and **two documents were genuinely stale**:
-`muon-variants.md` (medium totals since `907b3b5` set `use_msa=false`) and
-`token-skipping.md` (b1 count since `af8b0c9`). Both fixed with the old value kept
-as superseded. The ten drifted claims from the deletion audit are repaired too:
-three README numbers, the PPO-as-shipped paragraph, the 1B plan's self-contradiction,
-and status banners on ADR-0014 (MSA not cut), ADR-0003 (fused deleted), the "final"
-bank architecture (dense won), the scaling recipe's "expert-rich" direction, and
-the burn-byteflow DELETE row.
-
-**The gate itself is not armed and now says why:** `--no-params` makes the
-mismatch count a lower bound (1 vs 9), and "new" means the document is dated
-today — 220 claims in tonight's own reports are "new" by that rule. Arming it
-needs line-accurate evidence association first.
-
-## The GitHub divergence (found 2026-11-08 while pushing)
-
-`origin/main` is NOT this lane. Its tree is the Rust-era layout (`src/`,
-`tests/` at the root, a 5060 Ti MoE README with `assets/banner.svg`), and its
-HEAD is a data commit from that lineage. Local `main` is the Python lane under
-`port/`, 357 commits ahead and 78 behind; an automatic merge produced **319
-conflicts** (a directory flatten plus two overlapping trees) and was aborted.
-
-What exists now: `origin/backup/main-local-2026-11-08` carries all 357 local
-commits, so nothing is only-on-one-disk. `origin/main` is untouched.
-
-Three ways forward, for the owner:
-1. **Make the local lane canonical**: push local main to a new `origin/python`
-   branch and merge it into `origin/main` as a rewrite (the Rust tree moves to
-   `rust/` or `archive/`). One decision, one big commit.
-2. **Flatten locally** to the remote's layout (`port/*` → root) and merge; the
-   conflict count drops but the two `src/` and `docs/` trees still overlap.
-3. **Keep two branches** (`main` = Rust lineage, `python` = this lane) and stop
-   pretending they are one project.
-
-Until the owner picks, pushes go to `backup/main-local-2026-11-08`.
-
-## Waiting on the owner
-
-- `port/` → `python/` rename: scripted (`scripts/split_lanes.sh`), never run.
-  It touches every doc path, so it goes after the audit lands.
-- Rust lane: delete or keep frozen. The audit reports its real status.
-
-## Debt that needs an owner decision
-
-- **claims ledger**: 1 875 claims, 9 mismatches, 373 without evidence (all dated
-  before the rule). `scripts/gate_fast.sh` reports it instead of blocking, and
-  CI has no ledger job — so nothing enforces the rule today. The fix is a
-  `--since <date>` blocking mode plus a CI step; it is not done.
-- **docs drift**: 10 of 10 checked pre-2026-11-01 documents contradict the code
-  (`docs/reviews/2026-11-08-deletion-audit.md` §7).
-- **deletions**: C4 (agent_rl) is done. **C2 is BLOCKED, not skipped**: deleting
-  `jepa`/`muon_sf_retract` breaks `test_every_snapshot_on_disk_loads`, because
-  153 checkpoint snapshots on disk carry `jepa = false` and the loader refuses an
-  unknown key BY DESIGN (that refusal is a gate, not a nuisance). The honest way
-  to retire a field is a `RETIRED_KEYS` allowlist in the loader that accepts the
-  old name with a counted note — a decision, not a silent edit. Reverted with the
-  test green; C7 (vendor) is still open and needs a workspace build.
-
-## COMPANY MODE — 2026-11-08 13:30
-
-The owner's bar: commercial byte-level models trained from scratch, and the
-open-source engine must be the best available. Twenty agent workstreams ran on
-2026-11-08 (docs/reviews, docs/architecture, docs/guides, port/scripts).
-
-Four findings that change decisions:
-
-1. **MFU is 43.8%, not 73%** (`docs/reviews/2026-11-08-mfu-first-look.md`): the
-   6N bill is 21% low (executed 691.37 FLOP/byte), and the repo's 47.7 TF/s pin
-   is the 5060 Ti's number. fp8/kernels are the lever; grad-accum buys 1.03-1.11x.
-2. **The code slice is legally unresolved** (`docs/guides/data-provenance.md`):
-   `mix/code.bin` is 40.08% GPL/AGPL/LGPL and codeparrot declares no licence;
-   `refetch_pretrain.py` wrongly calls cosmopedia ODC-By (it is Apache-2.0).
-   The 2 GB budget run proceeds as RESEARCH on this corpus; a commercial
-   checkpoint must replace the code slice and carry the manifest (G1-G8 in the
-   provenance doc).
-3. **The LR schedule is 1.5% of the run's value** (`docs/research/2026-11-08-lr-schedule.md`):
-   WSD 3e-4, 1% warmup, 10% decay, min-lr 0.1. The one 0.25-BPB risk (no warmup)
-   is now closed by default in `train_budget.sh`.
-4. **The 2 GB run is 2.29x the hardware floor**, not "near" it: a fused-quantize
-   fp8 lane is the only remaining large throughput lever (1.4-1.6x projected).
-
-## SUITE GREEN, CPU-only (2026-11-08 06:20)
-
-`CUDA_VISIBLE_DEVICES="" pytest -q` over all 2 194 tests: **exit 0**, three
-times, the last after every edit. The 22-red starting point is closed. The two
-launch-count gates still need a card run (they skip on CPU), and the card is the
-ladder's until ~09:30.
-
-## Known-red: reclassified 2026-11-08 05:40 (the list was wrong)
-
-The old table said "seven pre-existing, all in the fused/CUDA-graph cluster,
-several pass alone". `docs/reviews/2026-11-08-fused-cluster.md` measured the
-seven with CUDA hidden: **five SKIP** (they are card gates), so the "7 red CPU
-suite" was a card-visible run. The real content:
-
-| # | test | class | fix |
-|---|---|---|---|
-| 1 | `test_full_graph::test_the_first_replay_is_the_eager_step` | **real defect**: the AdamW bias-correction counter (`_adamw_t`) was not advanced by the torch path, so the graph fallback resumed at a stale t (3.1e-05 at embed.weight) | **fixed** + CPU two-arm gate |
-| 2 | `test_fused_epilogue::test_the_kernel_is_fp32_roundoff[one-gain]` | stale tolerance: gradients held to 1e-6 where the module's own `PARITY_GRTOL` is 5e-5 | **fixed** |
-| 4 | `test_fused_residual::test_gate_reddens_when_the_pre_bias_moves` | stale test: patched `fr.pre`, which the compose path never calls | **fixed** (patches `fr.epilogue_read`) |
-| 6 | `test_invariants_checkpoint::...[kda+shareu]` | flaky: unseeded model + sign-LFB controller can read all zeros | **fixed** (seeded) |
-| 7 | `test_moe_combine_fused::test_the_fused_combine_counter...` | stale: asserted the bf16 counter on a default fp32 store | **fixed** (two arms) |
-| 3 | `test_fused_kda::test_kernel_launch_counter_drops` | card-only, never run | guard added; needs one card run |
-| 5 | `test_fused_residual::test_the_fused_path_issues_far_fewer_launches` | card-only, no arithmetic change since written | guard added; needs one card run |
-
-**All seven are closed (2026-11-08 05:20).** The two card gates ran on the busy
-card and found a REAL defect in themselves: their launch counter counted only
-`cudaLaunchKernel`, while a Triton kernel launches through the driver API and
-appears as `cuLaunchKernelEx` — so the fused arm read as **zero launches** and
-the "drop" was 11 vs 0, measuring nothing. Counting all three names gives the
-real numbers: **fused 2 vs eager 11** per KDA iteration, and **49 vs 804 (16.4x)**
-for the residual chain. Both pass.
-
-```
-cd port && CUDA_VISIBLE_DEVICES="" pytest -q   # 2 194 tests, exit 0, twice
-```
-
-## Gates that must stay green
-
-`scripts/gate_fast.sh`, `scripts/gate_format.sh`, `pytest -q`, `dead_knob_audit`,
-`check_doc_refs.py`, and (new) the `site` CI job that refuses a page with an
-unfilled `/*__DATA__*/` placeholder.
+## Rules for every lane
+- Never `git add .`; commit only the files your task names.
+- `config.py` is Lane A's file; B/C/D read the flags with `getattr(cfg, ..., False)`.
+- No GPU job without `/tmp/dormouse-gpu.lock`; no shelling around the guard.
+- Report numbers with the command that produced them; a claim without one is not
+  a result.

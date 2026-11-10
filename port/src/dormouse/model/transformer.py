@@ -15,7 +15,12 @@ GELU FFN (`d_ffn = 4·d_model` in the control; an arm sets `d_ffn` and
 `ffn_gated=true` swaps that FFN for a gated GLU — `gate`/`up` into `fc2` as the
 `down`, activation `expert_act` (`silu` = SwiGLU, `situ` = K3's capped GLU),
 width `8·d/3` for the same bill — and is refused on every other block form
-(`config.validate_ffn`).
+(`config.validate_ffn`). `ffn_form="tsct"` factors those THREE matrices
+through `tsct.TSCTLinear` (`U[d,r]·diag(s)·V[r,f]`, ranks `ffn_rank_gate` /
+`ffn_rank_down`, `0` = `rank`) — the one `ffn_form` value wired on this block;
+every other value is refused (`config.validate_block_form`), because before
+this wiring `ffn_form` reached no code here and an `arch_tsct275`-style config
+built the dense control while its log line said `tsct`.
 GPT-2 residual scaling on the two output projections
 (`0.02/sqrt(2·n_layers)`). Parameters per block:
 `4·d²` attention + `2·d·d_ffn` FFN + `4·d` of LayerNorm, which at
@@ -53,7 +58,7 @@ from ..config import check_gated_ffn_bill
 from ..instrument import Counters, loud
 from .experts import expert_glu
 from .packed_acts import packed_act_mm, packed_glu
-from .tsct import dense_qat_kind, dense_qat_weight, mm_mixed
+from .tsct import TSCTLinear, dense_qat_kind, dense_qat_weight, mm_mixed
 
 __all__ = [
     "TransformerBlock",
@@ -184,6 +189,12 @@ class TransformerBlock(nn.Module):
         #: that names `fc2` reads a write in both arms.
         self.ffn_gated = bool(getattr(cfg, "ffn_gated", False))
         self.expert_act = cfg.expert_act
+        #: `ffn_form="tsct"`: the gated FFN's three matrices are
+        #: `TSCTLinear`s. Only built on the gated path (the factorised form has
+        #: no ungated arm), and only this form reaches code here —
+        #: `config.validate_block_form` refuses every other non-default value,
+        #: so a config cannot name a form this block never builds.
+        self.ffn_tsct = cfg.ffn_form == "tsct"
         self.beta1 = float(cfg.expert_beta1)
         self.beta2 = float(cfg.expert_beta2)
         #: The dense-QAT seam (`dense_qat`, `DENSE_QATS`): the SAME projector the
@@ -210,16 +221,54 @@ class TransformerBlock(nn.Module):
         #: when the flag is off, so the off forward is the same calls it has
         #: always made.
         self.act_qat = cfg.act_qat
+        self.r_gate = self.r_down = 0
         if self.ffn_gated:
             # The runtime seam a hand-built config reaches, the same rule
             # `config.validate_ffn` applies on the loader path: the gated bill
             # must be the ungated block's, or the flag is a bigger model.
             check_gated_ffn_bill(d, ffn, cfg.d_ffn_gelu)
-            self.gate_proj = nn.Linear(d, ffn, bias=False, device=device)
-            self.up_proj = nn.Linear(d, ffn, bias=False, device=device)
+            if self.ffn_tsct:
+                # The runtime seam `config.validate_block_form` owns: a
+                # hand-built config can reach the block without the loader.
+                if cfg.n_experts != 1 or cfg.moe_topk:
+                    loud(
+                        f"ffn_form='tsct' with n_experts={cfg.n_experts}/"
+                        f"moe_topk={cfg.moe_topk} on the transformer block: this "
+                        f"block has one FFN and no router, so the bank of tsct "
+                        f"experts would never be built. Escape: n_experts=1 and "
+                        f"moe_topk=0."
+                    )
+                self.r_gate = cfg.ffn_rank_gate or cfg.rank
+                self.r_down = cfg.ffn_rank_down or cfg.rank
+                if self.r_gate < 1 or self.r_down < 1:
+                    loud(
+                        f"ffn_rank_gate={self.r_gate} / ffn_rank_down="
+                        f"{self.r_down}: a factor rank must be >= 1. Escape: a "
+                        f"positive rank, or ffn_form='bank'."
+                    )
+                kw = dict(
+                    dtype=self.compute_dtype,
+                    factor_qat=cfg.factor_qat,
+                    factor_qat_alpha=cfg.factor_qat_alpha,
+                    device=device,
+                )
+                self.gate_proj = TSCTLinear(d, ffn, self.r_gate, **kw)
+                self.up_proj = TSCTLinear(d, ffn, self.r_gate, **kw)
+                self.fc2 = TSCTLinear(ffn, d, self.r_down, **kw)
+            else:
+                self.gate_proj = nn.Linear(d, ffn, bias=False, device=device)
+                self.up_proj = nn.Linear(d, ffn, bias=False, device=device)
         else:
+            if self.ffn_tsct:
+                loud(
+                    "ffn_form='tsct' with ffn_gated=false: the factorised form "
+                    "replaces the GATED FFN's gate/up/down, and the plain "
+                    "`gelu(fc)` block has no arm. Escape: ffn_gated=true, or "
+                    "ffn_form='bank'."
+                )
             self.fc = nn.Linear(d, ffn, bias=False, device=device)
-        self.fc2 = nn.Linear(ffn, d, bias=False, device=device)
+        if not self.ffn_tsct:
+            self.fc2 = nn.Linear(ffn, d, bias=False, device=device)
         #: Value residuals (`value_residual`): a per-head scale on block 0's
         #: value, ZERO-initialised so the arm starts bit-equal to off. Block 0
         #: IS the source (`v_first`), so it gets no α — an α there would be a
@@ -245,13 +294,14 @@ class TransformerBlock(nn.Module):
         # shared one, not re-drawn.
         std = 0.02
         nn.init.normal_(self.qkv.weight, std=std)
-        if self.ffn_gated:
+        if self.ffn_gated and not self.ffn_tsct:
             nn.init.normal_(self.gate_proj.weight, std=std)
             nn.init.normal_(self.up_proj.weight, std=std)
-        else:
+        elif not self.ffn_gated:
             nn.init.normal_(self.fc.weight, std=std)
         nn.init.normal_(self.proj.weight, std=std / math.sqrt(2 * n_layers))
-        nn.init.normal_(self.fc2.weight, std=std / math.sqrt(2 * n_layers))
+        if not self.ffn_tsct:
+            nn.init.normal_(self.fc2.weight, std=std / math.sqrt(2 * n_layers))
         # The MoD router (`r_i = w^T x_i`), built IFF routing is on. A
         # CONSTANT init, not `nn.Linear`'s: `nn.Linear` would draw from the
         # global RNG, shifting every later block's init and turning the arm
@@ -347,8 +397,26 @@ class TransformerBlock(nn.Module):
         # fp32 stream (mm_mixed's contract, widened back here).
         x = x + self._qmm(y, self.proj, self._qat_attn, counters).to(x.dtype)
         h2 = self.ln2(x)
+        return x + self._ffn(h2, counters).to(x.dtype)
+
+    def _ffn(self, h2: torch.Tensor, counters: Counters | None) -> torch.Tensor:
+        """The FFN body: `ln2(x) [b,t,d]` in, the FFN's write `[b,t,d]` out.
+
+        Three arms, one seam: the factorised GLU (`ffn_tsct`, COUNTED as
+        `ffn_tsct`), the dense gated GLU (`ffn_gated`) and the plain GELU
+        block. The last two are the calls this method has always made; the
+        tsct arm bypasses the packed/dense-QAT seams (both read an `nn.Linear`
+        weight, and this arm's weights are `U`/`s`/`V`), which is why those
+        combinations are refused at config load and at `__init__`.
+        """
         packed = self.act_qat != "none"
-        if self.ffn_gated:
+        if self.ffn_tsct:
+            if counters is not None:
+                counters.count("ffn_tsct", h2.shape[0] * h2.shape[1])
+            g = self.gate_proj(h2)
+            u = self.up_proj(h2)
+            h = expert_glu(self.expert_act, g, u, beta1=self.beta1, beta2=self.beta2)
+        elif self.ffn_gated:
             if packed:
                 # ONE pack feeds gate and up; `packed_glu` then owns the GLU so
                 # its three `[T, f]` saves become two packed `[T, f/2]`.
@@ -384,7 +452,9 @@ class TransformerBlock(nn.Module):
             h = F.gelu(self._qmm(h2, self.fc, self._qat_ffn, counters))
         if self.ffn_clip > 0.0:
             h = h.clamp(max=self.ffn_clip)
-        if packed:
+        if self.ffn_tsct:
+            h = self.fc2(h)
+        elif packed:
             h = packed_act_mm(
                 h,
                 self.compute_dtype,
@@ -393,7 +463,7 @@ class TransformerBlock(nn.Module):
             )[0]
         else:
             h = self._qmm(h, self.fc2, self._qat_ffn, counters)
-        return x + h.to(x.dtype)
+        return h
 
     def _qat_weight(self, linear: nn.Linear, kind: str) -> torch.Tensor:
         """`dense_qat` projected onto `linear`'s weight — the master when off.

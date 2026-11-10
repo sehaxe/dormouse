@@ -228,14 +228,16 @@ def test_flag_off_keeps_the_gelu_block_names_count_and_forward():
         ({"block_form": "kda", "n_layers": 0}, "block_form"),
         ({"d_ffn": 128}, "d_ffn"),  # 3·64·128 vs 2·64·(4·64): -25%
         ({"expert_act": "memglu"}, "memglu"),
-        ({"ffn_form": "dense", "fused_glu": True}, "fused_glu"),
+        ({"ffn_form": "dense", "fused_glu": True}, "ffn_form"),
         ({"ffn_gated": False, "d_ffn_gelu": 3072}, "d_ffn_gelu"),
     ],
 )
 def test_validate_ffn_refuses_the_illegal_gated_combinations(over, named):
-    cfg = _block_cfg(**{"ffn_gated": True, **over})
+    # Construction is inside the block: the `block_form` half of these refusals
+    # runs in `ModelConfig.__post_init__` (the loader seam), the `validate_ffn`
+    # half on the explicit `validate()` call.
     with pytest.raises(LoudError) as e:
-        validate(cfg)
+        validate(_block_cfg(**{"ffn_gated": True, **over}))
     msg = str(e.value)
     assert named in msg, msg
     assert "ffn_gated" in msg and "Escape:" in msg, msg
