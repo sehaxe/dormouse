@@ -70,6 +70,14 @@ The update is `burn-muon-plus`'s, not a re-derivation:
     TSCT retraction is `muon_sf_retract` and `true` is refused (S3: the
     averaged iterate is a convex combination of retracted factors, and the
     projection step needs a convex set).
+* The per-head **Newton–Schulz** arm (`muon_per_head`, K3 §2.5,
+  arXiv:2607.24653): an attention Q/K/V momentum matrix is split along its head
+  axis and each head's block is orthogonalized ON ITS OWN, so the head with the
+  largest momentum cannot set the update direction every head shares. The split
+  is one block per head (`PER_HEAD_SITES`, by name; COUNTED `muon_per_head`),
+  the tail after the polar is the full-matrix one, and a split of ONE block
+  (`n_heads == 1` on an unpacked projection) is the full-matrix call bit for
+  bit. Off by default.
 """
 
 from __future__ import annotations
@@ -160,6 +168,15 @@ SF_BETA1 = 0.9
 #: the b1 bench can sweep it against VRAM. The value is the one the step has
 #: always used (`(1 << 27) // (d0 * d1 * 4)` params).
 MUON_CHUNK_ELEMS = 1 << 25
+
+#: The attention projections `muon_per_head` (K3 §2.5, arXiv:2607.24653) splits
+#: per head, by the parameter's PARENT module (`.q_proj.weight`). `q_proj`/
+#: `k_proj`/`v_proj` carry ONE projection; the `block_form="transformer"` block
+#: packs all three into one `[3·d, d]` weight (`model/transformer.py`), so its
+#: head axis holds `3·n_heads` blocks — the q/k/v stack is a per-HEAD factor,
+#: i.e. a head's q, k and v blocks stay separate matrices instead of being
+#: re-joined.
+PER_HEAD_SITES = ("q_proj", "k_proj", "v_proj", "qkv")
 
 
 def _check_ns_kind(kind: str) -> None:
@@ -671,6 +688,11 @@ class _MomGroup:
     * `x`, `z` — the schedule-free iterates, `[N, d0, d1]` in the state dtype
       (`sf=True`). `x` is the returned/eval iterate and `z` the fast one; the
       PARAMS are `Y = (1-β1)Z + β1 X` (`sf_switch`).
+
+    `per_head` is `(blocks, head_dim)` for a group whose parameters carry the
+    per-head marker (`muon_per_head`), `None` otherwise: the NS chain then runs
+    on `[N·blocks, head_dim, d1]` (one matrix per head) and the tail on the
+    reassembled `[N, d0, d1]`, so nothing after the polar moves.
     """
 
     __slots__ = (
@@ -685,6 +707,7 @@ class _MomGroup:
         "tsct_row",
         "packed",
         "rows",
+        "per_head",
     )
 
     def __init__(
@@ -698,6 +721,7 @@ class _MomGroup:
         z: torch.Tensor | None = None,
         packed: bool = False,
         rows: int | None = None,
+        per_head: tuple[int, int] | None = None,
     ) -> None:
         self.gi = gi
         self.shape = shape
@@ -706,6 +730,7 @@ class _MomGroup:
         self.v = v
         self.x = x
         self.z = z
+        self.per_head = per_head
         #: TSCT-2's per-expert LR row ids (`0` = no scale) and the current
         #: step's `[N]` scale vector. `None` without the arm, so the OFF path
         #: allocates and multiplies nothing. A packed group's ids are one row
@@ -996,10 +1021,19 @@ class Muon(Optimizer):
                     # their jobs together.
                     by_shape.setdefault(("packed", id(p), p.shape[1], p.shape[2]), []).append(p)
                 elif p.ndim == 2:
-                    by_shape.setdefault(("2d", p.shape[0], p.shape[1]), []).append(p)
+                    # The per-head marker is part of the GROUP KEY: a `[d, d]`
+                    # attention projection is orthogonalized per head while an
+                    # unmarked parameter of the same shape is not, so the two
+                    # cannot share one stacked NS call.
+                    by_shape.setdefault(
+                        ("2d", p.shape[0], p.shape[1], getattr(p, "_muon_per_head", None)), []
+                    ).append(p)
             for key, params in by_shape.items():
                 packed = key[0] == "packed"
                 shape = (key[2], key[3]) if packed else (key[1], key[2])
+                # One block IS the full-matrix call (`_orthogonalize_marked`), so
+                # the marker is dropped instead of carried as a no-op.
+                per_head = None if packed or key[3] is None or key[3][0] == 1 else key[3]
                 n = params[0].shape[0] if packed else len(params)
                 dtype = _torch_dtype(self.state_dtype)
                 mom = torch.zeros(n, *shape, dtype=dtype, device=params[0].device)
@@ -1049,7 +1083,9 @@ class Muon(Optimizer):
                             pv = self.state[p].get(name)
                             buf[i].copy_(pv if pv is not None else p.detach())
                             self.state[p][name] = buf[i]
-                grp = _MomGroup(gi, shape, params, mom, v, x, z, packed=packed, rows=n)
+                grp = _MomGroup(
+                    gi, shape, params, mom, v, x, z, packed=packed, rows=n, per_head=per_head
+                )
                 if self._tsct_moes:
                     # ONE device row id per parameter — or per EXPERT SLICE of a
                     # packed 3-D buffer — built once at setup, never per step:
@@ -1119,6 +1155,32 @@ class Muon(Optimizer):
             return zeropower_via_ns(x, steps, self.ns_kind)
         return zeropower_via_ns(x, steps, self.ns_kind, self.ns_dtype)
 
+    def _orthogonalize_marked(
+        self, x: torch.Tensor, steps: int, per_head: tuple[int, int] | None
+    ) -> torch.Tensor:
+        """`_orthogonalize`, per HEAD when `per_head` names a split (K3 §2.5).
+
+        `per_head` is the parameter's `(blocks, head_dim)` marker
+        (`mark_per_head`): `x` is `[…, blocks·head_dim, cols]` (2-D for a single
+        parameter, `[N, d0, d1]` for a stacked chunk), and the chain runs on
+        `[N·blocks, head_dim, cols]` — the 3-D branch of `zeropower_via_ns`,
+        whose Frobenius prescale is per SLICE, i.e. per head. That prescale is
+        the whole mechanism: each head's polar factor is one unit matrix, so a
+        10×-larger head no longer dominates the shared update direction
+        (`tests/test_muon_per_head.py` measures the spread both ways).
+
+        ONE block is NOT a split: the call is the full-matrix one, bit for bit
+        (the same kernel, the same iteration count), so `n_heads == 1` on an
+        unpacked projection cannot move a number. Only a real split is COUNTED
+        (`muon_per_head`), which is what the audit reads.
+        """
+        if not per_head or per_head[0] == 1:
+            return self._orthogonalize(x, steps)
+        blocks, head_dim = per_head
+        self.counters.count("muon_per_head")
+        views = x.reshape(-1, head_dim, x.shape[-1])
+        return self._orthogonalize(views, steps).reshape(x.shape)
+
     def _muon_scale(self, rows: int, cols: int) -> float:
         """The per-shape factor that turns the polar step into `RMS(dW) = lr`.
 
@@ -1167,7 +1229,7 @@ class Muon(Optimizer):
             buf.copy_(buf.float().mul_(mu).add_(p.grad, alpha=1.0 - mu))
         else:
             buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
-        update = self._orthogonalize(buf, ns)
+        update = self._orthogonalize_marked(buf, ns, getattr(p, "_muon_per_head", None))
         if row_scale is not None:
             assert not self.sf and self.variant == "muon", (
                 "TSCT-2's per-expert LR has no seam in the SF/NorMuon tails; "
@@ -1371,11 +1433,13 @@ class Muon(Optimizer):
             self._build_groups()
         n_batches = 0
         # `(write_targets, tensor_to_orthogonalize, lr, scale, ns_steps,
-        #   singleton, row_scale, packed)`. `row_scale` is TSCT-2's per-expert
-        # LR (`[k]`, or a 0-dim tensor for a singleton), gathered from the
-        # counts ONCE per step; `packed` says the write target is ONE 3-D slice
-        # of the parameter (`[k, r, f]`), never a list of E 2-D parameters.
-        jobs: list[tuple[list, torch.Tensor, float, float, int, bool, object, bool]] = []
+        #   singleton, row_scale, packed, head_shape)`. `row_scale` is TSCT-2's
+        # per-expert LR (`[k]`, or a 0-dim tensor for a singleton), gathered from
+        # the counts ONCE per step; `packed` says the write target is ONE 3-D slice
+        # of the parameter (`[k, r, f]`), never a list of E 2-D parameters;
+        # `head_shape` is the `[k, d0, d1]` a per-head NS result is reassembled
+        # into before the tail (`None` when the chain ran on the whole matrix).
+        jobs: list[tuple[list, torch.Tensor, float, float, int, bool, object, bool, object]] = []
         for grp in stepaudit.iterations("muon.groups", self._groups):
             group = self.param_groups[grp.gi]
             lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
@@ -1420,7 +1484,16 @@ class Muon(Optimizer):
                 else:
                     buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
                 row = grp.tsct_row[0] if grp.tsct_row is not None else None
-                jobs.append(([p], buf, lr, scale, ns, True, row, False))
+                # Per-head (`muon_per_head`): the NS input is the head view and
+                # the tail below is the full matrix — the same split
+                # `_orthogonalize_marked` makes, written out here because the
+                # update is written back into `buf`'s shape, not the view's.
+                ns_x, head_shape = buf, None
+                if grp.per_head:
+                    ns_x = buf.reshape(-1, grp.per_head[1], buf.shape[-1])
+                    head_shape = buf.shape
+                    self.counters.count("muon_per_head")
+                jobs.append(([p], ns_x, lr, scale, ns, True, row, False, head_shape))
                 continue
             mom = grp.mom
             if grp.packed:
@@ -1456,16 +1529,24 @@ class Muon(Optimizer):
                     params_c = params[start : start + n_chunk]
                 pieces = mom[start : start + n_chunk]
                 if self.sf:
-                    update = self._orthogonalize(pieces, ns)
+                    update = self._orthogonalize_marked(pieces, ns, grp.per_head)
                     self._sf_batched(grp, start, len(params_c), params_c, update, lr, c)
                     continue
                 if self.variant == "normuon":
-                    update = self._orthogonalize(pieces, ns)
+                    update = self._orthogonalize_marked(pieces, ns, grp.per_head)
                     self._nor_batched(grp, start, len(params_c), params_c, update, lr, flag)
                     continue
                 k = pieces.shape[0]
                 row = grp.tsct_row[start : start + k] if grp.tsct_row is not None else None
-                jobs.append((params_c, pieces, lr, scale, ns, False, row, grp.packed))
+                head_shape = None
+                if grp.per_head:
+                    # ONE matrix per HEAD: the chain's per-slice Frobenius
+                    # prescale is the equalizer (K3 §2.5); the tail below runs on
+                    # the reassembled `[k, d0, d1]` (the writeback reshapes).
+                    pieces = pieces.reshape(-1, grp.per_head[1], pieces.shape[-1])
+                    head_shape = (k, *grp.shape)
+                    self.counters.count("muon_per_head")
+                jobs.append((params_c, pieces, lr, scale, ns, False, row, grp.packed, head_shape))
             n_batches += 1
 
         if jobs:
@@ -1482,8 +1563,12 @@ class Muon(Optimizer):
             for job, update in stepaudit.iterations(
                 "muon.writeback", zip(jobs, updates, strict=True)
             ):
-                params_c, _, lr, scale, _, singleton, row, packed = job
+                params_c, _, lr, scale, _, singleton, row, packed, head_shape = job
                 assert update is not None
+                if head_shape is not None:
+                    # Per-head NS: the chain ran one matrix per head; the tail
+                    # below is `_step_one`'s full-matrix one, unchanged.
+                    update = update.reshape(head_shape)
                 if packed:
                     # The 3-D tail: per-slice ColRow (`colrow_3d="colrow"` IS
                     # the 2-D definition on each matrix, `colrow_normalize`'s
@@ -1689,6 +1774,56 @@ def is_muon_param(name: str, p: torch.Tensor) -> bool:
     return p.ndim == 2 and p.shape[0] > 1 and p.shape[1] > 1
 
 
+def per_head_split(name: str) -> int:
+    """How many attention projections one parameter carries: 3 for a packed
+    `qkv`, 1 for `q_proj`/`k_proj`/`v_proj`, 0 for anything else.
+
+    The SITE is the parameter's parent module (`loop.attn.q_proj.weight`, or
+    `layers.3.qkv.weight`): `fused_latent_proj` keeps q/k/v as four parameters,
+    while `block_form="transformer"` packs all three into ONE `[3·d, d]` weight,
+    so the site — not the shape — says how many head stacks a parameter holds.
+    """
+    parts = name.split(".")
+    leaf = parts[-2] if len(parts) > 1 else parts[-1]
+    if leaf == "qkv":
+        return 3
+    return 1 if leaf in PER_HEAD_SITES else 0
+
+
+def mark_per_head(named: list[tuple[str, nn.Parameter]], n_heads: int, head_dim: int) -> list[str]:
+    """Mark every attention Q/K/V projection for per-head Newton–Schulz (K3 §2.5).
+
+    The marker `(blocks, head_dim)` on the PARAMETER is the contract — the same
+    form `_muon_batched` uses — read by `Muon._build_groups` (the group key and
+    its NS shape) and by `_step_one`. It is set only when `muon_per_head` is ON,
+    so the OFF path carries no attribute and takes no branch.
+
+    `blocks` is `n_heads`, or `3·n_heads` for the packed `qkv`, whose three
+    projections are stacked along the head axis. A projection whose head axis is
+    not `blocks·head_dim` rows is LOUD — never a silent full-matrix fallback,
+    because that is a shape the split cannot tile (a `n_kv_heads < n_heads` GQA
+    `k_proj` is the usual cause).
+    """
+    marked: list[str] = []
+    for name, p in stepaudit.iterations("muon.per_head_scan", named):
+        split = per_head_split(name)
+        if not split:
+            continue
+        blocks = split * n_heads
+        if p.shape[0] != blocks * head_dim:
+            loud(
+                f"muon_per_head=true but {name} is {tuple(p.shape)}: its head axis "
+                f"is {blocks} block(s) x head_dim={head_dim} = {blocks * head_dim} "
+                f"rows ({split} projection(s) x n_heads={n_heads}), so the split "
+                f"would be ragged. Escape: muon_per_head=false, or a model whose "
+                f"attention projections tile the head axis exactly (a GQA module "
+                f"with n_kv_heads < n_heads is the usual cause)."
+            )
+        p._muon_per_head = (blocks, head_dim)
+        marked.append(name)
+    return marked
+
+
 class MixOptimizer:
     """Muon (2-D) + AdamW (the rest), or AdamW for everything.
 
@@ -1725,6 +1860,9 @@ class MixOptimizer:
         tsct_expert_lr: float = 0.0,
         muon_lr_mult: float = 1.0,
         muon_lr_mode: str = "uniform",
+        muon_per_head: bool = False,
+        n_heads: int = 0,
+        head_dim: int = 0,
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
@@ -1779,13 +1917,54 @@ class MixOptimizer:
         _check_muon_variant(muon_variant)
         muon_params: list[nn.Parameter] = []
         adamw_params: list[nn.Parameter] = []
+        muon_named: list[tuple[str, nn.Parameter]] = []
         self.routing: dict[str, str] = {}
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
             group = "muon" if (opt == "mix" and is_muon_param(name, p)) else "adamw"
             self.routing[name] = group
-            (muon_params if group == "muon" else adamw_params).append(p)
+            if group == "muon":
+                muon_named.append((name, p))
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
+        #: The attention projections the per-head NS arm marked (K3 §2.5,
+        #: `PER_HEAD_SITES`), by name. Empty on every other run — the flag is OFF
+        #: by default and the OFF path sets no attribute, so `Muon`'s groups and
+        #: step do not move.
+        self.per_head_sites: list[str] = []
+        if muon_per_head:
+            if opt != "mix":
+                loud(
+                    f"muon_per_head=true with opt={opt!r}: the per-head split is "
+                    f"Muon's Newton-Schulz step, and this optimizer routes every "
+                    f"parameter to AdamW. Escape: opt='mix', or "
+                    f"muon_per_head=false."
+                )
+            if not muon_params:
+                loud(
+                    "muon_per_head=true but no parameter is routed to Muon (the "
+                    "model has no 2-D matrix, or every one is excluded by "
+                    "`is_muon_param`): the split would have nothing to run on. "
+                    "Escape: opt='mix' on a model with attention projections, or "
+                    "muon_per_head=false."
+                )
+            if n_heads < 1 or head_dim < 1:
+                loud(
+                    f"muon_per_head=true with n_heads={n_heads}, "
+                    f"head_dim={head_dim}: the arm splits a projection along its "
+                    f"head axis and cannot find it without the model's head "
+                    f"geometry. Escape: pass the model config's n_heads/head_dim."
+                )
+            self.per_head_sites = mark_per_head(muon_named, n_heads, head_dim)
+            if not self.per_head_sites:
+                loud(
+                    "muon_per_head=true but no attention Q/K/V projection is in "
+                    f"the Muon group (sites by name: {list(PER_HEAD_SITES)}): the "
+                    "flag would be inert while the run reported it on. Escape: "
+                    "muon_per_head=false, or a block form that has one."
+                )
         if muon_sf and not muon_params:
             loud(
                 f"muon_sf=true with no Muon parameter: `opt={opt!r}` routes every "

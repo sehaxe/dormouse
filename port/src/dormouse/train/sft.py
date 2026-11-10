@@ -1134,6 +1134,12 @@ def sft_train(
         muon_chunk_elems=cfg.muon_chunk_elems,
         muon_lr_mult=cfg.muon_lr_mult,
         muon_lr_mode=cfg.muon_lr_mode,
+        # K3 §2.5's per-head Newton–Schulz (`muon_per_head`, a MODEL field):
+        # forwarded for the same reason as the fields above — a config flag that
+        # the only optimizer construction here drops is a flag that lies.
+        muon_per_head=getattr(run.model, "muon_per_head", False),
+        n_heads=run.model.n_heads,
+        head_dim=run.model.head_dim,
         # AdamW's denominator floor is a pure optimizer setting whose mechanism
         # (the logit scale ceiling ~ log(1/eps)) is loop-independent, so it is
         # forwarded rather than refused: a non-default value used to be dropped

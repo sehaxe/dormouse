@@ -1604,6 +1604,15 @@ def _train_impl(
         muon_chunk_elems=cfg.muon_chunk_elems,
         muon_lr_mult=cfg.muon_lr_mult,
         muon_lr_mode=cfg.muon_lr_mode,
+        # K3 §2.5's per-head Newton–Schulz on the attention projections (a MODEL
+        # field, DEFAULT OFF). The head geometry is the model's too: the
+        # optimizer can only find a projection's head axis if it knows what one
+        # head is, so `n_heads`/`head_dim` are read from the same config. Without
+        # the flag no parameter is marked and `Muon`'s groups, step and counters
+        # are exactly what they were.
+        muon_per_head=getattr(run.model, "muon_per_head", False),
+        n_heads=run.model.n_heads,
+        head_dim=run.model.head_dim,
         # The AdamW denominator floor (`train.adam_eps`): a one-line experiment
         # with a sourced mechanism — the equilibrium logit scale is bounded by
         # about log(1/eps), and 1e-8's ~18.4 nats sits above the fp32
