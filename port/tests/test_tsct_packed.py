@@ -51,10 +51,13 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn.functional as F
+from conftest import tiny_cfg
 
 from dormouse.config import ModelConfig
 from dormouse.instrument import Counters, LoudError
 from dormouse.model import DormouseModel, param_count
+from dormouse.model.experts import SparseMoE
 from dormouse.train.optim import Muon, is_muon_param
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,13 +91,21 @@ IDS = torch.arange(2 * 64).reshape(2, 64) * 7 % 256
 
 #: Captured on clean `907b3b5` BEFORE the field existed (the first pin script in
 #: this worktree): params, sha256(logits+loss+every grad), sha256(state dict).
+#:
 #: RE-CAPTURED 2026-11-10 for `SparseMoE._bank_dispatch`'s router-weight layout
 #: (the weight is applied in rank space before `@ v` instead of scaling a
 #: `[n·k, f]` fp32 product). That is a deliberate change to the OFF forward's
-#: rounding, so the GRAD digest moved (`state` and `loss` did not: no init and no
-#: logits bit moved). The semantics the change must keep are gated in
-#: `tests/test_moe_batched.py` (1e-5 fp32 / 1e-2 relative bf16 vs the loop, plus
-#: `moe_w_in_bank`) — this pin's job is to catch FUTURE drift.
+#: rounding, so this alarm MOVED — and it moved in the one place the change
+#: touches: the logits differ (review measured max|Δ| 7.15e-07, rel 1.67e-07,
+#: 27,670 of 32,768 elements) while `state` (no init bit) and `loss` (rounded at
+#: its own scale) did not.
+#:
+#: THIS DIGEST IS A DRIFT ALARM, NOT PROOF. A digest captured from our own run
+#: cannot say the layout is right; it says nothing moved since yesterday.
+#: The PROOF is `test_the_moe_slot_matches_an_external_float64_implementation`
+#: (logits AND dL/dweight against a second, float64 implementation of the same
+#: module) and `test_the_hand_computed_two_token_case` (two tokens, two rank-1
+#: experts, `w = [0.75, 0.25]`, expected output written on paper).
 GOLDEN_PARAMS = 55_025
 GOLDEN_GRAD = "256f0dde88fc62d086cf906a6268e30fa73756586ac3d8822451dc05a3df9227"
 GOLDEN_STATE = "537126066f1b70c4f40b05773be323a27221690e74a6cfd1040408493a18460b"
@@ -143,6 +154,12 @@ def _digest_at_one_thread(cfg: ModelConfig) -> tuple[str, str, float]:
 # A. OFF is clean main — the pins were taken before the edit
 # --------------------------------------------------------------------------- #
 def test_off_is_bit_identical_to_clean_main() -> None:
+    """Gate A: the OFF arm matches its 2026-11-10 re-captured alarm (DRIFT only).
+
+    Read the constant's comment: the digest moved with the router-weight layout,
+    so this test is a regression alarm. What proves that move is CORRECT is the
+    float64 anchor and the hand-computed case below, not this equality.
+    """
     model = _build()
     assert model.cfg.tsct_packed is False, "the arm must default to off"
     assert param_count(model) == GOLDEN_PARAMS
@@ -154,6 +171,170 @@ def test_off_is_bit_identical_to_clean_main() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# ------------------------------------------------- A2. the external anchors
+#
+# The digest above is an alarm, so the layout needs an authority OUTSIDE our own
+# run. Two, at different granularity: (i) a second, float64 implementation of the
+# whole `SparseMoE` module (router → top-k → routed GLU → shared expert → down),
+# compared on logits AND `dL/dweight`; (ii) a two-token fixture whose expected
+# output is arithmetic on paper.
+#
+# NOT re-derived: the model's VOCAB logits in float64. That needs a second
+# implementation of KDA/attention/engram, which is a different project; the
+# module that changed is the MoE slot, and these anchors cover it at its own
+# boundary (`SparseMoE.forward`'s output, and the gradient reaching its `weight`).
+
+
+def _glu64(expert, x64: torch.Tensor) -> torch.Tensor:
+    """One `DualLatentGLU` forward in float64, straight from the parameter names."""
+    g = (x64 @ expert.gate_u.detach().double()) * expert.gate_s.detach().double()
+    u = (x64 @ expert.up_u.detach().double()) * expert.up_s.detach().double()
+    return (F.silu(g) * u) @ expert.v.detach().double()
+
+
+def _moe64(moe: SparseMoE, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`SparseMoE.forward` in float64: `(output, weight-for-grad, index)`.
+
+    Deliberately a SECOND transcription (autograd included) of the module: the
+    router, the LFB-raised top-k, the per-assignment weighted GLU, the always-on
+    shared expert and the `down` projection. If the bank's layout is wrong, this
+    and the module disagree — a digest cannot say that.
+    """
+    x64 = x.detach().double()
+    logits = x64 @ moe.router.weight.detach().double().T
+    probs = torch.softmax(logits, -1)
+    index = (logits + moe.lfb_bias.detach().double()).topk(moe.topk, dim=-1).indices
+    w = torch.gather(probs, 1, index)
+    w = (w / w.sum(-1, keepdim=True).clamp_min(1e-9)).requires_grad_()
+    out = torch.zeros(x64.shape[0], moe.f, dtype=torch.float64)
+    for e in range(moe.n_experts):
+        for slot in range(moe.topk):
+            sel = torch.nonzero(index[:, slot] == e).reshape(-1)
+            if sel.numel() == 0:
+                continue
+            y = _glu64(moe.experts[e], x64[sel]) * w[sel, slot].unsqueeze(-1)
+            out = out.index_add(0, sel, y)
+    out = out + _glu64(moe.shared, x64)
+    return out @ moe.down.weight.detach().double().T, w, index
+
+
+def test_the_moe_slot_matches_an_external_float64_implementation() -> None:
+    """Anchor A2(i): the MoE module's logits AND `dL/dweight` vs float64.
+
+    The pin's digest was re-captured because `SparseMoE._bank_dispatch` moved the
+    router weight into rank space (2026-11-10). This is what says that move is
+    the same function: the module and an independent float64 transcription agree
+    on its output to the fp32 bound, and on the gradient reaching the routed
+    weight (`dL/dweight`) to the same bound. Measured: output rel 2.7e-07,
+    `dL/dweight` rel 1.2e-07, routing indices identical.
+    """
+    torch.manual_seed(4)
+    moe = SparseMoE(
+        tiny_cfg(
+            n_experts=4,
+            moe_topk=2,
+            d_model=32,
+            d_ffn=48,
+            head_dim=8,
+            rank=4,
+            bf16=False,
+            moe_capacity=0.0,
+            moe_kernel="batched",
+        ),
+        device="cpu",
+    ).train()
+    x = torch.randn(19, moe.d)
+    # Capture the NORMALIZED weight the changed code receives, with its gradient.
+    seen: dict[str, torch.Tensor] = {}
+    real = moe._dispatch
+
+    def spy(xin, w, idx, counters):
+        w.retain_grad()
+        seen["w"] = w
+        seen["i"] = idx
+        return real(xin, w, idx, counters)
+
+    moe._dispatch = spy
+    out = moe(x)
+    cot = torch.randn_like(out)
+    (out * cot).sum().backward()
+    assert "w" in seen, "the spy never saw the routed weight"
+
+    ref, w64, idx64 = _moe64(moe, x)
+    (ref * cot.double()).sum().backward()
+    d_out = float((out.detach().double() - ref.detach()).abs().max())
+    rel_out = d_out / float(ref.detach().abs().max())
+    d_w = float((seen["w"].grad.double() - w64.grad).abs().max())
+    rel_w = d_w / float(w64.grad.abs().max())
+    print(
+        f"[fp64 anchor] out max|Δ|={d_out:.3e} rel={rel_out:.3e} "
+        f"dL/dweight max|Δ|={d_w:.3e} rel={rel_w:.3e} bound=1e-5 "
+        f"routing_identical={torch.equal(idx64, seen['i'])}"
+    )
+    assert torch.equal(idx64, seen["i"]), "the two implementations routed differently"
+    assert rel_out <= 1e-5, f"logits moved: {rel_out:.3e}"
+    assert rel_w <= 1e-5, f"dL/dweight moved: {rel_w:.3e}"
+
+
+def test_the_hand_computed_two_token_case() -> None:
+    """Anchor A2(ii): two tokens, two rank-1 experts, `w = [0.75, 0.25]` — ON PAPER.
+
+    Fixture: d=2, rank=1, f=2. Expert 0 reads `h = silu(x0)·x1` with `v = [1,1]`;
+    expert 1 reads `h = silu(x1)·x0` with `v = [0,2]`; both scales are 1.
+
+    `x = [[1,1], [2,3]]`, both tokens route to both experts, weights 0.75/0.25.
+
+        token 0: h0 = silu(1)·1 = 0.7310585786, h1 = silu(1)·1 = same
+                 o = 0.75·[h,h] + 0.25·[0,2h] = [0.75h, 1.25h]
+                   = [0.5482939339, 0.9138232233]
+        token 1: h0 = silu(2)·3 = 5.2847824679, h1 = silu(3)·2 = 5.7154447609
+                 o = 0.75·[h0,h0] + 0.25·[0,2h1] = [0.75h0, 0.75h0+0.5h1]
+                   = [3.9635868509, 6.8213092314]
+
+    (`silu(z) = z/(1+e^-z)`: 0.7310585786, 1.7615941560, 2.8577223805.)
+    Measured max|Δ| against those literals: 0.0 — the same seven digits.
+    """
+    torch.manual_seed(0)
+    moe = SparseMoE(
+        tiny_cfg(
+            n_experts=2,
+            moe_topk=2,
+            d_model=2,
+            d_ffn=2,
+            head_dim=1,
+            rank=1,
+            bf16=False,
+            moe_capacity=0.0,
+            moe_kernel="batched",
+        ),
+        device="cpu",
+    )
+    with torch.no_grad():
+        e0, e1 = moe.experts
+        e0.gate_u.copy_(torch.tensor([[1.0], [0.0]]))
+        e0.up_u.copy_(torch.tensor([[0.0], [1.0]]))
+        e0.v.copy_(torch.tensor([[1.0, 1.0]]))
+        e1.gate_u.copy_(torch.tensor([[0.0], [1.0]]))
+        e1.up_u.copy_(torch.tensor([[1.0], [0.0]]))
+        e1.v.copy_(torch.tensor([[0.0, 2.0]]))
+        for e in (e0, e1):
+            e.gate_s.fill_(1.0)
+            e.up_s.fill_(1.0)
+    x = torch.tensor([[1.0, 1.0], [2.0, 3.0]])
+    index = torch.tensor([[0, 1], [0, 1]])
+    weight = torch.tensor([[0.75, 0.25], [0.75, 0.25]])
+    got = moe._dispatch(x, weight, index, Counters())
+    want = torch.tensor(
+        [
+            [0.5482939339725037, 0.9138232232875061],
+            [3.9635868509004706, 6.8213092313677710],
+        ]
+    )
+    delta = float((got.detach() - want).abs().max())
+    print(f"[hand case] got={got.tolist()} max|Δ|={delta:.3e} atol=1e-6")
+    assert delta <= 1e-6, f"{delta:.3e} — the paper arithmetic and the bank disagree"
+
+
 # B. packed == unpacked, bit for bit
 # --------------------------------------------------------------------------- #
 def _pair(share: str) -> tuple[DormouseModel, DormouseModel]:

@@ -229,7 +229,7 @@ ours, not the package's:
 |---|---|---|---|
 | bank vs naive, fp32 | 64 rows, d 64, f 128, E 4, k 2, cap 0 & 1.0 | max\|Δ\| **1.431e-06**, rel **2.392e-07** | 1e-5 |
 | bank vs naive, bf16 | same | max\|Δ\| 2.843e-02, rel **4.730e-03** | 1e-2 |
-| bank vs float64, bf16 | same | **1.992e-02 vs the loop's own 2.159e-02 = 0.92×** | ≤ 1× |
+| bank vs float64, bf16 | same | **1.992e-02 vs the loop's own 2.159e-02 = 0.92×** | ≤ 1.25× |
 | wide `[R, f]` fp32 `mul` in the dispatch | 48 rows, cap 1.0 | **0 hits**, rel 1.612e-07 | 0 hits |
 | `moe_w_in_bank` per dispatch | 32 rows, dropless | **1** | 1 |
 
@@ -247,8 +247,11 @@ pins moved and are named here rather than buried:
 * `test_moe_buckets`'s one-bucket **bit-equality** became the same dtype bound,
   and its fixture weight moved off `0.5` — an exact bf16 scaling that would have
   hidden the difference while `bucketed` still carries the old tail.
-* `test_tsct_packed`'s OFF digest was re-captured (grad moved; **state and loss
-  did not**: no init and no logits bit moved).
+* `test_tsct_packed`'s OFF digest was re-captured. Correcting this section's
+  first wording: the logits DID move (review measured max|Δ| 7.15e-07, rel
+  1.67e-07, 27,670 of 32,768 elements); only `state` (no init bit) and `loss`
+  (rounded at its own scale) did not. A digest from our own run is a drift
+  alarm, never proof — the proof is §8.6's float64 anchor and paper case.
 
 ### 7.3 The per-layer bill (exact shapes; b24: R 49,152, E·cap 98,304, f 1,664, rank 832, bf16)
 
@@ -367,7 +370,9 @@ So the Triton arms keep the wide product and SAY SO:
 | `triton`, `fused_bwd=False` (the reference adjoint) | **yes** — `_triton_dispatch`'s own `y.to(fp32) * w` | `moe_wide_weight = 1` |
 | `moe_gather="kernel"` | same as its combine arm | `moe_wide_weight` when `combine != fused` |
 
-`_count_wide_weight` carries that reasoning at the call site. No arm is silently
+`_count_wide_weight` carries that reasoning at the call site of the non-fused
+adjoint; the combine routes count inside `_Combine.forward`, where the branch is
+TAKEN (see §8.7 — a refused fused launch used to go uncounted). No arm is silently
 on the wrong side: the bank/bucketed arms assert the counter's ABSENCE
 (`test_moe_batched` gate a3) and the Triton arm asserts its PRESENCE
 (`test_moe_kernel`'s CUDA gate).
@@ -394,9 +399,10 @@ Measured on the bench's own fixture (E=4, k=2, n=64, so `n·k = 128`):
 
 `config.ModelConfig.moe_capacity` now carries the recommendation: **1.25 with
 `moe_qb=true`** (Quantile Balancing holds each expert within ±5% of `topk/E`, so a
-25% pad covers the spread) and **2.0 as the un-balanced default**, with those two
-counters naming what a run actually paid. `tests/test_moe_batched.py` gate (a5)
-pins the three rows of that table.
+25% pad covers the spread) and **2.0** for an un-balanced router. The field's own
+default stays `1.0` and the presets' stays `2.0` — neither moved — and the counters
+name what a run actually paid. `tests/test_moe_batched.py` gate (a5) pins all three
+rows of the table above.
 
 ### 8.4 The per-layer census after the fix (b24: R=49,152, E·cap=98,304, f=1,664, rank=832)
 
@@ -443,3 +449,117 @@ The CUDA bounds moved on the measured CPU deltas (4.73e-3 bank, 4.94e-3
 bucketed, both ≤1e-2) and the float64 closeness gate — not on a guess — but they
 have NOT been observed on the card. That is the one claim in this document that
 is [S] and not [M].
+
+### 8.6 The re-captured pin, corrected, and its external anchors
+
+The 2026-11-10 adversarial review caught a false sentence in §7.2 (repeated in
+`tests/test_tsct_packed.py` and in the commit message): the OFF digest was said
+to have moved **only** in the gradients, with "no logits bit moved". **That is
+wrong.** The reviewer measured the logits: **max|Δ| 7.15e-07, rel 1.67e-07,
+27,670 of 32,768 elements moved.** `state` (no init bit) and `loss` (rounded at
+its own scale) genuinely did not. The comment now says exactly that, and states
+what a self-captured digest is: **a drift alarm, not proof.**
+
+The proof is two anchors outside our own run (`tests/test_tsct_packed.py`):
+
+| anchor | measured | bound |
+|---|---|---|
+| MoE module output vs an independent **float64** `SparseMoE.forward` (router → LFB top-k → weighted GLU per assignment → shared expert → down) | max\|Δ\| 5.560e-07, **rel 2.736e-07** | 1e-5 |
+| **`dL/dweight`** vs the same float64 graph (autograd on a re-attached normalized weight) | max\|Δ\| 9.554e-07, **rel 1.235e-07** | 1e-5 |
+| routing: fp64 top-k vs the module's | **identical** | identical |
+| hand-computed paper case: 2 tokens, 2 rank-1 experts, `w=[0.75,0.25]` | **max\|Δ\| 0.000e+00** | 1e-6 |
+
+The paper case, written out so it can be checked without a computer
+(`d=2, rank=1, f=2`; expert 0 is `h=silu(x₀)·x₁, v=[1,1]`, expert 1 is
+`h=silu(x₁)·x₀, v=[0,2]`, all scales 1):
+
+```
+token 0  x=(1,1)  h₀=silu(1)=0.7310585786  h₁=silu(1)=0.7310585786
+         o = 0.75·[h,h] + 0.25·[0,2h] = [0.75h, 1.25h]
+           = [0.5482939339725037, 0.9138232232875061]
+token 1  x=(2,3)  h₀=silu(2)·3=5.2847824679  h₁=silu(3)·2=5.7154447609
+         o = 0.75·[h₀,h₀] + 0.25·[0,2h₁]
+           = [3.9635868509004706, 6.8213092313677710]
+```
+
+**Not re-derived:** the model's VOCAB logits in float64 — that needs a second
+implementation of KDA/attention/engram, a different project. These anchors cover
+the module that changed, at its own boundary.
+
+### 8.7 Two defects the review found in the counters (both fixed)
+
+* **`moe_wide_weight` under-reported on exactly the path it exists for.** The
+  counter was decided at the CALL SITE from `moe_combine`, but
+  `_Combine.forward` can flip `fused` to `False` after a `LaunchRefused` and then
+  take the fp32 three-pass branch that DOES materialise `[R, f]`
+  (`moe_kernels.py:1596-1602`) — so the fallback ran silently. It is now counted
+  **where the branch is taken** (`_Combine.forward`), and the call site keeps a
+  count only for the non-fused adjoint route (`_triton_dispatch`'s own inline
+  `y.to(fp32) * w`, which never reaches `combine`). New CUDA gate
+  `test_a_refused_fused_combine_still_counts_the_wide_buffer` forces the refusal
+  by monkeypatching `_launch` for `_combine_fwd_kernel` and asserts
+  `moe_wide_weight == 1` **together with** `moe_triton_fallback == 1`,
+  `moe_combine_fused` absent, and the output still within 1e-2 of the loop.
+* **`moe_bank_ratio_x100` vanished when it rounded to 0** (`Counters.count`
+  ignores 0), i.e. exactly when the cap is far below the mean. It is clamped to
+  `>= 1`, so a heavily under-capacity run still prints a ratio.
+
+The fused combine route (`moe_combine="fused"`, no refusal) still pays
+nothing wide and counts nothing: its kernel reads the bank-dtype `y` and
+accumulates the scaled rows in registers.
+
+### 8.8 The CUDA bounds, OBSERVED on the card (the gap §8.5 left)
+
+Command (through the guard, `GPU_TIMEOUT=3600`, 12.4 s of card):
+
+```
+GPU_TIMEOUT=3600 bash scripts/gpu_lock.sh env PYTHONPATH=src .venv/bin/python -m pytest \
+  tests/test_experts_gpu.py tests/test_moe_kernel.py tests/test_moe_sonic.py \
+  tests/test_moe_batched.py tests/test_moe_dropless.py tests/test_compile_moe_gpu.py \
+  -p no:logging -s -v -rs
+-> 110 passed, 7 skipped in 12.39s
+```
+
+Every bf16 delta the review asked to see, with its margin:
+
+| gate | measured on the card | bound | margin |
+|---|---|---|---|
+| `[moe parity]` padded vs naive, bf16 | max_rel **5.513e-03** | 1e-2 | **1.81×** |
+| `[kernel parity]` triton vs padded, fp32 | max_rel **1.701e-07** | 1e-5 | 59× |
+| `[kernel parity]` triton vs padded, bf16 | max_rel **5.486e-03** | 1e-2 | **1.82×** |
+| `[bf16 arms]` sonic, padded vs naive (CPU fixture) | max_rel **5.942e-03** | 1e-2 | **1.68×** |
+| `[kernel grads]` triton vs padded autograd, bf16 | worst param **4.177e-07**, dx 2.301e-07 | 1e-4 | 240× |
+| `[fp64]` bank vs float64, parameter grads | worst **4.264e-06** | 1e-5 | 2.3× |
+| `[bf16 quality]` bank vs float64 ÷ loop vs float64 | **0.92×** | 2× | 2.2× |
+| `[moe parity vs fp64]` same ratio, capacity fixture | **1.59×** | 2× | 1.3× |
+| `[wide weight]` / `[refused combine]` | `moe_wide_weight=1` (and with `moe_triton_fallback=1` on the forced refusal) | present | — |
+
+**Three bf16 margins are below the review's 2× rule (1.68×, 1.81×, 1.82×), and
+tightening them is not a design choice — it is arithmetic.** A probe over three
+seeds × three tails (`scripts`-scratch, `/tmp` … reproduced here) measured the
+delta against the loop for: `h*w` in bf16 (today) **3.87e-3 / 4.92e-3 / 6.95e-3**;
+the product in fp32 then cast (one rounding instead of two) **4.15e-3 / 3.79e-3 /
+6.79e-3**; `silu·u` in fp32 then `*w` in fp32 then cast **5.34e-3 / 3.17e-3 /
+7.18e-3**. All three are the same distribution — the delta is the **bf16 GEMM
+reduction order** (a `[E, cap, d] × [E, d, rank]` bmm against E per-expert
+matmuls), which no layout of the weight can move. The floor for two correct bf16
+chains is ~1-2 ulp of the tensor (2^-9 = 2e-3 per rounding), i.e. 4-7e-3 at this
+fixture: a 1e-2 bound therefore cannot have more than ~2× headroom *at bf16*.
+
+What was done instead of widening or pretending:
+
+* the 1e-2 bounds are unchanged (they were not the defect);
+* each bf16 gate now also prints the **float64 ratio**, so a wiring defect — which
+  moves the ratio by the tensor's scale — is caught even where the absolute
+  margin is thin. The ratio is bounded at **2×**, not 1.25×: on these max-error
+  statistics a single seed spreads 0.92 (dropless CPU fixture) to 1.59 (64-row
+  capacity fixture), so 1.25× would be a coin flip and 2× still fails on a
+  dropped/doubled term.
+* a real bug in the shared helper surfaced while wiring that ratio:
+  `_fp64_reference` ignored `keep`, so on a capacity fixture it compared a
+  full-routing reference against a capped arm (the delta measured the DROPS —
+  1.47 absolute at `tests/test_experts_gpu.py`). It now takes `keep` and zeroes
+  the dropped assignments' weights.
+* `test_the_bf16_seam_arms_agree_on_the_card` SKIPS on this box — reason from the
+  run: `the card already holds 1912 MiB` (the pre-existing desktop gate, not
+  ours). Its ratio line is therefore the CPU fixture's, recorded as such.

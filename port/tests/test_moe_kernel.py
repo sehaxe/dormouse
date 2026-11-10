@@ -108,13 +108,15 @@ def test_triton_and_padded_agree_on_the_same_rows(bf16, bound):
 
 @CUDA
 def test_the_triton_arm_counts_the_wide_weight_it_still_pays():
-    """The triton arms cannot ride the rank axis, and they SAY so (ADR-0011).
+    """The triton arm cannot ride the rank axis, and it SAYS so (ADR-0011).
 
     `_count_wide_weight` is the record: the kernel's GLU output never reaches a
     graph the caller can scale, and the weight's own gradient needs the UNSCALED
     `h @ v`, so the `[R, f]` fp32 scaling stays here. The bank/bucketed arms have
     the rank-space tail and must NOT carry this counter (gate a3 in
     `tests/test_moe_batched.py` asserts the absence on the CPU side).
+
+    The count happens in `_Combine.forward`, where the branch is TAKEN.
     """
     moe = _moe(bf16=True)
     x = torch.randn(64, moe.d, device=DEV)
@@ -127,6 +129,40 @@ def test_the_triton_arm_counts_the_wide_weight_it_still_pays():
     # `moe_combine="torch"` (the default) materializes `y.to(fp32) * w`.
     assert counters["moe_wide_weight"] == 1
     assert "moe_w_in_bank" not in counters
+
+
+@CUDA
+def test_a_refused_fused_combine_still_counts_the_wide_buffer(monkeypatch):
+    """A `LaunchRefused` on the fused combine must COUNT the wide fp32 product.
+
+    The 2026-11-10 review's defect: the counter was decided at the CALL SITE from
+    `moe_combine`, so a refusal that flips `fused` to False ran the three-pass
+    `y.to(fp32) * w` SILENTLY. It is now counted in `_Combine.forward` where the
+    branch is taken — i.e. it fires TOGETHER with `moe_triton_fallback`.
+    """
+    moe = _moe(bf16=True, moe_combine="fused")
+    x = torch.randn(64, moe.d, device=DEV)
+    index, weight = _routing(moe, x)
+    order, keep, _ = moe._permute(index)
+    with torch.no_grad():
+        ref = moe._naive_dispatch(x, weight, index, order, keep, Counters())
+
+    real = mk._launch
+
+    def refusing(kernel, grid, *args, **kwargs):
+        if kernel is mk._combine_fwd_kernel:
+            raise mk.LaunchRefused("forced", RuntimeError("shared memory"))
+        return real(kernel, grid, *args, **kwargs)
+
+    monkeypatch.setattr(mk, "_launch", refusing)
+    counters = Counters()
+    with torch.no_grad():
+        out = moe._triton_dispatch(x, weight, index, order, keep, counters=counters)
+    print(f"[refused combine] {dict(counters)}")
+    assert counters["moe_triton_fallback"] == 1, dict(counters)
+    assert counters["moe_wide_weight"] == 1, dict(counters)
+    assert "moe_combine_fused" not in counters
+    assert _rel(out, ref) <= 1e-2
 
 
 @pytest.mark.parametrize("bf16,bound", [(False, 1e-4), (True, 2e-2)])

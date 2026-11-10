@@ -877,6 +877,21 @@ def test_the_bf16_seam_arms_agree_on_the_card():
     # real regression hides.
     assert rel_pad <= 1e-2, f"padded {rel_pad:.3e} exceeds 1e-2"
     assert rel_tri <= 2e-3, f"triton {rel_tri:.3e} exceeds 2e-3"
+    # The bf16-to-bf16 delta is floored by the GEMM reduction order (three
+    # variants x three seeds in the review's §8.8 all land 3.9-7.0e-3), so the
+    # real wiring detector is the float64 ratio: the padded arm may not be
+    # further from the truth than the loop it replaces.
+    from test_moe_batched import _fp64_reference
+
+    ref64, _, _ = _fp64_reference(
+        moe, xb.detach(), weight, index, order, torch.ones(x.shape[0], moe.f, device=x.device), keep
+    )
+    e_pad = float((pad.double() - ref64).abs().max())
+    e_loop = float((ref.double() - ref64).abs().max())
+    print(f"[bf16 seam vs fp64] padded={e_pad:.3e} loop={e_loop:.3e} ratio={e_pad / e_loop:.2f}")
+    # A WIRING bound on a max statistic (see `test_experts_gpu`'s twin): a
+    # dropped/doubled term moves the ratio by the tensor's scale, not by 20%.
+    assert e_pad <= 2.0 * e_loop, f"padded is {e_pad / e_loop:.2f}x the loop's fp64 error"
 
 
 # --------------------------------------------------------------------------

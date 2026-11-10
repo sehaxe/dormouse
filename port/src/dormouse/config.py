@@ -1174,14 +1174,6 @@ class ModelConfig:
     #: with the static row-block bound and the kernels' on-device empty-block
     #: exit (`moe_dropless` + `moe_triton_gemm`), and the reference loop is the
     #: COUNTED fallback (`moe_naive_dispatch` + the reason).
-    #: **RECOMMENDED (`docs/reviews/2026-11-10-moe-package-bench.md` §8):** the
-    #: padded arm's bill is exactly `E·cap` bank rows against `n·k` assignments,
-    #: so `1.25` computes 1.25x the assigned rows and `2.0` computes 2x. Use
-    #: **1.25 with `moe_qb=true`** — Quantile Balancing (Kimi K3 §2.3.3) holds
-    #: each expert's load within ±5% of `topk/E`, so a 25% pad covers the spread —
-    #: and keep **2.0 as the un-balanced default** (a fresh or un-balanced router
-    #: needs the headroom). `moe_bank_ratio_x100` / `moe_pad_waste_rows` print
-    #: which of the two a run actually paid.
     #: Tie-breaking noise on the router logits, Switch-Transformer style
     #: (`std` in logit units). Measured 2026-11-04: with a fresh bank of 512
     #: near-identical experts and NO jitter, one expert took 3 800 of 8 192
@@ -1189,6 +1181,14 @@ class ModelConfig:
     #: doing the work of two. 0.01 is the Switch value. OFF, and it consumes RNG
     #: only when on, so every existing pin and RNG stream is untouched.
     moe_router_jitter: float = 0.0
+    #: **RECOMMENDED (`docs/reviews/2026-11-10-moe-package-bench.md` §8):** the
+    #: padded arm's bill is exactly `E·cap` bank rows against `n·k` assignments,
+    #: so `1.25` computes 1.25x the assigned rows and `2.0` computes 2x. Use
+    #: **1.25 with `moe_qb=true`** — Quantile Balancing (Kimi K3 §2.3.3) holds
+    #: each expert's load within ±5% of `topk/E`, so a 25% pad covers the spread —
+    #: and **2.0** for an un-balanced router (a fresh one needs the headroom).
+    #: The field's own default is `1.0` and the presets' is `2.0`; neither moves
+    #: here. `moe_bank_ratio_x100` / `moe_pad_waste_rows` print what a run paid.
     moe_capacity: float = 1.0
     #: Loss-Free Balancing step (arXiv:2408.15664): before the top-k decision
     #: the LOGITS read `logits + b_e`, and after the forward `b_e` moves by

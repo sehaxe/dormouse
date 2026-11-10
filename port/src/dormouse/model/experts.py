@@ -2917,7 +2917,7 @@ class SparseMoE(nn.Module):
         log line can carry:
 
             rows_run    = dump
-            ratio_x100  = round(100 · dump / assignments)
+            ratio_x100  = max(1, round(100 · dump / assignments))
             waste_rows  = dump − assignments      # counted only when > 0
 
         With `moe_capacity=2.0` and a balanced router `dump = 2·assignments`, so
@@ -2935,27 +2935,33 @@ class SparseMoE(nn.Module):
         counters.count("moe_bank_rows", dump)
         if assignments <= 0:
             return
-        counters.count("moe_bank_ratio_x100", round(100 * dump / assignments))
+        # Clamped to >= 1: `Counters.count` refuses 0 (`instrument.py`), and a
+        # ratio that would round to 0 is exactly the under-capacity case a reader
+        # must still see — an absent counter reads as "no bank at all".
+        counters.count("moe_bank_ratio_x100", max(1, round(100 * dump / assignments)))
         if dump > assignments:
             counters.count("moe_pad_waste_rows", dump - assignments)
 
     def _count_wide_weight(self, counters: Counters | None) -> None:
-        """COUNTED: this arm still scales a `[R, f]` fp32 product with the weight.
+        """COUNTED: this route scales a `[R, f]` fp32 product with the weight itself.
 
-        The Triton arms compute `h @ v` inside a kernel whose GLU output never
-        leaves registers, so the router weight cannot ride the rank axis without
-        a kernel rewrite — and the rewrite is not local: the weight's own
-        gradient is `dw = <dout, h @ v>`, i.e. the UNSCALED expert output, which
-        is exactly the wide tensor this fix removes from the bank arm. The split
-        GLU path (`E < moe_kernels.FUSED_GLU_MIN_E`) does materialise `[R, rank]
-        h`, but inside `_ExpertGemmGlu`'s autograd Function — not on a graph the
-        caller can scale without moving the weight gradient into the kernel too.
+        ONE caller: `_triton_dispatch`'s non-fused adjoint (`fused_bwd=False`),
+        which runs `y.to(fp32) * weight[rows]` inline and never reaches
+        `moe_kernels.combine`.
 
-        So the arms that pay the wide fp32 buffer SAY SO here: `moe_combine`
-        "torch" (the default; `_Combine.forward`'s `y.to(fp32) * w`) and the
-        non-fused adjoint route (`_triton_dispatch`'s own `y.to(fp32) * w`).
-        `moe_combine="fused"` does not: its kernel reads the bank-dtype `y` and
-        accumulates the scaled rows in registers, so nothing wide is written.
+        Every OTHER wide product is counted where the branch is TAKEN —
+        `_Combine.forward`'s `not fused` arm (`moe_kernels.py`) — because a
+        `LaunchRefused` can flip `fused` to False after the caller has decided
+        what to count (2026-11-10 review: the call site stayed silent on exactly
+        that fallback).
+
+        Why the Triton arms cannot ride the rank axis at all: they compute
+        `h @ v` inside a kernel whose GLU output never leaves registers, and the
+        weight's own gradient is `dw = <dout, h @ v>` — the UNSCALED expert
+        output, i.e. the wide tensor this fix removed from the bank arm. The
+        split GLU path (`E < moe_kernels.FUSED_GLU_MIN_E`) does materialise
+        `[R, rank] h`, but inside `_ExpertGemmGlu`'s autograd Function, not on a
+        graph the caller can scale without moving `dw` into the kernel too.
         """
         if counters is not None:
             counters.count("moe_wide_weight")
@@ -3829,10 +3835,10 @@ class SparseMoE(nn.Module):
         # inside `combine` keeps the kernel's own `w.dtype == torch.float32`
         # assert LOUD: a future caller that hands it a non-fp32 weight still
         # fails instead of being silently coerced.
-        if self.moe_combine != "fused":
-            # The torch combine materialises `y.to(fp32) * w` (`[R, f]`); the
-            # fused kernel reads the bank-dtype `y` and scales in registers.
-            self._count_wide_weight(counters)
+        #
+        # The wide-product counter is NOT decided here: `combine` counts it in
+        # the branch that actually materialises it (`_Combine.forward`), which a
+        # refused fused launch can select after this call is made.
         return moe_kernels.combine(
             y,
             weight.reshape(-1)[rows].float(),
@@ -3905,10 +3911,9 @@ class SparseMoE(nn.Module):
             seg=seg,
             ws=ws,
         )
-        if self.moe_combine != "fused":
-            # The torch combine materialises `y.to(fp32) * w` (`[R, f]`); the
-            # fused kernel reads the bank-dtype `y` and scales in registers.
-            self._count_wide_weight(counters)
+        # The wide-product counter is counted inside `_Combine.forward` (the
+        # branch that materialises `y.to(fp32) * w`), not here: a refused fused
+        # launch selects that branch after this call is made.
         return moe_kernels.combine(
             y,
             weight.reshape(-1)[rows].float(),

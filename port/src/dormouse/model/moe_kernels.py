@@ -1598,6 +1598,13 @@ class _Combine(torch.autograd.Function):
             # degradation is visible in the output dtype, not silently fp32.
             out = torch.zeros(n, y.shape[1], dtype=out_dtype, device=y.device)
             if out_dtype == torch.float32:
+                if counters is not None:
+                    # COUNTED HERE, not at the call site: this is the branch that
+                    # materialises the wide `[R, f]` fp32 product, and a
+                    # `LaunchRefused` above flips `fused` to False AFTER the
+                    # caller decided what to count (2026-11-10 review: the
+                    # counter stayed silent on its own fallback path).
+                    counters.count("moe_wide_weight")
                 out.index_add_(0, owner, y.to(torch.float32) * w.unsqueeze(-1))
             else:
                 out.index_add_(0, owner, y * w.unsqueeze(-1).to(out_dtype))

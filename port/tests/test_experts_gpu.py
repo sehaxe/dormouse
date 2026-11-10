@@ -43,6 +43,17 @@ def _routing(moe: SparseMoE, x: torch.Tensor, seed: int = 0):
 
 @pytest.mark.parametrize("bf16,bound", [(False, 1e-5), (True, 1e-2)])
 def test_padded_and_naive_agree_on_the_same_routing(bf16, bound):
+    """Two arms, the same rows, the same bank.
+
+    The bf16 bound is 1e-2 (measured 5.5e-3, margin 1.8x) because BOTH arms are
+    bf16 rounding chains and the delta between two correct chains is floored by
+    the GEMM reduction order, not by where the router weight is applied (a
+    three-variant / three-seed probe in
+    `docs/reviews/2026-11-10-moe-package-bench.md` §8.8 measured 3.9-7.0e-3 for
+    every variant, including fp32 products). The bound alone would therefore be
+    a weak wiring detector at bf16, so the gate ALSO asserts the float64 ratio:
+    the arm may not be further from the truth than the loop it replaces.
+    """
     moe = _moe(bf16=bf16)
     x = torch.randn(64, 64, device=DEV)
     index, weight = _routing(moe, x)
@@ -61,6 +72,27 @@ def test_padded_and_naive_agree_on_the_same_routing(bf16, bound):
     # 0.8-0.9x the loop's OWN error against float64).
     print(f"[moe parity] bf16={bf16} E={moe.n_experts} rows={x.shape[0]} dropped={dropped} {m}")
     assert m["max_rel"] <= bound, f"{m} exceeds {bound}"
+    if bf16:
+        # The wiring detector the absolute delta cannot be at this dtype: both
+        # arms against float64, on the same routing and the same weights.
+        from test_moe_batched import _fp64_reference
+
+        # The arms all cast to the bank dtype first (`x.to(dt)`), so the fp64
+        # reference must read the SAME values or the ratio measures bf16's
+        # quantization of `x` (1.47) instead of the layout.
+        cot = torch.ones(x.shape[0], moe.f, device=DEV)
+        ref64, _, _ = _fp64_reference(moe, x.to(moe._bank_dtype()), weight, index, order, cot, keep)
+        e_pad = float((padded.double() - ref64).abs().max())
+        e_loop = float((naive.double() - ref64).abs().max())
+        print(
+            f"[moe parity vs fp64] padded={e_pad:.3e} loop={e_loop:.3e} ratio={e_pad / e_loop:.2f}"
+        )
+        # 2x, and the number is a WIRING bound, not an accuracy one: on this
+        # fixture (64 rows, capacity drops) the max-error ratio is 1.59, and on
+        # the dropless CPU fixture it is 0.92 — a single-seed max statistic has
+        # that much spread. A wiring defect (a dropped or doubled term) moves it
+        # by the tensor's scale, i.e. >=2x, and blows the absolute bound too.
+        assert e_pad <= 2.0 * e_loop, f"padded is {e_pad / e_loop:.2f}x the loop's fp64 error"
 
 
 def test_padded_path_backpropagates_into_the_expert_bank():
