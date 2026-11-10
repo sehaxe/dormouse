@@ -11,7 +11,11 @@ checkpoint and resume are shared, and only the block differs.
 THE BLOCK IS THE CONTROL'S, TRANSCRIBED. Pre-LayerNorm, no biases, packed
 `qkv` (`3·d²`), RoPE on `head_dim`, `F.scaled_dot_product_attention(is_causal=True)`,
 GELU FFN (`d_ffn = 4·d_model` in the control; an arm sets `d_ffn` and
-`flagship3_dense` runs 3.69×, so the width is the config's, not this file's),
+`flagship3_dense` runs 3.69×, so the width is the config's, not this file's).
+`ffn_gated=true` swaps that FFN for a gated GLU — `gate`/`up` into `fc2` as the
+`down`, activation `expert_act` (`silu` = SwiGLU, `situ` = K3's capped GLU),
+width `8·d/3` for the same bill — and is refused on every other block form
+(`config.validate_ffn`).
 GPT-2 residual scaling on the two output projections
 (`0.02/sqrt(2·n_layers)`). Parameters per block:
 `4·d²` attention + `2·d·d_ffn` FFN + `4·d` of LayerNorm, which at
@@ -45,7 +49,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ..config import check_gated_ffn_bill
 from ..instrument import Counters, loud
+from .experts import expert_glu
 from .tsct import mm_mixed
 
 __all__ = [
@@ -170,7 +176,24 @@ class TransformerBlock(nn.Module):
         self.qkv = nn.Linear(d, 3 * d, bias=False, device=device)
         self.proj = nn.Linear(d, d, bias=False, device=device)
         self.ln2 = nn.LayerNorm(d, device=device)
-        self.fc = nn.Linear(d, ffn, bias=False, device=device)
+        #: `ffn_gated` (`config.validate_ffn` owns the refusals): the plain
+        #: `gelu(fc(x))@fc2^T` becomes `fc2(expert_glu(act)(gate(x), up(x)))`.
+        #: `fc2` stays the GLU's `down` on purpose — same `[d, ffn]` shape and
+        #: the same state-dict name as the GELU block's write, so an export path
+        #: that names `fc2` reads a write in both arms.
+        self.ffn_gated = bool(getattr(cfg, "ffn_gated", False))
+        self.expert_act = cfg.expert_act
+        self.beta1 = float(cfg.expert_beta1)
+        self.beta2 = float(cfg.expert_beta2)
+        if self.ffn_gated:
+            # The runtime seam a hand-built config reaches, the same rule
+            # `config.validate_ffn` applies on the loader path: the gated bill
+            # must be the ungated block's, or the flag is a bigger model.
+            check_gated_ffn_bill(d, ffn, cfg.d_ffn_gelu)
+            self.gate_proj = nn.Linear(d, ffn, bias=False, device=device)
+            self.up_proj = nn.Linear(d, ffn, bias=False, device=device)
+        else:
+            self.fc = nn.Linear(d, ffn, bias=False, device=device)
         self.fc2 = nn.Linear(ffn, d, bias=False, device=device)
         #: Value residuals (`value_residual`): a per-head scale on block 0's
         #: value, ZERO-initialised so the arm starts bit-equal to off. Block 0
@@ -197,7 +220,11 @@ class TransformerBlock(nn.Module):
         # shared one, not re-drawn.
         std = 0.02
         nn.init.normal_(self.qkv.weight, std=std)
-        nn.init.normal_(self.fc.weight, std=std)
+        if self.ffn_gated:
+            nn.init.normal_(self.gate_proj.weight, std=std)
+            nn.init.normal_(self.up_proj.weight, std=std)
+        else:
+            nn.init.normal_(self.fc.weight, std=std)
         nn.init.normal_(self.proj.weight, std=std / math.sqrt(2 * n_layers))
         nn.init.normal_(self.fc2.weight, std=std / math.sqrt(2 * n_layers))
         # The MoD router (`r_i = w^T x_i`), built IFF routing is on. A
@@ -272,8 +299,13 @@ class TransformerBlock(nn.Module):
         # Every projection runs in the compute dtype; the residual add is the
         # fp32 stream (mm_mixed's contract, widened back here).
         x = x + mm_mixed(y, self.proj.weight, self.compute_dtype, counters).to(x.dtype)
-        h = mm_mixed(self.ln2(x), self.fc.weight, self.compute_dtype, counters)
-        h = F.gelu(h)
+        h2 = self.ln2(x)
+        if self.ffn_gated:
+            g = mm_mixed(h2, self.gate_proj.weight, self.compute_dtype, counters)
+            u = mm_mixed(h2, self.up_proj.weight, self.compute_dtype, counters)
+            h = expert_glu(self.expert_act, g, u, beta1=self.beta1, beta2=self.beta2)
+        else:
+            h = F.gelu(mm_mixed(h2, self.fc.weight, self.compute_dtype, counters))
         if self.ffn_clip > 0.0:
             h = h.clamp(max=self.ffn_clip)
         h = mm_mixed(h, self.fc2.weight, self.compute_dtype, counters)

@@ -595,6 +595,41 @@ class ModelConfig:
     #: NOTE: the live `configs/flagship3_dense.toml` is `block_form="transformer"`
     #: (the control's GELU FFN), which has no `silu(g)·u` and never reads this.
     fused_glu: bool = False
+    #: ---- Gated FFN in the LIVE `TransformerBlock` path ----
+    #: The live `block_form="transformer"` block is a plain `gelu(x)@fc2^T`
+    #: (`model/transformer.py`): `d_ffn = 4·d` with no gate matrix. Setting this
+    #: TRUE turns that FFN into a gated GLU -- `gate` [f,d] and `up` [f,d] into
+    #: `down` [d,f] -- whose activation is `expert_act` (`silu` = SwiGLU, `situ`
+    #: = Kimi K3's capped GLU, arXiv 2607.24653 Eq. 12; `memglu` refused here).
+    #: PARAM-NEUTRAL BY CONSTRUCTION: a GLU with `d_ffn = 2·d_ffn_gelu/3` has
+    #: exactly the `2·d·d_ffn_gelu` weights of the ungated GELU block it
+    #: replaces, so the arm changes the FUNCTION, not the budget. `validate_ffn`
+    #: refuses the flag when the bills differ by more than 2% (that is a bigger
+    #: model, not a different FFN) and refuses it on every other `block_form`
+    #: (walk blocks already run `DenseFFN`/the bank, which are gated already).
+    ffn_gated: bool = False
+    #: The UNGATED FFN width a gated arm is param-neutral against — the width the
+    #: same model would build with `ffn_gated = false`. `0` = `4·d_model` (the
+    #: canonical control, `scripts/control_transformer.py`); a preset copied from
+    #: a control with another width (`flagship3_dense` runs 3.69·d) MUST declare
+    #: it, because the gated width alone cannot say what it replaces: a gated arm
+    #: sets `d_ffn = 2·d_ffn_gelu/3` (`804` of 1,216; `2048` of 3,072 at d=832).
+    #: REFUSED when set with `ffn_gated = false` (the ungated block builds
+    #: `d_ffn`; a second width would be an inert key).
+    d_ffn_gelu: int = 0
+    #: Muon's Newton-Schulz step on attention projections, applied PER HEAD
+    #: (Kimi K3 §2.5, arXiv 2607.24653): the Q/K/V momentum matrices are split
+    #: along the head axis and each `[head_dim, head_dim]` block is
+    #: orthogonalized on its own. K3's argument is scale equalization -- a
+    #: full-matrix NS lets the largest-momentum head set the shared update
+    #: direction. DEFAULT OFF: `n_heads=1` is bit-identical to the full-matrix
+    #: step (`tests/test_muon_per_head.py`), so the flag is the only difference.
+    muon_per_head: bool = False
+    #: Quantile Balancing for the routed bank (Kimi K3 §2.3.3, arXiv
+    #: 2607.24653): each expert's routing bias is set from the router-score
+    #: quantile that matches its target load, instead of the auxiliary-loss-free
+    #: fixed-rate bias update. Refused when there is no router (`n_experts=1`).
+    moe_qb: bool = False
     #: The `tsct` form's gate/up rank `r_g`. `0` = `rank`. The same rank is
     #: used for gate and up because they are the two halves of one d→f GLU.
     #: Refused on the other forms (a rank knob on a form with no factors is an
@@ -2786,6 +2821,31 @@ def _drop_dead_snapshot_keys(cls: type, table: dict[str, Any], where: str) -> di
     return {k: v for k, v in table.items() if k not in dead}
 
 
+def check_gated_ffn_bill(d_model: int, d_ffn: int, d_ffn_gelu: int = 0) -> tuple[int, int]:
+    """LOUD unless the gated FFN's weights are the ungated block's (within 2%).
+
+    The arm is a different FFN at the SAME budget, so a gated arm sets
+    `d_ffn = 2·d_ffn_gelu/3`: `3·d·d_ffn == 2·d·d_ffn_gelu` exactly there. The
+    two callers share this one rule: [`validate_ffn`] on the loader path and
+    `TransformerBlock.__init__` at the runtime seam a hand-built config reaches
+    (ADR-0019). `d_ffn_gelu = 0` reads as `4·d_model`, the canonical control.
+    """
+    want = 3 * d_model * d_ffn
+    ref = d_ffn_gelu or 4 * d_model
+    label = f"{d_ffn_gelu}" if d_ffn_gelu else f"{4 * d_model} (4·d, default)"
+    base = 2 * d_model * ref
+    if abs(want - base) / base > 0.02:
+        loud(
+            f"ffn_gated=true with d_ffn={d_ffn} against d_ffn_gelu={label}: the "
+            f"gated FFN holds {want:,} weights against the ungated block's "
+            f"{base:,} ({want / base - 1:+.2%}) — more than 2% apart is a BIGGER "
+            f"MODEL, not a different FFN, and the arm would confound gating with "
+            f"the budget. Escape: d_ffn = 2·d_ffn_gelu/3 (≈{2 * ref // 3}), or "
+            f"ffn_gated=false."
+        )
+    return want, base
+
+
 def validate_ffn(model: ModelConfig) -> None:
     """The `ffn_form` combinations that cannot work, LOUD with an `Escape`.
 
@@ -2815,6 +2875,40 @@ def validate_ffn(model: ModelConfig) -> None:
                 f"computes silu(gate)·up, and the other activations have no epilogue "
                 f"here. Escape: expert_act='silu', or fused_glu=false."
             )
+    if getattr(model, "ffn_gated", False):
+        if model.block_form != "transformer":
+            loud(
+                f"ffn_gated=true with block_form={model.block_form!r}: the flag swaps "
+                f"the LIVE `TransformerBlock`'s GELU FFN for a gate/up GLU, and "
+                f"every other block form already runs a gated FFN (`DenseFFN`, the "
+                f"routed bank) that reads `expert_act` on its own. Escape: "
+                f"block_form='transformer', or ffn_gated=false."
+            )
+        if getattr(model, "fused_glu", False):
+            loud(
+                "ffn_gated=true with fused_glu=true: the fused kernel is the `dense` "
+                "FFN's `silu(gate)·up` epilogue (`model/glu_kernel.py`), and the "
+                "transformer block's GLU has no fused path — one of the two flags "
+                "would be silently inert. Escape: fused_glu=false, or "
+                "ffn_gated=false."
+            )
+        if model.expert_act not in ("silu", "situ"):
+            loud(
+                f"ffn_gated=true with expert_act={model.expert_act!r}: the live "
+                f"block runs `expert_glu` with `silu` (SwiGLU) or `situ` (Kimi K3, "
+                f"arXiv 2607.24653 Eq. 12) only; `memglu` is the closed-tail gate "
+                f"calibrated for the routed bank's latent rank, not a `4·d` FFN, "
+                f"and it has no arm on this form. Escape: expert_act='silu'/'situ', "
+                f"or ffn_gated=false."
+            )
+        check_gated_ffn_bill(model.d_model, model.d_ffn, model.d_ffn_gelu)
+    elif getattr(model, "d_ffn_gelu", 0):
+        loud(
+            f"d_ffn_gelu={model.d_ffn_gelu} with ffn_gated=false: the ungated block "
+            f"builds `d_ffn={model.d_ffn}` and never reads a second width, so the "
+            f"key would be inert. Escape: d_ffn_gelu=0, or ffn_gated=true with "
+            f"d_ffn=2·d_ffn_gelu/3."
+        )
     if model.ffn_rank_gate < 0 or model.ffn_rank_down < 0:
         loud(
             f"ffn_rank_gate={model.ffn_rank_gate} / ffn_rank_down="
