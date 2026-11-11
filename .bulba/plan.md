@@ -127,6 +127,40 @@ Measured params: 5,537,792 → 5,591,040 per layer (+0.96% at align-64).
   still `9.5e-07`; `test_tsct2`/`test_tsct_packed`/`test_ffn_form`/
   `test_block_form` bit-identical gates green.
 
+### T8 — `attn_form="tsct"` factorises the attention projections (2026-11-11) — DONE
+- `attn_form ∈ {"dense", "tsct"}` (default `dense`) + `attn_rank` (`0` =
+  `rank`): the packed `qkv [3d, d]` becomes ONE `TSCTLinear`
+  `U[d,r]·diag(s)·V[r,3d]` and `proj` `U[d,r]·diag(s)·V[r,d]` — the largest
+  FLOP lever the FFN cut leaves (attention projections are 27% of the block's
+  MAC; SDPA's 24% is quadratic and not rank-shaped).
+- Init matched to the dense arm through `weight_std` (0.02 on `qkv`, `0.02/√(2L)`
+  on `proj`). Measured at the live shape (`arch_dense275`, ONE field changed,
+  seed 1234, b2×t8): qkv output std 1.000x, proj 1.000x, last-block output
+  1.004x. Without it the arm's composed entry std is 1.0, i.e. 50x the dense
+  write.
+- Exact at `r = d`: SVD of the dense `qkv`/`proj` → logits agree to **9.5e-07**
+  (fp32).
+- Params/MAC per layer at d=1152: dense 5,308,416 / 5,308,416 MC; r=64 →
+  **442,496 / 442,368** (12.0x); r=256 → 1,769,984 / 1,769,472 (3.0x). 18
+  layers: −87,586,560 / −63,691,776 params. Block MAC/token (t=1024): 19.87M
+  dense; 10.80M with the FFN factorised only (1.84x); **5.93M with both at
+  r=64 (3.35x)**; 9.56M at r=256 (2.08x). The brief's 3.27x/1.96x assumed
+  `8·d·r` (three separate q/k/v cuts); the FUSED map costs `4·d·r`, hence the
+  higher ceiling.
+- `TSCTLinear` returns fp32; the block widens the projection back to the
+  compute dtype, or a bf16 arm would run SDPA (4.72M MC/token, quadratic) on
+  the fp32 lane and spend the cut it just bought.
+- LOUD refusals, at config load AND at the block's `__init__`: any
+  `block_form != "transformer"` (and the hybrid stack),
+  `attn_latent_rank`, `fused_latent_proj`, `act_qat`, `dense_qat`, `attn_rank`
+  above `d_model`, and `attn_rank` set with `attn_form="dense"`.
+- Flag OFF is bit-identical to `tests/fixtures/transformer_off_prechange.pt`.
+- Tests: `port/tests/test_attn_form.py` (21, CPU).
+- Known interaction, not fixed here: `muon_per_head=true` refuses LOUDLY with
+  this arm — `mark_per_head` reads `.qkv.weight`, so it sees `qkv.u` `[d, r]`
+  and fails the head-axis tile check ("its head axis is 12 block(s) x
+  head_dim=16 = 192 rows"), never silently splitting nothing.
+
 ## A/B protocol (after T1 lands, GPU is free)
 120 MB / 120M bytes, 3 seeds, arms: `control` (GELU 4d) vs `gated_silu`
 (2.67d) vs `gated_situ` (2.67d). KEEP a gated arm only if it is ≥0.01 BPB better

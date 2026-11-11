@@ -245,6 +245,11 @@ SHARE_U_MODES = ("off", "plane", "dict")
 #: `tsct` (all three matrices independently factorised). A name that is not
 #: here is LOUD; `tests/test_ffn_form.py` pins the arithmetic of all three.
 FFN_FORMS = ("bank", "dense", "tsct")
+#: The `attn_form` literals — what the attention projections are:
+#: `dense` (the control's packed `qkv [3d, d]` + `proj [d, d]`) and `tsct`
+#: (the same two matrices factorised, `model/transformer.py`). A name that is
+#: not here is LOUD.
+ATTN_FORMS = ("dense", "tsct")
 #: The `moe_topk_mode` literals — how many experts each TOKEN runs
 #: (`model/adaptive_topk.py`): `off` is the constant `moe_topk` width every
 #: number on record runs; `entropy`/`margin` are the per-token confidence
@@ -655,6 +660,24 @@ class ModelConfig:
     #: The `tsct` form's down rank `r_d`. `0` = `rank`. Refused on the other
     #: forms and above `min(d_model, d_ffn)`.
     ffn_rank_down: int = 0
+    #: ---- the ATTENTION projections' form (`model/transformer.py`) ----
+    #: `dense` (the default, every number on record) — the control's packed
+    #: `qkv [3d, d]` and readout `proj [d, d]`, both `nn.Linear`.
+    #: `tsct` — the same two matrices through `tsct.TSCTLinear`:
+    #: `qkv = U[d, r]·diag(s)·V[r, 3d]` (ONE fused factorisation, exactly the
+    #: shape the dense arm packs) and `proj = U[d, r]·diag(s)·V[r, d]` at rank
+    #: `attn_rank` (`0` = `rank`). The attention projections are 27% of the
+    #: block's MAC at d=1152, f=2848, t=1024 — 5.31M of 19.87M per token — and
+    #: SDPA's 4.72M is quadratic in the sequence, so a rank cut cannot touch it.
+    #: Only wired on `block_form='transformer'` with `block_stack='uniform'`,
+    #: and REFUSED with `attn_latent_rank`/`fused_latent_proj` (a second
+    #: attention factorisation, which would double-apply) and with
+    #: `act_qat`/`dense_qat` (both seams read plain `nn.Linear` weights).
+    attn_form: str = "dense"
+    #: The `tsct` attention projections' rank. `0` = `rank`. Refused on the
+    #: other forms (a rank knob on a form with no factors is an inert key) and
+    #: above `min(d_model, 3·d_model)` (not a factorisation).
+    attn_rank: int = 0
     norm_eps: float = 1e-3
     #: ---- LayerRoPE (`model/layerrope.py`, arXiv:2610.09179) ----
     #: Depth-wise magnitude + angular superposition of the norm gain. ONE shared
@@ -3338,6 +3361,86 @@ def validate_block_form(model: ModelConfig) -> None:
             f"loop_blocks × max_iter on block_form='transformer'). Escape: "
             f"n_layers >= 0, or 0 to derive it."
         )
+    # ---- the attention form (`attn_form`, `model/transformer.py`) ---------
+    # Checked BEFORE the stack/form branches below, because both of those
+    # return early (`kda`, `hybrid`) and a name that reaches neither block must
+    # be refused here rather than left to the loader.
+    if model.attn_form not in ATTN_FORMS:
+        loud(
+            f"attn_form={model.attn_form!r} is not an attention form. Known: "
+            f"{list(ATTN_FORMS)} — 'dense' is the control's `qkv`/`proj` as two "
+            f"`nn.Linear`s, 'tsct' factorises both (`model/transformer.py`). "
+            f"Escape: name one of those."
+        )
+    if model.attn_form == "tsct" and model.block_form != "transformer":
+        loud(
+            f"attn_form='tsct' with block_form={model.block_form!r}: only the "
+            f"UNIQUE transformer block builds `qkv`/`proj` — the `kda` form's "
+            f"loop block owns its own q/k/v/g (what `attn_latent_rank` "
+            f"factorises), so this form would reach no code while the config "
+            f"reported it on. Escape: block_form='transformer' with "
+            f"block_stack='uniform', or attn_form='dense'."
+        )
+    if model.attn_form == "tsct" and model.block_stack != "uniform":
+        loud(
+            f"attn_form='tsct' with block_stack={model.block_stack!r}: only the "
+            f"attention half of the hybrid stack is a `TransformerBlock`, so the "
+            f"KDA half would keep its dense projections while the config named "
+            f"the whole model factorised. Escape: block_stack='uniform' with "
+            f"block_form='transformer', or attn_form='dense'."
+        )
+    if model.attn_rank < 0:
+        loud(
+            f"attn_rank={model.attn_rank}: a factor rank is >= 1 and 0 is the "
+            f"`use rank` sentinel. Escape: a positive rank, or 0."
+        )
+    if model.attn_rank and model.attn_form != "tsct":
+        loud(
+            f"attn_rank={model.attn_rank} with attn_form={model.attn_form!r}: "
+            f"only the `tsct` form has factors to rank, so the key would reach "
+            f"no code. Escape: attn_form='tsct', or attn_rank=0."
+        )
+    if model.attn_form == "tsct":
+        r_attn = model.attn_rank or model.rank
+        if r_attn > model.d_model:
+            loud(
+                f"attn_rank={r_attn} > d_model={model.d_model}: the packed `qkv` "
+                f"is [3·d, d] and `proj` [d, d], so min(in, out) is d_model and "
+                f"a larger rank is not a factorisation. Escape: attn_rank <= "
+                f"d_model (0 = `rank`)."
+            )
+        if model.attn_latent_rank:
+            loud(
+                f"attn_form='tsct' with attn_latent_rank={model.attn_latent_rank}: "
+                f"the shared-latent arm is a DIFFERENT factorisation of "
+                f"attention (`d → r` once, then r → q/k/v/g), and pairing it with "
+                f"a factored `qkv` would apply two rank cuts to one projection "
+                f"and price neither. Escape: attn_latent_rank=0, or "
+                f"attn_form='dense'."
+            )
+        if model.fused_latent_proj:
+            loud(
+                "attn_form='tsct' with fused_latent_proj=true: that arm fuses "
+                "the KDA loop's q/k/v/g into one GEMM, which is not the packed "
+                "`qkv` this form factorises — the flag would name a projection "
+                "this model never builds. Escape: fused_latent_proj=false, or "
+                "attn_form='dense'."
+            )
+        if model.act_qat != "none":
+            loud(
+                f"attn_form='tsct' with act_qat={model.act_qat!r}: the packed "
+                f"4-bit activation seam read this block's `qkv`/`proj` as "
+                f"`nn.Linear` weights, and this form's are `U`/`s`/`V` — the arm "
+                f"would be silently absent. Escape: act_qat='none', or "
+                f"attn_form='dense'."
+            )
+        if model.dense_qat != "none":
+            loud(
+                f"attn_form='tsct' with dense_qat={model.dense_qat!r}: the dense "
+                f"projector applies to plain `nn.Linear` weights and these are "
+                f"factors — their knob is `factor_qat` (wired through "
+                f"`TSCTLinear`). Escape: dense_qat='none', or attn_form='dense'."
+            )
     if model.block_stack != "uniform":
         # The hybrid stack is its own tree: the KDA half is the `kda` form's
         # block, the attention half the transformer form's, and the refusals

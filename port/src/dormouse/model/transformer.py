@@ -21,6 +21,17 @@ through `tsct.TSCTLinear` (`U[d,r]·diag(s)·V[r,f]`, ranks `ffn_rank_gate` /
 every other value is refused (`config.validate_block_form`), because before
 this wiring `ffn_form` reached no code here and an `arch_tsct275`-style config
 built the dense control while its log line said `tsct`.
+`attn_form="tsct"` factorises the ATTENTION side with the same module: the
+packed `qkv [3d, d]` as ONE `[d, r]·diag(s)·[r, 3d]` (the dense arm packs all
+three projections into that one matrix, so the factorisation keeps the packing)
+and `proj` as `[d, r]·diag(s)·[r, d]`, rank `attn_rank` (`0` = `rank`). That is
+the largest FLOP lever the FFN factorisation leaves inside the block: at
+d=1152, f=2848, t=1024 the attention projections are 27% of the block's MAC
+(5.31M of 19.87M per token) and SDPA's 4.72M is quadratic in the sequence, so
+no rank cut shrinks it. Refused with a block form that builds no `qkv`/`proj`,
+with `attn_latent_rank`/`fused_latent_proj` (a second attention factorisation
+would double-apply) and with `act_qat`/`dense_qat` (their seams read plain
+`nn.Linear` weights).
 GPT-2 residual scaling on the two output projections
 (`0.02/sqrt(2·n_layers)`). Parameters per block:
 `4·d²` attention + `2·d·d_ffn` FFN + `4·d` of LayerNorm, which at
@@ -179,8 +190,60 @@ class TransformerBlock(nn.Module):
         #: RMSNorm in `model.py` reads it — so an A/B on `norm_eps` tests the
         #: final norm only; `tests/test_block_form.py` pins both halves.
         self.ln1 = nn.LayerNorm(d, device=device)
-        self.qkv = nn.Linear(d, 3 * d, bias=False, device=device)
-        self.proj = nn.Linear(d, d, bias=False, device=device)
+        #: The dense arm's init contract (`nn.init.normal_` below): every
+        #: projection N(0, 0.02), then the two writes into the residual stream
+        #: shrunk by sqrt(2·L). The `TSCTLinear`s (attention under
+        #: `attn_form="tsct"`, the FFN under `ffn_form="tsct"`) read the SAME
+        #: numbers as their composed `U·diag(s)·V` entry std, so a fresh
+        #: factorised block writes the dense block's distribution — without that
+        #: the A/B would measure init scale (13.3x at the live shape for the
+        #: FFN), not the factorisation.
+        std = 0.02
+        #: `attn_form="tsct"`: the packed `qkv [3d, d]` and the readout
+        #: `proj [d, d]` are `TSCTLinear`s at rank `attn_rank` (`0` = `rank`).
+        #: `config.validate_block_form` owns the loader-path refusals; the three
+        #: checks below are the runtime seam a hand-built config reaches.
+        self.attn_tsct = getattr(cfg, "attn_form", "dense") == "tsct"
+        self.r_attn = 0
+        if self.attn_tsct:
+            if cfg.block_form != "transformer" or cfg.block_stack != "uniform":
+                loud(
+                    f"attn_form='tsct' on block_form={cfg.block_form!r}/"
+                    f"block_stack={cfg.block_stack!r}: only the UNIQUE transformer "
+                    f"block builds `qkv`/`proj`, so on this stack the flag would "
+                    f"reach no code. Escape: block_form='transformer' with "
+                    f"block_stack='uniform', or attn_form='dense'."
+                )
+            if cfg.attn_latent_rank or cfg.fused_latent_proj:
+                loud(
+                    f"attn_form='tsct' with attn_latent_rank="
+                    f"{cfg.attn_latent_rank}/fused_latent_proj="
+                    f"{cfg.fused_latent_proj}: those are a DIFFERENT attention "
+                    f"factorisation, and pairing them with a factored `qkv` would "
+                    f"apply two rank cuts to one projection. Escape: both off, or "
+                    f"attn_form='dense'."
+                )
+            if cfg.act_qat != "none" or cfg.dense_qat != "none":
+                loud(
+                    f"attn_form='tsct' with act_qat={cfg.act_qat!r}/dense_qat="
+                    f"{cfg.dense_qat!r}: both seams read a plain `nn.Linear` "
+                    f"weight and this form's are `U`/`s`/`V` — the arm would be "
+                    f"silently absent. Escape: both 'none', or attn_form='dense'."
+                )
+            self.r_attn = cfg.attn_rank or cfg.rank
+            attn_kw = dict(
+                dtype=self.compute_dtype,
+                factor_qat=cfg.factor_qat,
+                factor_qat_alpha=cfg.factor_qat_alpha,
+                device=device,
+            )
+            self.qkv = TSCTLinear(d, 3 * d, self.r_attn, weight_std=std, **attn_kw)
+            self.proj = TSCTLinear(
+                d, d, self.r_attn, weight_std=std / math.sqrt(2 * n_layers), **attn_kw
+            )
+        else:
+            self.qkv = nn.Linear(d, 3 * d, bias=False, device=device)
+            self.proj = nn.Linear(d, d, bias=False, device=device)
         self.ln2 = nn.LayerNorm(d, device=device)
         #: `ffn_gated` (`config.validate_ffn` owns the refusals): the plain
         #: `gelu(fc(x))@fc2^T` becomes `fc2(expert_glu(act)(gate(x), up(x)))`.
@@ -222,14 +285,6 @@ class TransformerBlock(nn.Module):
         #: always made.
         self.act_qat = cfg.act_qat
         self.r_gate = self.r_down = 0
-        #: The dense arm's init contract (`nn.init.normal_` below): every
-        #: projection N(0, 0.02), then the two writes into the residual stream
-        #: shrunk by sqrt(2·L). The `TSCTLinear`s read the SAME numbers as their
-        #: composed `U·diag(s)·V` entry std, so a fresh factorised block writes
-        #: the dense gated block's distribution — without that the A/B would
-        #: measure init scale (13.3x at the live shape), not rank-64
-        #: factorisation.
-        std = 0.02
         if self.ffn_gated:
             # The runtime seam a hand-built config reaches, the same rule
             # `config.validate_ffn` applies on the loader path: the gated bill
@@ -302,13 +357,15 @@ class TransformerBlock(nn.Module):
         # shrunk by sqrt(2·L) so the stream does not grow with depth. LayerNorm
         # keeps torch's (weight=1, bias=0), and the embedding is the port's
         # shared one, not re-drawn.
-        nn.init.normal_(self.qkv.weight, std=std)
+        if not self.attn_tsct:
+            nn.init.normal_(self.qkv.weight, std=std)
         if self.ffn_gated and not self.ffn_tsct:
             nn.init.normal_(self.gate_proj.weight, std=std)
             nn.init.normal_(self.up_proj.weight, std=std)
         elif not self.ffn_gated:
             nn.init.normal_(self.fc.weight, std=std)
-        nn.init.normal_(self.proj.weight, std=std / math.sqrt(2 * n_layers))
+        if not self.attn_tsct:
+            nn.init.normal_(self.proj.weight, std=std / math.sqrt(2 * n_layers))
         if not self.ffn_tsct:
             nn.init.normal_(self.fc2.weight, std=std / math.sqrt(2 * n_layers))
         # The MoD router (`r_i = w^T x_i`), built IFF routing is on. A
@@ -372,15 +429,21 @@ class TransformerBlock(nn.Module):
         """The plain block. `rope` is the pre-built `(cos, sin)` table of a
         compacted MoD call (per-token ORIGINAL positions); `None` is today's
         table over positions `0..t-1`, and `self.nope` skips it entirely."""
-        pdt = self.qkv.weight.dtype
-        if x.dtype is not pdt:
-            x = x.to(pdt)
+        if not self.attn_tsct:
+            # The `TSCTLinear` widens its own activation (and returns fp32); a
+            # dense block casts the residual onto its master dtype first, as it
+            # always has.
+            pdt = self.qkv.weight.dtype
+            if x.dtype is not pdt:
+                x = x.to(pdt)
         b, t, _ = x.shape
         d = self.d
         if self.act_qat != "none" and counters is not None:
             counters.count("act_qat_arms")
+        if self.attn_tsct and counters is not None:
+            counters.count("attn_tsct", b * t)
         h1 = self.ln1(x)
-        qkv = self._qmm(h1, self.qkv, self._qat_attn, counters)
+        qkv = self._attn_proj(h1, self.qkv, counters)
         q, k, v = qkv.split(d, dim=-1)
         q = q.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
@@ -404,9 +467,25 @@ class TransformerBlock(nn.Module):
         y = y.transpose(1, 2).reshape(b, t, d)
         # Every projection runs in the compute dtype; the residual add is the
         # fp32 stream (mm_mixed's contract, widened back here).
-        x = x + self._qmm(y, self.proj, self._qat_attn, counters).to(x.dtype)
+        x = x + self._attn_proj(y, self.proj, counters).to(x.dtype)
         h2 = self.ln2(x)
         return x + self._ffn(h2, counters).to(x.dtype)
+
+    def _attn_proj(
+        self, x: torch.Tensor, module: nn.Module, counters: Counters | None
+    ) -> torch.Tensor:
+        """One of the two attention projections, whichever form built it.
+
+        `attn_form="tsct"` calls the `TSCTLinear` itself (its forward owns the
+        factor matmuls and `factor_qat`; both `dense_qat` and `act_qat` are
+        refused with that form, so no second numerics path can apply). Its
+        result is widened back to the compute dtype, exactly what the dense
+        arm's `mm_mixed` already returns: SDPA is quadratic in the sequence and
+        must stay on the tensor-core dtype (`bf16=false` is fp32 either way).
+        """
+        if self.attn_tsct:
+            return module(x).to(self.compute_dtype)
+        return self._qmm(x, module, self._qat_attn, counters)
 
     def _ffn(self, h2: torch.Tensor, counters: Counters | None) -> torch.Tensor:
         """The FFN body: `ln2(x) [b,t,d]` in, the FFN's write `[b,t,d]` out.
