@@ -80,6 +80,20 @@ The update is `burn-muon-plus`'s, not a re-derivation:
   the tail after the polar is the full-matrix one, and a split of ONE block
   (`n_heads == 1` on an unpacked projection) is the full-matrix call bit for
   bit. Off by default.
+* The **low-rank polar** arm (`muon_variant="orth_dion"`, arXiv:2605.16341's
+  target with arXiv:2509.11983's sketch): one random sketch of the momentum,
+  `power` re-orthonormalised power iterations, then the top-`rank` singular
+  triplets of the small factor — `orth_dion_polar`. It replaces the whole
+  Newton–Schulz chain (the live step's ~113 ms of a 377 ms step) at `~8·n·f·r`
+  FLOPs instead of `~30·n·f²`, and the tail after the polar is the `muon` one,
+  so the step's magnitude convention does not move. `rank=0` (the default) is
+  OFF and the NS path is bit-identical. Measured on the live model: 49.6 ms of
+  polar against NS-5's 113.5 ms at the accuracy-compliant configuration
+  (`rank=64, power=1, oversample=32`, cosine 0.9988 to the rank-64 polar), and
+  NOT the 20x the FLOP count promises — the small-side ops must run in fp64 on
+  this card, and `rank=128` needs `oversample=64` to reach the gate and then
+  costs MORE than the chain it replaces. Read `orth_dion_polar`'s table before
+  trusting the arm.
 """
 
 from __future__ import annotations
@@ -132,7 +146,16 @@ OPT_DTYPES = ("fp32", "bf16")
 #: magnitude, NorMuon's direction**, which is what makes the arm a controlled
 #: direction-only change against our Muon+ColRow control. A name that is not
 #: here is refused at the door, at the config layer and at the constructor.
-MUON_VARIANTS = ("muon", "normuon")
+#:
+#: `orth_dion` REPLACES the Newton–Schulz chain itself with the rank-`r` polar
+#: factor, from ONE random sketch of the momentum (`orth_dion_polar`): the
+#: update is `Q·U_B·W_Bᵀ`, a partial isometry whose column space is the top-`r`
+#: left subspace. The tail after the polar is the `muon` one (ColRow + the same
+#: `-lr·scale`), so the step's MAGNITUDE convention is unchanged and the arm is a
+#: direction-only change at a fraction of the FLOPs. Off by default, and it is
+#: NOT a config arm yet (`config.MUON_VARIANTS` does not carry it): the numbers it
+#: needs first are the cosine table in `orth_dion_polar`'s docstring.
+MUON_VARIANTS = ("muon", "normuon", "orth_dion")
 
 #: NorMuon's row second-moment EMA rate — `beta2 = 0.95` in BOTH references
 #: (`zichongli5/NorMuon` `normuon.py:35`'s `beta2=0.95` default; `2605.23061v1`
@@ -156,6 +179,34 @@ NOR_SF_EPS = 1e-8
 #: takes its magnitude from the repo's Frobenius rescale instead, which is what
 #: makes that arm a DIRECTION-only change against the control.
 NOR_ETA_SCALE = 0.2
+
+#: `orth_dion`'s sketch width is `rank + ORTH_DION_OVERSAMPLE` columns. 0 is the
+#: literal randomized-SVD rung (a sketch as wide as the rank) and it is NOT enough
+#: at these spectra: with `rank=64` the live momentum's `σ_64` and `σ_65` are
+#: nearly degenerate, so the cut is ill-defined and the sketch lands at cosine
+#: 0.9388 however many power iterations follow. A half-rank guard block is what
+#: lifts it past the 0.99 gate (0.9988 measured); the full table is in
+#: `orth_dion_polar`'s docstring.
+ORTH_DION_OVERSAMPLE = 32
+
+#: `orth_dion`'s default rank. 64 of the live model's 832 columns is the only rung
+#: that is BOTH at the 0.99 cosine gate and cheaper than Newton–Schulz: the
+#: measured polar stage is 49.6 ms here against the NS-5 chain's 113.5 ms, while
+#: `rank=128` needs `oversample=64` to reach 0.9987/0.9777 and costs 124.9 ms — it
+#: is not a saving at all on this card (fp64 runs at ~1/20 of fp32).
+ORTH_DION_RANK = 64
+
+#: `orth_dion`'s default power-iteration count on the sketch. One is the rung the
+#: lane priced (`S ← M·(Mᵀ·S)`); 0 is the bare sketch and loses ~0.06 cosine at
+#: `rank=64` (0.9388 -> 0.9988 with the guard block), 2+ buys ~0.001 for ~25% more
+#: FLOPs.
+ORTH_DION_POWER = 1
+
+#: The sketch's RNG seed. FIXED, not drawn per step: the sketch is a constant of the
+#: arm's definition, so a resume re-derives the same `Ω` and the update is
+#: reproducible from (shape, rank, width) alone. A per-step draw would make the
+#: optimizer non-deterministic for no measured gain.
+ORTH_DION_SEED = 0x0D10
 
 #: The schedule-free interpolation parameter β1 (`Y = (1−β1)Z + β1 X`):
 #: `betas=(0.9, 0.95)` in the reference, so `β1 = betas[0] = 0.9` (Appendix F:23).
@@ -230,7 +281,10 @@ def _check_muon_variant(arm: str) -> None:
             f"momentum and the NS polar and REPLACES the ColRow tail with NorMuon's "
             f"row-wise EMA second moment applied the authors' repo way "
             f"(`normuon.py:48-56`: row-scale, restore the pre-normalization "
-            f"Frobenius norm, then `max(1, m/n)^0.5`). Escape: name one of those, or "
+            f"Frobenius norm, then `max(1, m/n)^0.5`), `orth_dion` replaces the "
+            f"Newton-Schulz chain with the rank-`r` polar factor from one random "
+            f"sketch (`orth_dion_polar`; `muon_orth_dion_rank=0` disables it). "
+            f"Escape: name one of those, or "
             f"land the arm in `optim.MUON_VARIANTS` with its gate BEFORE the config "
             f"can lie about it."
         )
@@ -333,6 +387,212 @@ def _gram(x: torch.Tensor) -> torch.Tensor:
 
 def _matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.bmm(x, y) if x.ndim == 3 else torch.mm(x, y)
+
+
+def _check_orth_dion(rank: int, power: int, oversample: int, n: int, f: int) -> None:
+    """Every rung `orth_dion_polar` cannot serve is refused LOUD, at the door."""
+    for name, value, floor in (  # stepaudit-excuse: a 3-item argument check, no tensor work
+        ("rank", rank, 1),
+        ("power", power, 0),
+        ("oversample", oversample, 0),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+            loud(
+                f"muon_orth_dion_{name}={value!r}: it must be a whole number >= {floor} "
+                f"(`rank` is the polar's truncation, `power` the sketch's power "
+                f"iterations, `oversample` the guard columns). Escape: an integer, "
+                f"e.g. rank=128, power=1, oversample=0."
+            )
+    small = min(n, f)
+    if rank > small:
+        loud(
+            f"muon_orth_dion_rank={rank} on a {n}x{f} momentum: the rank cannot "
+            f"exceed min(n, f)={small} — the top-{rank} subspace of a rank-{small} "
+            f"matrix does not exist, so the QR would return {small} columns and the "
+            f"update would be silently smaller than the one the arm reports. "
+            f"Escape: rank <= {small} for this shape (the DEFAULT "
+            f"{ORTH_DION_RANK} needs every Muon matrix to have min(n, f) >= "
+            f"{ORTH_DION_RANK}), or muon_orth_dion_rank=0."
+        )
+
+
+def _orth_dion_basis(s: torch.Tensor, counters=None) -> torch.Tensor:
+    """The orthonormal basis of `S`'s columns (`S = Q·Lᵀ`), in fp64.
+
+    `torch.linalg.qr` is the honest call and it is the arm's second-largest cost:
+    10.6 ms for ONE batched `[12, 2496, 128]` sketch on this card (against 4.1 ms
+    here), because Householder reflectors are applied to the tall operand. The
+    Cholesky route computes the SAME `Q` from the small `SᵀS`; accuracy is
+    identical where it matters (cosine to the rank-64 polar 0.9988 vs 0.9987 at
+    `rank=64, oversample=32`, 1.0000 vs 1.0000 at `oversample=64`).
+
+    fp64 is not a preference: the Gram squares the sketch's condition number, and
+    a sketch of this model's momentum is ill-conditioned by construction. fp32
+    here (with a relative 1e-6 jitter) measured cosine **0.80 / min 0.41** where
+    fp64 gives 0.9988 / 0.9950 — it points somewhere else.
+
+    A non-positive-definite Gram means the sketch is degenerate (all-zero or
+    non-finite momentum, or a sketch that lost rank). That is COUNTED
+    (`muon_orth_dion_qr_fallback`) and served by the Householder QR, which does
+    not raise: a NaN step must reach the trainer's firewall as a NaN update, not
+    as an exception from inside the optimizer (ADR-0019's counted degradation).
+    """
+    st = s.double()
+    try:
+        chol = torch.linalg.cholesky(st.transpose(-2, -1) @ st)
+    except torch.linalg.LinAlgError:
+        q, _ = torch.linalg.qr(s)
+        if counters is not None:
+            counters.count("muon_orth_dion_qr_fallback")
+            counters.why = (  # type: ignore[attr-defined]
+                "orth_dion: the sketch's Gram was not positive definite (a degenerate "
+                "momentum); that call ran the Householder QR instead"
+            )
+        return q.to(torch.float32)
+    return (
+        torch.linalg.solve_triangular(chol, st.transpose(-2, -1), upper=False)
+        .transpose(-2, -1)
+        .to(torch.float32)
+    )
+
+
+def orth_dion_polar(
+    x: torch.Tensor,
+    rank: int,
+    power: int = ORTH_DION_POWER,
+    oversample: int = ORTH_DION_OVERSAMPLE,
+    *,
+    seed: int = ORTH_DION_SEED,
+    counters=None,
+) -> torch.Tensor:
+    """The rank-`rank` POLAR FACTOR of `x` (`[n, f]` or `[N, n, f]`) from a sketch.
+
+    The algorithm (Dion's range finder, Orth-Dion's polar target — arXiv:2605.16341
+    replaced Dion's column normalisation with an orthogonalisation of the right
+    factor, and its abstract names the object: *"the rank-r polar factor that Muon
+    implicitly targets"*):
+
+    1. `S = M·Ω` (`Ω [f, rank+oversample]`, seeded), `power` re-orthonormalised
+       power iterations `S ← M·(Mᵀ·basis(S))`, then `Q = basis(S)` (`[n, w]`);
+    2. `B = Qᵀ·M` (`[w, f]`);
+    3. the top-`rank` singular triplets of `B`, from the eigendecomposition of the
+       SMALL Gram `B·Bᵀ` (`[w, w]`);
+    4. update `Q·U_B·W_Bᵀ` — a partial isometry of Frobenius norm `√rank`, i.e.
+       the same scale the Newton–Schulz polar has, so the caller's ColRow tail and
+       `-lr·scale` are unchanged (`tr(UᵀU) = rank` is a gate).
+
+    **The accuracy this actually buys, and it is NOT the rank-r polar in general.**
+    Cosine with the rank-`r` polar (`U_r·V_rᵀ` of an SVD), 60 live momentum
+    matrices of `arch_gated_swiglu` after 40 steps (b8×s512, the live recipe):
+
+    | `rank` | `oversample` | `power` | mean | min |
+    |---|---|---|---|---|
+    | 64 | 0 | 1 | 0.9388 | 0.9220 |
+    | 64 | 32 | 1 | **0.9988** | 0.9950 |
+    | 64 | 64 | 1 | 1.0000 | 0.9999 |
+    | 64 | 32 | 2 | 1.0000 | 0.9999 |
+    | 128 | 0 | 1 | 0.9466 | 0.9025 |
+    | 128 | 32 | 1 | 0.9927 | 0.9510 |
+    | 128 | 64 | 1 | 0.9987 | 0.9777 |
+    | 128 | 128 | 1 | 0.9999 | 0.9961 |
+    | 128 | 64 | 2 | 0.9999 | 0.9969 |
+    | 256 | 0 | 1 | 0.9484 | 0.8652 |
+    | 256 | 128 | 1 | 0.9975 | 0.9625 |
+    | 256 | 128 | 2 | 0.9997 | 0.9899 |
+    | 256 | 128 | 4 | 1.0000 | 0.9996 |
+
+    For scale: **the Newton–Schulz chain this replaces scores 0.6464 / 0.8398 /
+    0.8470** (mean) against the same three objects, so the sketch's 0.99 is a
+    HIGHER bar than Muon's own update meets — the rank-r polar weights every one
+    of its `r` directions equally, including the tail ones whose singular values
+    are `σ_64/σ_1 ≈ 0.03` and `σ_128/σ_1 ≈ 3e-4` on this model.
+
+    Two measured consequences worth carrying:
+
+    * **`oversample` is not optional at these spectra.** With `oversample=0` the
+      `r`-th and `r+1`-th singular values are nearly degenerate (`σ_r ≈ σ_{r+1}`
+      is what a bulk tail means), so the cut is ill-defined and the sketch lands
+      at ~0.94 no matter how many power iterations follow; a guard block
+      (`oversample ≈ rank/2`) is what lifts it past 0.99.
+    * **`power` beyond 1 is a cliff, not a dial.** A power iteration without
+      re-orthonormalisation cubes the spectrum in fp32; WITH it, `power=2` is
+      monotone (`tests/test_muon_orth_dion.py` pins that) and buys ~0.001 cosine
+      for ~25% more FLOPs — which is why 1 is the default.
+
+    **Why step 3 is an eigendecomposition and not `qr(Bᵀ)`.** The literal form —
+    `V, _ = qr(Bᵀ)`, update `Q·Vᵀ` — does NOT produce the polar when `Q` is merely
+    SOME orthonormal basis of the subspace, and a sketch's basis is exactly that.
+    Writing `Q = U_r·R` for the true left singular basis `U_r` gives
+    `B = Rᵀ·Σ·Wᵀ`, so `qr(Bᵀ)` returns `V_r·orth(Σ·Rᵀ)ᵀ`: an arbitrary ROTATION of
+    the right factor, not `V_r` (the rotation vanishes only when `R` is diagonal,
+    i.e. when the basis was already the singular one — which is what Orth-Dion's
+    warm-started fixed point supplies over training steps and a one-shot sketch
+    does not). Measured on the 60 live matrices at r=64: cosine **-0.022** (mean,
+    min -0.263) for the `qr(Bᵀ)` form against **0.9988** for the eigendecomposition
+    below. Consequence: the `r = min(n,f)` reduction fails for the QR form too
+    (0.031) and holds here (1.000000, rel 5.5e-04).
+
+    **Why `eigh` and not `svd`.** `torch.linalg.svd` on the small factor is the
+    whole cost: batched `[N, 128, 832]` is 39.5 ms (N=12) / 78.2 ms (N=24) here,
+    against 0.8 / 1.0 ms for a batched `eigh` of the `[128, 128]` Gram — the whole
+    Newton–Schulz chain it replaces is 113.5 ms. `_orth_dion_basis` makes the same
+    trade for the sketch's own basis (a `[12, 2496, 128]` `torch.linalg.qr` is
+    10.6 ms, ~40% of the stage).
+
+    **Both small-side ops are fp64, and that is the arm's whole cost.** Forming a
+    Gram squares the condition number; at `σ_128/σ_1 ≈ 3e-4` fp32's ~1e-7 leaves
+    the tail eigenvectors unresolved. Measured with an fp32 basis and fp32 `eigh`
+    (relative jitter 1e-6): cosine **0.80 / 0.41** at r=64/over=32 — i.e. the arm
+    points somewhere else — against **0.9988 / 0.9950** in fp64. There is no fp32
+    rung of this algorithm; this card runs fp64 at ~0.8 TFLOP/s (~1/20 of fp32),
+    which is why the measured saving is 2.3x and not the 20x the FLOP count says.
+
+    Constants of the arm, not of the call: `Ω` is drawn from `seed` on the
+    momentum's own shape, so a resume re-derives the same sketch (no per-step
+    RNG, and the update is a function of (momentum, shape, rank, power) alone).
+
+    `rank == min(n, f)` is the exact-polar rung and is served with `power=0`,
+    `oversample=0`: `M·Ω` then already spans the whole column space, and a power
+    iteration would CUBE the spectrum through `M·Mᵀ·M` in fp32 — measured cosine
+    0.62 at `[2496, 832]` against 1.000000 for the bare sketch.
+    """
+    if x.ndim not in (2, 3):
+        loud(
+            f"orth_dion_polar got a rank-{x.ndim} tensor: the arm is defined on a "
+            f"matrix `[n, f]` or one batch of matrices `[N, n, f]`. Escape: reshape "
+            f"the momentum to 2-D/3-D, or muon_orth_dion_rank=0 (the NS arm)."
+        )
+    n, f = x.shape[-2], x.shape[-1]
+    _check_orth_dion(rank, power, oversample, n, f)
+    if rank == min(n, f):
+        power, oversample = 0, 0
+    width = min(rank + oversample, min(n, f))
+    m = x.to(torch.float32)
+    gen = torch.Generator(device=m.device)
+    gen.manual_seed(seed + 1_000_003 * (rank + width))
+    omega = torch.randn(f, width, generator=gen, device=m.device, dtype=torch.float32)
+    if m.ndim == 3:
+        omega = omega.expand(m.shape[0], f, width)
+    s = _matmul(m, omega)
+    for _ in stepaudit.iterations("muon.orth_dion_power", range(power)):
+        s = _matmul(m, _matmul(m.transpose(-2, -1), _orth_dion_basis(s, counters)))
+    q = _orth_dion_basis(s, counters)
+    b = _matmul(q.transpose(-2, -1), m)
+    gram = _matmul(b.double(), b.double().transpose(-2, -1))
+    evals, evecs = torch.linalg.eigh(gram)
+    evals, evecs = evals[..., -rank:], evecs[..., -rank:]
+    # A direction whose `σ²` is below `1e-12·σ²_max` is numerically null: the
+    # rank-r polar would give it weight 1 (which is why the object is undefined
+    # at `rank = min(n, f)` on a rank-deficient momentum) and `1/√0` is inf. Those
+    # columns are ZEROED, so the update is always finite and is a partial isometry
+    # of the rank the sketch could actually resolve, never a NaN weight.
+    floor = evals[..., -1:].clamp_min(torch.finfo(torch.float64).tiny) * 1e-12
+    live = evals > floor
+    safe = torch.where(live, evals, torch.ones_like(evals))
+    inv = torch.where(live, torch.rsqrt(safe), torch.zeros_like(evals))
+    right = _matmul(b.transpose(-2, -1).double(), evecs) * inv.unsqueeze(-2)
+    update = _matmul(q @ evecs.to(q.dtype), right.to(q.dtype).transpose(-2, -1))
+    return update.to(torch.float32)
 
 
 def _foreach_is_cheaper(numels: list[int]) -> bool:
@@ -924,12 +1184,38 @@ class Muon(Optimizer):
         sf_beta: float = SF_BETA1,
         chunk_elems: int = MUON_CHUNK_ELEMS,
         lr_mode: str = "uniform",
+        orth_dion_rank: int = 0,
+        orth_dion_power: int = ORTH_DION_POWER,
+        orth_dion_oversample: int = ORTH_DION_OVERSAMPLE,
     ) -> None:
         _check_ns_kind(ns_kind)
         _check_colrow_3d(colrow_3d)
         _check_dtype("state_dtype", state_dtype)
         _check_dtype("ns_dtype", ns_dtype)
         _check_muon_variant(variant)
+        if variant == "orth_dion" and orth_dion_rank < 1:
+            loud(
+                f"muon_variant='orth_dion' with muon_orth_dion_rank={orth_dion_rank}: "
+                f"the arm IS the rank-r polar, so a rank below 1 leaves it nothing "
+                f"to run while the run reports the arm on. Escape: "
+                f"muon_orth_dion_rank>=1 (the arm's 128), or muon_variant='muon'."
+            )
+        if variant != "orth_dion" and orth_dion_rank:
+            loud(
+                f"muon_orth_dion_rank={orth_dion_rank} with muon_variant={variant!r}: "
+                f"the rank configures the `orth_dion` arm only, and this flag would "
+                f"be inert while the run reported it set. Escape: "
+                f"muon_variant='orth_dion', or muon_orth_dion_rank=0."
+            )
+        if variant == "orth_dion" and (sf or ns_kind != "classic" or ns_dtype != "fp32"):
+            loud(
+                f"muon_variant='orth_dion' with muon_sf={sf}, ns_kind={ns_kind!r}, "
+                f"ns_dtype={ns_dtype!r}: the `orth_dion` arm computes the polar from "
+                f"a sketch in fp32 and runs NO Newton-Schulz chain, so the `sf` "
+                f"magnitude path and both NS rungs would be inert while the run "
+                f"reported them set. Escape: muon_sf=false, ns_kind='classic', "
+                f"ns_dtype='fp32' on this arm, or muon_variant='muon'."
+            )
         if lr_mode not in ("shape_fair", "uniform"):
             loud(
                 f"lr_mode={lr_mode!r}: known modes are 'shape_fair' and 'uniform' "
@@ -962,6 +1248,9 @@ class Muon(Optimizer):
         self.state_dtype = state_dtype
         self.ns_dtype = ns_dtype
         self.variant = variant
+        self.orth_dion_rank = orth_dion_rank
+        self.orth_dion_power = orth_dion_power
+        self.orth_dion_oversample = orth_dion_oversample
         self.beta2 = beta2
         self.wd = wd
         self.sf = sf
@@ -984,6 +1273,19 @@ class Muon(Optimizer):
                 "parameter with E rows. The default `muon` batched path is the "
                 "supported arm. Escape: tsct_packed=false, muon_sf=false and "
                 "muon_variant='muon', or land the packed tail with its gate."
+            )
+        if variant == "orth_dion" and any(
+            getattr(p, "_muon_per_head", None)
+            for group in self.param_groups
+            for p in group["params"]
+        ):
+            loud(
+                "muon_variant='orth_dion' with muon_per_head=true: the per-head "
+                "split turns each projection into `head_dim x cols` matrices, and "
+                "the sketch's accuracy and cost at that shape were not measured "
+                "(the `rank=64` default would also be the FULL-rank rung there, "
+                "i.e. 3·n_heads sketches per projection, none of them cheaper). "
+                "Escape: muon_per_head=false, or muon_variant='muon'."
             )
         #: One stacked momentum buffer per (param group, shape) — the canonical
         #: state, built lazily by `_build_groups` and rebuilt after a load.
@@ -1157,7 +1459,21 @@ class Muon(Optimizer):
         does not move. The `triton` arm is the same rule one step further: its
         counters are forwarded (the arm must be able to show which chain ran) and
         nothing else about the call changes for `classic`.
+
+        If `muon_variant='orth_dion'` the polar itself is `orth_dion_polar`'s
+        rank-r sketch (the arm and its refusals live in that function); every
+        other rung — the arm counters, the `bf16` chain, `triton` — is the NS
+        path's and is not consulted, because this arm does not run a chain.
         """
+        if self.variant == "orth_dion":
+            self.counters.count("muon_orth_dion")
+            return orth_dion_polar(
+                x,
+                self.orth_dion_rank,
+                self.orth_dion_power,
+                self.orth_dion_oversample,
+                counters=self.counters,
+            )
         if self.ns_kind == "triton":
             return zeropower_via_ns(x, steps, self.ns_kind, self.ns_dtype, counters=self.counters)
         if self.ns_dtype == "fp32":
@@ -1644,7 +1960,28 @@ class Muon(Optimizer):
         box — is COUNTED with its reason and then run through the SAME lockstep
         classic chain, so a fallback no longer costs 25 elementwise launches per
         iteration per group.
+
+        `muon_variant='orth_dion'` is ONE sketch call per queued tensor: the
+        sketch, the two QRs and the small-side eigendecomposition are all
+        `bmm`/batched kernels, so a shape group of N matrices costs the same
+        launches as one. The argument the NS arms call `steps` is unused there
+        (the arm has no iteration count; its budget is `orth_dion_rank`).
         """
+        if self.variant == "orth_dion":
+            # COUNTED per queued tensor (one sketch call), so the step log names
+            # the arm and the shape-group count — `ns_triton` is counted the same
+            # way. A run cannot report `orth_dion` while running Newton-Schulz.
+            self.counters.count("muon_orth_dion", len(tensors))
+            return [
+                orth_dion_polar(
+                    g,
+                    self.orth_dion_rank,
+                    self.orth_dion_power,
+                    self.orth_dion_oversample,
+                    counters=self.counters,
+                )
+                for g in stepaudit.iterations("muon.orth_dion", tensors)
+            ]
         if self.ns_kind != "triton":
             return _classic_ns_many(tensors, steps, self.ns_dtype, self.chunk_elems)
         from .ns_kernels import LAUNCH_REFUSALS, path_reason, zeropower_triton
@@ -1872,6 +2209,9 @@ class MixOptimizer:
         muon_per_head: bool = False,
         n_heads: int = 0,
         head_dim: int = 0,
+        orth_dion_rank: int = 0,
+        orth_dion_power: int = ORTH_DION_POWER,
+        orth_dion_oversample: int = ORTH_DION_OVERSAMPLE,
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
@@ -2027,6 +2367,14 @@ class MixOptimizer:
                 wd=sf_wd if muon_sf else 0.0,
                 sf=muon_sf,
                 chunk_elems=muon_chunk_elems,
+                # The `orth_dion` arm's sketch budget: `rank` IS the arm (0 = off /
+                # unreachable), `power` its power iterations and `oversample`
+                # the guard columns of its sketch. Every refusal lives in `Muon`
+                # and `orth_dion_polar`, which see the SHAPES — a rank the model's
+                # matrix cannot carry is refused there, not here.
+                orth_dion_rank=orth_dion_rank,
+                orth_dion_power=orth_dion_power,
+                orth_dion_oversample=orth_dion_oversample,
             )
             if muon_params
             else None

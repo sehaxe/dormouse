@@ -380,7 +380,11 @@ def test_the_default_path_is_bit_identical_to_the_pre_change_tree():
     cannot drift with a re-transcription, which is why it is the gate here and
     `tests/test_muon_fast.py`'s transcribed `old_batched_step` is the other one.
     """
-    assert MUON_VARIANTS == ("muon", "normuon")
+    # The tuple pins the ARMS the two files agree on: `orth_dion` joined it with
+    # its own gate (`tests/test_muon_orth_dion.py`), and it is unreachable from
+    # the config layer on purpose — this test's pin is on the literals, not on
+    # `config.MUON_VARIANTS`, which still names only the two config arms.
+    assert MUON_VARIANTS == ("muon", "normuon", "orth_dion")
     assert load_run("small").train.muon_variant == "muon"
     assert load_run("small").train.muon_sf is False
 
