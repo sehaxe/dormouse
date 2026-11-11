@@ -403,8 +403,14 @@ RESIDUAL_DTYPES = ("fp32", "bf16")
 #: this arm is a REPLACE, and against our ColRow control its magnitude is not
 #: preserved either. The SF paper's `eta_hat = 0.2·η·√(mn)/‖P̂‖_F` form is the
 #: rejected alternative (it fixes the step norm regardless of the matrix); it is
-#: what the `sf` arm uses. A name that is not here is LOUD.
-MUON_VARIANTS = ("muon", "normuon")
+#: what the `sf` arm uses. `orth_dion` replaces the Newton–Schulz chain itself
+#: with the rank-`r` polar of the momentum, computed from ONE sketch
+#: (`optim.orth_dion_polar`; measured cosine 0.9989 to the rank-64 polar at
+#: `rank=64, power=1, oversample=32`, 57.4 ms against NS-5's 142.5 ms on the 60
+#: live matrices). Its three knobs are `muon_orth_dion_rank` (the rank IS the
+#: arm, so 0 with the arm selected is LOUD), `muon_orth_dion_power` and
+#: `muon_orth_dion_oversample`. A name that is not here is LOUD.
+MUON_VARIANTS = ("muon", "normuon", "orth_dion")
 
 
 @dataclass
@@ -2272,6 +2278,24 @@ class TrainConfig:
     #: `scripts/ab_muon_variants.py` is the driver. A name that is not in
     #: `MUON_VARIANTS` is LOUD at load and at the constructor.
     muon_variant: str = "muon"
+
+    #: The `orth_dion` arm's sketch budget (`optim.ORTH_DION_*`; the literals are
+    #: duplicated here the way `NS_KINDS` is, so this layer does not import the
+    #: trainer). `rank` IS the arm — 0 is the default and it is REFUSED with
+    #: `muon_variant='orth_dion'` rather than leaving the arm nothing to run;
+    #: a non-zero rank with any other arm is refused too (it would be inert).
+    #: 64 is the only rung that is BOTH at the arm's 0.99 cosine gate and cheaper
+    #: than NS-5 on this card (`optim.ORTH_DION_RANK`); 128 needs
+    #: `oversample=64` and costs what the chain costs. `power` is the count of
+    #: re-orthonormalised power iterations on the sketch (0 is the bare sketch,
+    #: ~0.06 cosine worse at `rank=64`; 1 is the measured rung). `oversample` is
+    #: the sketch's guard width — `rank + oversample` columns; 0 is the literal
+    #: randomized-SVD rung and lands at 0.9388 at `rank=64` because the live
+    #: spectrum's `σ_64 ≈ σ_65`, 32 is the measured 0.9989. Every rank a shape
+    #: cannot carry is refused by the optimizer, which is where the shape is.
+    muon_orth_dion_rank: int = 0
+    muon_orth_dion_power: int = 1
+    muon_orth_dion_oversample: int = 32
 
     #: The SCHEDULE-FREE wrapper (`optim.Muon(sf=...)`), `false` by default.
     #: SF-NorMuon (arXiv:2605.23061, JPMorgan) around the `muon_variant`
@@ -5735,6 +5759,56 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"AdamW group's `wd`. Escape: muon_sf_wd>0 (the arm's 0.01), or "
             f"muon_sf=false."
         )
+    if tcfg.muon_variant == "orth_dion":
+        for name in ("muon_orth_dion_rank", "muon_orth_dion_power", "muon_orth_dion_oversample"):
+            value = getattr(tcfg, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                loud(
+                    f"{name}={value!r}: the sketch budget is whole numbers — a "
+                    f"bool or a float would silently run a different sketch. "
+                    f"Escape: an integer."
+                )
+        if tcfg.muon_orth_dion_rank < 1:
+            loud(
+                f"muon_variant='orth_dion' with muon_orth_dion_rank="
+                f"{tcfg.muon_orth_dion_rank}: the arm IS the rank-r polar, so a "
+                f"rank below 1 leaves it nothing to run while the run reports the "
+                f"arm on. Escape: muon_orth_dion_rank>=1 (the measured 64), or "
+                f"muon_variant='muon'."
+            )
+        if tcfg.muon_orth_dion_power < 0 or tcfg.muon_orth_dion_oversample < 0:
+            loud(
+                f"muon_orth_dion_power={tcfg.muon_orth_dion_power}/"
+                f"muon_orth_dion_oversample={tcfg.muon_orth_dion_oversample}: "
+                f"both are counts of iterations/columns, so they are >= 0 (0 and "
+                f"32 are the measured rungs). Escape: >= 0."
+            )
+        if tcfg.opt != "mix":
+            loud(
+                f"muon_variant='orth_dion' with opt={tcfg.opt!r}: the arm is a "
+                f"Muon-group direction, and `opt={tcfg.opt!r}` routes every "
+                f"parameter to AdamW — the arm would reach no matrix while the "
+                f"run reported it on. Escape: opt='mix', or muon_variant='muon'."
+            )
+        if tcfg.muon_sf or tcfg.ns_kind != "classic" or tcfg.ns_dtype != "fp32":
+            loud(
+                f"muon_variant='orth_dion' with muon_sf={tcfg.muon_sf}, "
+                f"ns_kind={tcfg.ns_kind!r}, ns_dtype={tcfg.ns_dtype!r}: the arm "
+                f"computes the polar from a sketch in fp32 and runs NO "
+                f"Newton-Schulz chain, so the `sf` magnitude path and both NS "
+                f"rungs would be inert while the run reported them set (the "
+                f"optimizer refuses the same pair at its constructor). Escape: "
+                f"muon_sf=false, ns_kind='classic', ns_dtype='fp32', or "
+                f"muon_variant='muon'."
+            )
+    elif tcfg.muon_orth_dion_rank:
+        loud(
+            f"muon_orth_dion_rank={tcfg.muon_orth_dion_rank} with "
+            f"muon_variant={tcfg.muon_variant!r}: the rank configures the "
+            f"`orth_dion` arm only, so this flag would be inert while the run "
+            f"reported it set. Escape: muon_variant='orth_dion', or "
+            f"muon_orth_dion_rank=0."
+        )
     if tcfg.muon_sf_retract:
         loud(
             "muon_sf_retract=true: the per-step TSCT polar retraction cannot run "
@@ -5913,6 +5987,34 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
                 f"does not price. Escape: engram_ram=false, or "
                 f"block_stack='uniform'."
             )
+    if tcfg.muon_variant == "orth_dion":
+        # The arm's numbers are ONE block form: `arch_gated_swiglu`
+        # (`block_form='transformer'`). The optimizer itself is block-agnostic,
+        # but the sketch's accuracy and price were measured on that block's 60
+        # momentum matrices, so another form is an unmeasured rung.
+        if model.block_form != "transformer":
+            loud(
+                f"muon_variant='orth_dion' with block_form={model.block_form!r}: "
+                f"the arm's cosine and its 57.4-vs-142.5 ms are measured on the "
+                f"DENSE `TransformerBlock`'s momentum matrices "
+                f"(`arch_gated_swiglu`), so another form is an unmeasured rung. "
+                f"Escape: block_form='transformer', or muon_variant='muon'."
+            )
+        if model.muon_per_head:
+            loud(
+                "muon_variant='orth_dion' with muon_per_head=true: the per-head "
+                "split turns each projection into `head_dim x cols` matrices, "
+                "and the sketch's accuracy and cost at that shape were not "
+                "measured (the optimizer refuses the same pair). Escape: "
+                "muon_per_head=false, or muon_variant='muon'."
+            )
+        if getattr(model, "tsct_packed", False):
+            loud(
+                "muon_variant='orth_dion' with tsct_packed=true: a packed bank "
+                "is one 3-D parameter, and the arm's batched path is priced per "
+                "2-D matrix (the optimizer refuses the pair). Escape: "
+                "tsct_packed=false, or muon_variant='muon'."
+            )
     if not model.layerrope:
         return
     # `full_graph` is ALLOWED. The per-depth gain is selected by a Python depth
@@ -5940,6 +6042,7 @@ def load_run(
     train: TrainConfig | None = None,
     train_overrides: dict[str, Any] | None = None,
     model_overrides: dict[str, Any] | None = None,
+    muon_variant: str | None = None,
 ) -> RunConfig:
     """Resolve a run: preset (name or path) + both config halves + loud overrides.
 
@@ -5947,6 +6050,14 @@ def load_run(
     (`validate` for a self-inconsistent set, and the unknown-key check the
     preset layer runs), because an override that bypasses them is the
     silent-collapse shape the preset layer exists to prevent.
+
+    `muon_variant` is the one train field a driver may name on its own (the
+    `ab_*` scripts otherwise go through `train_overrides`): it is applied after
+    the preset's train defaults and BEFORE the overrides, so `--set` keeps the
+    last word. It is not a second source of truth — the resolved value is the
+    field the snapshot pins. The `orth_dion` arm's rank stays in
+    `train_overrides['muon_orth_dion_rank']`, because a rank without the arm is
+    itself refused.
     """
     model = load_preset(preset)
     tcfg = train if train is not None else TrainConfig()
@@ -5958,6 +6069,8 @@ def load_run(
         preset_keys = PRESET_TRAIN_DEFAULTS.get(Path(preset).stem, {})
         if preset_keys:
             tcfg = dataclasses.replace(tcfg, **preset_keys)
+    if muon_variant is not None:
+        tcfg = dataclasses.replace(tcfg, muon_variant=muon_variant)
     if train_overrides:
         known = {f.name for f in dataclasses.fields(TrainConfig)}
         unknown = [k for k in train_overrides if k not in known]
@@ -6052,9 +6165,11 @@ def load_run(
             f"`-lr*max(1, m/n)^0.5`), `normuon` keeps that pipeline and replaces the "
             f"tail with NorMuon's row-wise EMA second moment plus the "
             f"`eta_hat = 0.2*eta*sqrt(m*n)/|Phat|_F` step scale (arXiv:2510.05491 "
-            f"Alg 1 lines 5-11, transcribed by arXiv:2605.23061v1 App F). Escape: "
-            f"name one of those, or land the arm in `optim.MUON_VARIANTS` and its "
-            f"gate BEFORE the config can lie about it."
+            f"Alg 1 lines 5-11, transcribed by arXiv:2605.23061v1 App F), "
+            f"`orth_dion` replaces the NS chain with the rank-r polar of ONE "
+            f"sketch (`muon_orth_dion_rank`, the arm's 64). Escape: name one of "
+            f"those, or land the arm in `optim.MUON_VARIANTS` and its gate BEFORE "
+            f"the config can lie about it."
         )
     validate_train(tcfg)
     if model_overrides:

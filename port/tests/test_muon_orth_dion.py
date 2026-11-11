@@ -372,3 +372,125 @@ def test_the_two_arms_apply_the_same_magnitude(model) -> None:
     assert 0.9 < ratio < 1.1, (
         f"‖ΔW‖ ratio {ratio:.3f} (ns {deltas['ns']:.4f}, sketch {deltas['sketch']:.4f})"
     )
+
+
+# --- the CONFIG path: the arm is selectable from a run, and its rungs are LOUD ---
+
+
+def test_the_config_layer_names_the_arm_and_the_default_is_untouched() -> None:
+    """`config.MUON_VARIANTS` carries the third arm; the default run does not."""
+    from dormouse import config
+
+    assert config.MUON_VARIANTS == ("muon", "normuon", "orth_dion")
+    run = config.load_run("arch_gated_swiglu")
+    assert run.train.muon_variant == "muon"
+    assert run.train.muon_orth_dion_rank == 0
+
+
+def test_a_run_selects_the_arm_and_its_measured_rung() -> None:
+    """`load_run(..., muon_variant='orth_dion')` + the rank resolves a real run."""
+    from dormouse.config import load_run
+
+    run = load_run(
+        "arch_gated_swiglu",
+        muon_variant="orth_dion",
+        train_overrides={"muon_orth_dion_rank": 64},
+    )
+    assert run.train.muon_variant == "orth_dion"
+    assert run.train.muon_orth_dion_rank == 64
+    assert run.train.muon_orth_dion_power == ORTH_DION_POWER == 1
+    assert run.train.muon_orth_dion_oversample == ORTH_DION_OVERSAMPLE == 32
+
+
+def test_the_trainer_forwards_the_arm_and_its_sketch_budget(tmp_path) -> None:
+    """The wiring gate: a `TrainConfig` flip reaches `MixOptimizer` and runs.
+
+    One step on a tiny `block_form='transformer'` stack is enough — the arm
+    counts `muon_orth_dion` on every sketch it runs, so a dropped kwarg in
+    `train/loop.py` would leave the counter empty while the config reported the
+    arm on.
+    """
+    import dataclasses
+
+    from conftest import tiny_cfg, tiny_run
+
+    from dormouse.model import DormouseModel
+    from dormouse.train import train
+
+    run = tiny_run(tmp_path, steps=1, log_every=1, muon_variant="orth_dion", muon_orth_dion_rank=4)
+    run = dataclasses.replace(
+        run,
+        model=tiny_cfg(
+            block_form="transformer",
+            n_experts=1,
+            moe_topk=0,
+            max_iter=1,
+            n_layers=1,
+            use_kda=False,
+            use_engram=False,
+            engram_rows=0,
+        ),
+    )
+    report = train(DormouseModel(run.model), run, log=lambda *_: None)
+    counters = report["counters"]
+    assert counters.get("muon_orth_dion", 0) > 0, counters.line()
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        (dict(train_overrides={"muon_orth_dion_rank": 0}), "nothing to run"),
+        (dict(train_overrides={"muon_orth_dion_rank": True}), "whole numbers"),
+        (
+            dict(train_overrides={"muon_orth_dion_power": -1, "muon_orth_dion_rank": 64}),
+            "measured rungs",
+        ),
+    ],
+)
+def test_the_config_refuses_a_broken_sketch_budget(kwargs: dict, match: str) -> None:
+    from dormouse.config import load_run
+
+    with pytest.raises(LoudError, match=match):
+        load_run("arch_gated_swiglu", muon_variant="orth_dion", **kwargs)
+
+
+def test_the_config_refuses_a_rank_without_the_arm() -> None:
+    """Inert flag: the rank configures `orth_dion` only."""
+    from dormouse.config import load_run
+
+    with pytest.raises(LoudError, match="inert"):
+        load_run("arch_gated_swiglu", train_overrides={"muon_orth_dion_rank": 64})
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        (dict(train_overrides={"ns_kind": "triton", "muon_orth_dion_rank": 64}), "inert"),
+        (dict(train_overrides={"ns_dtype": "bf16", "muon_orth_dion_rank": 64}), "inert"),
+        (
+            dict(train_overrides={"muon_sf": True, "muon_sf_wd": 0.01, "muon_orth_dion_rank": 64}),
+            "inert",
+        ),
+        (dict(train_overrides={"opt": "adamw", "muon_orth_dion_rank": 64}), "AdamW"),
+        (
+            dict(
+                train_overrides={"muon_orth_dion_rank": 64}, model_overrides={"muon_per_head": True}
+            ),
+            "muon_per_head",
+        ),
+    ],
+)
+def test_the_config_path_keeps_every_untested_rung_loud(kwargs: dict, match: str) -> None:
+    """The optimizer's own refusals are not bypassed by the config layer."""
+    from dormouse.config import load_run
+
+    with pytest.raises(LoudError, match=match):
+        load_run("arch_gated_swiglu", muon_variant="orth_dion", **kwargs)
+
+
+def test_the_config_refuses_an_unmeasured_block_form() -> None:
+    """The arm's numbers are the dense block's; `kda` is an unmeasured rung."""
+    from dormouse.config import load_run
+
+    with pytest.raises(LoudError, match="block_form"):
+        load_run("small", muon_variant="orth_dion", train_overrides={"muon_orth_dion_rank": 64})

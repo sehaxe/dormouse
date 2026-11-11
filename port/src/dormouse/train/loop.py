@@ -1605,6 +1605,12 @@ def _train_impl(
         # number on record are unaffected; the snapshot pins them, so a flip on
         # a resume is refused by `diff_keys`.
         muon_variant=cfg.muon_variant,
+        # The `orth_dion` arm's sketch budget (DEFAULT off: rank 0). Without
+        # these three the config fields would be INERT — the same wiring rule
+        # the dtype rungs follow — and the arm would refuse its own rank=0.
+        orth_dion_rank=cfg.muon_orth_dion_rank,
+        orth_dion_power=cfg.muon_orth_dion_power,
+        orth_dion_oversample=cfg.muon_orth_dion_oversample,
         muon_sf=cfg.muon_sf,
         muon_sf_wd=cfg.muon_sf_wd,
         # The lockstep NS cap (`train.muon_chunk_elems`): the schema default is
