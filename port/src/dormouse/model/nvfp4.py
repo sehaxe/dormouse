@@ -14,8 +14,12 @@ overflows e4m3 once `amax > 2688`, and the cast SATURATES silently (ADR-0011).
 NVFP4's answer is one fp32 per-TENSOR scale `g = max(1, max_block_scale/448)`:
 the e4m3 scales are `s/g`, the codes are computed against the ROUNDED scale
 (so codes and dequantization cannot disagree), and the GEMM output is
-multiplied by `g_a·g_b` on the way out. `g` is a device scalar — the helper
-never reads it back to the host, so a call is sync-free (ADR-0018 rule 2).
+multiplied by `g_a·g_b` on the way out. That epilogue is the kernel's OWN
+second level when the build has the v2 recipe (`_two_level_mm`), and one
+`[M, N]` pass otherwise — an `[M, N]` pass is 0.29 ms at the live shape
+against the GEMM's 0.20, which is the whole reason the recipe is worth
+reaching for. `g` is a device scalar — the helper never reads it back to the
+host, so a call is sync-free (ADR-0018 rule 2).
 
 THE GEMM: `torch._scaled_mm` on `float4_e2m1fn_x2` operands with e4m3 scale
  tensors `[M, K/16]` / `[N, K/16]`. Torch has no `.to(fp4)` cast, which is why
@@ -69,6 +73,7 @@ import torch
 from ..instrument import Counters
 from .act_quant import _e2m1_round
 from .mxfp import E4M3_MAX
+from .qat_cache import SHARED_PACK_CACHE
 from .tsct import _NVFP4_MAGNITUDES
 
 try:  # the fused pack/unpack kernels; the eager code below is the reference
@@ -596,11 +601,145 @@ def emulated_mm(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> torch
     return _dequant_mm(a, sa, ga, b, sb, gb, dt)
 
 
+def can_use_kernel(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> bool:
+    """True if the fp4 `_scaled_mm` can run THIS pair — a pure shape/dtype/device fact.
+
+    `_reason`'s `None`, named for callers that decide a LANE (not a fallback):
+    `packed_acts.packed_act_mm` asks this before it chooses between one pack +
+    the fp4 GEMM and one pack + a bf16 GEMM. It reads no values, so the branch
+    it drives is static — a CPU call is answered `False` by the device check.
+    """
+    return _reason(x, weight, dt) is None
+
+
+def pack_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Everything the kernel needs from a `[N, K]` weight: `(packed, scales, g, blocked)`.
+
+    `blocked` is the 512-byte-tile swizzle of the e4m3 scales — static like the
+    weight, so the per-step cache (`qat_cache.QuantCache.pack_nvfp4`) stores it
+    with the pack instead of re-permuting 1.3 MB per forward.
+    """
+    packed, scales, g = quantize_nvfp4(weight)
+    return packed, scales, g, _blocked_scale(scales)
+
+
+#: NVFP4's OWN scale recipe, which `_scaled_mm_v2` takes as two lists: a 1x16
+#: e4m3 block scale plus the fp32 per-tensor second level, per operand. The
+#: ints are torch 2.13's own enums (`ScalingType.BlockWise1x16` = 2,
+#: `TensorWise` = 0, `SwizzleType.SWIZZLE_32_4_4` = 1, `NO_SWIZZLE` = 0); the
+#: op's schema takes `int[]`, so the enums are read once and written as ints.
+try:  # pragma: no cover - the enums exist on every torch with `_scaled_mm_v2`
+    from torch.nn.functional import ScalingType as _Scaling
+    from torch.nn.functional import SwizzleType as _Swizzle
+
+    _NV_RECIPE = [int(_Scaling.BlockWise1x16), int(_Scaling.TensorWise)]
+    _NV_SWIZZLE = [int(_Swizzle.SWIZZLE_32_4_4), int(_Swizzle.NO_SWIZZLE)]
+    _HAS_V2 = hasattr(torch.ops.aten, "_scaled_mm_v2")
+except ImportError:  # pragma: no cover
+    _NV_RECIPE, _NV_SWIZZLE, _HAS_V2 = [], [], False
+
+#: Does this build's fp4 kernel apply the second level INSIDE the epilogue?
+#: `None` until the first call answers it; a process constant, not a per-call
+#: decision (the answer is a property of the build). `_EPILOGUE_WHY` is the
+#: refusal, for the log line and for a reader of `bench_nvfp4_qat`'s report.
+_EPILOGUE: bool | None = None
+_EPILOGUE_WHY = ""
+
+
+def epilogue() -> str:
+    """Which epilogue the fp4 lane uses: `"v2"` (in-kernel), `"mul"`, or `"?"`."""
+    if _EPILOGUE is None:
+        return "?"
+    return "v2" if _EPILOGUE else "mul"
+
+
+def _note(counters: Counters | None, note: str) -> None:
+    """Append a reason to `counters.why` — the port's seam channel (`_emulate`'s)."""
+    if counters is None:
+        return
+    prev = getattr(counters, "why", None)
+    counters.why = f"{prev}; {note}" if prev else note  # type: ignore[attr-defined]
+
+
+def _two_level_mm(
+    a: torch.Tensor,
+    sa: torch.Tensor,
+    ga: torch.Tensor,
+    b: torch.Tensor,
+    blocked_b: torch.Tensor,
+    gb: torch.Tensor,
+    dt: torch.dtype,
+    counters: Counters | None,
+) -> torch.Tensor:
+    """`(codes·sa·ga) @ (codes·sb·gb)`ᵀ with the second level in the kernel.
+
+    NVFP4's recipe IS two levels, and `_scaled_mm_v2` takes both:
+    `scale_a=[blocked 1x16 e4m3, fp32 per-tensor]` with
+    `recipe=[BlockWise1x16, TensorWise]`, and the same for B. That is the
+    `ga·gb` epilogue FOR FREE — one fused multiply on the accumulator, reading
+    the scales the codes were computed against, so nothing is re-rounded.
+
+    THE COST IT REMOVES, measured at `[24576, 832]×[832, 2048]`: a
+    `out * (ga·gb)` pass is `[M, N]` at the memory roofline, **0.29 ms against
+    the GEMM's 0.20**. Folding the factor into the weight's e4m3 block scales
+    instead is neither exact (e4m3 has 3 mantissa bits, `ga·gb` is an arbitrary
+    fp32) nor always representable (a block scale is already at the top of the
+    format whenever its own second level is > 1) — so the alternative is the
+    `[M, N]` pass, not a fold.
+
+    THE FALLBACK IS MEASURED, not defensive. The v1 op also takes a
+    `scale_result` argument and **ignores it silently** on this build: a 2.4×
+    factor came back 0.58 relative short with no exception, which is why nothing
+    here passes one. If v2 refuses this build, one `[M, N]` multiply runs and
+    the reason is on `counters.why` and in `_EPILOGUE_WHY`.
+    """
+    global _EPILOGUE, _EPILOGUE_WHY
+    if _EPILOGUE is not False and _HAS_V2:
+        try:
+            out = torch._scaled_mm_v2(
+                a.view(torch.float4_e2m1fn_x2),
+                b.view(torch.float4_e2m1fn_x2).t(),
+                [_blocked_scale(sa), ga.float()],
+                _NV_RECIPE,
+                _NV_SWIZZLE,
+                [blocked_b, gb.float()],
+                _NV_RECIPE,
+                _NV_SWIZZLE,
+                None,
+                dt,
+            )
+        except RuntimeError as e:
+            if _EPILOGUE:  # it worked before: this is a new shape, not the build
+                raise
+            _EPILOGUE, _EPILOGUE_WHY = False, str(e)[:160]
+            _note(counters, f"nvfp4: no two-level epilogue [{_EPILOGUE_WHY}]")
+        else:
+            _EPILOGUE = True
+            if counters is not None:
+                counters.count("nvfp4_gemm")
+            return out
+    out = torch._scaled_mm(
+        a.view(torch.float4_e2m1fn_x2),
+        b.view(torch.float4_e2m1fn_x2).t(),
+        scale_a=_blocked_scale(sa),
+        scale_b=blocked_b,
+        out_dtype=dt,
+    )
+    if counters is not None:
+        counters.count("nvfp4_gemm")
+    return out * (ga * gb).to(dt)
+
+
 def nvfp4_mm(
     x: torch.Tensor,
     weight: torch.Tensor,
     dt: torch.dtype,
     counters: Counters | None = None,
+    *,
+    cache: object | None = SHARED_PACK_CACHE,
+    packed: tuple[torch.Tensor, ...] | None = None,
 ) -> torch.Tensor:
     """`x @ Wᵀ` on NVFP4: the fp4 kernel where it runs, the emulated lane otherwise.
 
@@ -616,28 +755,40 @@ def nvfp4_mm(
     accelerated arm degrades, it does not kill the run (`moe_triton_fallback`'s
     rule). The PACKING above it is plain torch and outside that handler: a
     failure there is a bug in this module and stays LOUD.
+
+    `cache` is the per-optimizer-step pack cache (`QuantCache.pack_nvfp4`). A
+    weight does not change inside a training step, and its pack (0.30 ms at
+    `[2048, 832]`) plus the swizzle of its scales (0.05) are 0.35 of the call —
+    the cache is what makes the fp4 GEMM beat the bf16 one at our shape. The
+    DEFAULT is the process-wide cache (`qat_cache.SHARED_PACK_CACHE`), because
+    the free-function shape has no module to hang one on; `cache=None` opts out, and
+    `packed_acts.packed_act_mm` does, because the weight it passes is the
+    per-forward `dense_qat` STE tensor: a fresh OBJECT every call, so a cache
+    would miss every time and retain a `[N, K]` master per site until the step
+    boundary. The invalidation is the trainer's one per-step call
+    (`invalidate_qat_cache_all`), not a timer — a stale pack trains on old
+    weights silently, which is the worst failure this design has.
+
+    `packed` is a prior `quantize_nvfp4(x)` result: the gated FFN packs ONE
+    activation for `gate` and `up`, and this is how the second product reads it
+    instead of repacking 20.4 M elements.
     """
     _contraction(x, weight, "nvfp4_mm")
-    a, sa, ga = quantize_nvfp4(x)
-    b, sb, gb = quantize_nvfp4(weight)
     why = _reason(x, weight, dt)
     if why is not None:
+        a, sa, ga = quantize_nvfp4(x) if packed is None else packed
+        b, sb, gb = quantize_nvfp4(weight)
         _emulate(why[0], why[1], counters)
         return _dequant_mm(a, sa, ga, b, sb, gb, dt)
+    b, sb, gb, blocked_b = (
+        cache.pack_nvfp4(weight) if cache is not None else pack_weight(weight)
+    )
+    a, sa, ga = quantize_nvfp4(x) if packed is None else packed
     try:
-        out = torch._scaled_mm(
-            a.view(torch.float4_e2m1fn_x2),
-            b.view(torch.float4_e2m1fn_x2).t(),
-            scale_a=_blocked_scale(sa),
-            scale_b=_blocked_scale(sb),
-            out_dtype=dt,
-        )
+        return _two_level_mm(a, sa, ga, b, blocked_b, gb, dt, counters)
     except RuntimeError as e:
         _emulate("`_scaled_mm` refused the call", str(e)[:160], counters)
         return _dequant_mm(a, sa, ga, b, sb, gb, dt)
-    if counters is not None:
-        counters.count("nvfp4_gemm")
-    return out * (ga * gb).to(dt)
 
 
 def bytes_per_elements(n: int) -> float:

@@ -33,10 +33,16 @@ import torch
 from torch.autograd.graph import saved_tensors_hooks
 
 from dormouse.config import ModelConfig
+from dormouse.instrument import Counters
 from dormouse.model import DormouseModel
 from dormouse.model.act_quant import fake_quant_act
 from dormouse.model.experts import expert_glu
-from dormouse.model.nvfp4 import bytes_per_elements, dequantize_nvfp4, quantize_nvfp4
+from dormouse.model.nvfp4 import (
+    bytes_per_elements,
+    dequantize_nvfp4,
+    emulated_mm,
+    quantize_nvfp4,
+)
 from dormouse.model.packed_acts import packed_act_mm, packed_glu
 
 BASE = dict(
@@ -417,3 +423,67 @@ def test_g_the_peak_falls_on_cuda():
         f"the packed arm peaked at {on / 2**20:.1f} MiB against bf16's "
         f"{off / 2**20:.1f} MiB: no bytes were saved and the arm is a no-op"
     )
+
+
+# ---------------------------------------------------------------------------
+# the forward GEMM's lane: the fp4 kernel on the card, bf16 everywhere else
+# ---------------------------------------------------------------------------
+
+HAS_FP4 = hasattr(torch, "float4_e2m1fn_x2") and torch.cuda.is_available()
+
+
+@pytest.mark.skipif(not HAS_FP4, reason="needs the CUDA fp4 `_scaled_mm` (sm_120, torch >= 2.13)")
+def test_the_forward_gemm_is_the_fp4_kernel_on_the_card():
+    """`packed_act_mm`'s forward takes `nvfp4.nvfp4_mm` when it can run.
+
+    Two things are pinned. The COUNTER names the lane (a silent fall back to
+    bf16 is the whole 6.7% the arm was losing), and the kernel agrees with the
+    EMULATED lane — same packed bytes, fp32 dequantize, fp32 GEMM — within the
+    format's own band. Compared against `emulated_mm`, never a bf16 GEMM: a bf16
+    reference agrees with a wrong scale swizzle to 46% (measured).
+    """
+    torch.manual_seed(0)
+    x = (torch.randn(2, 4, 32) * 2.0).cuda()  # `[..., K]`, the live block's shape
+    w = (torch.randn(16, 32) * 0.1).cuda()
+    c = Counters()
+    (y,) = packed_act_mm(x, torch.bfloat16, w, counters=c)
+    assert y.shape == (2, 4, 16), y.shape
+    assert c.get("nvfp4_gemm", 0) == 1, f"the bf16 lane ran on the card: {getattr(c, 'why', '')}"
+    emu = emulated_mm(x.reshape(-1, 32), w, torch.bfloat16)
+    rel = ((y.float().reshape(-1, 16) - emu.float()).norm() / emu.float().norm()).item()
+    assert rel < 1e-2, f"kernel vs emulated relative error {rel:.4f}"
+
+
+@pytest.mark.skipif(not HAS_FP4, reason="needs the CUDA fp4 `_scaled_mm` (sm_120, torch >= 2.13)")
+def test_the_backward_does_not_depend_on_which_forward_lane_ran(monkeypatch):
+    """Both lanes unpack the SAME saved bytes, so `grad_x` and `grad_W` are the
+    same arithmetic on the same values — the lane moves the forward's operand
+    precision (named in `packed_acts`' docstring), not the gradient.
+
+    This is the gate that says the arm's VRAM/throughput win cannot silently
+    change what it trains on: bit-identical gradients, lane or no lane.
+    """
+    import dormouse.model.packed_acts as pa
+
+    torch.manual_seed(0)
+    x = (torch.randn(8, 32) * 2.0)
+    w = (torch.randn(16, 32) * 0.1)
+    gp = torch.randn(8, 16)
+
+    def run(bf16_lane: bool, device: str):
+        if bf16_lane:
+            monkeypatch.setattr(pa, "can_use_kernel", lambda *a, **k: False)
+        xp = x.to(device).clone().requires_grad_(True)
+        wp = w.to(device).clone().requires_grad_(True)
+        (y,) = packed_act_mm(xp, torch.bfloat16, wp)
+        y.backward(gp.to(device))
+        return y.detach(), xp.grad, wp.grad
+
+    y_fp4, gx_fp4, gw_fp4 = run(False, "cuda")
+    monkeypatch.undo()
+    y_bf16, gx_bf16, gw_bf16 = run(True, "cuda")
+    assert torch.equal(gx_fp4, gx_bf16), "the forward lane moved grad_x"
+    assert torch.equal(gw_fp4, gw_bf16), "the forward lane moved grad_W"
+    # The forward's value DOES move: the weight operand is now 4-bit too.
+    rel = ((y_fp4.float() - y_bf16.float()).norm() / y_bf16.float().norm()).item()
+    assert rel < 0.2, f"the fp4 forward is {rel:.3f} from the bf16 one"

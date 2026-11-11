@@ -422,3 +422,140 @@ def test_autograd_falls_back_counted_and_the_values_still_match():
     assert out.shape == (256, 128)
     assert c.get("nvfp4_emulated", 0) == 1 and c.get("nvfp4_gemm", 0) == 0
     assert "autograd" in getattr(c, "why", "")
+
+
+# ---------------------------------------------------------------------------
+# the per-step pack cache: a weight's pack is 0.30 ms and it does not move
+# ---------------------------------------------------------------------------
+
+
+def test_the_pack_cache_serves_the_same_tensors():
+    """A hit is the SAME pack object, not an equal one — the whole point is that
+    the 0.30 ms pack and its 0.05 ms swizzle are not recomputed per forward."""
+    from dormouse.model.nvfp4 import pack_weight
+    from dormouse.model.qat_cache import QuantCache
+
+    c = QuantCache()
+    w = torch.randn(64, 32)
+    first = c.pack_nvfp4(w)
+    assert c.take_hits() == 0, "the first call is a miss"
+    again = c.pack_nvfp4(w)
+    assert all(a is b for a, b in zip(first, again, strict=True)), "a hit re-packed"
+    assert c.take_hits() == 1
+    fresh = pack_weight(w)
+    assert torch.equal(again[0], fresh[0])
+    assert torch.equal(again[1].view(torch.uint8), fresh[1].view(torch.uint8))
+    assert torch.equal(again[3].view(torch.uint8), fresh[3].view(torch.uint8))
+
+
+def test_an_in_place_weight_move_is_never_served_a_stale_pack():
+    """The `_version` half of the guard: an optimizer's `p.add_` is in place.
+
+    A stale pack is the worst failure this design has — the forward would train
+    on the codes of weights the optimizer already moved, silently.
+    """
+    from dormouse.model.nvfp4 import pack_weight
+    from dormouse.model.qat_cache import QuantCache
+
+    c = QuantCache()
+    w = torch.randn(64, 32)
+    old = c.pack_nvfp4(w)[0]
+    w.add_(1.0)  # `optimizer.step()`'s own shape of move
+    new = c.pack_nvfp4(w)[0]
+    assert new is not old, "the cache served the pre-step codes"
+    assert torch.equal(new, pack_weight(w)[0]), "the cache served the pre-step codes"
+
+
+def test_the_step_boundary_clears_a_pack_the_version_counter_cannot_see():
+    """THE GATE for the invalidation, on the one move a version cannot catch.
+
+    A CUDA-graph replay moves a parameter's VALUE without bumping `_version`
+    (measured 2026-10-19, memory ID 77), so `w.data = ...` — same object, same
+    version, different weights — is served the old pack, BY DESIGN: the
+    trainer's once-per-step `invalidate_qat_cache_all` is the authority. This
+    asserts both halves: the trap is real, and the call closes it.
+    """
+    import torch.nn as nn
+
+    from dormouse.model.nvfp4 import pack_weight
+    from dormouse.model.qat_cache import SHARED_PACK_CACHE, invalidate_qat_cache_all
+
+    w = torch.randn(64, 32)
+    stale = SHARED_PACK_CACHE.pack_nvfp4(w)[0]
+    w.data = torch.randn(64, 32)
+    assert SHARED_PACK_CACHE.pack_nvfp4(w)[0] is stale, (
+        "this test is about the move `_version` cannot see; if the cache now "
+        "notices it, delete this assertion, not the invalidation"
+    )
+    assert invalidate_qat_cache_all(nn.Module()) == 0, "a bare module owns no cache"
+    fresh = SHARED_PACK_CACHE.pack_nvfp4(w)[0]
+    assert fresh is not stale, "the per-step call did not reach the shared pack cache"
+    assert torch.equal(fresh, pack_weight(w)[0])
+
+
+# ---------------------------------------------------------------------------
+# a ternary weight through the pack: the code is exact, the e4m3 scale is not
+# ---------------------------------------------------------------------------
+
+
+def _ternary(alpha: float, blocks: int = 4) -> torch.Tensor:
+    """`[blocks, 16]` with values in `{0, +alpha, -alpha}` — what `dense_qat` emits."""
+    signs = torch.tensor([1.0, -1.0, 0.0] * 6, dtype=torch.float32)[:16]
+    return (signs * alpha).repeat(blocks, 1)
+
+
+def test_a_ternary_weight_whose_block_scale_is_e4m3_exact_survives_bit_for_bit():
+    """Every e2m1 level IS reachable exactly: the code is a level index, so the
+    only thing that can round is the block scale — and these scales are exact.
+
+    `alpha = 6 * 2**k` makes `alpha/6 = 2**k` exact in e4m3, across the format's
+    normal range. The levels themselves are covered by
+    `test_the_16_e2m1_levels_are_hit_exactly`.
+    """
+    for k in (-6, -3, 0, 3, 6):
+        w = _ternary(6.0 * 2.0**k)
+        packed, scales, g = quantize_nvfp4(w)
+        got = dequantize_nvfp4(packed, scales, torch.float32, global_scale=g)
+        assert torch.equal(got, w), f"alpha={6.0 * 2.0**k}: {got[0].tolist()}"
+
+
+def test_an_arbitrary_ternary_alpha_keeps_the_ternary_structure():
+    """The honest half of "lossless": the CODE is exact (every nonzero is the top
+    level, 6), so the tensor stays ternary with ONE magnitude per 16-block; the
+    magnitude itself carries the e4m3 scale's rounding, <= half an ulp (2**-4
+    relative — e4m3 has 3 mantissa bits). Alpha is NOT generally e4m3-exact, so
+    "a ternary weight packs losslessly" holds for the codes, not the scale.
+    """
+    alpha = 1.0 / 3.0
+    w = _ternary(alpha)
+    packed, scales, g = quantize_nvfp4(w)
+    got = dequantize_nvfp4(packed, scales, torch.float32, global_scale=g)
+    mag = got.abs()[got != 0].unique()
+    assert mag.numel() == 1, f"ternary structure lost: {mag.tolist()}"
+    rel = abs(float(mag[0]) / alpha - 1.0)
+    assert rel <= 2**-4 + 1e-6, f"block scale off by {rel:.4f} relative"
+    assert torch.equal((got != 0), (w != 0)) and torch.equal(torch.sign(got), torch.sign(w))
+
+
+@pytest.mark.skipif(not HAS_FP4, reason="needs a CUDA fp4 `_scaled_mm` (sm_120, torch >= 2.13)")
+def test_the_second_level_scale_reaches_the_output():
+    """A call whose `ga·gb` is NOT 1: a dropped epilogue factor is a huge error.
+
+    `x` is scaled so the block scale overflows e4m3 (amax 6000 -> scale 1000) and
+    the second-level `g` carries it. `nvfp4_mm` folds that factor into the
+    kernel's own epilogue; the EMULATED lane applies the same factor to
+    fp32-dequantized operands, so the two are comparable by construction.
+    """
+    torch.manual_seed(0)
+    x = torch.full((129, 128), 6000.0, device="cuda", dtype=torch.bfloat16)
+    x += torch.randn_like(x) * 100.0
+    w = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16) * 0.02
+    ga = float(quantize_nvfp4(x)[2])
+    gb = float(quantize_nvfp4(w)[2])
+    assert ga * gb > 1.0, f"this gate needs a non-trivial factor, got {ga * gb}"
+    c = Counters()
+    fast = nvfp4_mm(x, w, torch.bfloat16, c)
+    assert c.get("nvfp4_gemm", 0) == 1, getattr(c, "why", "")
+    emu = emulated_mm(x, w, torch.bfloat16)
+    rel = ((fast.float() - emu.float()).norm() / emu.float().norm()).item()
+    assert rel < 1e-2, f"kernel vs emulated relative error {rel:.4f} (factor {ga * gb:.3f})"

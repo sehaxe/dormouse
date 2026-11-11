@@ -128,6 +128,13 @@ class QuantCache:
         # reused while the entry lives, and `is` pins identity (two same-shaped
         # weights must not share a projection).
         self._q: dict[int, tuple[torch.Tensor, str, float, tuple | None, torch.Tensor]] = {}
+        # id(w) -> (w, version, packed, scales, g, blocked): the NVFP4 pack of a
+        # weight (`nvfp4.pack_weight`'s four-tuple plus the version it was made
+        # from). A separate dict from `_q` because the payload and the KEY are
+        # different: the projection is keyed on the anneal's `alpha` as well,
+        # the pack on the tensor alone (checked against `_version`, so an
+        # in-place update cannot be served codes computed from the old values).
+        self._packs: dict[int, tuple] = {}
         #: Cache hits since the last `take_hits()` — the `qat_reuse` counter.
         self.hits = 0
 
@@ -189,11 +196,48 @@ class QuantCache:
     def invalidate(self) -> None:
         """Drop every entry — the trainer's once-per-trained-step call."""
         self._q.clear()
+        self._packs.clear()
+
+    @torch.compiler.disable
+    def pack_nvfp4(self, w: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """The weight's `(packed, scales, g, blocked_scales)` for the fp4 GEMM.
+
+        ONE pass over the weight per optimizer step instead of one per forward:
+        at the live `[2048, 832]` the pack is 0.30 ms and the 512-byte-tile
+        swizzle of its e4m3 scales 0.05, against a 0.20 ms GEMM — recomputing
+        them per call is why the fp4 lane measured SLOWER than bf16.
+
+        THE TRAP, the same one `_q` inherits (memory ID 77): a CUDA-graph replay
+        moves a parameter's VALUE without bumping `_version`. So the key carries
+        BOTH the identity and `_version` — an in-place update cannot be served
+        stale codes — and the trainer's per-step `invalidate()` is still the
+        authority for a value that moved without a version bump. Either alone
+        catches the common case; together a stale pack needs both a graph
+        replay and a missed invalidation.
+        """
+        ent = self._packs.get(id(w))
+        if ent is not None and ent[0] is w and ent[1] == w._version:
+            self.hits += 1
+            return ent[2:]
+        # Lazy import: `nvfp4` imports `tsct`, which imports this module.
+        from .nvfp4 import pack_weight
+
+        val = pack_weight(w)
+        self._packs[id(w)] = (w, w._version, *val)
+        return val
 
     def take_hits(self) -> int:
         """Return the hits since the last take and reset — the per-forward count."""
         n, self.hits = self.hits, 0
         return n
+
+
+#: The process-wide pack cache: `nvfp4.nvfp4_mm`'s default. A free function has
+#: no module to hang a `QuantCache` on, and its callers (the bench, inference, a
+#: frozen weight) pass the SAME tensor every call. It is cleared by the same
+#: per-step call as every other cache — the call, not a timer, is what makes a
+#: pack fresh (see `pack_nvfp4` for the `_version` half of the guard).
+SHARED_PACK_CACHE = QuantCache()
 
 
 def attach_qat_caches(model: nn.Module, *, dense: bool) -> list[QuantCache]:
@@ -231,7 +275,13 @@ def invalidate_qat_cache_all(model: nn.Module) -> int:
     (`_qat_caches`, built once by `attach_qat_caches`), so the per-step call
     walks caches, not modules. A hand-built module without that list keeps the
     walk — the only caller that reaches it is a test or a custom model.
+
+    `SHARED_PACK_CACHE` (the NVFP4 packs of a weight passed to the free
+    `nvfp4.nvfp4_mm`) has no model to be reached through, so it is cleared here
+    by name: one call per trained step must leave NO cache holding last step's
+    values, or the arm silently trains on weights the optimizer already moved.
     """
+    SHARED_PACK_CACHE.invalidate()
     caches = getattr(model, "_qat_caches", None)
     if caches is not None:
         for c in stepaudit.iterations("qat.invalidate", caches):

@@ -50,10 +50,34 @@ Autograd: no double backward (the recompute in `packed_glu` runs with gradients
 enabled but does not build a second graph). No `.item()`/D2H read anywhere —
 `quantize_nvfp4` keeps its per-tensor `g` on the device (ADR-0018 rule 2).
 
-NOT THE `mm_fp8` LANE. `packed_act_mm` runs the operand's own dequantized GEMM
-(`mm_mixed`'s bf16 line), so on a `mm_dtype="fp8"` run the FFN projections are
-not the fp8 lane's while attention's are. That combination is not refused in
-`config` yet — follow-up, named here rather than left silent.
+THE FORWARD GEMM IS NOW THE fp4 KERNEL, where it can run. `packed_act_mm`
+asked `nvfp4.can_use_kernel` once per call (a pure shape/dtype/device fact —
+static, no host read) and takes `nvfp4.nvfp4_mm` when it is true: one pack for
+the whole weight tuple, no dequantized copy, and the product at the kernel's
+0.20 ms instead of bf16's 1.01 at the live shape. The measured reason is the
+only one that ever mattered: bytes/s is tokens/s, and the batch a packed
+forward buys cannot pay a per-token loss. Two consequences, both named:
+
+  * the weight operand is quantized to NVFP4 by the kernel's own format (a
+    ternary weight's nonzeros are ONE e2m1 level times an e4m3 block scale, so
+    the tensor stays ternary — the block's magnitude moves by up to one e4m3
+    ulp, `tests/test_nvfp4.py` pins both halves);
+  * the backward's `grad_x = grad @ w` still uses the bf16 projection, so a
+    gradient path sees the weight ~one e4m3 ulp sharper than the forward's
+    operand. The arm already fake-quantizes that weight to ternary; unpacking
+    the packed weight per backward would cost 0.31 ms per site to remove it.
+
+The lane is decided per call, so a CPU box (or a shape the kernel refuses) keeps
+the bf16 line and its pinned values — the CPU gates in
+`tests/test_packed_acts.py` and `tests/test_qat_transformer.py` never see the
+fp4 lane, and `tests/test_packed_acts.py`'s two card gates pin its values.
+
+NOT THE `mm_fp8` LANE. On the bf16 lane `packed_act_mm` runs the operand's own
+dequantized GEMM (`mm_mixed`'s bf16 line); on the fp4 lane it runs the fp4
+kernel. Either way the FFN projections are not the fp8 lane's while
+attention's are, so on a `mm_dtype="fp8"` run the two lanes are still mixed.
+That combination is not refused in `config` yet — follow-up, named here rather
+than left silent.
 """
 
 from __future__ import annotations
@@ -62,7 +86,7 @@ import torch
 
 from ..instrument import Counters
 from .experts import expert_glu
-from .nvfp4 import dequantize_nvfp4, quantize_nvfp4
+from .nvfp4 import can_use_kernel, dequantize_nvfp4, nvfp4_mm, quantize_nvfp4
 
 __all__ = ["packed_act_mm", "packed_glu"]
 
@@ -73,15 +97,40 @@ class _PackedActMM(torch.autograd.Function):
     `weights` is a tuple so the gated FFN pays ONE pack for `gate` and `up`
     (two packs would store two copies and lose the win). The saved set is
     `(packed, scales, g, *weights)`: `x`'s bf16 value exists only inside the
-    forward. `dt` is the compute dtype (`mm_mixed`'s rule).
+    forward. `dt` is the compute dtype (`mm_mixed`'s rule). `counters` is a
+    non-tensor argument: the lane the forward took has to be readable on the log
+    line, or a silent fall back to bf16 is invisible.
     """
 
     @staticmethod
-    def forward(ctx, x, dt, *weights):
-        # ONE pass: the packed bytes the backward needs AND the dequantized value
-        # the GEMM reads. The eager quantizer measured 13.57 ms at the live
-        # `[24576, 832]` and this is 0.31, and a second `dequantize_nvfp4` pass
-        # is not paid at all (`deq_dtype`).
+    def forward(ctx, x, dt, counters, *weights):
+        # ONE pack, and the GEMM lane is decided by `can_use_kernel` — a pure
+        # shape/dtype/device fact, so the branch is static and a CPU call keeps
+        # the bf16 line bit for bit (`tests/test_packed_acts.py` pins it there).
+        # The fp4 lane does NOT need the dequantized copy: the backward unpacks
+        # from the same bytes, so the pack's second store is not paid at all.
+        #
+        # The GEMM is 2-D, the activation is `[..., K]` (`ln2(x)` in the live
+        # block): the fp4 lane flattens and un-flattens around it, the same
+        # arithmetic `@` does for the bf16 line. `_reason` refuses a 3-D operand
+        # by name and should — the flattening belongs here, not there.
+        rows = x.reshape(-1, x.shape[-1])
+        with torch.no_grad():
+            fp4 = all(can_use_kernel(rows, w, dt) for w in weights)
+        if fp4:
+            packed, scales, g = quantize_nvfp4(rows)
+            ctx.save_for_backward(packed, scales, g, *weights)
+            with torch.no_grad():
+                # `cache=None`: the weight here is the per-forward `dense_qat`
+                # STE tensor (a fresh object every call), so a pack cache would
+                # miss every time AND retain a `[N, K]` master per site until
+                # the step boundary — a VRAM regression on the arm whose whole
+                # point is VRAM. The pack is still 1/3 of the GEMM it feeds.
+                return tuple(
+                    nvfp4_mm(rows, w, dt, counters, packed=(packed, scales, g), cache=None)
+                    .view(*x.shape[:-1], w.shape[0])
+                    for w in weights
+                )
         packed, scales, g, xq = quantize_nvfp4(x, deq_dtype=dt)
         ctx.save_for_backward(packed, scales, g, *weights)
         return tuple(xq @ w.to(dt).t() for w in weights)
@@ -98,7 +147,7 @@ class _PackedActMM(torch.autograd.Function):
             grad_x = step if grad_x is None else grad_x + step
         rows = xq.reshape(-1, xq.shape[-1])
         grad_w = tuple(grad.reshape(-1, grad.shape[-1]).t() @ rows for grad in grads)
-        return (grad_x, None, *grad_w)
+        return (grad_x, None, None, *grad_w)
 
 
 class _PackedGLU(torch.autograd.Function):
@@ -152,7 +201,7 @@ def packed_act_mm(
                 f"packed_act_mm: x{tuple(x.shape)} does not contract with "
                 f"W{tuple(w.shape)}; the weights are [N, K] (`nn.Linear`)"
             )
-    out = _PackedActMM.apply(x, dt, *weights)
+    out = _PackedActMM.apply(x, dt, counters, *weights)
     if counters is not None:
         counters.count("packed_act_mm")
     return out
