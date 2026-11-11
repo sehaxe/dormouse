@@ -40,6 +40,19 @@ singular values. So the mechanism is a *function-shape* compression, and the bet
 is that the freed FLOPs/params buy more elsewhere (depth, width, data) than the
 rank costs in expressiveness.
 
+**The energy curve is also the reason this cannot be read as "compression".** If
+a *trained* dense matrix needed 92% of its singular values to hold 99% of its
+energy, then post-hoc factorisation at r=64 is not a 12.8× win, it is a
+different (worse) function. TSCT is therefore a bet on **training under the
+constraint** — the same bet BitNet makes with ternary weights, where a model
+trained in the format lands somewhere no post-hoc quantisation reaches — and not
+a bet on low-rank-ness of arbitrary solutions. Two consequences:
+
+- the arm must be trained from scratch with the constraint on (which it is), and
+- a *quality* loss at rank 64 does not by itself kill the mechanism; a loss that
+  survives reinvesting the freed budget does (that is what `arch_tsct275_wide`
+  tests).
+
 Two arms exist to test exactly that:
 
 | arm | params | FLOPs/token | what it answers |
