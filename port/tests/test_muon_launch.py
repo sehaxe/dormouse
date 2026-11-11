@@ -20,6 +20,16 @@ The change this file pins has three claims, and each one has a way to fail:
 3. **every fallback is named** — the per-group table's path/reason is asserted
    for the `ns_dtype` rung, the `MAX_RANK` cap and the CPU reason; the step's
    own `ns_triton_fallback` counter still counts one per refused chunk.
+4. **a shape group is ONE matmul per product per step** — `_MatmulLaunches`
+   counts `aten.mm`/`aten.bmm` under `TorchDispatchMode` (the axis the change
+   moves, not a wall clock a busy card can fake), and
+   `test_a_shape_group_is_ONE_matmul_per_product_and_step` pins
+   `groups x 3 x steps`. Three, not two: the chain needs the Gram, the Gram
+   squared and the polynomial's product. The parity gate on the four REAL
+   groups (`test_the_four_live_groups_match_the_per_matrix_chain`) is
+   `max|Δ|/‖ref‖ ≤ 1e-5` fp32 and `≤ 1e-2` bf16 against `zeropower_via_ns`
+   run per matrix — a `bmm` over a stack is the same arithmetic, so a larger
+   difference is a bug in the grouping, not a tolerance to widen.
 
 The lockstep chain itself has an independent gate
 (`test_the_classic_lockstep_chain_is_bit_identical_to_the_per_matrix_chain`):
@@ -37,6 +47,7 @@ from pathlib import Path
 import pytest
 import torch
 from torch import nn
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from dormouse.instrument import LoudError
 from dormouse.train import optim
@@ -217,6 +228,134 @@ def test_the_lockstep_chain_is_the_per_matrix_chain_on_a_MIXED_shapes_list():
     refs = [zeropower_via_ns(x, 5, "classic") for x in xs]
     gots = _classic_ns_many(xs, 5)
     assert all(torch.equal(a, b) for a, b in zip(refs, gots, strict=True))
+
+
+# --- 1b. one batched matmul per shape group per iteration --------------------
+
+
+class _MatmulLaunches(TorchDispatchMode):
+    """Counts the matmul KERNELS one NS call enqueues — the axis that moved.
+
+    `aten.mm`/`aten.bmm` are what `_matmul` calls; `matmul`/`addmm`/`baddbmm` are
+    here so a future rewrite that spells the contraction differently is still
+    counted rather than silently uncounted.
+    """
+
+    _OPS = frozenset(
+        {
+            "aten.mm.default",
+            "aten.bmm.default",
+            "aten.addmm.default",
+            "aten.baddbmm.default",
+            "aten.matmul.default",
+            "aten.mm.out",
+            "aten.bmm.out",
+            "aten.addmm.out",
+            "aten.baddbmm.out",
+        }
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.matmul = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: D105
+        if str(func) in self._OPS:
+            self.matmul += 1
+        return func(*args, **(kwargs or {}))
+
+
+def test_a_shape_group_is_ONE_matmul_per_product_and_step():
+    """60 matrices in 4 shapes = 4 x 3 x steps matmuls, not 60 x 3 x steps.
+
+    THREE products per step, not two: the classic degree-5 chain needs the Gram
+    (`xᵀx` / `x xᵀ`), the Gram SQUARED (`gram @ gram`) and the polynomial's own
+    product (`poly @ x` / `x @ poly`). The brief's ceiling was
+    `groups x 2 x steps`, which is the count with the Gram's product left out —
+    no implementation of this chain can reach it, so the gate is pinned to the
+    arithmetic floor `groups x 3 x steps` instead. A regression back to a
+    per-matrix chain fires the second assertion (`13 x 3 x 4 = 156`).
+    """
+    torch.manual_seed(0)
+    xs = [torch.randn(32, 48) * 1e-3 for _ in range(6)]  # one 2-D shape group
+    xs += [torch.randn(48, 48) * 1e-3 for _ in range(5)]  # a second
+    xs += [torch.randn(3, 32, 48) * 1e-3 for _ in range(2)]  # a 3-D stack group
+    with _MatmulLaunches() as c:
+        _classic_ns_many(xs, 4, "fp32")
+    assert c.matmul == 3 * 3 * 4, f"{c.matmul} matmuls for 3 shape groups x 4 steps"
+    assert c.matmul < len(xs) * 3 * 4
+
+
+@pytest.mark.parametrize(
+    "dtype,ns,tol", [(torch.float32, "fp32", 1e-5), (torch.bfloat16, "bf16", 1e-2)]
+)
+def test_the_grouped_chain_matches_the_per_matrix_chain(dtype, ns, tol):
+    """The stacked bmm must be the per-matrix chain to `tol`, on every rank/shape."""
+    torch.manual_seed(0)
+    xs = []
+    for shape in ((24, 40), (40, 24), (32, 32)):  # tall, wide, square
+        for _ in range(3):
+            xs.append((torch.randn(*shape) * 1e-3).to(dtype))
+    xs.append((torch.randn(2, 32, 32) * 1e-3).to(dtype))
+    refs = [zeropower_via_ns(x, 5, "classic", ns) for x in xs]
+    gots = _classic_ns_many(xs, 5, ns)
+    for ref, got in zip(refs, gots, strict=True):
+        rel = float((got - ref).abs().max()) / float(ref.norm())
+        assert rel <= tol, f"{dtype} {tuple(ref.shape)}: max|d|/|ref| = {rel:.3e}"
+
+
+def test_a_group_beyond_the_cap_is_split_within_itself_not_padded():
+    """Six `[16, 16]` matrices at a 4-matrix cap: two stacks, no padding row."""
+    torch.manual_seed(0)
+    xs = [torch.randn(16, 16) * 1e-3 for _ in range(6)]
+    cap = 4 * 16 * 16
+    with _MatmulLaunches() as c:
+        gots = _classic_ns_many(xs, 2, "fp32", chunk_elems=cap)
+    # 4 + 2 = two chunks (each its own lockstep batch), 3 products x 2 steps.
+    assert c.matmul == 2 * 3 * 2
+    refs = [zeropower_via_ns(x, 2, "classic", "fp32") for x in xs]
+    for ref, got in zip(refs, gots, strict=True):
+        assert float((got - ref).abs().max()) / float(ref.norm()) <= 1e-5
+
+
+#: The four shapes `arch_gated_swiglu` at b16 x 1024 queues: 60 matrices total.
+LIVE_GROUPS = ((24, 2048, 832), (12, 2496, 832), (12, 832, 832), (12, 832, 2048))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the four live groups are a card measurement"
+)
+@pytest.mark.parametrize(
+    "dtype,ns,tol", [(torch.float32, "fp32", 1e-5), (torch.bfloat16, "bf16", 1e-2)]
+)
+def test_the_four_live_groups_match_the_per_matrix_chain(dtype, ns, tol):
+    """The PARITY gate on the real shapes: one stack per group vs 60 matrices.
+
+    `max|Δ|/‖ref‖ <= 1e-5` fp32 and `<= 1e-2` bf16. `bmm` over a stack is the same
+    arithmetic per matrix, so a larger difference is a bug in the grouping, not
+    a tolerance to widen.
+    """
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    stacks, refs = [], []
+    for n, d0, d1 in LIVE_GROUPS:
+        t = (torch.randn(n, d0, d1, generator=gen, device="cuda") * 1e-3).to(dtype)
+        stacks.append(t)
+        refs.extend(zeropower_via_ns(t[i], 5, "classic", ns) for i in range(n))
+    with _MatmulLaunches() as c:
+        gots = _classic_ns_many([t[i] for t in stacks for i in range(t.shape[0])], 5, ns)
+    # The CAP is what splits the 24-matrix `[2048, 832]` group (40.9M elements)
+    # into a 19-stack and a 5-stack at the production `MUON_CHUNK_ELEMS`: five
+    # stacks, so five matmuls per product per step. With a cap that holds the
+    # whole group it is exactly `4 groups x 3 products x 5 steps = 60`.
+    assert c.matmul == 5 * 3 * 5, f"{c.matmul} matmuls for 5 stacks x 5 steps"
+    for ref, got in zip(refs, gots, strict=True):
+        rel = float((got - ref).abs().max()) / float(ref.norm())
+        assert rel <= tol, f"{dtype} {tuple(ref.shape)}: max|d|/|ref| = {rel:.3e}"
+    with _MatmulLaunches() as wide:
+        _classic_ns_many(
+            [t[i] for t in stacks for i in range(t.shape[0])], 5, ns, chunk_elems=1 << 26
+        )
+    assert wide.matmul == len(LIVE_GROUPS) * 3 * 5, f"{wide.matmul} matmuls at a cap that fits"
 
 
 def test_the_foreach_route_is_only_taken_when_it_saves_a_launch():

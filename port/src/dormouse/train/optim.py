@@ -669,74 +669,159 @@ def _classic_ns_batch(tensors: list[torch.Tensor], steps: int, ns_dtype: str) ->
     return out
 
 
+def _matrix_key(t: torch.Tensor) -> tuple:
+    """The grouping key of one item: matrix shape, rank, dtype and device.
+
+    The RANK is part of it because a 2-D matrix prescales by its own Frobenius
+    norm (`x.norm()`) while a `[k, d0, d1]` stack prescales per slice
+    (`x.norm(dim=(1, 2))`). The two agree on a one-slice stack, but a group of one
+    is passed through untouched (see `_shape_chunks`), so keeping them apart is
+    what guarantees the byte-pinned 2-D singletons of `tests/test_muon_launch.py`
+    keep running exactly the `mm` chain they ran before.
+    """
+    return (tuple(t.shape[-2:]), t.ndim, t.dtype, t.device)
+
+
+def _stack_chunk(tensors: list[torch.Tensor], idxs: list[int]) -> torch.Tensor:
+    """A group's chunk as ONE tensor: `cat` over the leading dim, no padding.
+
+    A chunk of one is returned AS THAT TENSOR, never copied: the batched step
+    hands `_classic_ns_many` its already-stacked `mom` chunks, so re-stacking
+    them would buy nothing and cost a full copy of the group.
+    """
+    if len(idxs) == 1:
+        return tensors[idxs[0]]
+    return torch.cat(
+        [tensors[i] if tensors[i].ndim == 3 else tensors[i].unsqueeze(0) for i in idxs], 0
+    )
+
+
+def _shape_chunks(
+    tensors: list[torch.Tensor], chunk_elems: int
+) -> list[tuple[list[int], torch.Tensor]]:
+    """Group the list by matrix shape and stack it: ONE tensor per shape group.
+
+    The chain's three products per iteration (`gram`, `gram@gram`, `poly@x` or
+    `x@poly`) then become three `bmm` calls for the WHOLE group instead of three
+    per matrix: `torch.bmm` runs one GEMM per slice of the stack, the same
+    arithmetic on the same operands, so only the launch count moves. A list of
+    60 `[2048, 832]`-class matrices in 4 shapes is 75 `bmm`s per chain instead
+    of 900 `mm`s, and 53.7 → 32.8 ms (measured 2026-11-11 on the 5070 Ti, bf16,
+    the live groups at the production cap: the 24-matrix group is 19 + 5).
+
+    **The stack pays only where the batched GEMM is a tensor-core kernel.** At
+    fp32 the same list measured 110.7 → 136.3 ms: cuBLAS's strided-batched SGEMM
+    is a worse kernel per product than 60 standalone SGEMMs and the launch
+    saving does not cover it. The live recipe is `ns_dtype="bf16"` (and the
+    batched step already queues 3-D stacks, which this function leaves as they
+    are), so the fp32 list path is the only loser; a caller that wants fp32 NS
+    throughput should keep passing one tensor per chunk.
+
+    A group is split WITHIN itself at `chunk_elems` ELEMENTS — the same cap the
+    lockstep pass already obeys — never padded and never made to fit by
+    borrowing room from another group. At `MUON_CHUNK_ELEMS` (33.5M) the live
+    24-matrix `[2048, 832]` group is a 19-stack and a 5-stack, which is what the
+    caller's own `muon_chunk_elems` split already produced.
+    """
+    groups: dict[tuple, list[int]] = {}
+    for i in stepaudit.iterations("muon.ns_group", range(len(tensors))):
+        groups.setdefault(_matrix_key(tensors[i]), []).append(i)
+    out: list[tuple[list[int], torch.Tensor]] = []
+    for idxs in stepaudit.iterations("muon.ns_group_split", groups.values()):
+        chunk: list[int] = []
+        elems = 0
+        for i in stepaudit.iterations("muon.ns_group_fill", idxs):
+            n = tensors[i].numel()
+            if chunk and elems + n > chunk_elems:
+                out.append((chunk, _stack_chunk(tensors, chunk)))
+                chunk, elems = [], 0
+            chunk.append(i)
+            elems += n
+        out.append((chunk, _stack_chunk(tensors, chunk)))
+    return out
+
+
+def _ns_take(
+    out: list[torch.Tensor | None],
+    chunks: list[tuple[list[int], torch.Tensor]],
+    batch: list[int],
+    steps: int,
+    ns_dtype: str,
+) -> None:
+    """Run one lockstep pass over the batch's stacks and scatter it back."""
+    outs = _classic_ns_batch([chunks[j][1] for j in batch], steps, ns_dtype)
+    for j, u in stepaudit.iterations("muon.ns_take", zip(batch, outs, strict=True)):
+        idxs = chunks[j][0]
+        for r, i in stepaudit.iterations("muon.ns_take_inner", enumerate(idxs)):
+            # `u` is a slice VIEW of the stacked result; every caller writes it
+            # in place and keeps it only until the write-back, so unbinding
+            # costs no copy (`_classic_ns_batch` always allocates a fresh fp32
+            # stack on its first `x / (norm + 1e-7)`).
+            out[i] = u if len(idxs) == 1 else u[r]
+
+
 def _classic_ns_many(
     tensors: list[torch.Tensor],
     steps: int = 5,
     ns_dtype: str = "fp32",
     chunk_elems: int = MUON_CHUNK_ELEMS,
 ) -> list[torch.Tensor]:
-    """`zeropower_via_ns(kind="classic")` for MANY matrices, one elementwise pass.
+    """`zeropower_via_ns(kind="classic")` for MANY matrices, one launch per group.
 
-    The contraction (`xᵀx` or `x xᵀ`, `gram @ gram`, `x·poly` or `poly·x`)
-    cannot be merged across different shapes, so each matrix keeps its own
-    `mm`/`bmm`. The FIVE
-    elementwise ops per iteration can be merged: they are the same scalar op on
-    every matrix, so `torch._foreach_*` issues one launch for the whole list
-    where the per-matrix loop issued one each (the port's step is
-    host-dispatch-bound — `AGENTS.md` §2.1).
+    Each matrix keeps its own iteration (a Gram per matrix, the degree-5
+    polynomial per matrix); what is shared is the LAUNCH. The list is grouped by
+    matrix shape (`_shape_chunks`), each group is stacked once, the chain's
+    three products per iteration run as three `bmm`s on the stack, and the
+    result is unbound at the end. The five elementwise ops per iteration are the
+    same scalar op on every stack, so `torch._foreach_*` issues one launch for
+    the whole batch where the per-matrix loop issued one each (the port's step
+    is host-dispatch-bound — `AGENTS.md` §2.1).
 
     The arithmetic is the SAME operation in the SAME dtype, in the same order:
     `b·gram`, then `c·(gram@gram)`, then their add; `a·x`, then `poly@x`, then
-    their add. `_foreach_mul`/`_foreach_add` apply exactly those elementwise
-    kernels; the per-element values are bit-identical to running
-    `zeropower_via_ns` on each tensor in turn, which `tests/test_muon_launch.py`
-    pins against the pre-change step.
+    their add. `bmm` over a stack is one GEMM per slice, i.e. the per-matrix
+    product; `_foreach_mul`/`_foreach_add` apply exactly those elementwise
+    kernels. The per-element values therefore agree with running
+    `zeropower_via_ns` on each tensor in turn to `bmm`'s last bits (measured on
+    the four live groups: `max|Δ|/‖ref‖` 3.8e-8 fp32, 0.0 bf16;
+    `tests/test_muon_launch.py` pins ≤1e-5 fp32 / ≤1e-2 bf16).
 
     The list is split at `chunk_elems` ELEMENTS (the schema
     `MUON_CHUNK_ELEMS`, or the preset's `train.muon_chunk_elems`), the same cap
-    a single chunk already obeys, and the biggest tensors are placed first so a
-    chunk that fills the cap gets its own batch while the many small groups
-    share one.
+    a single chunk already obeys, twice: INSIDE a shape group (`_shape_chunks`,
+    so a group never pads or over-allocates) and across the lockstep batch, with
+    the biggest stacks placed first so a batch that fills the cap gets its own
+    pass while the many small groups share one.
     The lockstep pass keeps ~6 fp32 temporaries per element alive for the WHOLE
     batch (the per-chunk loop freed them between chunks), so an unbounded pass
     would turn b1's ~400M NS elements into ~10 GiB of transients. The cap keeps
     the peak equal to main's one-chunk peak and only costs one extra elementwise
     launch per sub-batch.
 
-    The prescale/postscale stay per tensor: the Frobenius norm is per SLICE for
+    The prescale/postscale stay per STACK: the Frobenius norm is per SLICE for
     a 3-D chunk (a `_foreach_norm` would collapse the batch) and the division
     by that norm has a different shape per matrix, which is `_foreach_*`'s slow
-    route. Those are 3 launches per matrix, not 25.
+    route. Those are 3 launches per group, not 3 per matrix.
     """
     _check_dtype("ns_dtype", ns_dtype)
     out: list[torch.Tensor | None] = [None] * len(tensors)
-    # Biggest first: a chunk that fills the cap gets its own batch, and the many
+    chunks = _shape_chunks(tensors, chunk_elems)
+    # Biggest first: a stack that fills the cap gets its own batch, and the many
     # small groups share the remaining ones. The greedy split is otherwise
-    # order-dependent (a big chunk sandwiched between small ones costs an extra
+    # order-dependent (a big stack sandwiched between small ones costs an extra
     # batch). The contraction is per matrix, so the order cannot move a value.
-    order = sorted(range(len(tensors)), key=lambda i: -tensors[i].numel())
-    batch: list[torch.Tensor] = []
-    batch_idx: list[int] = []
+    order = sorted(range(len(chunks)), key=lambda j: -chunks[j][1].numel())
+    batch: list[int] = []
     elems = 0
-    for i in stepaudit.iterations("muon.ns_split", order):
-        t = tensors[i]
-        n = t.numel()
+    for j in stepaudit.iterations("muon.ns_split", order):
+        n = chunks[j][1].numel()
         if batch and elems + n > chunk_elems:
-            for j, u in stepaudit.iterations(
-                "muon.ns_take_inner",
-                zip(batch_idx, _classic_ns_batch(batch, steps, ns_dtype), strict=True),
-            ):
-                out[j] = u
-            batch, batch_idx, elems = [], [], 0
-        batch.append(t)
-        batch_idx.append(i)
+            _ns_take(out, chunks, batch, steps, ns_dtype)
+            batch, elems = [], 0
+        batch.append(j)
         elems += n
     if batch:
-        for j, u in stepaudit.iterations(
-            "muon.ns_take",
-            zip(batch_idx, _classic_ns_batch(batch, steps, ns_dtype), strict=True),
-        ):
-            out[j] = u
+        _ns_take(out, chunks, batch, steps, ns_dtype)
     return out  # type: ignore[return-value]
 
 
