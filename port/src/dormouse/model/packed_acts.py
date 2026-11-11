@@ -72,6 +72,18 @@ the bf16 line and its pinned values — the CPU gates in
 `tests/test_packed_acts.py` and `tests/test_qat_transformer.py` never see the
 fp4 lane, and `tests/test_packed_acts.py`'s two card gates pin its values.
 
+THE STORE-ONLY ARM (`act_store="nvfp4"`, `model/transformer.py`). `act_qat`
+is a NUMERICS arm: it fake-quantizes the operand the forward GEMM reads. The
+same two Functions carry the codec as a MEMORY arm when `store_only` is set:
+the forward multiplies the REAL values (its output is bit-identical to the
+`bf16` lane) and only `save_for_backward` holds the packed copy, so the
+backward's `grad_W = gradᵀ @ xq` reads the 4-bit storage rounding of an operand
+the forward used exactly, while `grad_x = grad @ W` is untouched. That is the
+whole numerical claim: logits EQUAL, gradients differ only by the rounding of
+the saved operand. `quantize_nvfp4` needs `K % 16 == 0` and a model width need
+not (the live `d=890` does not), so the STORED copy is tail-padded to the scale
+grid and sliced back on unpack — zeros in the tail blocks, no second codec.
+
 NOT THE `mm_fp8` LANE. On the bf16 lane `packed_act_mm` runs the operand's own
 dequantized GEMM (`mm_mixed`'s bf16 line); on the fp4 lane it runs the fp4
 kernel. Either way the FFN projections are not the fp8 lane's while
@@ -83,12 +95,52 @@ than left silent.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
-from ..instrument import Counters
+from ..config import ACT_STORES
+from ..instrument import Counters, loud
 from .experts import expert_glu
 from .nvfp4 import can_use_kernel, dequantize_nvfp4, nvfp4_mm, quantize_nvfp4
+from .tsct import mm_mixed
 
-__all__ = ["packed_act_mm", "packed_glu"]
+__all__ = ["check_store", "packed_act_mm", "packed_glu"]
+
+
+def check_store(mode: str) -> None:
+    """LOUD on anything outside [`ACT_STORES`], naming the escape.
+
+    The runtime seam (`TransformerBlock.set_act_store`): a hand-built config
+    reaches the block without `config.validate_model_train`.
+    """
+    if mode not in ACT_STORES:
+        loud(
+            f"act_store={mode!r} is not a saved-activation store. Known: "
+            f"{list(ACT_STORES)} — 'bf16' keeps every activation at 2 B (the "
+            f"historical graph, bit for bit); 'nvfp4' saves the block's GEMM "
+            f"inputs and GLU operands as e2m1 nibbles with one e4m3 scale per "
+            f"16, while the FORWARD still runs bf16. Escape: name one of those."
+        )
+
+
+def _pack(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Pack `x`'s last dim for storage, padding it UP to the codec's grid.
+
+    Returns `(packed, scales, g, k_orig)`. The tail pad is zeros, so every real
+    16-column block has the same `amax` (and therefore the same e4m3 scale) it
+    would have had unpadded, and `_unpack` slices the tail off again.
+    """
+    k = x.shape[-1]
+    pad = -k % 16
+    if pad:
+        x = F.pad(x, (0, pad))
+    packed, scales, g = quantize_nvfp4(x)
+    return packed, scales, g, k
+
+
+def _unpack(packed, scales, g, k: int, dtype: torch.dtype) -> torch.Tensor:
+    """The inverse of [`_pack`]: the real width, at the caller's dtype."""
+    xq = dequantize_nvfp4(packed, scales, dtype, global_scale=g)
+    return xq if xq.shape[-1] == k else xq[..., :k]
 
 
 class _PackedActMM(torch.autograd.Function):
@@ -103,7 +155,21 @@ class _PackedActMM(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, dt, counters, *weights):
+    def forward(ctx, x, dt, counters, store_only, *weights):
+        ctx.k_orig = x.shape[-1]
+        if store_only:
+            # THE MEMORY ARM: the forward is the bf16 line (`mm_mixed`), bit for
+            # bit; only the SAVE is packed. No fp4 GEMM here — the kernel would
+            # quantize the weight and read the packed operand in the forward,
+            # which is `act_qat`'s numerics arm, not this one.
+            packed, scales, g, _ = _pack(x.reshape(-1, x.shape[-1]))
+            # Save the CAST weight (`mm_mixed`'s operand), not the fp32 master: the
+            # bf16 lane's matmul saves exactly this tensor for its `grad_x`, so the
+            # weight half of the save set does not grow and `grad_x` is the same
+            # product.
+            ws = tuple(w if w.dtype is dt else w.to(dt) for w in weights)
+            ctx.save_for_backward(packed, scales, g, *ws)
+            return tuple(mm_mixed(x, w, dt) for w in ws)
         # ONE pack, and the GEMM lane is decided by `can_use_kernel` — a pure
         # shape/dtype/device fact, so the branch is static and a CPU call keeps
         # the bf16 line bit for bit (`tests/test_packed_acts.py` pins it there).
@@ -138,16 +204,17 @@ class _PackedActMM(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         packed, scales, g, *weights = ctx.saved_tensors
-        # The unpack IS the backward's input: the STE hands x's gradient to xq,
-        # and xq is only recoverable from the packed bytes now.
-        xq = dequantize_nvfp4(packed, scales, grads[0].dtype, global_scale=g)
+        # The unpack IS the backward's input: `act_qat`'s STE hands x's
+        # gradient to xq, and the store-only arm's saved operand is the same
+        # bytes — either way xq is only recoverable from the pack now.
+        xq = _unpack(packed, scales, g, ctx.k_orig, grads[0].dtype)
         grad_x = None
         for grad, w in zip(grads, weights, strict=True):
             step = grad @ w.to(grad.dtype)
             grad_x = step if grad_x is None else grad_x + step
         rows = xq.reshape(-1, xq.shape[-1])
         grad_w = tuple(grad.reshape(-1, grad.shape[-1]).t() @ rows for grad in grads)
-        return (grad_x, None, None, *grad_w)
+        return (grad_x, None, None, None, *grad_w)
 
 
 class _PackedGLU(torch.autograd.Function):
@@ -160,7 +227,18 @@ class _PackedGLU(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, g, u, act, beta1, beta2):
+    def forward(ctx, g, u, act, beta1, beta2, store_only):
+        ctx.k = (g.shape[-1], u.shape[-1])
+        if store_only:
+            # The MEMORY arm: the GLU runs on the REAL `g`/`u` (bit-identical to
+            # the bf16 lane) and only the save is packed. The backward unpacks
+            # and re-runs the GLU for the two gradients, so it reads the 4-bit
+            # storage rounding of operands the forward used exactly.
+            pg, sg, gg, _ = _pack(g)
+            pu, su, gu, _ = _pack(u)
+            ctx.save_for_backward(pg, sg, gg, pu, su, gu)
+            ctx.glu = (act, beta1, beta2)
+            return expert_glu(act, g, u, beta1=beta1, beta2=beta2)
         pg, sg, gg, dg = quantize_nvfp4(g, deq_dtype=g.dtype)
         pu, su, gu, du = quantize_nvfp4(u, deq_dtype=u.dtype)
         ctx.save_for_backward(pg, sg, gg, pu, su, gu)
@@ -171,13 +249,14 @@ class _PackedGLU(torch.autograd.Function):
     def backward(ctx, grad):
         pg, sg, gg, pu, su, gu = ctx.saved_tensors
         act, beta1, beta2 = ctx.glu
+        kg, ku = ctx.k
         with torch.enable_grad():
-            dg = dequantize_nvfp4(pg, sg, grad.dtype, global_scale=gg).requires_grad_(True)
-            du = dequantize_nvfp4(pu, su, grad.dtype, global_scale=gu).requires_grad_(True)
+            dg = _unpack(pg, sg, gg, kg, grad.dtype).requires_grad_(True)
+            du = _unpack(pu, su, gu, ku, grad.dtype).requires_grad_(True)
             grad_g, grad_u = torch.autograd.grad(
                 expert_glu(act, dg, du, beta1=beta1, beta2=beta2), (dg, du), grad
             )
-        return grad_g, grad_u, None, None, None
+        return grad_g, grad_u, None, None, None, None
 
 
 def packed_act_mm(
@@ -185,13 +264,19 @@ def packed_act_mm(
     dt: torch.dtype,
     *weights: torch.Tensor,
     counters: Counters | None = None,
+    store_only: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """`[y_i = x @ W_iᵀ]` with `x` saved packed. ONE codec: `nvfp4.py`'s.
 
     `x` is `[..., K]` and every `W_i` is `[N_i, K]` (`nn.Linear`'s layout), so
     the gated FFN passes `gate_proj.weight, up_proj.weight` in one call and both
-    products read the single packed copy. `K` must tile 16 — `quantize_nvfp4`
-    refuses otherwise, and `config` already refuses a width that does not.
+    products read the single packed copy. `K` must tile 16 on this lane —
+    `quantize_nvfp4` refuses otherwise, and `config` refuses a width that does
+    not for `act_qat`; the store-only lane below pads instead.
+
+    `store_only=True` is the MEMORY arm (`act_store`): the products run on the
+    real `x` exactly as `mm_mixed` would, and only the backward's saved operand
+    is the packed copy (`_pack` pads a width that does not tile 16).
     """
     if not weights:
         raise AssertionError("packed_act_mm needs at least one weight")
@@ -201,9 +286,11 @@ def packed_act_mm(
                 f"packed_act_mm: x{tuple(x.shape)} does not contract with "
                 f"W{tuple(w.shape)}; the weights are [N, K] (`nn.Linear`)"
             )
-    out = _PackedActMM.apply(x, dt, counters, *weights)
+    out = _PackedActMM.apply(x, dt, counters, store_only, *weights)
     if counters is not None:
         counters.count("packed_act_mm")
+        if store_only:
+            counters.count("act_store_mm")
     return out
 
 
@@ -215,9 +302,12 @@ def packed_glu(
     beta1: float = 4.0,
     beta2: float = 25.0,
     counters: Counters | None = None,
+    store_only: bool = False,
 ) -> torch.Tensor:
     """`expert_glu(act, g, u)` with both operands saved packed (see the class)."""
-    out = _PackedGLU.apply(g, u, act, beta1, beta2)
+    out = _PackedGLU.apply(g, u, act, beta1, beta2, store_only)
     if counters is not None:
         counters.count("packed_glu")
+        if store_only:
+            counters.count("act_store_glu")
     return out

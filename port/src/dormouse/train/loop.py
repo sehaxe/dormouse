@@ -1523,14 +1523,16 @@ def _train_impl(
     recompute = cfg.activation_recompute
     if recompute == "none" and cfg.iter_checkpoint:
         recompute = "full"
-    if recompute != "none" or cfg.activation_offload > 0.0:
+    if recompute != "none" or cfg.activation_offload > 0.0 or cfg.act_store != "bf16":
         # The activation-memory arms (`model/act_mem.py`,
-        # `model/recompute.py`): off by default and installed ONCE here,
-        # before any forward, so a run that says `false`/`0.0` takes no branch.
+        # `model/recompute.py`, `model/packed_acts.py`): off by default and
+        # installed ONCE here, before any forward, so a run that says
+        # `false`/`0.0`/`bf16` takes no branch.
         model.configure_actmem(
             iter_checkpoint=cfg.iter_checkpoint,
             activation_offload=cfg.activation_offload,
             activation_recompute=cfg.activation_recompute,
+            act_store=cfg.act_store,
         )
         if recompute != "none":
             log(
@@ -1544,6 +1546,14 @@ def _train_impl(
                 )
                 + ". `iter_checkpoint_saved` counts the recomputed iterations per "
                 "window."
+            )
+        if cfg.act_store != "bf16":
+            log(
+                f"act_store={cfg.act_store}: the forward is bf16 bit for bit; the "
+                f"qkv/proj/FFN GEMM inputs and the GLU operands are SAVED as NVFP4 "
+                f"(e2m1, one e4m3 scale per 16), so the backward's `grad_W` reads the "
+                f"4-bit rounding of the saved operand and `grad_x` is unchanged. "
+                f"`act_store_mm`/`act_store_glu` count the packed sites per forward."
             )
         if cfg.activation_offload > 0.0:
             log(

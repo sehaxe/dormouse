@@ -68,8 +68,8 @@ from torch import nn
 from ..config import check_gated_ffn_bill
 from ..instrument import Counters, loud
 from .experts import expert_glu
-from .packed_acts import packed_act_mm, packed_glu
-from .tsct import TSCTLinear, dense_qat_kind, dense_qat_weight, mm_mixed
+from .packed_acts import check_store, packed_act_mm, packed_glu
+from .tsct import TSCTLinear, dense_qat_kind, dense_qat_weight, mm_dtype, mm_mixed
 
 __all__ = [
     "TransformerBlock",
@@ -284,6 +284,13 @@ class TransformerBlock(nn.Module):
         #: when the flag is off, so the off forward is the same calls it has
         #: always made.
         self.act_qat = cfg.act_qat
+        #: WHERE the graph keeps this block's saved activations (`act_store`,
+        #: `ACT_STORES`): "bf16" (the historical graph, bit for bit) or "nvfp4"
+        #: (each GEMM input / GLU operand is SAVED packed, `model/packed_acts.py`'s
+        #: store-only lane). A TrainConfig memory arm, so it is set once by
+        #: `DormouseModel.set_act_store` — a model forwarded without that call
+        #: keeps "bf16" and takes no branch and allocates no pack.
+        self.act_store = "bf16"
         self.r_gate = self.r_down = 0
         if self.ffn_gated:
             # The runtime seam a hand-built config reaches, the same rule
@@ -419,6 +426,39 @@ class TransformerBlock(nn.Module):
         updates.append(current)
         return x.to(plain.dtype) + a
 
+    def set_act_store(self, mode: str) -> None:
+        """The STORE-ONLY arm's switch (`act_store`): "bf16" | "nvfp4".
+
+        Called once by `DormouseModel.set_act_store` (the trainer's
+        `configure_actmem`), never per step: it changes what the graph RETAINS,
+        not what the forward computes. This is the runtime seam a hand-built
+        config reaches; `config.validate_model_train` owns the same refusals.
+        """
+        check_store(mode)
+        if mode != "bf16":
+            if self.act_qat != "none":
+                loud(
+                    f"act_store='nvfp4' with act_qat={self.act_qat!r} on this "
+                    f"block: `act_qat` already saves the FFN operands packed, so "
+                    f"one save set would carry two names with different forward "
+                    f"numerics. Escape: act_qat='none', or act_store='bf16'."
+                )
+            if self.attn_tsct or self.ffn_tsct:
+                loud(
+                    "act_store='nvfp4' with a `TSCTLinear` projection "
+                    "(attn_form/ffn_form='tsct'): the packed store wraps a dense "
+                    "GEMM input and the factorised form has no such site. "
+                    "Escape: dense/bank forms, or act_store='bf16'."
+                )
+            if mm_dtype() == "fp8":
+                loud(
+                    "act_store='nvfp4' with mm_dtype='fp8': the store-only lane's "
+                    "forward runs `mm_mixed`, which enters the fp8 GEMM lane and "
+                    "changes the forward's numerics — the arm would no longer be "
+                    "memory-only. Escape: mm_dtype='bf16', or act_store='bf16'."
+                )
+        self.act_store = mode
+
     def _block(
         self,
         x: torch.Tensor,
@@ -485,6 +525,8 @@ class TransformerBlock(nn.Module):
         """
         if self.attn_tsct:
             return module(x).to(self.compute_dtype)
+        if self.act_store == "nvfp4":
+            return self._store_mm(x, module, self._qat_attn, counters)
         return self._qmm(x, module, self._qat_attn, counters)
 
     def _ffn(self, h2: torch.Tensor, counters: Counters | None) -> torch.Tensor:
@@ -524,9 +566,28 @@ class TransformerBlock(nn.Module):
                     counters=counters,
                 )
             else:
-                g = self._qmm(h2, self.gate_proj, self._qat_ffn, counters)
-                u = self._qmm(h2, self.up_proj, self._qat_ffn, counters)
-                h = expert_glu(self.expert_act, g, u, beta1=self.beta1, beta2=self.beta2)
+                if self.act_store == "nvfp4":
+                    g, u = packed_act_mm(
+                        h2,
+                        self.compute_dtype,
+                        self._qat_weight(self.gate_proj, self._qat_ffn),
+                        self._qat_weight(self.up_proj, self._qat_ffn),
+                        counters=counters,
+                        store_only=True,
+                    )
+                    h = packed_glu(
+                        self.expert_act,
+                        g,
+                        u,
+                        beta1=self.beta1,
+                        beta2=self.beta2,
+                        counters=counters,
+                        store_only=True,
+                    )
+                else:
+                    g = self._qmm(h2, self.gate_proj, self._qat_ffn, counters)
+                    u = self._qmm(h2, self.up_proj, self._qat_ffn, counters)
+                    h = expert_glu(self.expert_act, g, u, beta1=self.beta1, beta2=self.beta2)
         elif packed:
             h = F.gelu(
                 packed_act_mm(
@@ -537,7 +598,7 @@ class TransformerBlock(nn.Module):
                 )[0]
             )
         else:
-            h = F.gelu(self._qmm(h2, self.fc, self._qat_ffn, counters))
+            h = F.gelu(self._store_mm(h2, self.fc, self._qat_ffn, counters))
         if self.ffn_clip > 0.0:
             h = h.clamp(max=self.ffn_clip)
         if self.ffn_tsct:
@@ -550,7 +611,7 @@ class TransformerBlock(nn.Module):
                 counters=counters,
             )[0]
         else:
-            h = self._qmm(h, self.fc2, self._qat_ffn, counters)
+            h = self._store_mm(h, self.fc2, self._qat_ffn, counters)
         return h
 
     def _qat_weight(self, linear: nn.Linear, kind: str) -> torch.Tensor:
@@ -573,6 +634,27 @@ class TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         """`mm_mixed(x, W)` in the compute dtype — the bf16 (unpacked) lane."""
         return mm_mixed(x, self._qat_weight(linear, kind), self.compute_dtype, counters)
+
+    def _store_mm(
+        self, x: torch.Tensor, linear: nn.Linear, kind: str, counters: Counters | None
+    ) -> torch.Tensor:
+        """`_qmm`, or the SAME GEMM with `x` saved as NVFP4 bytes (`act_store`).
+
+        The forward is `mm_mixed`'s bf16 line, bit for bit — the packed copy is
+        storage only. The backward's `grad_W` reads the 4-bit rounding of `x`;
+        `grad_x` is exact (`grad @ W`). `packed_act_mm` pads a width the codec's
+        16-column scale grid cannot tile (the live `d=890`) and slices the pad
+        off on unpack, so the store never changes the arithmetic.
+        """
+        if self.act_store == "nvfp4":
+            return packed_act_mm(
+                x,
+                self.compute_dtype,
+                self._qat_weight(linear, kind),
+                counters=counters,
+                store_only=True,
+            )[0]
+        return self._qmm(x, linear, kind, counters)
 
     def _forward_mod(
         self,

@@ -699,12 +699,54 @@ class DormouseModel(nn.Module):
             )
         return n
 
+    def set_act_store(self, mode: str) -> int:
+        """Set `act_store` on every transformer block; return the count.
+
+        The arm is the STORE-ONLY lane (`model/packed_acts.py`): the forward runs
+        bf16, bit for bit, and only what the backward keeps is packed — a memory
+        arm, not a numerics one, hence a `TrainConfig` field applied here like
+        `activation_recompute` rather than a build-time arch flag.
+
+        The historical arm ("bf16") takes no branch: it is the default every
+        snapshot carries. A non-default mode refuses when the stack is not the
+        unique transformer form — the hybrid stack's KDA blocks save through the
+        loop's seam and would keep their bf16 set while the log said the arm was
+        on (the same reason `activation_offload` refuses there) — and when the
+        model builds no transformer block at all.
+        """
+        from .packed_acts import check_store
+
+        check_store(mode)
+        if mode != "bf16" and self.cfg.block_stack != "uniform":
+            loud(
+                f"act_store={mode!r} with block_stack={self.cfg.block_stack!r}: "
+                f"the packed save set is wired on the transformer block's GEMM "
+                f"sites, and the hybrid stack's KDA blocks save through the loop's "
+                f"seam — the arm would cover the attention half while the log "
+                f"reported it on. Escape: block_stack='uniform', or "
+                f"act_store='bf16'."
+            )
+        n = 0
+        for module in self.modules():
+            if isinstance(module, TransformerBlock):
+                module.set_act_store(mode)
+                n += 1
+        if mode != "bf16" and n == 0:
+            loud(
+                f"act_store={mode!r} but this model builds no transformer block "
+                f"(block_form='transformer' is where the packed GEMM sites live), so "
+                f"the arm would store nothing packed while the log reported it on. "
+                f"Escape: block_form='transformer', or act_store='bf16'."
+            )
+        return n
+
     def configure_actmem(
         self,
         *,
         iter_checkpoint: bool,
         activation_offload: float,
         activation_recompute: str = "none",
+        act_store: str = "bf16",
     ) -> None:
         """Install the TrainConfig activation-memory arms in one call.
 
@@ -729,6 +771,8 @@ class DormouseModel(nn.Module):
         if mode == "none" and iter_checkpoint:
             mode = "full"
         self.set_recompute(mode)
+        if act_store != "bf16":
+            self.set_act_store(act_store)
         if activation_offload > 0.0 and self.cfg.block_stack != "uniform":
             loud(
                 f"activation_offload={activation_offload} with block_stack="

@@ -317,6 +317,15 @@ ACT_QUANTS = ("none", "int8", "int4", "fp4", "e2m1", "mxfp8", "v2_int4", "v2_int
 #: "e2m1", 16)`); the packed kernel is the bench/inference lane and is COUNTED.
 #: Two activation quantizers on one forward is refused (see `validate`).
 ACT_QATS = ("none", "e2m1")
+#: The `act_store` literals — WHERE the autograd graph keeps the transformer
+#: block's saved activations (`model/packed_acts.py`'s store-only lane). A
+#: MEMORY arm, not a numerics one: `bf16` is today's graph, bit for bit;
+#: `nvfp4` keeps the same tensors as e2m1 nibbles with one e4m3 scale per 16,
+#: so the FORWARD still runs bf16 and only the backward's `grad_W` reads the
+#: rounded copy of the saved operand. It uses `act_qat`'s codec and refuses it
+#: (one save set, two names), and it is refused with `torch_compile`, with
+#: `mm_dtype='fp8'` and on every block form it does not reach.
+ACT_STORES = ("bf16", "nvfp4")
 #: The `ns_kind` literals — the Newton–Schulz arms the Muon group runs
 #: (`optim.NS_KINDS`, which is where they are executed; the list is duplicated
 #: here the way `MOE_KERNELS` is, so the config layer does not import the
@@ -2628,6 +2637,19 @@ class TrainConfig:
     #: hook or an H2D/D2H copy) and with `use_byteflow` (the chunked head builds
     #: a second patch-latent forward whose save set is not measured here).
     activation_offload: float = 0.0
+    #: WHERE the graph KEEPS the transformer block's activations (`ACT_STORES`,
+    #: `model/packed_acts.py`'s store-only lane). A MEMORY arm, not a numerics
+    #: one: the forward runs bf16 either way and its logits are bit-identical
+    #: between the two arms; `nvfp4` stores the qkv/proj/FFN GEMM inputs and the
+    #: GLU operands as e2m1 nibbles with one e4m3 scale per 16 (0.5625 B/element
+    #: against bf16's 2), so the backward's `grad_W` reads the 4-bit rounding of
+    #: an operand the forward used exactly while `grad_x` is unchanged. It is
+    #: NOT `act_qat` (that one fake-quantizes the forward's operands): the two
+    #: refuse each other, and this arm is refused with `torch_compile` (the
+    #: packed lane is not compiler-safe), with `mm_dtype='fp8'` (a different
+    #: compute lane, unmeasured with the packed store) and outside
+    #: `block_form='transformer'` / `block_stack='uniform'`.
+    act_store: str = "bf16"
 
     # --- the RL lane (`post/rl.py` + `post/rl_train.py`) ----------------
     # The reward/advantage knobs are `RLConfig`'s fields, spelled here so the CLI
@@ -5504,6 +5526,18 @@ def rl_config(tcfg: TrainConfig) -> RLConfig:
 MIN_EVAL_BYTES = 65_536
 
 
+def _check_act_store(mode: str) -> None:
+    """The `ACT_STORES` literal check, shared by both validation seams."""
+    if mode not in ACT_STORES:
+        loud(
+            f"act_store={mode!r} is not a saved-activation store. Known: "
+            f"{list(ACT_STORES)} — `bf16` keeps every activation at 2 B (the "
+            f"historical graph, bit for bit); `nvfp4` stores the block's GEMM "
+            f"inputs and GLU operands as e2m1 nibbles with one e4m3 scale per "
+            f"16, while the FORWARD still runs bf16. Escape: name one of those."
+        )
+
+
 def validate_train(tcfg: TrainConfig) -> None:
     """The train-half refusals the CLI and a hand-built `train()` share.
 
@@ -5608,6 +5642,7 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"activation_recompute={tcfg.activation_recompute!r} is not a recompute "
             f"mode. Known: 'none', 'full', 'selective'. Escape: name one of those."
         )
+    _check_act_store(tcfg.act_store)
     if tcfg.iter_checkpoint and tcfg.activation_recompute not in ("none", "full"):
         loud(
             f"iter_checkpoint=true with activation_recompute="
@@ -5762,6 +5797,66 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"The STE forward itself is compiler-safe; it is the measured kernel "
             f"that is not. Escape: torch_compile=false, or act_qat='none'."
         )
+    _check_act_store(tcfg.act_store)
+    if tcfg.act_store != "bf16":
+        if model.block_form != "transformer":
+            loud(
+                f"act_store={tcfg.act_store!r} with block_form={model.block_form!r}: "
+                f"the packed save set is wired on the DENSE `TransformerBlock`'s "
+                f"GEMM sites (`model/transformer.py`) and no other block form builds "
+                f"them — the arm would store nothing packed while the log reported "
+                f"it on. Escape: block_form='transformer', or act_store='bf16'."
+            )
+        if model.block_stack != "uniform":
+            loud(
+                f"act_store={tcfg.act_store!r} with block_stack="
+                f"{model.block_stack!r}: the hybrid stack's KDA blocks save through "
+                f"a different seam (the loop's), so the arm would cover the "
+                f"attention half only while the log reported it on. Escape: "
+                f"block_stack='uniform', or act_store='bf16'."
+            )
+        if model.use_byteflow:
+            loud(
+                f"act_store={tcfg.act_store!r} with use_byteflow=true: both channel "
+                f"shapes leave this model's transformer block stack (Option A builds "
+                f"none, Option B runs the loop over patch latents), so there is no "
+                f"block site to pack. Escape: use_byteflow=false, or act_store='bf16'."
+            )
+        if model.act_qat != "none":
+            loud(
+                f"act_store={tcfg.act_store!r} with act_qat={model.act_qat!r}: "
+                f"`act_qat` already saves the FFN operands packed (its arm "
+                f"fake-quantizes the forward too), so one save set would carry two "
+                f"names with different forward numerics and nothing in the log "
+                f"saying which one set the value. Escape: act_qat='none', or "
+                f"act_store='bf16'."
+            )
+        if model.attn_form == "tsct" or model.ffn_form == "tsct":
+            loud(
+                f"act_store={tcfg.act_store!r} with attn_form={model.attn_form!r}/"
+                f"ffn_form={model.ffn_form!r}: the packed store wraps a dense GEMM "
+                f"input and this form's projections are `TSCTLinear` factors "
+                f"(`U·diag(s)·V`), so the arm would reach no site. Escape: both "
+                f"forms dense/bank, or act_store='bf16'."
+            )
+        if tcfg.torch_compile:
+            loud(
+                f"act_store={tcfg.act_store!r} with torch_compile=true: the packed "
+                f"lane's quantizer (`model/nvfp4.py`) is not compiler-safe — the "
+                f"CUDA lane calls the fused Triton pack and the eager reference uses "
+                f"`searchsorted` — so a compiled run would silently ride the eager "
+                f"fallback while reporting a compiled step. This is the same refusal "
+                f"`act_qat` carries. Escape: torch_compile=false, or "
+                f"act_store='bf16'."
+            )
+        if tcfg.mm_dtype == "fp8":
+            loud(
+                f"act_store={tcfg.act_store!r} with mm_dtype='fp8': the store-only "
+                f"lane's forward runs `mm_mixed`, which enters the fp8 GEMM lane and "
+                f"changes the forward's numerics — the arm would no longer be "
+                f"memory-only, and the fp8 lane's save set with a packed store is "
+                f"unmeasured. Escape: mm_dtype='bf16', or act_store='bf16'."
+            )
     if model.block_form == "transformer" and tcfg.segment_len:
         loud(
             f"segment_len={tcfg.segment_len} with block_form='transformer': the "
