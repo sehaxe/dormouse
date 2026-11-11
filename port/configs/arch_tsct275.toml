@@ -9,13 +9,14 @@
 # (9.2M proved nothing, SCT collapsed at 1.7B), and it fits the card: masters
 # bf16 = 4 B/param = 1.1 GB, so a b8-b12 step leaves room for activations.
 # Params = 2·256·d + n_layers·(4d² + 3·(d·r + r + r·f)) = 0.59M + 18·6.08M
-#        = 110,052,864  (measured; the dense control of the same shape is
-#        273,393,792 — the 12.8x smaller FFN is the whole difference).
+#        = 110,052,864  (+84,096 of norms the formula above omits). The dense
+#        control of the same shape is 273,393,792 — the 12.8x smaller FFN is
+#        the whole difference.
 #
 # The gated width keeps the param-neutral identity of the 95M recipe:
 # d_ffn = 2·d_ffn_gelu/3 → 3·d·2848 == 2·d·4272.
 #
-# THIS FILE IS THE CONTROL of the tsct275 A/B; arch_tsct275.toml is the arm.
+# THE ARM. The control is arch_dense275.toml (same shape, dense gated FFN).
 
 d_model = 1152
 n_heads = 18
