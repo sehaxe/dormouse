@@ -47,11 +47,13 @@ _RL_TRAIN = sys.modules["dormouse.post.rl_train"]
 #: sha256 over `model.state_dict()` (keys sorted, raw bytes) after 3 SFT steps
 #: of `_sft_run(steps=3, log_every=3)`, `torch.manual_seed(0)` — and the step-3
 #: loss field verbatim. m3's fix must be a multiply-by-1.0 / selection identity.
-MAIN_SFT_SHA = "a71d7f49ecfed77936a9580e5493b0b3e338198268c79326a6efe6a76c8cceb1"
+#: Re-pinned 2026-11-11 (Muon's small-side Newton–Schulz; every loss field here
+#: is unchanged, only the stepped parameters moved).
+MAIN_SFT_SHA = "4c918bdb6f4624efb350ea7b4677e30648712dcdb1a9c86dc8b971bf9ffb056b"
 MAIN_SFT_LOSS = "4.6880"
 #: The same golden for 3 RL steps (`_rl_run(steps=3, ckpt_every=3)`): sha256
 #: over the checkpoint's model half, `torch.manual_seed(0)`.
-MAIN_RL_SHA = "ad3d8469f02b519bb4c6dfeb30d96f9f077d64e487d4731fe6781a5a1616e185"
+MAIN_RL_SHA = "80f143e2bd34b61dd91b2227b2b7f8447685b0e5c91031f3308cb1f370965c2e"
 
 
 def _sha_state(state: dict[str, torch.Tensor]) -> str:

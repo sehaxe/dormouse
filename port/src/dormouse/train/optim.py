@@ -27,10 +27,12 @@ The update is `burn-muon-plus`'s, not a re-derivation:
 * `O_t = Norm_d(Ortho(M_t))` with ColRow normalisation, and the step
   `W -= η·max(1, m/n)^0.5·O_t` — `max(1, ·)` is Jordan's, which is what both
   the crate and this port follow.
-* `orthogonalize` divides by the Frobenius norm, and the NS loop runs in the
-  TRANSPOSED orientation when the matrix is tall, i.e. in the `[r, r]` Gram
-  space of the smaller side — the burn economics that keeps `[768, 768]` out
-  of fp32 NS entirely.
+* `orthogonalize` divides by the Frobenius norm, and the NS loop always
+  contracts on the SMALLER side: a tall `[n, f]` runs `A = xᵀx` where it is
+  stored and applies `x·A` on the right, a short one runs `x xᵀ` and applies
+  `A·x` on the left. Both are the `[r, r]` Gram of the smaller side — the burn
+  economics that keeps `[768, 768]` out of fp32 NS entirely — and the tall arm
+  needs no transpose in or out.
 * Two precision **rungs**, both `fp32` by default so a live run's semantics and
   its resume do not change:
   - `muon_state_dtype` (`fp32` | `bf16`) stores the momentum buffers in bf16
@@ -267,10 +269,10 @@ def zeropower_via_ns(
     `tests/test_muon_fast.py`.
 
     The batched form accepts `[N, d0, d1]`: the polynomial is ELEMENTWISE in
-    the leading batch dim (a Gram per slice), and `x @ x.T` broadcasts
-    unchanged, so the same math runs for N slices at once — that is the
-    whole point of the batched Muon pass (version-branched off the same
-    body, no second implementation exists here).
+    the leading batch dim (a Gram per slice), and the contraction is per slice
+    too, so the same math runs for N slices at once — that is the whole point
+    of the batched Muon pass (version-branched off the same body, no second
+    implementation exists here).
     """
     _check_ns_kind(kind)
     _check_dtype("ns_dtype", ns_dtype)
@@ -283,43 +285,45 @@ def zeropower_via_ns(
         from .ns_kernels import zeropower_triton_or_classic
 
         return zeropower_triton_or_classic(g, steps, counters=counters, ns_dtype=ns_dtype)
+    # The Gram is `[r, r]` on the SMALLER side in both branches. A tall `[n, f]`
+    # contracts `xᵀx` IN PLACE (no transpose copy, the same iteration
+    # re-associated: `x ← a·x + x·(b·A + c·A²)` with `A = xᵀx`), which is
+    # `f · f` instead of the `n · n` a naive `x xᵀ` would build. `n <= f` keeps
+    # `x xᵀ` and the polynomial on the left, where `n` is already the small side.
     if g.ndim == 2:
         a, b, c = JORDAN_NS_COEFFS
         x = g.to(torch.float32)
         x = x / (x.norm() + 1e-7)
-        transposed = x.shape[0] > x.shape[1]
-        if transposed:
-            x = x.T.contiguous()
         x = x.to(_torch_dtype(ns_dtype))
+        tall = x.shape[0] > x.shape[1]
         for _ in range(steps):
-            gram = x @ x.T
+            gram = torch.mm(x.T, x) if tall else torch.mm(x, x.T)
             poly = b * gram + c * (gram @ gram)
-            x = a * x + poly @ x
-        out = x.T.contiguous() if transposed else x
-        return out.to(torch.float32)
+            x = a * x + (torch.mm(x, poly) if tall else torch.mm(poly, x))
+        return x.to(torch.float32)
     assert g.ndim == 3, f"NS is matrix-only or [N,d0,d1] batched, got shape {tuple(g.shape)}"
     a, b, c = JORDAN_NS_COEFFS
     x = g.to(torch.float32)
     x = x / (x.norm(dim=(1, 2), keepdim=True) + 1e-7)
-    transposed = x.shape[1] > x.shape[2]
-    if transposed:
-        x = x.transpose(1, 2).contiguous()
     x = x.to(_torch_dtype(ns_dtype))
+    tall = x.shape[1] > x.shape[2]
     for _ in range(steps):
         # `torch.bmm` is the SAME kernel `x @ y` selects for 3-D operands, with
         # the same operands: `matmul` only adds view/expand metadata dispatches
         # around it (7 aten ops vs 2 per product, measured). The port's step is
         # CPU-dispatch-bound, so the metadata is the cost; the values are
         # bit-identical (`tests/test_muon_launch.py` pins it).
-        gram = torch.bmm(x, x.transpose(1, 2))
+        gram = torch.bmm(x.transpose(1, 2), x) if tall else torch.bmm(x, x.transpose(1, 2))
         poly = b * gram + c * torch.bmm(gram, gram)
-        x = a * x + torch.bmm(poly, x)
-    out = x.transpose(1, 2).contiguous() if transposed else x
-    return out.to(torch.float32)
+        x = a * x + (torch.bmm(x, poly) if tall else torch.bmm(poly, x))
+    return x.to(torch.float32)
 
 
 def _gram(x: torch.Tensor) -> torch.Tensor:
     """`x @ xᵀ` for one 2-D matrix or one `[N, d0, d1]` batch.
+
+    The SHORT-side contraction (`[n, r] → [n, n]`): callers route a tall tensor
+    through `xᵀx` instead, see `zeropower_via_ns` / `_classic_ns_batch`.
 
     `torch.mm`/`torch.bmm` are the SAME kernels `x @ ...` selects; `matmul`
     only adds view/expand metadata around them. Values are bit-identical.
@@ -351,7 +355,8 @@ def _classic_ns_batch(tensors: list[torch.Tensor], steps: int, ns_dtype: str) ->
     """One lockstep pass over a list that fits the memory cap (see `_classic_ns_many`)."""
     a, b, c = JORDAN_NS_COEFFS
     pre: list[torch.Tensor] = []
-    transposed: list[bool] = []
+    #: `tall[i]` says tensor `i` contracts `xᵀx` (it stays as stored, no copy).
+    tall_flags: list[bool] = []
     for t in stepaudit.iterations("muon.ns_pre", tensors):
         x = t.to(torch.float32)
         if x.ndim == 2:
@@ -359,10 +364,7 @@ def _classic_ns_batch(tensors: list[torch.Tensor], steps: int, ns_dtype: str) ->
         else:
             assert x.ndim == 3, f"NS is matrix-only or [N,d0,d1] batched, got {tuple(x.shape)}"
             x = x / (x.norm(dim=(1, 2), keepdim=True) + 1e-7)
-        tall = x.shape[-2] > x.shape[-1]
-        transposed.append(tall)
-        if tall:
-            x = x.transpose(-2, -1).contiguous()
+        tall_flags.append(x.shape[-2] > x.shape[-1])
         pre.append(x.to(_torch_dtype(ns_dtype)))
     # `_foreach_*` is NOT free: its fast route splits at 320 `multi_tensor_apply`
     # blocks (65536 elements each), so one 33.5M-element tensor costs TWO
@@ -379,7 +381,14 @@ def _classic_ns_batch(tensors: list[torch.Tensor], steps: int, ns_dtype: str) ->
 
     work = pre
     for _ in stepaudit.iterations("muon.ns_steps", range(steps)):
-        grams = [_gram(x) for x in work]
+        # The Gram is `[r, r]` on the SMALLER side in both arms: a tall tensor
+        # gets `xᵀx` in its stored layout, a short one keeps `x xᵀ`. Same
+        # iteration, re-associated on the tall side (no transpose copy, and the
+        # operand is the square `[r, r]` instead of the tall `[n, n]`).
+        grams = [
+            (_matmul(x.transpose(-2, -1), x) if tall else _gram(x))
+            for x, tall in zip(work, tall_flags, strict=True)
+        ]
         # `gram @ gram`, NOT `_gram(gram)`: the Gram is symmetric in exact
         # arithmetic, but a bmm's two triangles are independently rounded, so
         # `gram @ gramᵀ` moves the last bits. The reference has no transpose here.
@@ -390,14 +399,13 @@ def _classic_ns_batch(tensors: list[torch.Tensor], steps: int, ns_dtype: str) ->
         bg = scale(grams, b)
         cg = scale(squares, c)
         polys = add(bg, cg)
-        px = [_matmul(p, x) for p, x in zip(polys, work, strict=True)]
+        px = [
+            (_matmul(x, p) if tall else _matmul(p, x))
+            for p, x, tall in zip(polys, work, tall_flags, strict=True)
+        ]
         ax = scale(work, a)
         work = add(ax, px)
-    out: list[torch.Tensor] = []
-    for x, tall in stepaudit.iterations("muon.ns_post", zip(work, transposed, strict=True)):
-        if tall:
-            x = x.transpose(-2, -1).contiguous()
-        out.append(x.to(torch.float32))
+    out = [x.to(torch.float32) for x in stepaudit.iterations("muon.ns_post", work)]
     return out
 
 
@@ -409,8 +417,9 @@ def _classic_ns_many(
 ) -> list[torch.Tensor]:
     """`zeropower_via_ns(kind="classic")` for MANY matrices, one elementwise pass.
 
-    The contraction (`x @ xᵀ`, `gram @ gram`, `poly @ x`) cannot be merged
-    across different shapes, so each matrix keeps its own `mm`/`bmm`. The FIVE
+    The contraction (`xᵀx` or `x xᵀ`, `gram @ gram`, `x·poly` or `poly·x`)
+    cannot be merged across different shapes, so each matrix keeps its own
+    `mm`/`bmm`. The FIVE
     elementwise ops per iteration can be merged: they are the same scalar op on
     every matrix, so `torch._foreach_*` issues one launch for the whole list
     where the per-matrix loop issued one each (the port's step is

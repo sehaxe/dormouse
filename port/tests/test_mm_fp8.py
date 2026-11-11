@@ -46,7 +46,9 @@ from dormouse.train import train
 #: `/tmp/opencode/capture_mm_fp8.py`, run against the tree BEFORE the lane
 #: landed, twice (two processes, identical output): seed 0, tiny preset, 10
 #: steps, lr 0.01, sha256 of every parameter's bytes in NAME order.
-_PRE_CHANGE_TRAIN_SHA = "b4d2aa542e6efd76b4fb1c6560544e1aad7bd72a920206503d0a347d64c11966"
+#: Re-pinned 2026-11-11 (Muon's small-side Newton–Schulz; the same value
+#: `tests/test_opt_graph.py::_PRE_CHANGE_TRAIN_SHA` pins).
+_PRE_CHANGE_TRAIN_SHA = "ff48e61cf4e42f7dd0fe7abdcb82c39c20633841feaf28e94456bce613d1de56"
 
 
 @pytest.fixture(autouse=True)

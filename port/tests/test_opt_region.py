@@ -66,8 +66,12 @@ GATE_BATCH, GATE_SEQ = 2, 64
 #: SCALE (`eps_bf16 * max|p_fp32|`) after the 100 steps. The rung is NOT
 #: bit-identical: a 1-ulp parameter gate is unreachable without the stochastic
 #: rounding the rung's docstring names as the next rung.
-GATE_LOSS_REL = 0.000356995146858374
-GATE_PARAM_ULP = 9.677561322382633
+#: Re-pinned 2026-11-11 with Muon's Newton–Schulz contracting on the small side
+#: (`optim.py`): that is a re-association, but a fp32 1e-7 move still walks a
+#: 100-step curve, so both numbers moved (loss 1.8%, ulp 16%) and the QUALITY
+#: bar above — `loss_rel < seed_spread` — is what the rung is judged on.
+GATE_LOSS_REL = 0.00035072604757507804
+GATE_PARAM_ULP = 8.116083185513272
 
 
 def _gate_run(rung: str, seed: int) -> tuple[list[float], dict[str, torch.Tensor]]:

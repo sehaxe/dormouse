@@ -34,10 +34,12 @@ from dormouse.train.loop import train
 from dormouse.train.optim import AGC_EPS, MixOptimizer, agc_clip, is_muon_param
 
 #: Clean-main golden: `state_dict` after 5 tiny steps (the same value
-#: `tests/test_nan_firewall.py::HEAD_SHA` pins).
-HEAD_STATE_SHA = "526b6c9eed17225ef6f72a5784b5046d9bc076d11548ef131a415e85afcaad1a"
+#: `tests/test_nan_firewall.py::HEAD_SHA` pins). Re-pinned 2026-11-11 with
+#: Muon's small-side Newton–Schulz; the forward-only logits below moved with it
+#: because the parameters the forward sees are the stepped ones.
+HEAD_STATE_SHA = "62cf3843ac570a67c089ef8a7a0f19529ac5e45cbd9e7ef0f71c1bf98a6bf988"
 #: Clean-main golden: final logits of `(arange(128)*7+3) % 256`, `[2, 64]`.
-HEAD_LOGITS_SHA = "af5d2fd8fbd7fee944b0a23a6dca00d79a782d65f1ddbc1ef2ad21002eb11d41"
+HEAD_LOGITS_SHA = "3df478c82b1605ff0772cb26791aa899625d9eb3f1872c435c1c7e247467b3b1"
 
 GOLDEN_STEPS = 5
 SEQ, BATCH = 64, 2

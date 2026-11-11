@@ -35,7 +35,9 @@ from dormouse.train import train
 PINS_FROM = "main@3e736ae"
 LOGITS_SHA = "c7839283a79291cf713aab57476cf202ba1a68167c365197f785da08203055c2"
 INIT_SHA = "06eecd1d36bcf49ea3eb27247c32409487c3cf667fe48be1108e03cae6405b8a"
-STATE_SHA = "4079bf46dfe9cffa6b45cd463708db7c67e4cb0d0024adb76f8c3920e16b3fde"
+#: Re-pinned 2026-11-11 (Muon's small-side Newton–Schulz): the 2-step state is
+#: downstream of the NS chain, the forward-only pins above are not.
+STATE_SHA = "8ce665773a42bf4200c321f97713e693e33eeaacb1d496ab99761e90109b178f"
 LOSS2 = 4.442110538483
 
 

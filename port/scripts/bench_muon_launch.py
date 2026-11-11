@@ -14,8 +14,10 @@ the two optimizer arms and times the stage; it does not score a training run.
 * `main` — the path this branch replaces, transcribed below from `b36ef27`
   (`batched_step_main` / `_momentum_update_main`). It is a transcription, not a
   git checkout: the gate in `tests/test_muon_launch.py` pins it against the
-  byte hashes captured from a clean `main` worktree, so a drift between the two
-  is a red test, not a silent comparison against the wrong program.
+  same byte hashes as the new arm (re-captured 2026-11-11 when Newton–Schulz
+  moved to the small-side Gram; only the tall parameters moved), so a drift
+  between the two is a red test, not a silent comparison against the wrong
+  program.
 * `new` — `MixOptimizer.step` on this branch.
 
 **What is counted.** `LaunchCounter` models the two CUDA rules a CPU dispatch

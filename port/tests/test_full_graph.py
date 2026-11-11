@@ -55,8 +55,11 @@ from dormouse.train.optim import MixOptimizer, clip_grads
 # `_five_steps` repeats (the same 10 240-byte fixture), two processes, identical:
 #   PARAMS d3001de29191f26c055ef8d9e9762e8ff69f98eb2ba1833c4648a02c199bb128
 #   LOGITS b862230dffd0ab6ab0643b806218945eab2c3c80135df2e5367e88f8fd46463d
-_PRE_CHANGE_PARAMS_SHA = "d3001de29191f26c055ef8d9e9762e8ff69f98eb2ba1833c4648a02c199bb128"
-_PRE_CHANGE_LOGITS_SHA = "b862230dffd0ab6ab0643b806218945eab2c3c80135df2e5367e88f8fd46463d"
+# Re-captured 2026-11-11 after Muon's Newton–Schulz moved to the small-side Gram
+# (`optim.py`): a re-association, and this 5-step run's parameters are downstream
+# of it. The VALUES contract for that change is `tests/test_muon_small_side.py`.
+_PRE_CHANGE_PARAMS_SHA = "1885bd9fd624dd3c278aad0c835a7ac4009a5f4a3162513af4a7d8b03a3ca6a0"
+_PRE_CHANGE_LOGITS_SHA = "025987743afc1afb2db142771f6518864d10d2884b379b6c851c70c33c179ce5"
 
 
 def _sha_state(sd: dict) -> str:

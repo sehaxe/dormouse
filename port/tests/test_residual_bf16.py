@@ -100,7 +100,11 @@ PIN_B_SD = "3db871895d7f5f7c8e3b0bf57303a08802c98e04ad8d96716e7ddee8d40c5be5"
 #: final-loss delta; `last20` the mean |Δloss| over the last 20 steps.
 DRIFT_STEPS = 200
 GATE_MAX_REL = 0.0007322474101372813
-GATE_FINAL_DELTA = 0.00010442733764648438
+#: Re-pinned 2026-11-11 (+7.61e-4, was +1.04e-4) with Muon's small-side
+#: Newton–Schulz: the signed FINAL delta is the chaotic end of a 200-step curve, so
+#: a 1e-7 re-association walks it; `max_rel` and `last20` are unchanged and
+#: still inside their pins, which is what says the rung did not get costlier.
+GATE_FINAL_DELTA = 0.0007610321
 GATE_LAST20_MEAN = 0.0006329298248291015
 #: 25 % on the pin. The measurement is deterministic at one thread; the band is
 #: for a scheduler that interleaves the reduction differently, and it is still

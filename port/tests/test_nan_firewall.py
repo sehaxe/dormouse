@@ -45,7 +45,9 @@ from dormouse.train.loop import train
 #: The HEAD golden: sha256 over `model.state_dict()` (keys sorted, raw bytes)
 #: after 5 steps of `tiny_run(steps=5, log_every=5, warmup_tokens=0)`, seed 0,
 #: captured at 642099e in a clean worktree (the change must not move a bit).
-HEAD_SHA = "526b6c9eed17225ef6f72a5784b5046d9bc076d11548ef131a415e85afcaad1a"
+#: Re-pinned 2026-11-11 with Muon's small-side Newton–Schulz; the printed loss
+#: field did NOT move (it is the 5-step eager number, `loss=2.7103`).
+HEAD_SHA = "62cf3843ac570a67c089ef8a7a0f19529ac5e45cbd9e7ef0f71c1bf98a6bf988"
 #: The same run's log line at step 5 (eager, HEAD): the loss field verbatim.
 HEAD_LOSS_FIELD = "loss=2.7103"
 

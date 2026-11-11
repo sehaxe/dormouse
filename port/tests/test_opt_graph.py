@@ -62,7 +62,7 @@ _PRE_CHANGE_SHA = (
     "2b4189cc2733ec5b1d0d33e1ee330d09d30555558d1cc5861af840511d1e8ec8",  # (8, 128)
 )
 
-_PRE_CHANGE_TRAIN_SHA = "b4d2aa542e6efd76b4fb1c6560544e1aad7bd72a920206503d0a347d64c11966"
+_PRE_CHANGE_TRAIN_SHA = "ff48e61cf4e42f7dd0fe7abdcb82c39c20633841feaf28e94456bce613d1de56"
 
 
 def _sha(p: torch.Tensor) -> str:

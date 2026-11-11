@@ -62,7 +62,9 @@ SEQ, BATCH = 64, 2
 #:     step-5 loss field verbatim.
 MAIN_MODEL_SD = "b8e610d715ec86d59b229e61c173998813ac40a34867dc82ccc90dc1b1682694"
 MAIN_MODEL_LOGITS = "642106fbb7cbc5c354c45d8edd5490ca1d73201b9a3bc1a9d128a50c90354128"
-MAIN_TRAIN_SD = "526b6c9eed17225ef6f72a5784b5046d9bc076d11548ef131a415e85afcaad1a"
+#: Re-pinned 2026-11-11 (Muon's small-side Newton–Schulz): only the TRAIN pin
+#: moved — `_model_pin` is AdamW-only. The step-5 loss is unchanged (`2.7103`).
+MAIN_TRAIN_SD = "62cf3843ac570a67c089ef8a7a0f19529ac5e45cbd9e7ef0f71c1bf98a6bf988"
 MAIN_TRAIN_LOSS = "2.7103"
 
 
