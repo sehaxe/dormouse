@@ -15,7 +15,13 @@ The gates the variant owes an A/B:
    `[b, t, n, d]` STACK it replaced (reference written in this file) ≤1e-6;
 8. and it is flat: no `[b, t, n, d]` buffer is allocated at all;
 9. dynamo traces the loop into ONE graph, so a compiled A/B is not silently
-   running eager.
+   running eager;
+10. the TRAINING step retains no `[T, d]` fp32 residency: at the live shape
+    (T = 24576, d = 832, S = 13) with gradients ON, the new path's own saved
+    bytes are under a tenth of the old expression's, and the old expression is
+    built HERE, not recorded. The `@torch.no_grad()` gates above cannot see
+    this — every source requires grad in training, so each RMSNorm output and
+    each `.float()` upcast was held for the backward.
 """
 
 from __future__ import annotations
@@ -32,6 +38,8 @@ from dormouse.model import DormouseModel, param_count
 from dormouse.model.attnres import full_depth_attend, full_depth_weights
 
 BATCH, SEQ = 2, 16
+#: The live training shape (b24×1024 tokens, d = 832), the one that OOMed.
+LIVE_T, LIVE_D, LIVE_S = 24576, 832, 13
 
 
 def _cfg(**over) -> ModelConfig:
@@ -260,7 +268,121 @@ def test_no_btnd_buffer_is_ever_allocated():
     print(f"[attnres] largest allocation: {biggest} elems; the old stack: {BATCH * SEQ * n * d}")
 
 
-# --- 9. torch.compile -------------------------------------------------------
+# --- 9. the TRAINING peak: what the backward holds ---------------------------
+
+
+def _saved_loop_attend(sources, query, prior, eps=1e-6):
+    """THE OLD TRAINING PATH, written out here: the loop as it was shipped.
+
+    Its own RMSNorm and its own `.float()` in the value sum, so a shared-helper
+    bug cannot cancel itself out against the module under test.
+    """
+    n = len(sources)
+
+    def rms(x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+    logits = sources[0].new_empty(sources[0].shape[:-1] + (n + 1,), dtype=torch.float32)
+    logits[..., 0] = math.log(n)
+    for j, s in enumerate(sources):
+        logits[..., j + 1] = (rms(s) * query.float()).sum(-1) + prior[j].float()
+    w = (n + 1) * torch.softmax(logits, dim=-1)
+    a = sources[0].new_zeros(sources[0].shape, dtype=torch.float32)
+    for j, u in enumerate(sources):
+        a += w[..., j + 1].unsqueeze(-1) * u.float()
+    return a
+
+
+class _Saved:
+    """`saved_tensors_hooks` sink: the bytes the backward is allowed to read.
+
+    Counted once per STORAGE, so a tensor two nodes save is one residency. `own`
+    excludes the tensors HANDED IN — the sources ARE the residual history and
+    stay resident whatever the mixer does with them. `biggest` is the largest of
+    those owned tensors in ELEMENTS: a `[T, d]` residency shows up there even
+    when the total is dominated by the history.
+    """
+
+    def __init__(self, owned) -> None:
+        self._owned = {t.untyped_storage().data_ptr() for t in owned}
+        self._seen: dict[int, int] = {}
+        self.own = 0
+        self.biggest = 0
+
+    def __call__(self, t: torch.Tensor) -> torch.Tensor:
+        st = t.untyped_storage()
+        key = st.data_ptr()
+        if key not in self._seen:
+            self._seen[key] = st.nbytes()
+            if key not in self._owned:
+                self.own += st.nbytes()
+                self.biggest = max(self.biggest, t.numel())
+        return t
+
+    @property
+    def total(self) -> int:
+        return sum(self._seen.values())
+
+
+def _saved_under_grad(fn, sources, query, prior):
+    """`(fwd bytes, fwd+bwd bytes, own bytes, largest own numel, out)`."""
+    rec = _Saved([*sources, query, prior])
+    with torch.autograd.graph.saved_tensors_hooks(rec, lambda x: x):
+        out = fn(sources, query, prior)
+        fwd = rec.total
+        out.sum().backward()
+    if rec.total != fwd:
+        raise AssertionError("the backward saved new tensors: this measures the forward")
+    return fwd, rec.total, rec.own, rec.biggest, out
+
+
+def test_the_training_step_retains_no_t_d_residency():
+    """The gate the `no_grad` tests above cannot be: gradients ON, live shape.
+
+    T = 24576, d = 832, S = 13, fp32 — the shape the arm OOMed at b24. Both
+    paths run here, the OLD one as an expression written in this file, and the
+    new one must hold at most half of what it held. The old path took its
+    1,019 MiB of `[T, d]` residency (13 RMSNorm outputs, 78 MiB each) in the
+    forward — a `@torch.no_grad()` measurement sees none of it.
+    """
+    torch.manual_seed(1301)
+    live = [torch.randn(LIVE_T, LIVE_D, requires_grad=True) for _ in range(LIVE_S)]
+    q = torch.randn(LIVE_D, requires_grad=True)
+    prior = torch.full((LIVE_S,), -30.0)
+    prior[0] = 0.0
+    prior.requires_grad_(True)
+    mib = 2**20
+
+    o_fwd, o_all, o_own, o_big, out_old = _saved_under_grad(_saved_loop_attend, live, q, prior)
+    g_old = ([t.grad.clone() for t in live], q.grad.clone(), prior.grad.clone())
+    for t in [*live, q, prior]:
+        t.grad = None
+    n_fwd, n_all, n_own, n_big, out_new = _saved_under_grad(full_depth_attend, live, q, prior)
+
+    print(
+        f"[attnres] saved bytes at T={LIVE_T} d={LIVE_D} S={LIVE_S} (fp32, grad on): "
+        f"FWD old {o_fwd / mib:.1f} MiB -> new {n_fwd / mib:.1f} MiB | "
+        f"FWD+BWD old {o_all / mib:.1f} MiB -> new {n_all / mib:.1f} MiB | "
+        f"mixer's own {o_own / mib:.1f} -> {n_own / mib:.1f} MiB"
+    )
+
+    # The same arithmetic, bit for bit — forward AND every gradient.
+    assert torch.equal(out_new, out_old), "the recompute changed the forward"
+    for got, want in zip([*live, q, prior], [*g_old[0], g_old[1], g_old[2]], strict=True):
+        torch.testing.assert_close(got.grad, want, atol=0, rtol=0)
+
+    # THE GATE: the new path's own residency against everything the old held.
+    assert n_own <= 0.5 * o_all, (
+        f"new retains {n_own / mib:.1f} MiB, over 50 % of the old {o_all / mib:.1f} MiB"
+    )
+    assert n_own <= 0.5 * o_own, f"own {n_own / mib:.1f} vs {o_own / mib:.1f} MiB"
+    # No per-source `[T, d]` buffer survives the forward.
+    assert n_big <= LIVE_T * (LIVE_S + 1), f"retained {n_big} elems; a [T, d] is back"
+    assert o_big >= LIVE_T * LIVE_D, "the reference did not reproduce the residency"
+
+
+# --- 10. torch.compile ------------------------------------------------------
 
 
 def test_dynamo_traces_the_source_loop_into_one_graph():

@@ -49,6 +49,44 @@ what makes the identity exact, and it grows with the source count by constructio
 The stores are fp32 (the residual dtype) so the score reduction and the softmax
 never run in bf16 — the same rule `loopblock.depth_attend` follows.
 
+WHAT THE BACKWARD HOLDS, AND WHY NOTHING IS HELD. The loop made the FORWARD
+flat and left the training step untouched: every source requires grad, so each
+`.float()` upcast and each RMSNorm output was kept for the backward. Measured
+with `saved_tensors_hooks`, unique storages, at the live shape
+(T = 24576, d = 832, S = 13 — FWD and FWD+BWD are the same number, all of it is
+taken in the forward):
+
+    sources   path   FWD+BWD   the mixer's own   largest own tensor
+    fp32      old    2,031.8       1,017.8 MiB   20,447,232 elems  = [T, d]
+    fp32      new    1,016.6           2.6 MiB      344,064 elems  = [T, S+1]
+    bf16      old    3,045.8       3,045.8 MiB   20,447,232 elems
+    bf16      new      509.6           2.6 MiB      344,064 elems
+
+What is left of those totals is the source history itself: 13 tensors resident
+whatever the mixer does with them, because they ARE the residual stream. The
+mixer's own copy is what OOMed the arm at b24/b20/b16 (bf16 line), and it is
+the copy a `@torch.no_grad()` memory test structurally cannot see: in training
+the upcasts and the norm outputs are 78 MiB each and there are three per
+source.
+
+Two changes, decided by that measurement (option (a) "save the sources packed"
+collapses into (b) here: the sources are ALREADY bf16 and resident, so there is
+nothing to pack — the fp32 copies exist only for the backward):
+
+1. the score column `q·RMSNorm(u_j) + prior_j` is a `torch.utils.checkpoint`
+   SEGMENT. Its inputs are the bf16 source, the query and one scalar, all
+   already alive; the fp32 upcast and the RMSNorm output are RECOMPUTED in the
+   backward, one source at a time, and dropped before the next. Doubling this
+   mixer's arithmetic costs 0.019 % of a step's MACs.
+2. the value sum multiplies the source in ITS dtype and lets promotion produce
+   fp32 (`w` is fp32, so `w[..., j+1] * u` is fp32 — bit for bit the same as
+   `w * u.float()`, whose fp32 copy autograd would otherwise save).
+
+The result is bit-identical — forward, and every gradient through a 4-layer
+`use_attnres` model in fp32 AND bf16 (`max|Δ| = 0.0`). The gate is
+`test_attnres_full.py`'s `test_the_training_step_retains_no_t_d_residency`,
+which builds the old expression in the test and runs it with gradients on.
+
 WHY THE LOOP. The first cut stacked every RMSNorm'd source into one
 `[b, t, n, d]` fp32 key tensor, contracted it against the query in one
 broadcast, and did the same to the values. At the live shape (b24×1024 → 24576
@@ -63,7 +101,9 @@ same order of accumulation: the result is not merely comparable to the stack,
 the test finds it EQUAL (`max|Δ| = 0.0`, gated at ≤1e-6 against the old
 expression written out in `test_attnres_full.py`). The new binding tensor is
 the fp32 `[T, d]` RMSNorm transient — 78.0 MiB, ≤3 live at one instant, 234 MiB
-— plus the 78 MiB accumulator; measured largest single block 78.0 MiB.
+— plus the 78 MiB accumulator; measured largest single block 78.0 MiB. That is
+the FORWARD; the backward holds one of those transients at a time and nothing
+permanent (…WHAT THE BACKWARD HOLDS).
 """
 
 from __future__ import annotations
@@ -73,12 +113,25 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 __all__ = ["FullDepthAttnRes", "full_depth_attend", "full_depth_weights"]
 
 
 def _rms_no_gain(x: torch.Tensor, eps: float) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+
+def _score_column(
+    s: torch.Tensor, q: torch.Tensor, prior_j: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """One source's `q·RMSNorm(u_j) + prior_j` — a checkpoint SEGMENT.
+
+    Called through `checkpoint`, so the fp32 `[T, d]` upcast and the RMSNorm
+    output are recomputed in the backward, one source at a time, instead of
+    being held for it (module docstring, WHAT THE BACKWARD HOLDS).
+    """
+    return (_rms_no_gain(s.float(), eps) * q).sum(-1) + prior_j
 
 
 def _logits(
@@ -90,14 +143,17 @@ def _logits(
     `prior[0]` scores it and `prior[k]` scores the update `k` layers back.
 
     One `[b, t]` column per source, written into the `[b, t, n+1]` matrix: no
-    `[b, t, n, d]` key tensor ever exists (module docstring, WHY THE LOOP).
+    `[b, t, n, d]` key tensor ever exists (module docstring, WHY THE LOOP), and
+    no `[b, t, d]` one survives the forward either (…WHAT THE BACKWARD HOLDS).
     """
     n = len(sources)
     q = query.float()
     logits = sources[0].new_empty(sources[0].shape[:-1] + (n + 1,), dtype=torch.float32)
     logits[..., 0] = math.log(n)
     for j, s in enumerate(sources):
-        logits[..., j + 1] = (_rms_no_gain(s.float(), eps) * q).sum(-1) + prior[j].float()
+        logits[..., j + 1] = checkpoint(
+            _score_column, s, q, prior[j].float(), eps, use_reentrant=False
+        )
     return logits
 
 
@@ -118,11 +174,14 @@ def full_depth_attend(
     the softmax needs) is computed, never its product. The sum accumulates in
     place, one `[b, t]` weight column against one `[T, d]` source, so neither
     the `[b, t, n, d]` value stack nor its `[b, t, n, d]` product is built.
+
+    The multiply is `w * u`, NOT `w * u.float()`: promotion gives the same fp32
+    product bit for bit while leaving the fp32 copy out of the saved set.
     """
     w = full_depth_weights(sources, query, prior, eps)
     a = sources[0].new_zeros(sources[0].shape, dtype=torch.float32)
     for j, u in enumerate(sources):
-        a += w[..., j + 1].unsqueeze(-1) * u.float()
+        a += w[..., j + 1].unsqueeze(-1) * u
     return a
 
 
