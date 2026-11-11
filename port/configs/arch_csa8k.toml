@@ -1,0 +1,62 @@
+# arch_csa8k — compressed sparse attention at 8192 (the DeepSeek-V4 lineage):
+# each query reads the top csa_topk chunks of 8 bytes, so cost stops growing from
+# the quadratic term. This is our existing long-context mechanism, not SDPA.
+# Arch arm B1: the frontier's 3:1 hybrid at d=890 — 9 KDA blocks, 3 attention.
+#
+# The single most-used non-vanilla mechanism in the field is a MIX, not either
+# pure form: Qwen3-Next, Kimi Linear and Jamba all keep a minority of full
+# attention layers (3:1 for the first two). Our trainer could build an all-KDA
+# stack (`block_form="kda"`, `loop_blocks=N`, `max_iter=N`) or an all-attention
+# one (`block_form="transformer"`, `n_layers=N`), never the mix. This arm is the
+# mix: `block_stack="3:1"` builds `[K,K,K,A]×3` from the SAME two block modules,
+# runs each once, and scores ONE final CE.
+#
+# WHY d=890 (the FLOP-matched width, docs/research/2026-11-07-frontier-vs-vanilla.md §2.2):
+# attention is 122.7 MFLOP/byte of C0's 692.9 at d=832; making 75% of it linear
+# saves 92.0 MFLOP/byte, which buys +15.3M parameters at 6 FLOP/param/token.
+# 95.0M × 1.16 = 110.2M, and d=890 at the same FFN ratio lands there. So B1 is
+# ISO-FLOPs with C0 (692.7 vs 692.9 MFLOP/byte) at +15.7% parameters, and the
+# pair B1 vs C0 asks "capacity or mechanism" at equal compute.
+#
+# Sizing: d=890 = 5 heads × 178 (the only even-head_dim factorisation; 178/2=89
+# is the RoPE half). d_ffn=2184 is where the hybrid's 3-attention/9-KDA allocation
+# meets the C0 FLOP bill: 6·109,892,835 + 3·12·890·1024 = 692.2 MFLOP/byte vs
+# C0's 692.9 (-0.1%). Exact count: 109,892,835 params — 0.05% below
+# arch_dense890 (109,947,930), the equal-parameter control.
+#
+# The pair is NOT equal architecture: B1's 9 KDA blocks have no full attention,
+# its 3 attention blocks have no KDA, and its FFN is narrower than B2's (2184 vs
+# 3344) while both total the same parameters. That is the question — same budget,
+# different allocation — not a hidden width difference.
+d_model = 890
+n_heads = 5
+head_dim = 178
+d_ffn = 2184
+vocab = 256
+max_seq_len = 8192
+
+# A 12-block UNIQUE stack: each block runs once (max_iter=1), the ratio tiles
+# 12 exactly (3:1 → cycle 4 → 3 cycles), and `loop_blocks` is the loop's body
+# count, which this stack does not run (must stay 1).
+block_form = "kda"
+block_stack = "uniform"
+n_layers = 0
+max_iter = 12
+loop_blocks = 12
+
+# Every KDA-only arm OFF: this is the block-form arm, not a memory/CSA/mHC arm.
+# The KDA block itself is the kda form's block (`use_kda=true`).
+use_kda = true
+use_csa = true
+use_mhc = false
+use_attnres = false
+use_engram = false
+layerrope = false
+
+# A dense FFN on both halves: the expert bank would add a second variable.
+ffn_form = "dense"
+use_tsct = false
+n_experts = 1
+moe_topk = 0
+
+bf16 = true
