@@ -1,57 +1,63 @@
-# GOAL — AWAY mode
+# MODE: AWAY — night of 2026-11-11
 
-MODE: AWAY. The owner is asleep and gave full autonomy until they return.
-Deliver at the end: STATUS: DONE + a full report (what changed, what was
-measured, what is still red, what needs their decision).
+Owner is asleep. Work autonomously until he returns, then close with a full
+report (`.bulba/report-2026-11-11.md` + a summary in chat).
 
-## Mission
+## The question this night must answer
 
-Make this repo the best software it can be, measured — not asserted. In order:
+"Highest intelligence density": minimum file bytes, minimum inference FLOPs,
+minimum training data and FLOPs, maximum quality. The owner's own framing:
+never learn what you cannot keep — no compressing a smart model afterwards.
 
-1. **Fix what is red.** The full CPU suite has 22 failures (2026-11-08 run).
-   Classify each: real defect / stale test / GPU-only. Fix the real ones with a
-   gate that would catch the return; fix the stale tests by updating the claim,
-   never by deleting a gate that still describes the code.
-2. **Find defects the audits only pointed at.** The five 2026-11-08 audits leave
-   a named list: LayerRoPE `exp` overflow at `a_mag=95`, the WSD edge where
-   `warmup+decay > total` never reaches the floor, the KDA `g_min=-5` floor from
-   K3, `web.bin.docs.json` (a shard-seam sidecar the loader would accept), and
-   the 9 claims-ledger mismatches.
-3. **Reduce the codebase.** Execute the deletion audit's safe tier: C2 (two
-   DEAD config fields), C7 (vendor burn-eggroll + burn-ptrn — this one edits the
-   burn-fused facade, so it needs a workspace build). Then re-measure.
-4. **Keep the record honest.** Every number that tonight's audits retracted
-   (`1.4621`, the `-0.267` Muon claim) must stay marked in the docs it appears
-   in; the claims ledger gate must be re-armed with a `--since` mode.
+## Night queue (strict order, card must never idle)
 
-## Hard rules
+1. **fp4 fused kernel** (subagent `ses_e38b868b2ffe4eQwLI5eKxE9m4`, running).
+   Measured basis: `_scaled_mm` fp4 is **3.16× faster** than bf16 at
+   `[24576,832]x[832,2048]`; the eager `quantize_nvfp4` costs 10.67 ms and is
+   the entire 5.4× slowdown of the `e2m1` arm. Fix = fused kernel, target
+   ≤0.6 ms total. Gate: the blocked-scale swizzle, because a wrong swizzle
+   "succeeds" with 46% error.
+2. **TSCT rank-64 at 275M** — the biggest single lever (0.048/0.071/0.096/0.121
+   = 5/8/11/14/17 h saved), 3 seeds vs the gated control, 120 MB. This is the
+   experiment that decides whether the project's central bet (low-rank =
+   quality) survives at a scale that matters.
+3. **AttnRes memory fix** (score one source at a time: 507 MiB → 39 MiB peak per
+   layer) so the arm can actually run at b24 — it OOM'd at b24, b20 AND b16.
+4. **QAT-finish at 95M** if time remains: the 18.8 MB artifact.
 
-- No push to `origin/main`: it is a DIFFERENT lineage (see `.bulba/plan.md`).
-  Push to `origin/backup/main-local-2026-11-08` only.
-- One task per commit; stage the paths you touched, never `git add .`.
-- A fix without a gate is unfinished. A gate that cannot fail is a defect.
-- If the GPU is free and the work needs it, one heavy thing at a time.
-- Never delete a test to make a suite green; if the test's claim is wrong, say
-  in the commit why the claim moved.
+## Rules for the night
 
-## Queue (2026-11-08 05:15)
+- Every number comes from a command, not from a paper or a prior claim.
+- Every A/B is 3 seeds; a delta inside 2× the seed spread is "not separated".
+- Any arm that loses is recorded as a measured refusal with its number, in
+  `docs/reviews/`, and stays as a flag — never deleted silently.
+- `scripts/gpu_lock.sh` for every GPU job. Never bypass it, never kill another
+  lane's job to take the card.
+- Commit per task, own files only, no preset of a frozen control edited.
+- If a run fails, read the reason and record it; do not retry blindly.
 
-- [x] 22 red tests: classified and fixed — **CPU suite green, 2 194 tests, exit 0**
-  (five of the seven "reds" were card gates that skip without CUDA; the one real
-  defect was the AdamW bias-correction desync on the graph fallback)
-- [x] LayerRoPE overflow guard
-- [x] WSD edge refusal
-- [x] KDA g_min: written as a DECISION with a gate (no floor; a clamp on the
-  reference tail alone would split it from the FLA kernel)
-- [x] C2 dead config fields — **blocked, not skipped**: 153 snapshots carry
-  `jepa=false`; recorded in `.bulba/plan.md` with the `RETIRED_KEYS` way out
-- [ ] C7 vendor prune — skipped on purpose: the two crates are 60 KB of a FROZEN
-  lane and no root crate depends on them; it is cleanup, not a lever
-- [x] claims ledger: CI job + the two honest limits printed (`--no-params` is a
-  lower bound; "new" is a date window, so today's reports count as new)
-- [x] claims repair: 9 mismatches = 7 parser artifacts + 2 stale docs, all 10
-  drifted claims repaired or bannered
-- [x] README/site: the 1M stat says designed, 33 MiB/slot named, corpus provenance
-- [x] 1M path: artifact audit + protocol + `niah.py` runner + `train_csa8k.sh`
-- [x] fused-cluster review + fixes
-- [ ] recipe ladder: RUNNING (7 arms x 120 MB, ~08:40)
+## Progress (updated 04:35)
+
+1. fp4 kernel: done (`00c9626`) — quantize 13.57 → 0.32 ms (43x), bare GEMM 3.16x
+   faster than bf16, but the end-to-end arm is a 6.7% loss (bytes/s is tokens/s).
+2. TSCT wired into the live transformer block (`3e5c727`) — was a silent no-op.
+3. **The first A/B was CONFOUNDED and killed**: the tsct arm's init was 13.3x
+   larger than the block contract (review caught it). Fixed in `1043573`, gate
+   added that fails on the old code.
+4. Mechanism arm measured: tsct275 110.1M = 2.1067 vs dense275 273.4M = 1.6406
+   (+0.466). That is a parameter-count difference, not a rank verdict.
+5. Reinvestment arm (`arch_tsct275_wide`, 272.8M/544M == control) running at b4.
+6. AttnRes training peak fixed (`0bfe05e`): the mixer's retained bytes
+   3045.8 → 2.6 MiB per block; the earlier fix was forward-only.
+
+## Known results to carry into the report
+
+| arm | result |
+|---|---|
+| gated FFN (SwiGLU, param-neutral) | **−0.0145 BPB**, 3 seeds, t=−19 → live recipe |
+| mHC in transformer | **+0.0853 BPB** at b16 (1.5714 vs 1.4861), +936 MiB — measured loss |
+| AttnRes full N=L | unrunnable: OOM at b24 (858 MiB short), b20, b16 (48 MiB short) |
+| MoE bank buffers | −468 MiB/layer ≈ −5.5 GiB at b24 (fixed), cap 2.0→1.25/dropless |
+| fp4 GEMM | **3.16×** vs bf16 at live shape; 7.5× at 4096³ |
+| 4-bit activation storage | 4.34 GiB saved of the activation sites (80%), max batch 24→28, but 5.4× slower because of the eager quantizer |
+| qwen3.8-27B | 3.6→3.8 at IDENTICAL architecture: +8.2 SWE-Pro, +20.4 OSWorld — post-training, not architecture |
