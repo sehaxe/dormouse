@@ -1,0 +1,51 @@
+# kda12_equal — the KDA block as a 12-layer stack, matched to the gated control.
+#
+# THE MISSING MEASUREMENT: `TransformerBlock` has one FFN and refuses
+# `n_experts>1`, so MoE / a TSCT expert bank / the 1B-stored model all live on
+# `block_form="kda"`. The KDA block's QUALITY has never been measured against
+# the live transformer at equal parameters and equal data.
+#
+# Control: `configs/arch_gated_swiglu.toml` — 95,035,200 params
+#          (d=832, 12 unique blocks, SwiGLU, f=2048).
+# This arm: 94,916,556 params, -118,644 = **-0.125%** (`dormouse info`).
+#
+# NO LOOPING. `loop_blocks=12, max_iter=12`: iteration i runs body `i % 12`
+# (`model/loopblock.py:_run`), so each of the 12 distinct bodies is visited
+# exactly ONCE — a plain 12-layer model whose attention is KDA instead of full.
+# `n_layers` must stay 0 on this form (`validate_block_form`).
+#
+# THE FFN IS ALREADY GATED, WHICH IS WHY `ffn_gated` IS ABSENT. `ffn_gated=true`
+# is REFUSED on every block form but `transformer` (`config.validate_ffn`): the
+# loop's `DenseFFN` already IS the gated GLU — `gate`/`up`/`down` with
+# `expert_act` (silu here, the control's activation) and one bias pair,
+# `3·d·f + f + d`. So `ffn_form="dense"` plus the flag left off builds the same
+# SwiGLU the control's `ffn_gated=true` builds; setting the flag would refuse.
+#
+# `d_ffn=1760`: the KDA block's attention side (q/k/v/g, controller, per-body
+# norms) is wider than the control's packed `qkv`+`proj`, so the FFN width pays
+# it back. 1760 is 16-aligned (tensor-core tile); 1764 is the exact-parity width
+# (-0.001%) but 4-aligned, so the 32-params/layer step lands on 1760.
+# Every unit of `d_ffn` is 12 bodies x (3·832+1) = 29,964 params.
+d_model = 832
+n_heads = 13
+head_dim = 64
+d_ffn = 1760
+vocab = 256
+max_seq_len = 1024
+
+block_form = "kda"
+loop_blocks = 12
+max_iter = 12
+
+ffn_form = "dense"
+use_tsct = false
+n_experts = 1
+moe_topk = 0
+share_u_mode = "off"
+
+use_csa = false
+use_mhc = false
+use_attnres = false
+use_engram = false
+layerrope = false
+bf16 = true
