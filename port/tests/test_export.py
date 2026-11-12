@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 import torch
 from conftest import TINY, tiny_cfg, tiny_model
+from torch import nn
 
 from dormouse.config import load_preset
 from dormouse.instrument import LoudError
@@ -25,11 +26,12 @@ from dormouse.model.export import (
     export_qat,
     load_qat,
     pack_ternary,
+    roundtrip_deltas,
     unpack_ternary,
     verify_roundtrip,
 )
 from dormouse.model.ternary import ternarize
-from dormouse.model.tsct import factor_qat_project, is_factor_key
+from dormouse.model.tsct import DenseLinear, factor_qat_project, is_factor_key
 
 #: The tiny fixture's export, measured 2026-10-18.
 TINY_PAYLOAD = 102_032
@@ -249,6 +251,7 @@ def test_load_qat_refuses_a_key_set_mismatch_and_names_the_host_table_case(
     with pytest.raises(LoudError, match="ngram"):
         load_qat(host_path, tiny_cfg())
 
+
 # ---------------------------------------------------------------------------
 # (e) the preset and the demo — the CPU/CI path
 # ---------------------------------------------------------------------------
@@ -273,3 +276,210 @@ def test_demo_runs_on_cpu_with_the_tiny_preset(tmp_path: Path) -> None:
     )
     assert rc == 0
     assert out.is_file() and out.stat().st_size > 0
+
+
+# ---------------------------------------------------------------------------
+# (f) the DENSE set: derived from the model's modules, packed at the same codec
+# ---------------------------------------------------------------------------
+
+
+def _dense_cfg(**over):
+    """`dense_qat="ternary"` on the transformer form — plain `nn.Linear` sites.
+
+    `use_tsct=false` also makes `lm_head` a `DenseLinear`, so the fixture covers
+    both kinds of packed site. `d_ffn=170` is the gated bill for `d_ffn_gelu=256`
+    (`check_gated_ffn_bill`); depth 2 is the smallest stack with a shared shape.
+    """
+    base = dict(
+        block_form="transformer",
+        max_iter=1,
+        n_layers=2,
+        n_experts=1,
+        moe_topk=0,
+        use_kda=False,
+        use_engram=False,
+        use_tsct=False,
+        ffn_gated=True,
+        d_ffn=170,
+        dense_qat="ternary",
+    )
+    return tiny_cfg(**{**base, **over})
+
+
+def _dense_model(**over) -> DormouseModel:
+    torch.manual_seed(0)
+    return DormouseModel(_dense_cfg(**over))
+
+
+def _projected_weights(model: DormouseModel, monkeypatch) -> set[str]:
+    """The module names whose weight the FORWARD actually projects.
+
+    `dense_qat_weight`/`qat_linear` resolve `dense_qat_project` in `tsct`'s
+    globals, so one patch there covers every call site (no module re-binds it).
+    """
+    from dormouse.model import tsct as tsct_mod
+
+    seen: set[int] = set()
+    real = tsct_mod.dense_qat_project
+
+    def spy(w, *a, **kw):
+        seen.add(id(w))
+        return real(w, *a, **kw)
+
+    monkeypatch.setattr(tsct_mod, "dense_qat_project", spy)
+    model.eval()
+    x = torch.randint(0, 256, (2, 8))
+    with torch.no_grad():
+        model(x, x)
+    return {
+        name
+        for name, m in model.named_modules()
+        if isinstance(m, (nn.Linear, DenseLinear)) and id(m.weight) in seen
+    }
+
+
+def test_the_packed_set_is_exactly_what_the_forward_projects(monkeypatch) -> None:
+    """No name list: the export's set and the forward's calls are one set.
+
+    `skip_attn` on leaves the attention masters alone (BitNet's rule); off packs
+    the whole tree. A site added to either side without the other fails here,
+    which is the property the hand-kept list could not give.
+    """
+    from dormouse.model.export import _weight_kinds
+
+    for skip in (True, False):
+        model = _dense_model(dense_qat_skip_attn=skip)
+        packed = set(_weight_kinds(model, "ternary")[0])
+        projected = {f"{name}.weight" for name in _projected_weights(model, monkeypatch)}
+        assert packed == projected, f"skip_attn={skip}: {sorted(packed ^ projected)}"
+        assert packed, "the fixture must quantize something"
+        assert _weight_kinds(model, "ternary")[1] == [], "every site declares a kind"
+
+    skipped = set(_weight_kinds(_dense_model(dense_qat_skip_attn=True), "ternary")[0])
+    assert "transformer_blocks.0.qkv.weight" not in skipped
+    assert "transformer_blocks.0.gate_proj.weight" in skipped
+    assert "lm_head.weight" in skipped  # `DenseLinear` declares its own kind
+
+
+def test_dense_export_report_is_the_real_arithmetic(tmp_path: Path) -> None:
+    model = _dense_model()
+    path = tmp_path / "dense.qat.pt"
+    rep = export_qat(model, path)
+    sd = model.state_dict()
+    from dormouse.model.export import _weight_kinds
+
+    dense = list(_weight_kinds(model, "ternary")[0])
+    assert rep.keys["dense"] == len(dense) == 7  # 3 FFN weights per block + lm_head
+    assert rep.groups["dense"] == sum(sd[k].numel() // 4 + 2 for k in dense)
+    assert rep.counts["dense"] == sum(sd[k].numel() for k in dense)
+    assert rep.total_bytes == sum(rep.groups.values())
+    # 8x on the packed matrices, and the report says so instead of assuming it
+    assert rep.bf16_groups["dense"] / rep.groups["dense"] > 7.0
+    assert rep.ratio_vs_bf16 == pytest.approx(rep.bf16_bytes / rep.total_bytes)
+    assert rep.file_bytes == path.stat().st_size > rep.total_bytes
+    assert rep.undeclared == []
+    ck = torch.load(path, weights_only=True)
+    rec = ck["tensors"]["transformer_blocks.0.gate_proj.weight"]
+    assert rec["rung"] == "ternary" and rec["codes"].dtype == torch.uint8
+    assert rec["codes"].numel() * 4 == rec["n"]
+    assert rec["scale"].dtype == torch.float16 and rec["scale"].ndim == 0
+    # the skip rule's half of the file: the attention master stays bf16, whole
+    assert ck["tensors"]["transformer_blocks.0.qkv.weight"].dtype == torch.bfloat16
+
+
+def test_dense_load_reproduces_the_projection_and_the_roundtrip_delta(tmp_path: Path) -> None:
+    """export → load: the file IS the quantized network, and the numbers say so."""
+    model = _dense_model(dense_qat_skip_attn=False)
+    path = tmp_path / "dense.qat.pt"
+    export_qat(model, path)
+    loaded = load_qat(path, model.cfg)
+    assert loaded.cfg.dense_qat == "none" and loaded.cfg.factor_qat == "none"
+    assert all(m.dense_qat == "none" for m in loaded.modules() if hasattr(m, "dense_qat"))
+    assert all(
+        getattr(m, a) == "none"
+        for m in loaded.modules()
+        for a in ("_qat_attn", "_qat_ffn")
+        if hasattr(m, a)
+    )
+    sd0, sd1 = model.state_dict(), loaded.state_dict()
+    worst = 0.0
+    for key in (
+        "transformer_blocks.0.gate_proj.weight",
+        "lm_head.weight",
+        "transformer_blocks.1.qkv.weight",
+    ):
+        proj = ternarize(sd0[key])
+        scale = max(float(proj.abs().max()), 1e-30)
+        worst = max(worst, float((sd1[key] - proj).abs().max()) / scale)
+    assert worst <= FACTOR_REL_BOUND, worst
+
+    torch.manual_seed(3)
+    x = torch.randint(0, 256, (2, 8))
+    d = roundtrip_deltas(model, path, (x,))
+    # The storage must cost a small fraction of the quantization training
+    # accepted: 0.5% here, measured ~0.3%, with the bound wide enough for a
+    # different init. Equal-ish would mean a broken pack, not a tight tolerance.
+    assert 0.0 < d["export_abs"] < 0.01 * d["quant_abs"], d
+    assert d["export_rel"] < 1e-2 and d["quant_rel"] > 0.1, d
+    assert verify_roundtrip(model, path, (x,)) == pytest.approx(d["export_abs"], rel=1e-9)
+    # the two paths are restored after the measurement
+    assert model.transformer_blocks[0]._qat_ffn == "ternary"
+    assert model.lm_head.dense_qat == "ternary"
+
+
+def test_export_refuses_a_selected_weight_that_is_not_2d() -> None:
+    from dormouse.model.export import export_plan
+
+    class Bank(nn.Module):
+        """A declared-quantized site whose weight is a STACK, not a matrix."""
+
+        dense_qat = "ternary"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.bank = nn.Linear(8, 8)
+            self.bank.weight = nn.Parameter(torch.randn(4, 8, 8))  # the [E, ·, ·] shape
+
+    with pytest.raises(LoudError, match="is selected for packing"):
+        export_plan(Bank())
+
+
+def test_export_refuses_a_rung_it_has_no_codec_for() -> None:
+    from dormouse.model.export import export_plan
+
+    class Site(nn.Module):
+        dense_qat = "mxfp4"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = nn.Linear(8, 8)
+
+    with pytest.raises(LoudError, match="but this file writes"):
+        export_plan(Site())
+
+
+def test_export_refuses_a_ternary_label_on_a_model_with_nothing_packed() -> None:
+    """The silent no-op this task exists to remove: a bf16 file called ternary.
+
+    The reported case: a plain transformer (`use_tsct=false`, no expert bank, so
+    no `u`/`v` factor key either) trained with `dense_qat="none"`, exported
+    with `mode="ternary"` — which used to write the bf16 model byte for byte
+    and report it as the ternary release.
+    """
+    from dormouse.model.export import export_plan
+
+    with pytest.raises(LoudError, match="nothing in this model is packable"):
+        export_plan(DormouseModel(_dense_cfg(dense_qat="none")))
+
+
+def test_load_refuses_a_record_whose_shape_is_not_the_models(tmp_path: Path) -> None:
+    model = _dense_model()
+    path = tmp_path / "dense.qat.pt"
+    export_qat(model, path)
+    ck = torch.load(path, weights_only=True)
+    rec = ck["tensors"]["lm_head.weight"]
+    ck["tensors"]["lm_head.weight"] = {**rec, "shape": (rec["shape"][0], rec["shape"][1] + 4)}
+    bad = tmp_path / "bad.qat.pt"
+    torch.save(ck, bad)
+    with pytest.raises(LoudError, match="different model config"):
+        load_qat(bad, model.cfg)

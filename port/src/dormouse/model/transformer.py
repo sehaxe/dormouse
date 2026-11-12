@@ -356,6 +356,23 @@ class TransformerBlock(nn.Module):
             self.gate = nn.Linear(d, heads, device=device)
             nn.init.zeros_(self.gate.weight)
             nn.init.constant_(self.gate.bias, 4.0)
+        #: Each `nn.Linear` child DECLARES the kind its forward reads, so
+        #: `model/export.py` packs exactly the weights this block quantized —
+        #: and never a neighbour — from the model itself rather than a second,
+        #: hand-kept site list. `gate` (the attention gate) is in no site list,
+        #: so it says `none` out loud instead of being guessed at.
+        for _site, _kind in (
+            ("qkv", self._qat_attn),
+            ("proj", self._qat_attn),
+            ("fc", self._qat_ffn),
+            ("fc2", self._qat_ffn),
+            ("gate_proj", self._qat_ffn),
+            ("up_proj", self._qat_ffn),
+            ("gate", "none"),
+        ):
+            _mod = getattr(self, _site, None)
+            if isinstance(_mod, nn.Linear):
+                _mod._qat_kind = _kind
         #: Block 0's value for the NEXT block's `value_residual` (None until the
         #: first forward; the model threads it, the block never looks ahead).
         self.last_v: torch.Tensor | None = None
