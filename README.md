@@ -7,9 +7,11 @@
 **Train a real model on your own computer.**
 
 The goal is a cheap but capable chatbot: a model you can download, run locally,
-and afford to train yourself in days instead of months. The project is the
-research that gets there — every technique that makes a model cheaper and
-smarter, measured on one consumer GPU, and thrown out when it does not pay.
+and afford to train yourself in days instead of months. What we maximise is
+**intelligence density** — ability per byte of file, per FLOP, per hour of
+training — so the project is the research that buys it: every technique that
+makes a model cheaper and smarter, measured on one consumer GPU, and thrown out
+when it does not pay.
 
 Byte-level input (256 symbols, no tokenizer), trained in the format it ships in,
 with one rule for every mechanism: *it must beat its own removal on held-out
