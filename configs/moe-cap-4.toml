@@ -15,7 +15,7 @@
 #
 # The ladder is a CAPACITY measurement, not a shipped recipe: the measured
 # params and the FLOP accounting for all four rungs are in
-# docs/reviews/moe-dev-2026-10-03.md §3, measured on the instantiated model by
+# docs/records/reviews/moe-dev-2026-10-03.md §3, measured on the instantiated model by
 # `cargo test -p dormouse-core --test preset_exec -- --ignored`.
 #
 # NOT AN A/B WINNER. These rungs exist to price capacity. Whether more experts

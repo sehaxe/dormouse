@@ -1069,7 +1069,7 @@ def test_the_torch_adamw_path_advances_the_bias_correction_counter(monkeypatch):
     run that falls back from the captured graph (or from the fused writer) to
     the torch path therefore resumed the fused correction at t=1 — measured as a
     3.1e-05 divergence at `embed.weight` with losses equal to nine digits
-    (docs/reviews/2026-11-08-fused-cluster.md §1).
+    (docs/records/reviews/2026-11-08-fused-cluster.md §1).
     """
     slow_m, slow_o = _adamw_arm()
     fast_m, fast_o = _adamw_arm()

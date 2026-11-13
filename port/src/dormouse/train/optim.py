@@ -45,7 +45,7 @@ The update is `burn-muon-plus`'s, not a re-derivation:
     approximate by design (gate: `tests/test_muon_fast.py`).
   - `ns_dtype` (`fp32` | `bf16`) runs the Newton–Schulz chain in bf16 with
     explicit fp32 in/out casts — nanogpt's practice, row 4 of
-    `docs/research/2026-10-16-muon-orthogonalization-cost.md` (predicted
+    `docs/records/research/2026-10-16-muon-orthogonalization-cost.md` (predicted
     −100…−200 ms at b1, NOT measured here: this file prices nothing).
 * Two **direction / schedule arms**, both opt-in and both `off` by default, so
   a live run's semantics and its resume do not change:
@@ -117,7 +117,7 @@ JORDAN_NS_COEFFS = (3.4445, -4.7750, 2.0315)
 #: the whole Jordan chain (the Gram lives in registers), against ~52 dispatches
 #: for a `[2048, 64]` factor (measured, `scripts/bench_ns_triton.py`) — the one
 #: arm whose mechanism is *fewer launches* on a launch-bound step
-#: (`docs/research/2026-10-17-muon-variants.md` §2 #1). It is COUNTED and falls
+#: (`docs/records/research/2026-10-17-muon-variants.md` §2 #1). It is COUNTED and falls
 #: back to `classic` with its reason when it cannot serve a call.
 NS_KINDS = ("classic", "triton")
 
@@ -318,7 +318,7 @@ def zeropower_via_ns(
     and the Frobenius prescale runs in fp32 (it is one pass and it is what the
     polynomial's conditioning rests on), then the chain runs in bf16 and the
     result is returned in fp32. nanogpt's practice (row 4 of
-    `docs/research/2026-10-16-muon-orthogonalization-cost.md`); the rung is
+    `docs/records/research/2026-10-16-muon-orthogonalization-cost.md`); the rung is
     approximate by design and the orthogonality gate is in
     `tests/test_muon_fast.py`.
 
@@ -1596,7 +1596,7 @@ class Muon(Optimizer):
 
         After `colrow_normalize` every row of the update has norm 1, so the
         per-element RMS of the bare update is `1/sqrt(cols)` and the applied step
-        is `lr * scale / sqrt(cols)`. The audit (`docs/reviews/2026-11-07-muon-audit.md`
+        is `lr * scale / sqrt(cols)`. The audit (`docs/records/reviews/2026-11-07-muon-audit.md`
         §D2) measured the old `sqrt(max(1, rows/cols))` and found RMS from 1.0e-5
         to 2.0e-5 at `lr=3e-4` against AdamW's 3.0e-4 — a 15x-55x deficit, and
         NOT uniform across shapes, so a factorised bank was punished harder than
@@ -2409,7 +2409,7 @@ class MixOptimizer:
                 f"not this arm.)"
             )
         # The SF arm's decay at Z is a DIFFERENT quantity from the AdamW half's
-        # `wd` (the SF paper's Lemma 3.1, `docs/research/2026-10-16-sf-muon.md`:
+        # `wd` (the SF paper's Lemma 3.1, `docs/records/research/2026-10-16-sf-muon.md`:
         # S2), so it has its own value. `None` keeps the pre-key behaviour
         # (inherit `wd`) for a caller that predates the key; the trainer passes
         # the config field explicitly.

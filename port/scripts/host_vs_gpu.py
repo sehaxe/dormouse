@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 """Is one `flagship3_dense` step limited by the GPU or by the host?
 
-The kernel audit (`docs/reviews/2026-11-08-kernel-audit.md`) accounts for 58% of
+The kernel audit (`docs/records/reviews/2026-11-08-kernel-audit.md`) accounts for 58% of
 the step as arithmetic and leaves 42% unnamed. This instrument names it from
 measurements, in four modes, all on the REAL trainer (it imports `dormouse.cli`
 and runs `train` in-process, so the model, optimizer, dataloader and step body

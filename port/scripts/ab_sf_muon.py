@@ -12,9 +12,9 @@ number is therefore unmeasured until it runs.
 the control on the two seeds that finished, and one seed diverged to
 **BPB 4.0573** — the headline was a trimmed mean with the divergence dropped
 and no marker on the table. The arm also sat outside the paper's theorem in
-ways the research note had already named (`docs/research/2026-10-16-sf-muon.md`
+ways the research note had already named (`docs/records/research/2026-10-16-sf-muon.md`
 §3: S1 exact-polar gap, S2 decay at `Z`, S3 retraction). Tasks A and the note
-`docs/reviews/2026-10-21-sf-muon-prerequisites.md` made the SF-specific
+`docs/records/reviews/2026-10-21-sf-muon-prerequisites.md` made the SF-specific
 preconditions explicit; this driver tests the arm those preconditions describe.
 
 **Arms** (the control is first; every other flag is COMMON):
@@ -402,7 +402,7 @@ def ab(args: argparse.Namespace) -> int:
         "delta, the result is LR-specific and is not the schedule-free claim. A "
         "2k-step tie is the designed outcome (the published gains are stated at "
         ">=1000 tokens/param), so a tie escalates to one 10x-step arm before deletion "
-        "(`docs/research/2026-10-16-sf-muon.md` §4)."
+        "(`docs/records/research/2026-10-16-sf-muon.md` §4)."
     )
     return 0
 

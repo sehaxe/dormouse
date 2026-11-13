@@ -631,7 +631,7 @@ def test_a_fallback_hands_the_muon_group_its_own_lr_back():
     so the first eager step after a capture refusal ran Muon at `1/mult` of its
     learning rate — invisible in the log, one step, and exactly the class of
     silent non-arm the multiplier audit exists for
-    (docs/reviews/2026-11-08-fused-cluster.md §1b).
+    (docs/records/reviews/2026-11-08-fused-cluster.md §1b).
     """
     model, opt = _mix()
     opt.muon_lr_mult = 12.0

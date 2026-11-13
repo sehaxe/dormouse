@@ -49,7 +49,7 @@ def test_padded_and_naive_agree_on_the_same_routing(bf16, bound):
     bf16 rounding chains and the delta between two correct chains is floored by
     the GEMM reduction order, not by where the router weight is applied (a
     three-variant / three-seed probe in
-    `docs/reviews/2026-11-10-moe-package-bench.md` §8.8 measured 3.9-7.0e-3 for
+    `docs/records/reviews/2026-11-10-moe-package-bench.md` §8.8 measured 3.9-7.0e-3 for
     every variant, including fp32 products). The bound alone would therefore be
     a weak wiring detector at bf16, so the gate ALSO asserts the float64 ratio:
     the arm may not be further from the truth than the loop it replaces.

@@ -1,6 +1,6 @@
 """The LOOM arm (`2610.01153`): per-loop router conditioning + variance control.
 
-Source: `docs/research/2026-10-16-new-tech-scan.md` §2.1 — the row that measures
+Source: `docs/records/research/2026-10-16-new-tech-scan.md` §2.1 — the row that measures
 a weight-shared loop as stuck at two iterations (hidden-state variance growth +
 expert-selection collapse) and reports 9-12 stable loops at 100M-1.7B, our band.
 The arm is a TRANSCRIPTION of that scan's summary, not of the paper's full

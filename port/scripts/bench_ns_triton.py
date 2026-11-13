@@ -4,7 +4,7 @@
     uv run python scripts/bench_ns_triton.py cpu      # the dispatch counts only
 
 What it answers, in the order the arm's claim is made
-(`docs/research/2026-10-17-muon-variants.md` §1 row 1, §2 #1):
+(`docs/records/research/2026-10-17-muon-variants.md` §1 row 1, §2 #1):
 
 1. **how many dispatches each chain issues** — the classic arm's aten count is
    MEASURED with a `TorchDispatchMode` on CPU (device-independent: it is the same

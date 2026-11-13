@@ -2,7 +2,7 @@
 
 Source is `vendor/dormouse-fused/crates/burn-mhc` (module docstring and line
 citations in `model/mhc.py`); the wiring decisions are
-`docs/reviews/mhc-2026-09-30.md` §3 (K=2 lanes at the LOOP BOUNDARY, the
+`docs/records/reviews/mhc-2026-09-30.md` §3 (K=2 lanes at the LOOP BOUNDARY, the
 readout, `H_pre` by the caller, `h_ctx` as `x_l`).
 
 The gates here are the ones the burn lane's review paid for: a hand-computed

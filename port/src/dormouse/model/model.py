@@ -16,7 +16,7 @@ PonderNet (ADR-0013).
 The port also carries one REGULARISER, SIGReg (`sigreg.py`, default weight 0.0):
 `CE + sigreg_weight · sigreg_loss(z)` over the strided sample of the same
 `norm(out)` state — teacher-free, predictor-free, mask-free, 0 parameters, no
-second forward (`docs/research/2026-10-16-jepa-into-dormouse.md` §2/§3, the ONE
+second forward (`docs/records/research/2026-10-16-jepa-into-dormouse.md` §2/§3, the ONE
 arm to run first).
 """
 
@@ -1360,7 +1360,7 @@ class DormouseModel(nn.Module):
                 # reaches the loop (LeJEPA's "no stop-gradient"). The counter is
                 # bumped exactly here, where the term is added: the research
                 # doc's metric 2 is a term that was never added looking alive
-                # (`docs/research/2026-10-16-jepa-into-dormouse.md` §3).
+                # (`docs/records/research/2026-10-16-jepa-into-dormouse.md` §3).
                 counters.count("sigreg")
                 loss = loss + self.cfg.sigreg_weight * sigreg_loss(
                     stride_sample(hn.reshape(-1, self.cfg.d_model).to(torch.float32))

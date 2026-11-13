@@ -1,4 +1,4 @@
-"""Free-wins bench, research step 2/3 (docs/research/2026-10-15-tsct-super-kernel.md):
+"""Free-wins bench, research step 2/3 (docs/records/research/2026-10-15-tsct-super-kernel.md):
 
 (1) the port's operating cap was never measured — `b1.toml` says capacity 1.0
     (cap 32 at b16·s1024·topk2) while the kernel work used cap 64: measure the

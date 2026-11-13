@@ -1,6 +1,6 @@
 """The seedable synthetic task builder — the little-data multiplier.
 
-`docs/research/2026-10-15-agentic-post-training.md` §2.2: verifiable tasks are
+`docs/records/research/2026-10-15-agentic-post-training.md` §2.2: verifiable tasks are
 *generated* with their own verification targets; §5 rung (a) says every other
 rung consumes `(prompt, response, verifier-tag)` records, so the builder emits
 exactly that plus the hidden reference.

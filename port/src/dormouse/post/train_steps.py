@@ -1,6 +1,6 @@
 """CRR fork-replay advantage — the 2609.33875 shape, on a group of rollouts.
 
-`docs/research/2026-10-15-agentic-post-training.md` §1 row CRR: "restore a state,
+`docs/records/research/2026-10-15-agentic-post-training.md` §1 row CRR: "restore a state,
 take an alternative action, roll forward; replace the advantage at selected steps
 with (real return − counterfactual return). No human process labels, no learned
 process RM." At group granularity that is:

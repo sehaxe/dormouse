@@ -9,13 +9,13 @@ host-table update instead of failing, a short read was space-padded, a v1
 sidecar was reported and then discarded, `max_ortho` drift and the drift check
 were the only loud mechanisms.
 
-Decision: NASA P10 Rule 5 (docs/research/2026-09-25-nasa-burn-rust-practices.md) —
+Decision: NASA P10 Rule 5 (docs/records/research/2026-09-25-nasa-burn-rust-practices.md) —
 assertion density >= 2 per non-trivial function on average, and every assertion
 failure routes to a named recovery action (a startup config error is a hard
 error with the offending path named; the named recovery for a mid-run failure
 was the `--guard` checkpoint-and-resume, removed 2026-10-02 after its detached
 parent exited 0 and orchestrators read failure as success —
-docs/reviews/unguard-2026-10-02.md; the recovery today is a non-zero exit and
+docs/records/reviews/unguard-2026-10-02.md; the recovery today is a non-zero exit and
 an operator resume with the same `--ckpt-name`, with the NaN firewall
 unconditional in the loop). Data that does not exist stops the run; it is never
 synthesized. Shape mismatches stop the run; they are never skipped.
@@ -26,4 +26,4 @@ Landmarks: `collect_files`/`from_files` asserts + corpus size floor
 (commit 9605896), the refill dry-assert and short-read assert (data/lib.rs),
 host-grad shape assert and sidecar hard error (train/lib.rs), dead-field
 validation removed rather than kept as false confidence
-(docs/archive/audit-2026-09-25.md §3.10).
+(docs/records/archive/audit-2026-09-25.md §3.10).

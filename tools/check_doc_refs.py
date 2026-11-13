@@ -79,8 +79,8 @@ KNOWN_DEAD = {
 	"docs/README-model.md": "an old README section turned into its own file by a plan that never ran; the content is docs/architecture/PLAN.md",
 	"docs/20260420-flashkda-v1-deep-dive.md": "a report written outside the tree; the transcription that replaced it is docs/papers/spec-flashkda.md",
 	"docs/SCT_Patent_Application.pdf": "a patent PDF read once and never committed; the lineage is in docs/papers/tsct.md",
-	"research/reviews/gdn-fwd-review.md": "a review whose file was never committed; the gdn-kda lane's two halves are docs/reviews/2026-09-29-gdn-kda-review.md",
-	"research/reviews/fix-verification-2026-09-30.md": "an audit read out of a worktree (wt/fixverify) and named here as provenance; its four findings are closed in docs/reviews/verify-tails-2026-09-30.md",
+	"research/reviews/gdn-fwd-review.md": "a review whose file was never committed; the gdn-kda lane's two halves are docs/records/reviews/2026-09-29-gdn-kda-review.md",
+	"research/reviews/fix-verification-2026-09-30.md": "an audit read out of a worktree (wt/fixverify) and named here as provenance; its four findings are closed in docs/records/reviews/verify-tails-2026-09-30.md",
 	"research/papers/spec-bwd.md": "a spec transcribed in a lane that was cut before it committed; the backward is gated from docs/papers/gdn-kda.md",
 	"tools/gen_reference.rs": "renamed to tools/gen_reference_f64.py; two gate comments still carry the old name",
 	"vendor/dormouse-fused/crates/burn-sct/src/qr.rs": "the crate was deleted 2026-10-02; the audit that names it is a dated record",
@@ -136,7 +136,7 @@ def plausible(token: str) -> bool:
 	return True
 
 
-#: Historical documents (`docs/reviews`, `docs/research`, `docs/archive`) describe
+#: Historical documents (`docs/records/reviews`, `docs/records/research`, `docs/records/archive`) describe
 #: the tree as it was on their date. On 2026-11-07 the live package moved
 #: `port/` -> `python/`; a dated report that says `port/src/...` is a true record
 #: of that day, so the alias resolves it instead of forcing a rewrite of history.

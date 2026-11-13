@@ -1044,7 +1044,7 @@ def train_cmd(
     # is the historical default and stays bit-identical for resumption, but at a
     # shared LR the Muon half's step is 8x-52x smaller than AdamW's on this model's
     # shapes (0.7 %-17 % of its first-order decrease, see
-    # docs/reviews/2026-11-06-optimizer-audit.md). Every architecture verdict in
+    # docs/records/reviews/2026-11-06-optimizer-audit.md). Every architecture verdict in
     # the archive before 2026-11-07 was measured in that regime. Printed here
     # rather than in the trainer so the `log` callback keeps carrying only
     # step/eval lines (five test files read `lines[0]` as a step line).
@@ -1095,7 +1095,7 @@ def run(
 ) -> None:
     """One button: stage-1 pretrain → checkpoint family → stage-2 post-train.
 
-    The STAGE-EXIT rules are the research's, named (docs/research/
+    The STAGE-EXIT rules are the research's, named (docs/records/research/
     2026-10-16-one-button-pipeline.md): stage 1 leaves on the TOKEN budget
     (the `steps` line) — not on a loss plateau, which no published pipeline
     uses; the terminal decay + checkpoint average is stage 1's ONLY

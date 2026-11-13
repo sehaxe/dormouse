@@ -1,7 +1,7 @@
 """The DSpark port's own gate: D1's window, D9's Markov wiring, and the loss.
 
 `tests/test_dspark_gold.py` is the pre-registered vector
-(`docs/research/2026-10-16-jepa-dspark-alternatives.md` §4.1 item 2) and this
+(`docs/records/research/2026-10-16-jepa-dspark-alternatives.md` §4.1 item 2) and this
 file runs THAT vector through the real builder — the gold file's `make_window`
 and `check_position_order` are imported, not mirrored, so the two cannot drift.
 The remaining tests are the three burn defects' other halves (D9's width and its

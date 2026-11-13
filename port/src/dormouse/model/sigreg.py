@@ -1,6 +1,6 @@
 """SIGReg — the LeJEPA isotropic-Gaussian regulariser, and its strided input.
 
-`docs/research/2026-10-16-jepa-into-dormouse.md` §2 names the family and §3 the
+`docs/records/research/2026-10-16-jepa-into-dormouse.md` §2 names the family and §3 the
 assembly this ports: `loss = CE + sigreg_weight · sigreg_loss(z)`, `z` the
 strided sample of the state `lm_head` reads — **no teacher, no predictor, no
 mask, no second forward, 0 parameters**. §3 is the ONE arm the document puts

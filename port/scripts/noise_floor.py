@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The noise floor: rerun N steps twice from the same seed, print the BPB spread.
 
-`docs/reviews/2026-11-06-control-transformer.md` measured a same-seed rerun
+`docs/records/reviews/2026-11-06-control-transformer.md` measured a same-seed rerun
 0.043 BPB apart (CUDA nondeterminism on a shared GPU), which is larger than the
 0.01-0.03 effects the A/B queue was deciding on. A difference is only a result
 if it clears the floor of the SAME setup, so this script measures that floor

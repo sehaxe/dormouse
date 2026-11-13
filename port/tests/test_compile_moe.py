@@ -4,7 +4,7 @@ stays out of dynamo's guards, and the decision itself is unchanged.
 `SparseMoE._banks`' cache key holds per-step Python values — the annealed
 `factor_qat_alpha`, the experts' parameter `_version` tuple, the grad state —
 and dynamo guards a compiled region on every Python value it reads. Measured
-2026-10-18 (`docs/research/2026-10-18-compile-moe.md` §2-3): without the
+2026-10-18 (`docs/records/research/2026-10-18-compile-moe.md` §2-3): without the
 decorator the frame spends one compiled variant per step until it hits
 `config.recompile_limit` and falls back to eager (the trainer's step measured
 2939 ms against 573 eager); with `@torch.compiler.disable` on `_banks` it

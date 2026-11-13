@@ -1,6 +1,6 @@
 """The load-balance controller arms and the routing-health counters.
 
-Evidence (`docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md`, `m400` at
+Evidence (`docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md`, `m400` at
 step 149 999, real bytes, 8 192 assignments): **80 of 512 experts alive, top-10
 holding 50.1% of all tokens**. The sign LFB controller could not repair it —
 `b_e -= coef·sign(L_e − mean L)` gives a dead expert one `coef` per forward, its

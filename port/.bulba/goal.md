@@ -18,7 +18,7 @@ Goal: freeze the ternary release recipe, then start the real pretrain on it.
 ## What "done" means tonight
 
 1. Score the ladder (3 seeds each arm), write the verdict into
-   `docs/reviews/2026-10-22-ternary-ladder.md` with windows and the
+   `docs/records/reviews/2026-10-22-ternary-ladder.md` with windows and the
    matched-params check.
 2. Freeze the recipe: `configs/release_ternary.toml`.
 3. Launch the real pretrain on it (`mix_v3` = mix_big + instructions

@@ -22,7 +22,7 @@ form would not discriminate), no `recompile_limit` fallback is recorded, the
 loss stays finite and the parameters move. It also prints compiled vs eager
 ms/step at the same shape — the number the decision needs, because the spike's
 1.20x was measured on a simpler model
-(`docs/research/2026-10-15-torch-spike.md`) and ours has FLA/triton graph
+(`docs/records/research/2026-10-15-torch-spike.md`) and ours has FLA/triton graph
 breaks.
 """
 

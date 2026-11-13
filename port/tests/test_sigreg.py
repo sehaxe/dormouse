@@ -1,6 +1,6 @@
 """SIGReg: the formula, the strided input, the hook, the refusals.
 
-`docs/research/2026-10-16-jepa-into-dormouse.md` §2/§3 is the spec — SIGReg
+`docs/records/research/2026-10-16-jepa-into-dormouse.md` §2/§3 is the spec — SIGReg
 (arXiv:2511.08544) replaces KoLeo, and the assembly is
 `CE + sigreg_weight · sigreg_loss(z)` with `z` the strided sample of the state
 `lm_head` reads: teacher-free, predictor-free, mask-free, 0 params, no second

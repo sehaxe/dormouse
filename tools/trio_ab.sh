@@ -4,7 +4,7 @@
 #
 # WHAT THIS IS FOR. The research expert's standing objection to every
 # architecture comparison in this repo's archive is that it is a comparison of
-# TRAINING RESULTS with too many confounds at once (docs/reviews/
+# TRAINING RESULTS with too many confounds at once (docs/records/reviews/
 # trio-prep-2026-10-04.md §1). This script removes the confounds it can and
 # refuses to run the ones it cannot:
 #
@@ -75,7 +75,7 @@ EVAL_BATCHES=${EVAL_BATCHES:-20}
 WINDOW=$((EVAL_BATCHES * BATCH * SEQ))
 # Bytes per step, and bytes per run. THE comparison is fixed on these, not on
 # steps: all three arms take the same `batch * seq_len` through the same
-# `ByteStream` seam (measured, docs/reviews/byteflow-ab-2026-10-02.md §1), so
+# `ByteStream` seam (measured, docs/records/reviews/byteflow-ab-2026-10-02.md §1), so
 # equal steps is equal bytes - and this script prints the product so the claim
 # is checkable rather than inherited.
 BYTES_PER_STEP=$((BATCH * SEQ))

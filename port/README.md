@@ -82,7 +82,7 @@ nothing here.
 ## What lives in `docs/`
 
 `docs/decisions/2026-10-15-1b-readiness-plan.md` is the live plan (b1
-arithmetic, substrate verdict, the port lane §7). `docs/research/` carries
+arithmetic, substrate verdict, the port lane §7). `docs/records/research/` carries
 the verified technology bets (Muon, ByteFlow, LittleBit, data strategy,
 agentic post-training — every claim with a source). The burn crates in
 `../vendor/dormouse-fused/` are the formula source, not the spec.

@@ -353,7 +353,7 @@ def test_the_bf16_bank_is_no_noisier_than_the_loop():
     # max|Δ|-vs-fp64 ratio is noise around 1 (measured 0.92 here, 1.03 for the
     # bucketed arm). A WIRING defect moves this by the scale of the tensor — a
     # dropped or duplicated term is 2x or worse. Measured 0.92 here, 1.59 on the
-    # card fixture (see docs/reviews/2026-11-10-moe-package-bench.md §8.8).
+    # card fixture (see docs/records/reviews/2026-11-10-moe-package-bench.md §8.8).
     assert e_bank <= 2.0 * e_loop, f"the bank is {e_bank / e_loop:.2f}x the loop's fp64 error"
 
 

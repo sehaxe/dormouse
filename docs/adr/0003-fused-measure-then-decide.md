@@ -5,7 +5,7 @@
 > `grep DM_FUSED crates` returns nothing. ADR-0009 records the measured loss
 > (1.25x) that settled it. The body below is the 2026-09-21 record, kept as
 > history — its "6,568 LOC / DM_FUSED=1 / kept" is not the tree's state.
-> ([claims repair](docs/reviews/2026-11-08-claims-repair.md) D5)
+> ([claims repair](docs/records/reviews/2026-11-08-claims-repair.md) D5)
 
 Status: accepted, smoke verdict 2026-09-21.
 

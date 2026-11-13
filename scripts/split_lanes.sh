@@ -20,10 +20,10 @@ echo "== git mv port python"
 git mv port python
 
 echo "== rewrite live references (code, CI, guides, configs, scripts)"
-# Historical records under docs/reviews and docs/research describe the tree as it
+# Historical records under docs/records/reviews and docs/records/research describe the tree as it
 # was; rewriting them would falsify the record. They keep `port/` and
 # tools/check_doc_refs.py resolves the alias.
-files=$(git ls-files | grep -vE '^(docs/reviews|docs/research|docs/archive)/' | grep -E '\.(py|md|yml|yaml|sh|toml|rs|json)$' || true)
+files=$(git ls-files | grep -vE '^(docs/records/reviews|docs/records/research|docs/records/archive)/' | grep -E '\.(py|md|yml|yaml|sh|toml|rs|json)$' || true)
 for f in $files; do
   if grep -q 'port/' "$f" 2>/dev/null; then
     perl -0pi -e 's{(?<![\w./-])port/}{python/}g' "$f"

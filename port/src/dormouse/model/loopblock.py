@@ -42,7 +42,7 @@ passes `depth=T` to run `T` iterations instead, and the readout divides by the
 `T` actually run so different depths are scale-comparable.
 
 **LOOM** (`2610.01153`, 2026-10-01; scanned in
-`docs/research/2026-10-16-new-tech-scan.md` §2.1) is the arm behind
+`docs/records/research/2026-10-16-new-tech-scan.md` §2.1) is the arm behind
 `cfg.loom`. The paper measures a looped MoE stalling at **two** iterations —
 hidden-state variance growth plus expert-selection collapse — and reports 9-12
 stable loops at 100M-1.7B, i.e. exactly the band our `max_iter 4` / depth 2
@@ -83,7 +83,7 @@ step carries a second, per-iteration state (the chunk ring) beside KDA's; the
 
 mHC (`use_mhc`, arXiv:2512.24880) is the fourth residual arm, wired at the
 LOOP BOUNDARY by the φ study's placement (2604.21106 §5.2: K=2 lanes *across
-loops*, `docs/reviews/mhc-2026-09-30.md` §3.2): the loop carries `K =
+loops*, `docs/records/reviews/mhc-2026-09-30.md` §3.2): the loop carries `K =
 mhc_streams` FULL-width residual lanes across iterations, `H_res` (doubly
 stochastic, Eq. 9's Sinkhorn-Knopp) mixes them, `H_pre` aggregates them into
 the body's input and `H_post` weights the body's output back onto each lane

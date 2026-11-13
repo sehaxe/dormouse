@@ -58,7 +58,7 @@ PRE-REGISTERED DECISION RULE (written BEFORE the first run):
      (control is 6 684 672 parameters lighter than every TSCT-2 arm; the
      selector arm is +6.68M, the LR/revive arms are +0).
   6. If no arm wins, the bank has not been rescued at 22 GB of data; the
-     conclusion in `docs/reviews/2026-11-05-dense-beats-bank.md` stands.
+     conclusion in `docs/records/reviews/2026-11-05-dense-beats-bank.md` stands.
 
 `+basis` is the only arm with a parameter cost, so it is the one a tie deletes.
 The LR and revive arms add zero parameters and are deleted only by a LOSS or a

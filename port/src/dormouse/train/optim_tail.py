@@ -6,7 +6,7 @@ At the FAST rung (b8 x s1024, `ns_dtype=bf16`, `muon_state_dtype=bf16`) the
 optimizer stage is 57 ms of a 145.8 ms step and Newton–Schulz is 27.3 ms of it.
 The remaining ~30 ms is the tail: the momentum update, the ColRow
 normalization, the `-lr*scale` multiply, the firewall's `*flag`, and the
-write-back. Measured on the card (`docs/reviews/2026-11-08-optimizer-tail.md`),
+write-back. Measured on the card (`docs/records/reviews/2026-11-08-optimizer-tail.md`),
 none of it is arithmetic — it is PASSES OVER THE SAME 378 MiB fp32 update and
 the same 189 MiB bf16 momentum, at 52 and 32 bytes per element respectively.
 Both numbers are pure pass-counting a reader can re-derive from the source:
@@ -66,7 +66,7 @@ WHY THIS IS A NEW MODULE AND NOT AN EDIT
 (`momentum_update_`, `colrow_normalize_`) have the SAME signatures as the
 functions they replace, so the whole arm is `install()`, which swaps the module
 attributes — and the call-site diff (one five-line branch, in
-`docs/reviews/2026-11-08-optimizer-tail.md`) is the version that ships. Every
+`docs/records/reviews/2026-11-08-optimizer-tail.md`) is the version that ships. Every
 ineligible input falls back to the SHIPPED function with a counted reason
 (ADR-0019), so a shape/dtype/device this module does not serve can only be
 slower, never different.

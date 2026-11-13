@@ -52,7 +52,7 @@ The packing ratio is ~8× against bf16 — that is arithmetic, not a claim. The
 quality cost is a measurement: a ternary run against its bf16 control, same
 budget, same window, three seeds. The dated record lives in
 [measurements](/dormouse/docs/measurements/) and in
-`docs/reviews/2026-11-12-ternary-artifact.md`.
+`docs/records/reviews/2026-11-12-ternary-artifact.md`.
 
 Whether the trade is worth taking depends on what the saved bytes buy — more
 parameters, more bytes per token of context, or a smaller download. That is a

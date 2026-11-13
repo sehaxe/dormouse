@@ -2,8 +2,8 @@
 
 **SOURCE**: `docs/decisions/2026-10-15-1b-readiness-plan.md` §3.5 item 4 (the
 MQA + block-indexer recipe, carried from the burn re-entry review
-`docs/reviews/msa-reentry-2026-10-02.md`), and the verdict row in
-`docs/research/2026-10-15-1b-tech-verification.md`: *"sparse attention indexer:
+`docs/records/reviews/msa-reentry-2026-10-02.md`), and the verdict row in
+`docs/records/research/2026-10-15-1b-tech-verification.md`: *"sparse attention indexer:
 open, no published rank/k sweep"*. That verdict is why `msa_block` and
 `msa_topk` are SWEPT, never cited, and the defaults here are a starting point,
 not a claim.

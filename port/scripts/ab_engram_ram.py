@@ -9,7 +9,7 @@ pre-registered rule is written BEFORE the first run. A skipped preflight prints
 a SKIP banner and no table.
 
 **The finding this tests.** A 600-step `medium` screen, one seed, everything
-else identical (`docs/reviews/2026-10-23-architecture-verdict.md` §3.1):
+else identical (`docs/records/reviews/2026-10-23-architecture-verdict.md` §3.1):
 `engram` in VRAM scored **2.649 BPB**, the same arm with `engram_ram=true`
 scored **3.476** (+0.83), and iter3 reproduced the pattern. The mechanism is
 the host path's Nesterov look-ahead: for a row's first touch, with

@@ -19,7 +19,7 @@ moe_topk, mod_capacity, mod_top_k, mod_aux_weight`.
    independent sources that agree in sign and magnitude. Kill `loop2`.
 3. **The best unspent ΔBPB is in two zero-cost recipe knobs**: `value_residual`
    (82M table, −0.034 nats, +156 params) and `attn_gate` (+10.8K params).
-4. The repo's own control (`docs/reviews/2026-11-06-control-transformer.md`)
+4. The repo's own control (`docs/records/reviews/2026-11-06-control-transformer.md`)
    already measures the vanilla transformer **0.13–0.37 BPB better** than the KDA
    loop at equal bytes — 3–7× larger than any candidate below. Architecture
    search is the wrong budget line; recipe is the right one.

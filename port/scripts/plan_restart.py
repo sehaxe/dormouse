@@ -3,7 +3,7 @@
     python scripts/plan_restart.py [config] [--n-experts E] [--route-json PATH]
 
 Why: `route_hist.py` measured 80 of 512 experts alive on real bytes
-(`docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md`). The restart is a
+(`docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md`). The restart is a
 decision — the balance arm, and whether E is worth paying for — so it prints the
 exact command, both token budgets and the warning that the bank is oversized for
 the routing that actually happens. No model load, no GPU, no network.

@@ -4,7 +4,7 @@
 # WHY this exists: the 1M claim needs a model whose CSA ring was TRAINED. The
 # only CSA checkpoint on record (`longctx1`, 102.7M, 8K) died with the corpus on
 # 2026-11-08, and the 95M dense lane cannot express CSA at all
-# (`docs/research/2026-11-08-long-context-eval.md` §0). This is the re-run of
+# (`docs/records/research/2026-11-08-long-context-eval.md` §0). This is the re-run of
 # longctx1's recipe on the refetched corpus; it is the artifact gate A of the
 # S-NIAH protocol (`port/scripts/niah.py`).
 #

@@ -14,7 +14,7 @@ reads.
 The window for a plan source is `<stem>_eval.bin` beside it, with a `_train`
 suffix dropped: `best/fwedu_train.bin -> best/fwedu_eval.bin`,
 `mix/code.bin -> mix/code_eval.bin`. `scripts/carve_eval_tails.py` makes those
-files once; `docs/reviews/2026-11-08-domain-eval.md` records the offsets and
+files once; `docs/records/reviews/2026-11-08-domain-eval.md` records the offsets and
 SHA-256s.
 
 The overlap gate is `eval_window.py`'s path rule: a window that IS a training

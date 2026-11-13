@@ -9,7 +9,7 @@ launch count is a property of the *code path*, not of the config: the config
 supplies the shapes and chooses which arm runs.
 
 Why this exists: `scripts/kernel_profile.py` puts 31.6 ms of the m400 step in
-`moe_dispatch` (`docs/reviews/2026-11-05-kernel-profile.md`), but a REGION is
+`moe_dispatch` (`docs/records/reviews/2026-11-05-kernel-profile.md`), but a REGION is
 not a target. This file is the target list: it says which of those kernels are
 routing arithmetic (cheap, fusible), which are expert math the region's seam
 attribution swallowed (`_grouped_gemm_pair_kernel`, `_wgrad_kernel`,

@@ -10,7 +10,7 @@ gates are:
    No fp32 in the way, so this is the tier the 1e-9 belongs to.
 2. **fp32 parity at the b1 shapes** (GPU): the kernel vs the classic chain at
    rel ≤ 1e-5, the research note's Stage-0 gate
-   (`docs/research/2026-10-16-muon-orthogonalization-cost.md` §4).
+   (`docs/records/research/2026-10-16-muon-orthogonalization-cost.md` §4).
 3. **ONE kernel launch per chain** (CPU, by construction): the op's only launch is
    counted with a proxy — the claim that this arm exists to make is a launch
    count, and a claim like that gets a gate, not a comment.
@@ -274,7 +274,7 @@ def test_the_bf16_rung_does_not_compose_with_the_triton_arm():
     """`ns_dtype="bf16"` is a COUNTED fallback, not a silent compose.
 
     The kernels are fp32-native, so this arm SUBSUMES the bf16 rung
-    (`docs/research/2026-10-17-muon-variants.md` §5: "the two must not ride in one
+    (`docs/records/research/2026-10-17-muon-variants.md` §5: "the two must not ride in one
     A/B"). Composing would run the chain in fp32 while the config reported bf16 —
     a config that lies.
     """

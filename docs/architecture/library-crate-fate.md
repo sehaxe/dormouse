@@ -78,7 +78,7 @@ dependency on the other crates does not make them reachable.
 | `burn-swiglu` | 187 | 0 | b | REFERENCE | a line of `burn::activation::silu` as a crate |
 | **deleted 2026-09-28** | | | | | |
 | `burn-byteflow` | 1121 | 0 | – | **DELETE** | a whole competing byte-LM architecture |
-| `burn-byteflow` **(post-snapshot)** | 1,357 src + 832 tests/benches = 2,189 | – | – | **KEPT, wired** | The DELETE above did land once, then the crate was re-added (`8d61d74`) and wired (`48ef9ae`): `dormouse-core/Cargo.toml:50` and `dormouse-train/Cargo.toml:33` depend on it today. The row above is the 2026-10-02 snapshot, kept as history. ([claims repair](docs/reviews/2026-11-08-claims-repair.md) D8) |
+| `burn-byteflow` **(post-snapshot)** | 1,357 src + 832 tests/benches = 2,189 | – | – | **KEPT, wired** | The DELETE above did land once, then the crate was re-added (`8d61d74`) and wired (`48ef9ae`): `dormouse-core/Cargo.toml:50` and `dormouse-train/Cargo.toml:33` depend on it today. The row above is the 2026-10-02 snapshot, kept as history. ([claims repair](docs/records/reviews/2026-11-08-claims-repair.md) D8) |
 | `burn-diffusionblocks` | 793 | 0 | – | **DELETE** | diffusion; `AGENTS.md:650` lists it under "Do NOT adopt … dormouse is AR" |
 | `burn-fastblt` | 625 | 0 | – | **DELETE** | superseded — its finding is the Engram arm |
 | `burn-mod` | 411 | 0 | – | **DELETE** | third depth mechanism, duplicate of the wired `burn-mor` |

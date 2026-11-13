@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """One iteration of the mHC write seam, both Sinkhorn arms: dispatches and µs.
 
-The 2026-11-05 kernel profile (`docs/reviews/2026-11-05-kernel-profile.md`)
+The 2026-11-05 kernel profile (`docs/records/reviews/2026-11-05-kernel-profile.md`)
 priced `mhc_write` at 23.2 ms/step and its largest kernel family
 (`CUDAFunctor_add`) at 1 395 launches / 10 steps. This bench measures where
 that comes from on the arm the profile actually ran (`fused_residual=false`):

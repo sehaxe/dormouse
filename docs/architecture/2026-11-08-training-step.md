@@ -75,7 +75,7 @@ halves are written by **`MixOptimizer.set_lr`** and by nothing else
 `muon_lr * muon_lr_mult` (`:1940`). The reason it is a method and not two inline
 loops is a measured defect — until 2026-11-07 both call sites wrote the AdamW LR
 into every group, so `muon_lr_mult` was **inert** and an 8× A/B measured the knob
-off (`docs/reviews/2026-11-07-muon-audit.md:31`, `port/src/dormouse/train/optim.py:1912-1918`).
+off (`docs/records/reviews/2026-11-07-muon-audit.md:31`, `port/src/dormouse/train/optim.py:1912-1918`).
 
 ### 2.2 Data
 
@@ -278,15 +278,15 @@ same measurement; the per-arm line is what the arm's own A/B said.
 
 | arm | flag | state | why off, with the measurement |
 |---|---|---|---|
-| **KDA** (gated-delta attention, the only attention arm in the repo) | `use_kda` | off | a 13.5M dense decoder beat the 102.7M KDA/CSA/mHC/Engram block by **0.126 BPB on 8/8 eval windows** at matched bytes, 0.12–0.37 across the report's frames (`docs/reviews/2026-11-06-control-transformer.md:14-19`, `:274`). It is also unreachable on this form: `validate_block_form` refuses the flag (`port/src/dormouse/config.py:3231-3234`) |
-| **CSA** (coarse/fine sparse attention) | `use_csa` | off | 786 435 params, 7.1 ms/step (4.0 % of the step), **−0.011 BPB with no spread = a tie**; "delete at 1 KB" (`docs/reviews/2026-11-05-architecture-review-dense.md:196`, `:290-293`, `:319`) |
-| **mHC** (multi-lane residual) | `use_mhc` | off | it *won* on the loop — −0.078 at 142M (`docs/reviews/2026-10-23-architecture-verdict.md:34`) — but on a 142M **MoE**, at +40 % VRAM, with **no dense ablation at all** (`docs/reviews/2026-11-05-architecture-review-dense.md:318-319`) |
-| **AttnRes** | `use_attnres` | off | −0.050 at 142M MoE on a 3.3× spread, "unmeasured" on dense (`docs/reviews/2026-11-05-architecture-review-dense.md:194`); the dense stack has no per-iteration slots to attend over (`port/src/dormouse/config.py:3231-3234`) |
-| **Engram** (hashed n-gram input tables) | `use_engram` | off | best buy per MAC (+2.306 BPB when ablated) but it is **half the parameters and a lookup table, not capacity** (`docs/research/2026-11-07-tsct-ceiling.md:68`); "79 % of the parameters, zero clean evidence" (`docs/reviews/2026-11-05-architecture-review-dense.md:244`), and the only comparison on record was scored by a memory-disabled eval, so the verdict was never run (`AGENTS.md` §3.2) |
-| **MoE** (TSCT expert bank) | `n_experts`, `moe_topk`, `use_tsct` | `1`, `0`, `false` | +0.067 BPB for 44.8M params — 43.6 % of the model buying 0.067 (`docs/research/2026-11-07-tsct-ceiling.md:68`) — and the load-balancing controller collapsed: 9 of 512 experts ran, one holding 4096 of 8192 assignments (`docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md:12`, quoted at `port/src/dormouse/train/loop.py:335-341`) |
-| **`torch.compile`** | `torch_compile` | off | 285 ms/step against the control's 283 at the live shape, i.e. **1.00×** (`docs/architecture/2026-11-08-the-16x.md:30`, `:36`); on the MoE form it was 0.20× because of data-dependent cache guards (`docs/reviews/2026-10-23-architecture-verdict.md:77`) |
+| **KDA** (gated-delta attention, the only attention arm in the repo) | `use_kda` | off | a 13.5M dense decoder beat the 102.7M KDA/CSA/mHC/Engram block by **0.126 BPB on 8/8 eval windows** at matched bytes, 0.12–0.37 across the report's frames (`docs/records/reviews/2026-11-06-control-transformer.md:14-19`, `:274`). It is also unreachable on this form: `validate_block_form` refuses the flag (`port/src/dormouse/config.py:3231-3234`) |
+| **CSA** (coarse/fine sparse attention) | `use_csa` | off | 786 435 params, 7.1 ms/step (4.0 % of the step), **−0.011 BPB with no spread = a tie**; "delete at 1 KB" (`docs/records/reviews/2026-11-05-architecture-review-dense.md:196`, `:290-293`, `:319`) |
+| **mHC** (multi-lane residual) | `use_mhc` | off | it *won* on the loop — −0.078 at 142M (`docs/records/reviews/2026-10-23-architecture-verdict.md:34`) — but on a 142M **MoE**, at +40 % VRAM, with **no dense ablation at all** (`docs/records/reviews/2026-11-05-architecture-review-dense.md:318-319`) |
+| **AttnRes** | `use_attnres` | off | −0.050 at 142M MoE on a 3.3× spread, "unmeasured" on dense (`docs/records/reviews/2026-11-05-architecture-review-dense.md:194`); the dense stack has no per-iteration slots to attend over (`port/src/dormouse/config.py:3231-3234`) |
+| **Engram** (hashed n-gram input tables) | `use_engram` | off | best buy per MAC (+2.306 BPB when ablated) but it is **half the parameters and a lookup table, not capacity** (`docs/records/research/2026-11-07-tsct-ceiling.md:68`); "79 % of the parameters, zero clean evidence" (`docs/records/reviews/2026-11-05-architecture-review-dense.md:244`), and the only comparison on record was scored by a memory-disabled eval, so the verdict was never run (`AGENTS.md` §3.2) |
+| **MoE** (TSCT expert bank) | `n_experts`, `moe_topk`, `use_tsct` | `1`, `0`, `false` | +0.067 BPB for 44.8M params — 43.6 % of the model buying 0.067 (`docs/records/research/2026-11-07-tsct-ceiling.md:68`) — and the load-balancing controller collapsed: 9 of 512 experts ran, one holding 4096 of 8192 assignments (`docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md:12`, quoted at `port/src/dormouse/train/loop.py:335-341`) |
+| **`torch.compile`** | `torch_compile` | off | 285 ms/step against the control's 283 at the live shape, i.e. **1.00×** (`docs/architecture/2026-11-08-the-16x.md:30`, `:36`); on the MoE form it was 0.20× because of data-dependent cache guards (`docs/records/reviews/2026-10-23-architecture-verdict.md:77`) |
 | **CUDA graphs** (`opt_graph`, `full_graph`) | `opt_graph` / `full_graph` | off | 286 ms vs 283, **0.99×** (`docs/architecture/2026-11-08-the-16x.md:37`). `full_graph` would also refuse **this** config on its own: it runs the EMA update eagerly outside the capture, so a capture would re-apply the capture step's delta on every replay — `ema_decay=0.999` is a LOUD refusal (`port/src/dormouse/train/graph.py:661-668`), and `full_graph_refusal` refuses every arm it cannot replay (`:569-758`) |
-| **segmented forward** | `segment_len` | 0 | it is a **memory** decision that may not move a model boundary (`docs/reviews/2026-11-08-segment-csa.md:10-14`); at 8192 bytes/step there is no VRAM to save, and a capture refuses it (`port/src/dormouse/train/graph.py:633-639`) |
+| **segmented forward** | `segment_len` | 0 | it is a **memory** decision that may not move a model boundary (`docs/records/reviews/2026-11-08-segment-csa.md:10-14`); at 8192 bytes/step there is no VRAM to save, and a capture refuses it (`port/src/dormouse/train/graph.py:633-639`) |
 
 Three more arms exist on the same step and are also off:
 
@@ -294,7 +294,7 @@ Three more arms exist on the same step and are also off:
 |---|---|---|---|
 | `ce_fixed` | `ce_fixed=false` | off | every number on record is the historical line, bit for bit (`port/src/dormouse/config.py:1828`, `port/src/dormouse/model/model.py:1510-1512`) |
 | `logit_softcap`, `z_loss` | `0.0` | off | both are stability arms with no measurement on this lane yet (`port/src/dormouse/config.py:1387`, `:1407`) |
-| `muon_lr_mode=shape_fair` | `uniform` | off | it multiplies the step by ~`sqrt(cols)` (28.8× on `[832,832]`, 55× on `[832,3072]`), which is a bigger change than the measured optimum `muon_lr_mult=12`; the default stays `uniform` until the arm's own A/B lands (`port/src/dormouse/config.py:2042-2058`, `docs/reviews/2026-11-07-muon-audit.md:31`) |
+| `muon_lr_mode=shape_fair` | `uniform` | off | it multiplies the step by ~`sqrt(cols)` (28.8× on `[832,832]`, 55× on `[832,3072]`), which is a bigger change than the measured optimum `muon_lr_mult=12`; the default stays `uniform` until the arm's own A/B lands (`port/src/dormouse/config.py:2042-2058`, `docs/records/reviews/2026-11-07-muon-audit.md:31`) |
 
 **Вердикт.** Каждая строка — это измерение, а не мнение, и у четырёх из них один
 и тот же источник: плотный контроль 2026-11-06. Читать таблицу как «механизмы
@@ -373,9 +373,9 @@ still the only answer to "which region", and its largest region is the same one:
 | csa (fine + coarse) | 7.1 | 4.7 % |
 | moe_gemm | 1.3 | 0.9 % |
 
-`docs/reviews/2026-11-05-kernel-profile.md:23-36`. The same profile reports
+`docs/records/reviews/2026-11-05-kernel-profile.md:23-36`. The same profile reports
 **GPU busy 200 ms of a 401 ms profiled wall**, i.e. ~50 % host idle — and 4 692
-launches per step (`docs/reviews/2026-11-05-kernel-profile.md:15-18`).
+launches per step (`docs/records/reviews/2026-11-05-kernel-profile.md:15-18`).
 
 **Вердикт.** На живом рецепте шаг — это 76 % арифметики модели и 24 %
 оптимизатора, и оптимизатор в этой доле уже на быстром rung'е: на fp32-NS он был
@@ -398,7 +398,7 @@ Compile и graphs уже измерены как ноль **на этом** ша
 | **I6** | **The checkpoint key set:** `model`, `opt`, `step`, `model_quant_rung`, `moe`, optional `model_ema`. `ck["model"]` is exactly `state_dict()`-shaped; `moe` rides out of band | `port/src/dormouse/train/loop.py:450-463`, `:256-300`; gate `port/tests/test_resume.py:73` | a key that is not there is state lost between two files claiming one step count (the burn `7adda92` class) |
 | **I7** | **The LFB bias travels.** A file with `lfb_counts` but no `lfb_bias` is a LOUD refusal on a training load, never a zero default | `port/src/dormouse/train/loop.py:308-347` | measured: 50 of 51 tensors differ after a 4+resume at `moe_lb_coef=0.01` (`:315`) |
 | **I8** | **Config drift:** a resume refuses any differing key outside `PROGRESS_KEYS`, and the snapshot is written beside the weights | `port/src/dormouse/config.py:49-104`, `port/src/dormouse/train/loop.py:476`; gate `port/tests/test_resume.py:39` | extending a run is legal; changing the objective under one step count is not |
-| **I9** | **The Muon LR is written only through `set_lr`** | `port/src/dormouse/train/optim.py:1908-1941` | a direct `group["lr"] = lr` silently disables `muon_lr_mult` — measured inert once already (`docs/reviews/2026-11-07-muon-audit.md:31`) |
+| **I9** | **The Muon LR is written only through `set_lr`** | `port/src/dormouse/train/optim.py:1908-1941` | a direct `group["lr"] = lr` silently disables `muon_lr_mult` — measured inert once already (`docs/records/reviews/2026-11-07-muon-audit.md:31`) |
 | **I10** | **Every per-step random decision is `(seed, step)`**, never a global draw | `port/src/dormouse/train/loop.py:765-777`, `port/src/dormouse/cli.py:178-191` | a resume continues a different objective. The named exception is `ternary_s3t`, whose mask is process-local and does NOT survive a resume (`port/src/dormouse/train/loop.py:1256-1268`) |
 
 ---
@@ -417,7 +417,7 @@ Compile и graphs уже измерены как ноль **на этом** ша
    `AGENTS.md` §3.1 records.
 2. **The eval and the checkpoint are not in this budget.** Both are serial and
    outside the step: ~0.95 s per eval window and ~2.1 s per checkpoint write
-   (`docs/reviews/2026-11-08-cpu-perf-audit.md:17-19`). A run's wall clock is
+   (`docs/records/reviews/2026-11-08-cpu-perf-audit.md:17-19`). A run's wall clock is
    `steps × step` plus those, and the cadence policies decide which dominates.
 3. **The working tree is ahead of this document.** Three cited files have
    uncommitted edits as this is written. Re-check a line number before trusting

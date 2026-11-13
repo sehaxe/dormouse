@@ -30,7 +30,7 @@ never learn what you cannot keep — no compressing a smart model afterwards.
 - Every number comes from a command, not from a paper or a prior claim.
 - Every A/B is 3 seeds; a delta inside 2× the seed spread is "not separated".
 - Any arm that loses is recorded as a measured refusal with its number, in
-  `docs/reviews/`, and stays as a flag — never deleted silently.
+  `docs/records/reviews/`, and stays as a flag — never deleted silently.
 - `scripts/gpu_lock.sh` for every GPU job. Never bypass it, never kill another
   lane's job to take the card.
 - Commit per task, own files only, no preset of a frozen control edited.

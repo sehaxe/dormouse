@@ -3,7 +3,7 @@
 > ## CURRENT STATE (2026-11-08): this is a refetch, not the corpus
 >
 > `git merge origin/main` deleted `data_local/` and `checkpoints/`
-> (`docs/reviews/2026-11-08-merge-incident.md`). The mount the build read from
+> (`docs/records/reviews/2026-11-08-merge-incident.md`). The mount the build read from
 > is gone too. What is on disk now is what two scripts refetched:
 >
 > | path | bytes | how |

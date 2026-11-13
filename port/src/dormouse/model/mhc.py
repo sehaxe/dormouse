@@ -34,7 +34,7 @@ Static-bias init: `b_pre = 10`, `b_post = 0`, `b_res = 0` (`block.rs:5-25`,
 `:86-90`). `b_res = 0` is the 2026-10-02 **fidelity fix**: the old `10·I` put
 the diagonal at `e^10` against off-diagonals at `e^-10`, measured
 `|grad α_res| = 7.3e-9` on the exponential's flat top
-(`docs/reviews/fidelity-audit-2026-10-02.md` F-F4); at 0 the Sinkhorn starts at
+(`docs/records/reviews/fidelity-audit-2026-10-02.md` F-F4); at 0 the Sinkhorn starts at
 uniform mixing and the projection can leave it. α init 0.01 and the RMSNorm
 ε = 1e-20 are App. A.1 Table 5's (`lib.rs:66-72`).
 
@@ -43,7 +43,7 @@ uniform mixing and the projection can leave it. α init 0.01 and the RMSNorm
 the stream to `C` and the crate's caller (a `D`-wide body) cannot apply it
 (`block.rs:211-217`). The loop here carries `n` lanes of the FULL residual
 width (`C = D`, readout = their sum — 2409.19606 §2.1's readout, the base
-paper's, `docs/reviews/mhc-2026-09-30.md` §1.2): every lane is a complete
+paper's, `docs/records/reviews/mhc-2026-09-30.md` §1.2): every lane is a complete
 residual state, `H_res` mixes them, `H_pre` is a sigmoid-weighted mix down to
 the body's `D`-wide input, and `H_post_j` weights the same branch output onto
 lane `j`. This is the only layout that composes a `D`-wide body with a

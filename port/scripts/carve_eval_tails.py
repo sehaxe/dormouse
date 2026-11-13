@@ -15,7 +15,7 @@ document separator (`\\n\\n---\\n\\n`, the `best/` sources), the cut starts at
 the LAST such separator at or before that byte; the `mix/` sources were
 written raw with no separator, so the cut is a fixed line-aligned offset. Every
 window's offset, size and SHA-256 are printed; they are the record in
-`docs/reviews/2026-11-08-domain-eval.md`.
+`docs/records/reviews/2026-11-08-domain-eval.md`.
 
 ONE WAY: an existing `<stem>_eval.bin` is left alone and its hash printed.
 Truncation cannot be undone, so rebuilding a lost window means re-fetching the

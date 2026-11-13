@@ -68,7 +68,7 @@ burn side gates the aux graph on `targets.is_some()` for exactly that reason.
 `benches/history.tsv:51-56`), and the draft head needs none: the frozen target
 logits are the same network's own (`dspark.md` D15), so the correction is
 self-supervised at the cost of one low-rank projection
-(`docs/research/2026-10-16-jepa-dspark-alternatives.md` §1.3, row 3, and
+(`docs/records/research/2026-10-16-jepa-dspark-alternatives.md` §1.3, row 3, and
 `2610.06031`'s teacher-free LightMTP). No EMA, no momentum schedule, no second
 forward.
 """

@@ -16,7 +16,7 @@ Window: `data_local/best/fwedu_eval.bin`, 196 608 bytes, `off=0`. It changed on
 2026-11-08 when the corpus was refetched; anything before that date is a
 different measurement. Seed noise is ±0.011 BPB.
 
-Every arm that decided the recipe is in `docs/reviews/` — start with
+Every arm that decided the recipe is in `docs/records/reviews/` — start with
 `2026-11-09-architecture-matrix.md` (all arms, all seeds) and
 `2026-11-12-ternary-artifact.md` (the format's cost, and two corrections to
 earlier claims).

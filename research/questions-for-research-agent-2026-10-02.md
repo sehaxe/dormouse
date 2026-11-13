@@ -78,5 +78,5 @@ custom autodiff-узлы с fused backward (KDA-паттерн custom-node) — 
 
 ---
 
-*Каждый ответ с цитатами (статья/секция) пойдёт в `docs/reviews/` и станет
+*Каждый ответ с цитатами (статья/секция) пойдёт в `docs/records/reviews/` и станет
 гейтом или фикс-листом. Наша культура: verdict → gate → measurement.*

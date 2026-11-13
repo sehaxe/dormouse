@@ -15,7 +15,7 @@ WHAT IS MEASURED AND WHAT IS COMPUTED
 -------------------------------------
 [M] `act_mem.py:4` / `port/scripts/ab_actmem.py:60` — the 7.2 GiB b8/s1024 peak.
 [M] `dormouse info` — every parameter count and the `ffn_form`/MAC tables.
-[M] `docs/research/2026-11-05-small-model-mfu.md` §0.1/§0.3 — 45.7 TFLOP/s bf16
+[M] `docs/records/research/2026-11-05-small-model-mfu.md` §0.1/§0.3 — 45.7 TFLOP/s bf16
     measured on this card class; the brief's m400b 14.2 GiB reserved figure (not
     `max_memory_allocated`, and not the anchor).
 [M] `act_ckpt.py` — the MXFP4 codec's 17 B per 32 elements and its gradient bound.

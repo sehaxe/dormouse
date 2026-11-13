@@ -20,11 +20,11 @@ writers kept landing). On the record:
 
 * One in-flight edit to `crates/dormouse-data/src/lib.rs` broke `cargo check`
   for all three model crates, so **no test in the tree could run**.
-  `docs/archive/architecture/design-review-model-2026-09-27.md` opens by recording that its whole
+  `docs/records/archive/architecture/design-review-model-2026-09-27.md` opens by recording that its whole
   review is `NOTHING IS RUNTIME-VERIFIED` for exactly that reason.
 * A generated facade line in `vendor/dormouse-fused/Cargo.toml` broke **every
   cargo command in the tree** for ~30 min — `cargo metadata` fails ⇒ every
-  `check`/`test` fails (`docs/archive/research/2026-09-27-fused-build-matrix.md`,
+  `check`/`test` fails (`docs/records/archive/research/2026-09-27-fused-build-matrix.md`,
   "Environment hazards").
 * Two agents overwrote each other's edits. Four extraction agents lost their
   output. One agent's outright failure cost the tree a broken-build window.
@@ -167,7 +167,7 @@ trivial no-op change (`NOOP.md`, untracked), real command
 `:298` and `:364`). That file is `M` in the shared tree: the fix
 (`.mul(g_active.unsqueeze())`) exists but is **uncommitted**, which is why a
 worktree off `HEAD` cannot see it. Same defect class as
-`docs/archive/research/2026-09-27-fused-build-matrix.md` defect 2, and it is the same
+`docs/records/archive/research/2026-09-27-fused-build-matrix.md` defect 2, and it is the same
 ADR-0019 silence in a new place.
 
 The shared tree is not buildable either, in the way this ADR exists to

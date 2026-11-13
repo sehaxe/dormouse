@@ -33,7 +33,7 @@ STORAGE rung vs bf16, the exact mechanics (validated by test):
   further.
 * LittleBit is NOT the storage rung semantics above (it is a QAT ladder
   step: sign(U)s·sign(V)ᵀ + learned scales, G-A..G-D gates in
-  `docs/reviews/littlebit-design-2026-10-15.md` — a training-time change,
+  `docs/records/reviews/littlebit-design-2026-10-15.md` — a training-time change,
   not a checkpoint format).
 
 Deviations from burn, both deliberate and listed in the port report:
@@ -75,7 +75,7 @@ from .qat_cache import QuantCache, note_qat_values
 #: per-tensor amax scales computed from the bf16 operand. It is a COMPUTE lane,
 #: not a storage rung: the fp32 masters and the checkpoint are untouched.
 #: Measured by the spike on this card (RTX 5060 Ti, 2026-10-15; the spike dir's
-#: `bench_f_fp8.py` = `docs/research/2026-10-15-torch-spike.md` phase 2, bf16
+#: `bench_f_fp8.py` = `docs/records/research/2026-10-15-torch-spike.md` phase 2, bf16
 #: in/out, per-tensor scales): [32768,2048]×[2048→64] 23.8 → 39.3 TFLOP/s,
 #: [32768,64]×[64→5461] 14.2 → 22.3 — **1.6-1.8×** — and `_scaled_grouped_mm`
 #: refuses sm_120 outright ("only supported on CUDA devices with compute

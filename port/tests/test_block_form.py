@@ -1,6 +1,6 @@
 """`block_form`: the KDA loop and the vanilla transformer are first-class forms.
 
-The 2026-11-06 control (`docs/reviews/2026-11-06-control-transformer.md`) beat
+The 2026-11-06 control (`docs/records/reviews/2026-11-06-control-transformer.md`) beat
 the loop by 0.126 BPB on every eval window at equal bytes, so the block form is
 now a config choice rather than an assumption. This file gates the six claims
 the task makes, each able to fail on its own:

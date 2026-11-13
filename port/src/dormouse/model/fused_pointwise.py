@@ -10,7 +10,7 @@ so the seam costs 32 B/element forward, and the backward repeats it (cast of
 `grad_h` back to fp32, `native_layer_norm_backward`, cast of `dx` down to bf16
 for the projection GEMM) for ~26 B/element. At d=832, 12 layers, b8×s1024 that
 is the `_to_copy` + `add` + half the `native_layer_norm` column of
-`docs/reviews/2026-11-08-kernel-audit.md` §2.
+`docs/records/reviews/2026-11-08-kernel-audit.md` §2.
 
 WHAT THIS DOES. One program per row: read `x` (fp32) and `delta` (bf16), write
 `x_new = x + delta` (fp32, the residual stream the VJP and the next block need)
@@ -39,7 +39,7 @@ so two runs of the same step get the same bits).
 `patch()` is a BENCH-ONLY entry point: it swaps `TransformerBlock._block` for a
 verbatim copy of the body with the fused seam so `scripts/bench_pointwise_fusion.py`
 and the CLI can A/B the change before it lands. The integration proposal is the
-two-line diff in `docs/reviews/2026-11-08-pointwise-fusion.md` §5, not this.
+two-line diff in `docs/records/reviews/2026-11-08-pointwise-fusion.md` §5, not this.
 """
 
 from __future__ import annotations

@@ -45,7 +45,7 @@ ternary option (2.31 GiB) beats the checkpoint by 0.05 GiB.
 |---|---:|---|
 | card capacity | 15.56 GiB usable (16 GB decimal) | brief |
 | hard ceiling used here | 15.0 GiB | brief (leaves 0.56 GiB) |
-| bf16 tensor peak | 45.7 TFLOP/s | [M] `docs/research/2026-11-05-small-model-mfu.md` §0.3 (purchase report's measured 5060 Ti ceiling) |
+| bf16 tensor peak | 45.7 TFLOP/s | [M] `docs/records/research/2026-11-05-small-model-mfu.md` §0.3 (purchase report's measured 5060 Ti ceiling) |
 | HBM bandwidth | ~1.9 TB/s | [M] same memo's machine class |
 | DDR4 | 68 GB/s (4 channels, measured brief) | brief |
 | PCIe 3.0 x8 | 6.5 GB/s | brief |
@@ -391,7 +391,7 @@ state.
 | 7.2 GiB `b8/s1024` peak | **[M]** measured | `port/src/dormouse/model/act_mem.py:4`; `port/scripts/ab_actmem.py:60` |
 | parameter counts / groups | **[M]** measured | `DormouseModel(..., device="meta")` + `dormouse info`; gate |
 | Muon/AdamW routing | **[M]** code | `optim.is_muon_param`, `optim.optimizer_bytes` |
-| 45.7 TFLOP/s bf16 | **[M]** measured | purchase report via `docs/research/2026-11-05-small-model-mfu.md` §0.3 |
+| 45.7 TFLOP/s bf16 | **[M]** measured | purchase report via `docs/records/research/2026-11-05-small-model-mfu.md` §0.3 |
 | 14.2 GiB m400b b8 peak | **[M]** brief via the memo | same memo §0.1; it is the run's nvidia-smi/reserved figure with the unfused-residual arm, not `max_memory_allocated` — the ledger's m400b config gives 9.71 GiB allocated, so this is not the like-for-like anchor |
 | mxfp4 17 B/32 elements | **[M]** code | `mxfp.MX_BLOCK/MX_BYTES_PER_BLOCK` |
 | mxfp4 gradient drift 2.4e-1 | **[M]** measured (CPU tiny) | `act_ckpt.py`'s error table |

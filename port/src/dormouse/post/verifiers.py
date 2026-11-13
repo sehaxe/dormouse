@@ -1,6 +1,6 @@
 """Deterministic verifiers keyed by task class — the reward, and nothing else.
 
-Read from `docs/research/2026-10-15-agentic-post-training.md` §2.1
+Read from `docs/records/research/2026-10-15-agentic-post-training.md` §2.1
 ("verifier-first, everywhere"; code execution needs "a process jail, rlimits" —
 2602.11210's container-free shape) and §2.3 (a learned/LLM judge at this scale is
 the failure mode, not the signal — that is the plan's measured-later node), plus

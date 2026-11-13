@@ -1,7 +1,7 @@
 """The staged data mixture: N `.bin` sources, per-stage weights, an epoch cap.
 
 Today the pretrain loop streams ONE filtered-web corpus. The research recipe
-(`docs/research/2026-10-16-data-mixing.md` §6.1) is a 3-stage static mix over
+(`docs/records/research/2026-10-16-data-mixing.md` §6.1) is a 3-stage static mix over
 that corpus plus acquired code/math/RU — the shape SmolLM2 shipped, where the
 decay stage is the lever that pays (math 3.21 → 22.07, code 8.87 → 23.21,
 2502.02737):

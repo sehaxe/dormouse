@@ -51,17 +51,17 @@ The measured step, so the reader knows which fraction a second card can touch:
 
 | quantity | 95M (`flagship3_dense`) | b1 (1 066 358 209 params) | source |
 |---|---:|---:|---|
-| measured step, b8·s1024 | 0.307 s [M] | 1.399 s eager / **1.201 s TF32** [M] | `docs/research/2026-11-08-1b-on-one-card.md`; `docs/reviews/2026-10-16-b1-profile.md:11-19` |
-| forward / backward | — | 278 / 404 ms [M] | `docs/reviews/2026-10-16-b1-profile.md:11-15` |
-| **optimizer** | — | **530–850 ms = 44–53 %** [M] | same, `:15`; `docs/research/2026-10-17-muon-variants.md:6` |
-| — of which Muon NS matmuls | — | ≈ 535 ms [M] | `docs/reviews/2026-10-16-b1-profile.md:40-41` |
+| measured step, b8·s1024 | 0.307 s [M] | 1.399 s eager / **1.201 s TF32** [M] | `docs/records/research/2026-11-08-1b-on-one-card.md`; `docs/records/reviews/2026-10-16-b1-profile.md:11-19` |
+| forward / backward | — | 278 / 404 ms [M] | `docs/records/reviews/2026-10-16-b1-profile.md:11-15` |
+| **optimizer** | — | **530–850 ms = 44–53 %** [M] | same, `:15`; `docs/records/research/2026-10-17-muon-variants.md:6` |
+| — of which Muon NS matmuls | — | ≈ 535 ms [M] | `docs/records/reviews/2026-10-16-b1-profile.md:40-41` |
 | gradient bytes per optimizer step | 0.38 GB [C] | **4.27 GB** [C] | `N·4 B`, N = 1 066 358 209 (README) |
 | all-reduce @ 20 GB/s, accum=1 | 19 ms = 6 % [C,S] | 0.214 s = 18 % [C,S] | bandwidth **[S]** — no second GPU here |
 | all-reduce @ accum=8 | 0.8 % [C] | 2.3 % [C] | same bytes, 8× the compute per step |
 
 Two facts decide the strategy and both are already in the repo:
 
-* **The step is host-dispatch-bound, not GPU-bound** (`docs/research/2026-10-17-muon-variants.md:6`:
+* **The step is host-dispatch-bound, not GPU-bound** (`docs/records/research/2026-10-17-muon-variants.md:6`:
   "GPU residue ≈ 0 ms, wall ≈ enqueue"). A second *process* gets a second host thread and a
   second launch queue. That is why 2–8 processes can scale this workload closer to linearly
   than the 13.3 % GPU-utilisation figure (measured on the burn stack, AGENTS §3.1) would
@@ -195,7 +195,7 @@ test in §8.
   polynomial in the **Gram space of the small side**: `gram = x @ x.T` (`:278`), `poly @ x`
   (`:280`). The repo's own cost study says this explicitly for both shapes:
   `U [2048,64]` runs as `[64,2048]` and `V [64,5461]` as `[64,5461]`, "both orientations execute
-  NS in the `[64,64]` Gram space" (`docs/research/2026-10-16-muon-orthogonalization-cost.md` §1).
+  NS in the `[64,64]` Gram space" (`docs/records/research/2026-10-16-muon-orthogonalization-cost.md` §1).
 * The tail is `colrow_normalize` — columns then rows (`optim.py:486-488`) — then
   `p.add_(update, alpha=-lr·scale)`.
 
@@ -203,10 +203,10 @@ test in §8.
 
 | source | what it gives us | what it does not |
 |---|---|---|
-| **Dion / Gram-NS**, `2608.11612`, repo row: `docs/research/2026-09-29-res-optimizer.md:86` ("Gram-NS + CuteDSL + megabatching … distributed (sharded)") | the sharding structure: form the small Gram, all-reduce it, apply the polynomial to the **local block**; never gather the matrix | no number at our shapes; the "6× optimizer step" is their megabatched kernel, not our launch-bound one |
-| **Gram-NS regrouping**, `2608.11612` §4, priced for us in `docs/research/2026-10-16-muon-orthogonalization-cost.md` §2 row 1 | iterating on the `[64,64]` Gram is *mathematically the same polynomial*, so a sharded implementation needs only an equivalence gate, not a quality A/B | it is a cost cut here, not a task requirement |
-| **Orth-Dion**, `2605.16341`, rejected at `docs/research/2026-10-16-muon-orthogonalization-cost.md:26-27` | — | its `√r` gain is about **column normalisation** and its rate needs a spectral gap at rank `r`; our `r = min(m,n) = 64` makes `σ_{r+1} ≡ 0`. Take the *sharding shape*, not the normalisation |
-| **SF-Muon note** (`docs/research/2026-10-16-sf-muon.md`) | nothing about sharding — grepped: zero hits for distributed/shard/ZeRO | it is about the LR schedule, not about where the matrix lives |
+| **Dion / Gram-NS**, `2608.11612`, repo row: `docs/records/research/2026-09-29-res-optimizer.md:86` ("Gram-NS + CuteDSL + megabatching … distributed (sharded)") | the sharding structure: form the small Gram, all-reduce it, apply the polynomial to the **local block**; never gather the matrix | no number at our shapes; the "6× optimizer step" is their megabatched kernel, not our launch-bound one |
+| **Gram-NS regrouping**, `2608.11612` §4, priced for us in `docs/records/research/2026-10-16-muon-orthogonalization-cost.md` §2 row 1 | iterating on the `[64,64]` Gram is *mathematically the same polynomial*, so a sharded implementation needs only an equivalence gate, not a quality A/B | it is a cost cut here, not a task requirement |
+| **Orth-Dion**, `2605.16341`, rejected at `docs/records/research/2026-10-16-muon-orthogonalization-cost.md:26-27` | — | its `√r` gain is about **column normalisation** and its rate needs a spectral gap at rank `r`; our `r = min(m,n) = 64` makes `σ_{r+1} ≡ 0`. Take the *sharding shape*, not the normalisation |
+| **SF-Muon note** (`docs/records/research/2026-10-16-sf-muon.md`) | nothing about sharding — grepped: zero hits for distributed/shard/ZeRO | it is about the LR schedule, not about where the matrix lives |
 | **DDP-Muon notes** | there are none in this repo beyond the two Dion rows above | — |
 
 The `[A]`-style tags in those repo rows are the notes' own; the two papers were **not re-read**
@@ -351,7 +351,7 @@ continue.
 |---|---|
 | gradient all-reduce | once per optimizer step; `no_sync`'s job is **structural** here (there is no hook to suppress), which is one fewer way to be wrong than DDP's `no_sync()` around micro-batches 0..k-2 |
 | strong scaling | `rows_per_rank = batch // world`, global batch and LR unchanged; legal for `batch % world == 0`. The all-reduce **averages** (`sum/world`), it does not sum: the loss is already a mean over the rank's rows (`loop.py:1884-1888`), so the average over ranks is the mean over the global batch |
-| weak scaling | `rows_per_rank = batch` (1B: b=1 is the fit shape, `docs/research/2026-11-08-1b-on-one-card.md` §TL;DR 1), global batch ×W; **requires an LR arm** — `muon_lr_mult` is the seam (`optim.py:1888`), and the linear rule for a *normalised* Muon update is not published; 3 seeds, `docs/protocols/AB-PROTOCOL.md` |
+| weak scaling | `rows_per_rank = batch` (1B: b=1 is the fit shape, `docs/records/research/2026-11-08-1b-on-one-card.md` §TL;DR 1), global batch ×W; **requires an LR arm** — `muon_lr_mult` is the seam (`optim.py:1888`), and the linear rule for a *normalised* Muon update is not published; 3 seeds, `docs/protocols/AB-PROTOCOL.md` |
 | rank-0 eval, rank-0 EMA | the shadow's source params are already the global params |
 
 **Tested without multi-GPU:** the two-process gloo run at `world=2` with a **replicated** batch
@@ -402,7 +402,7 @@ answer flips:
   largest 2-D tensor is tens of MB [C]; the order where it matters is one matrix holding ~250M
   parameters (≈1 GB of fp32 momentum). We are 3 orders below that.
 * It becomes *cheap* only if the NS stops being launch-bound (a fused kernel: `ns_kernels.py`,
-  `docs/research/2026-10-17-muon-variants.md` #1) **and** the Gram all-reduce is fused into it.
+  `docs/records/research/2026-10-17-muon-variants.md` #1) **and** the Gram all-reduce is fused into it.
 * Until both hold, per-matrix sharding is a tax with no product.
 
 ---
@@ -458,7 +458,7 @@ config flag rather than a rewrite.
 | not | why (with the number) | flips when |
 |---|---|---|
 | **FSDP2 / ZeRO-3** | its default `Shard(0)` cuts our wide factors in the Gram direction (§4.3); `is_muon_param` sees 1-D shards and silently routes everything to AdamW (`optim.py:1667-1690`); `_shadow_params` assigns `.data` (`loop.py:1020-1042`), illegal on a sharded param; and params+grads are 8.6 GB at b1 [C], which fits | a single model whose weights+grads exceed the card **after** momentum is sharded, i.e. ≈ 2B params fp32 [C] |
-| **ZeRO-2 for AdamW state** | the AdamW group is 1.12M of 1.03B params at b1 → **9 MiB** of state [C]. Sharding it saves nothing and adds a code path | a run with `engram_ram` and tables in-VRAM (402.7M AdamW params, ~3.2 GB of m+v, `docs/research/2026-11-08-1b-on-one-card.md`), and even then `engram_ram` is the better lever |
+| **ZeRO-2 for AdamW state** | the AdamW group is 1.12M of 1.03B params at b1 → **9 MiB** of state [C]. Sharding it saves nothing and adds a code path | a run with `engram_ram` and tables in-VRAM (402.7M AdamW params, ~3.2 GB of m+v, `docs/records/research/2026-11-08-1b-on-one-card.md`), and even then `engram_ram` is the better lever |
 | **intra-matrix Muon sharding** | §4.3: no launch saving at `r=64`; the Gram traffic on a dense 1B is ~3.6 GB/step [C] | a single matrix's momentum ≳ 1 GB, or the NS stops being launch-bound |
 | **tensor / sequence / pipeline parallel** | the model fits with replicated weights; the loop block is weight-shared, so pipeline boundaries would cut the same matrices that already shard by chunk | a model whose **single layer's** activations or GEMM do not fit on one card (≳10B dense) [S] |
 | **multi-node** | one 16-GB card per rank and no NVLink already; the inter-node link is strictly worse. And the repo's own rule is one heavy thing at a time | not before single-node 8-GPU is saturated |

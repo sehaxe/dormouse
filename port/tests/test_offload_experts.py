@@ -1,6 +1,6 @@
 """SL1 gates: the routed expert pass with its saved activations parked in host RAM.
 
-`docs/research/2026-10-16-budget-savers.md` §5 (SL1 = N2 recompute + N3 SCO): the
+`docs/records/research/2026-10-16-budget-savers.md` §5 (SL1 = N2 recompute + N3 SCO): the
 MoE block owns the activation peak, and the tensors that own it are the
 `[E, cap, d]` / `[E, cap, f]` bank materializations plus the saved GLU gates.
 `ModelConfig.moe_offload` puts the pass `_dispatch` picked inside

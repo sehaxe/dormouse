@@ -9,7 +9,7 @@
 # cheap enough to stop. WSD's stable phase makes a later extension a legal
 # resume (progress keys are exempt), so the cheap launch is the right one.
 #
-# Evidence for the flags (all in .bulba/memory.md + docs/reviews/):
+# Evidence for the flags (all in .bulba/memory.md + docs/records/reviews/):
 # - FORM b8 s512: the VRAM ladder (2026-10-17, ~/logs/b1ladder_*.log) measured
 #   b8 s768 OOM (256 MB alloc, ~15.2 GiB in use), b4 s768 OK, b8 s512 OK — and
 #   b8 s512 carries MORE bytes per step (4096 vs 3072) than b4 s768, so it is

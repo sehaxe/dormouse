@@ -7,7 +7,7 @@
 time). `--steps 2000` at `configs/m400.toml` (b4 × s1024) is a real training run
 per arm, hours not minutes; the `--steps` knob exists for the smoke length.
 
-The finding this exists for (`docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md`):
+The finding this exists for (`docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md`):
 `m400` at step 149 999 carries a saved `lfb_bias` spanning `[-218.27, +72.67]`
 (mean `+34.30`), and its router keeps **9 of 512 experts** alive — one holding
 4096 of 8192 assignments. The bias is added to the router logits

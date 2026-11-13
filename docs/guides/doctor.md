@@ -5,8 +5,8 @@
 > class below), `scripts/vram_ledger.py` (the VRAM arithmetic the `vram` row
 > prints), `port/src/dormouse/train/mixture.py` (the plan's resolution rule),
 > `port/src/dormouse/eval_window.py` (the overlap predicate),
-> `docs/reviews/2026-11-08-merge-incident.md` (the lost corpus),
-> `docs/reviews/2026-11-08-data-eval-integrity.md` (the window audit), and
+> `docs/records/reviews/2026-11-08-merge-incident.md` (the lost corpus),
+> `docs/records/reviews/2026-11-08-data-eval-integrity.md` (the window audit), and
 > `docs/architecture/2026-11-08-training-step.md` §I8 (resume drift).
 
 Nine hours of card time is too expensive to spend discovering a missing file.
@@ -84,7 +84,7 @@ shard stream); the main `data` file may not.
 ### 1. A data source that is not on disk
 
 `data_local/` (80 GB) and `checkpoints/` (14 GB) were deleted by the
-`origin/main` merge (`docs/reviews/2026-11-08-merge-incident.md`). A run started
+`origin/main` merge (`docs/records/reviews/2026-11-08-merge-incident.md`). A run started
 after that fails in `ByteStream`/`MixtureStream` construction, or worse, reads a
 truncated source. The `data` and `mix:<name>` rows stat every path before the
 model is built, and the `mix` row parses the plan with the same function the
@@ -99,7 +99,7 @@ which one is still missing.
 
 The data/eval audit measured a window at `off=100,000,000` on `best/fwedu.bin`
 being scored while the run's own fwedu cursor had already passed 108.9-110.0 MB
-(`docs/reviews/2026-11-08-data-eval-integrity.md`). The "held-out" BPB was
+(`docs/records/reviews/2026-11-08-data-eval-integrity.md`). The "held-out" BPB was
 reading training bytes. The cheapest honest detector is a path comparison
 (`port/src/dormouse/eval_window.py::training_overlap`, shared with
 `scripts/eval_window.py` and `dormouse diagnose`), and the `overlap` row is that

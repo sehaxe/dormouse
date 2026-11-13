@@ -51,8 +51,8 @@ same spirit as Python: why, with the measurement.
 
 ## Docs
 
-- `docs/reviews/` — what we measured. Numbers with config, date, commit, log.
-- `docs/research/` — what the literature says. arXiv id, version, date, table.
+- `docs/records/reviews/` — what we measured. Numbers with config, date, commit, log.
+- `docs/records/research/` — what the literature says. arXiv id, version, date, table.
 - `docs/adr/` — what we decided and why, with the number that decided it.
 - `docs/guides/` — how to do a thing.
 - Every path mentioned in a comment or doc must exist:

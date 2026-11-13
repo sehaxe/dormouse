@@ -1,6 +1,6 @@
 """MoE: top-k dispatch over dual-latent GLU experts, plus an always-on shared expert.
 
-The expert is TSCT2 §14's shape (`docs/reviews/tsct2-design-2026-10-04.md`):
+The expert is TSCT2 §14's shape (`docs/records/reviews/tsct2-design-2026-10-04.md`):
 
 * **two latents, one for gate and one for up.** §13.3 names the defect this
   fixes: a *shared* gate/up latent makes the GLU a rescaling of one subspace.
@@ -80,7 +80,7 @@ Dispatch has FOUR arms over ONE permute, and the log line says which ran:
   the caller gathers the same ragged rows expert-major and the unpadded grouped
   GEMM takes them with `offs [E+1]`, one program per (expert, row-block), the
   GLU fused into the second GEMM's input. `ModelConfig.moe_kernel` picks it and
-  is the A/B kill-switch (`docs/research/2026-10-15-tsct-super-kernel.md` §5.5:
+  is the A/B kill-switch (`docs/records/research/2026-10-15-tsct-super-kernel.md` §5.5:
   expert-kernel verdicts come from isolated-pass benches, then the full step);
   when the kernel cannot run (no triton, not CUDA, a tile set the device cannot
   hold) the padded arm runs instead and `moe_triton_fallback` + the reason say
@@ -200,7 +200,7 @@ per position, and the segmented forward is the one-shot forward
   floor k" and drop everything (the defect that would look like a working run).
 
 One more thing the routed pass can do, OFF by default: `moe_offload` (SL1,
-`docs/research/2026-10-16-budget-savers.md` §5). The MoE block owns the
+`docs/records/research/2026-10-16-budget-savers.md` §5). The MoE block owns the
 activation peak, and the tensors that own it are the `[E, cap, d]` /
 `[E, cap, f]` bank materializations plus the saved GLU gates; with the switch on,
 the arm `_dispatch` picked runs inside `checkpoint(use_reentrant=False)` with
@@ -1833,7 +1833,7 @@ class SparseMoE(nn.Module):
         `counts` is this forward's `[E]` histogram (already on the device). The
         readings answer the question a LOSS cannot: a collapsed bank still
         lowers its loss (9 of 512 experts did the work of the bank at `m400` —
-        `docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md`; the bias-less
+        `docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md`; the bias-less
         router read 80/512, the file's own router 9/512), so the bank's health
         has to be counted where the routing is decided.
 
@@ -2553,7 +2553,7 @@ class SparseMoE(nn.Module):
         `_version` on every optimizer step) and dynamo guards a compiled region
         on every Python value it reads, so without the decorator the frame spent
         one recompile per step until it hit `config.recompile_limit` and fell
-        back to eager (measured 2026-10-18, `docs/research/2026-10-18-compile-moe.md`;
+        back to eager (measured 2026-10-18, `docs/records/research/2026-10-18-compile-moe.md`;
         the trainer wraps the model with `torch.compile(dynamic=True)`,
         `train/loop.py:626`). The three call sites consume the bank tensors as
         ordinary inputs, so the compiled region is unchanged; the DECISION is
@@ -3336,7 +3336,7 @@ class SparseMoE(nn.Module):
         The pack copy is SYNCHRONOUS `device→host` (pageable, no pin) — that is
         what the mechanism costs; pinned buffers plus a side-stream copy are the
         upgrade if the b1 step-time measurement says the sync is the bill
-        (`docs/research/2026-10-16-budget-savers.md` §5: predicted +5-15% step).
+        (`docs/records/research/2026-10-16-budget-savers.md` §5: predicted +5-15% step).
         """
         if not self.moe_offload:
             return run()

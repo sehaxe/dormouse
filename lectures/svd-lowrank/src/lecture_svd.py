@@ -190,7 +190,7 @@ def main() -> None:
     plt.close(fig)
 
     # ---- Figure 4: the price we measured for truncating OUR model ---------
-    # From the repo's own A/B record (docs/reviews, 3 seeds each, equal steps).
+    # From the repo's own A/B record (docs/records/reviews, 3 seeds each, equal steps).
     ladder = {"rank": [16, 32, 64], "d_bpb": [0.136, 0.027, 0.0]}
     numbers["rank_ladder"] = ladder
     fig, ax = plt.subplots(figsize=(5.4, 2.7))

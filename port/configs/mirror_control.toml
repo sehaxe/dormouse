@@ -1,7 +1,7 @@
 # mirror_control — `scripts/control_transformer.py`'s plain decoder, in the trainer.
 #
 # The 2026-11-06 control beat the KDA/CSA/mHC/Engram block by 0.126 BPB at equal
-# bytes on all eight eval windows (docs/reviews/2026-11-06-control-transformer.md).
+# bytes on all eight eval windows (docs/records/reviews/2026-11-06-control-transformer.md).
 # This preset is that block as a first-class `block_form`, so an A/B runs both
 # forms through the SAME data stream, eval window, optimizer, checkpoint and BPB
 # accounting. It is sized from the control's measured bill: `288·d² + 48·T·d`

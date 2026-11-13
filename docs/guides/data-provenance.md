@@ -1,7 +1,7 @@
 # Data provenance: the six sources a commercial release would inherit
 
 **Scope.** The 2026-11-08 refetch wrote six files and one held-out window
-(`docs/guides/dataset.md:3-27`, `docs/reviews/2026-11-08-night.md:14-44`). This
+(`docs/guides/dataset.md:3-27`, `docs/records/reviews/2026-11-08-night.md:14-44`). This
 document is the ledger for those files: what each one is, what its licence says,
 what a commercial release still lacks, and the smallest change that would make
 the record automatic. It is **not legal advice**; §6 names the questions a
@@ -62,7 +62,7 @@ the converted `code` shard, and compared them to the `.bin` files:
 | `cosmo.bin` | the **whole** shard: 108 328 rows × (text + 7-byte separator) = 302 198 823 B exactly | 108 328 / 108 328 |
 | `finemath.bin` | the **whole** shard: 167 232 rows × (text + 7-byte separator) = 948 125 886 B exactly | 167 232 / 167 232 |
 | `code.bin` | row-order **prefix**: first 21 252 rows = 209 714 775 B exactly; row 0 byte-identical | 21 252 / 49 985 |
-| `math.bin`, `ru.bin` | a 209 715 200 B cap (`--cap-mb 200`, `docs/reviews/2026-11-08-night.md:27`), row count **not recorded** | unrecorded |
+| `math.bin`, `ru.bin` | a 209 715 200 B cap (`--cap-mb 200`, `docs/records/reviews/2026-11-08-night.md:27`), row count **not recorded** | unrecorded |
 
 Two consequences. (a) The three `best/` files are **not** all whole shards:
 `cosmo` and `finemath` are, and `fwedu` is a prefix whose stop was decided by
@@ -83,7 +83,7 @@ its share of the *local bytes* is whatever those bytes happen to be. At the
 ladder budget (14 648 micro-batches × 8 × 1024) the plan served 120.1 MB:
 fwedu 66.3 (55.2 %), cosmo 13.9 (11.5 %), code 13.3 (11.1 %), ru 11.9 (9.9 %),
 finemath 7.5 (6.2 %), math 7.2 (6.0 %) — each within 0.5 pp of its weight
-(`docs/reviews/2026-11-08-night.md:35-39`, measured with
+(`docs/records/reviews/2026-11-08-night.md:35-39`, measured with
 `mixture.replay_bytes`). Locally, finemath is 33.7 % of the bytes for a 6 %
 weight and fwedu 33.2 % for 55 %.
 
@@ -392,7 +392,7 @@ questions rather than answering them.
 In-repo: `port/configs/mix_refetch.toml`, `port/scripts/refetch_pretrain.py`,
 `port/scripts/fetch_mix_sources.py`, `port/src/dormouse/train/loop.py`,
 `port/src/dormouse/train/mixture.py`, `port/src/dormouse/config.py`,
-`docs/guides/dataset.md`, `docs/reviews/2026-11-08-night.md`.
+`docs/guides/dataset.md`, `docs/records/reviews/2026-11-08-night.md`.
 
 ---
 
@@ -448,7 +448,7 @@ provenance в model card и исходящая лицензия на веса �
 2. Is a 40 %-copyleft code slice acceptable to ship? If not, the allow-list and
    the re-fetch budget are a decision, and the slice must be rebuilt from a
    licence-filtered dataset (The Stack v2's permissive subset was the original
-   first choice — `docs/research/2026-10-16-data-mixing.md:139`).
+   first choice — `docs/records/research/2026-10-16-data-mixing.md:139`).
 3. Should `fwedu_train.bin` be re-cut at a row boundary (it currently ends
    mid-document)? Re-cutting changes its sha256 and therefore every number
    measured on it.

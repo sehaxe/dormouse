@@ -15,7 +15,7 @@ one expert? This script prints both, so "we cannot train the bank" and "the bank
 is not trainable at this rank" stop being the same sentence.
 
 THE LEDGER, named because an MFU number without one is not a number
-(`docs/research/2026-11-05-small-model-mfu.md` §0.2):
+(`docs/records/research/2026-11-05-small-model-mfu.md` §0.2):
 
   body   = `width.macs_per_token` — `iters x (attn + out_proj + d x f)`, the
            project's own dense bill. `out_proj` is priced at its real rank

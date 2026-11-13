@@ -3,10 +3,10 @@
 One kernel launch per shape-group chunk runs the WHOLE Jordan chain, where the
 torch path (`optim.zeropower_via_ns`) issues ~53 dispatches per chain. That is
 the entire point: this port's step is **host-dispatch-bound**, not FLOP-bound —
-`docs/reviews/2026-10-16-b1-profile.md` §1/§3 measured a GPU residue of ≈0 ms
+`docs/records/reviews/2026-10-16-b1-profile.md` §1/§3 measured a GPU residue of ≈0 ms
 against a wall clock that is the enqueue, and `.bulba/memory.md:317` records
 Gram-NS losing 1.2-1.4× here *because it handed back MORE calls*. Turbo-Muon's
-finding (`docs/research/2026-10-17-muon-variants.md` §1 row 1, §2 #1) is the
+finding (`docs/records/research/2026-10-17-muon-variants.md` §1 row 1, §2 #1) is the
 other half of that idea: same polynomial, fewer launches.
 
 **What is transcribed, and from where** (fetched 2026-10-17):
@@ -56,7 +56,7 @@ House rules (`moe_kernels.py`'s, followed here): plain tensors in and out, no
 module-level mutable state, no host sync (every bound is a SHAPE the host already
 has), and **every fast arm has a COUNTED fallback with its reason** — `ns_triton`
 when the fused chain ran, `ns_triton_fallback` + the reason when it could not
-(`docs/research/2026-10-17-muon-variants.md` §2 #1's void check: "the Triton path
+(`docs/records/research/2026-10-17-muon-variants.md` §2 #1's void check: "the Triton path
 must be COUNTED, never a silent fallback to classic"). That includes a tile set
 the DEVICE cannot fit: the launch's own `OutOfResources` is caught and COUNTED
 (`zeropower_triton_or_classic`), never a traceback.
@@ -337,7 +337,7 @@ def zeropower_triton(
     fp32 in / fp32 out. A bf16 input is upcast in-kernel and the chain still runs
     in fp32 — the kernels are fp32-native, which is why this arm SUBSUMES the
     `ns_dtype="bf16"` rung rather than composing with it
-    (`docs/research/2026-10-17-muon-variants.md` §5: "the two must not ride in
+    (`docs/records/research/2026-10-17-muon-variants.md` §5: "the two must not ride in
     one A/B"). Exactly ONE kernel launch per call, plus the output allocation.
 
     `block_d` is the caliper: `None` takes the shipped `BLOCK_D`, an explicit

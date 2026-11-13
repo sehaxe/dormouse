@@ -14,7 +14,7 @@ term, where it lives, and what it is confused with — read
 pre-LN transformer** — `block_form="transformer"`, 12 unique layers,
 `d_model=832`, 95,035,200 params (`port/configs/flagship3_dense.toml`) — because
 a 13.5M dense control beat the 102.7M KDA/CSA/mHC loop by 0.126–0.37 BPB at
-equal bytes (`docs/reviews/2026-11-06-control-transformer.md`). The **loop form**
+equal bytes (`docs/records/reviews/2026-11-06-control-transformer.md`). The **loop form**
 described below is the frontier lane: every mechanism in it exists as a flag, and
 its one trained long-context checkpoint died with the corpus on 2026-11-08.
 
@@ -222,7 +222,7 @@ The old process-level `--guard` wrapper (wait 30 s, re-exec from a pinned
 executable image, resume from the last checkpoint) was removed 2026-10-02: with
 `--detach` its parent exited 0 immediately, so orchestrators read a crashed run
 as a finished one and stacked fifteen runs on one GPU
-(`docs/reviews/unguard-2026-10-02.md`). A persistent failure now stops the run
+(`docs/records/reviews/unguard-2026-10-02.md`). A persistent failure now stops the run
 with a non-zero exit; the operator resumes with the same `--ckpt-name`.
 
 A step's only stochastic input is the JEPA span mask, a pure function of
@@ -269,13 +269,13 @@ Knowing what is *not* in the model is part of the model:
   honest unweighted CE, so every train-CE number from the PonderNet era is void.
 - **No MSA in the recipe** — but ADR-0014 (the cut) was **never executed**: the
   `burn-msa` crate is still a live `dormouse-core` dependency and `use_msa` is a
-  live config field (`docs/reviews/2026-11-08-claims-repair.md` D1). The arm is
+  live config field (`docs/records/reviews/2026-11-08-claims-repair.md` D1). The arm is
   off in every preset; the code is not deleted.
 - **No output-side memory.** The Engram is input features only.
 - **No tokenizer.** Byte-level all the way down. The byte-patch unit (8 bytes per
   position) exists as an arm and is **rejected on quality**: 3.3007 BPB against
   1.4946 at 250 MB, and 3.742 vs 2.547 at equal steps
-  (`docs/reviews/2026-11-08-data-eval-integrity.md`).
+  (`docs/records/reviews/2026-11-08-data-eval-integrity.md`).
 - **No learned halting and no depth schedule.** Fixed depth by default; the two
   adaptive-depth arms are the queue's rung 4.
 - **No silent fallbacks.** Every degradation is LOUD, COUNTED, or fixed

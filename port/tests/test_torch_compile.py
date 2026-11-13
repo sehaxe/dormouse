@@ -197,7 +197,7 @@ def test_resume_across_the_compile_boundary(tmp_path, monkeypatch, first_compile
     assert len(calls) == int(first_compiled) + int(second_compiled)
     # Static shapes: every trainer step and every eval scores the same
     # batch x seq_len, so `dynamic=True` only paid its guards (0.952x vs 1.149x
-    # static in docs/reviews/2026-11-08-compile-matrix.md).
+    # static in docs/records/reviews/2026-11-08-compile-matrix.md).
     assert all(call.get("dynamic") is False for call in calls)
     assert all(call.get("mode") == "max-autotune-no-cudagraphs" for call in calls)
     assert report["opt_steps"] == 2, "the optimizer state must continue across the flip"

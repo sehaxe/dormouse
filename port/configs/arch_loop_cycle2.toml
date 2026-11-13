@@ -2,7 +2,7 @@
 #
 # The verdict "loops lose at <=200M" was measured on `medium`/`flagship_base`:
 # ONE shared body x 3-4 iterations = 14% of a 12-layer control's layer count
-# (docs/research/2026-11-06-depth-recurrence.md). The one <=200M iso-FLOP win
+# (docs/records/research/2026-11-06-depth-recurrence.md). The one <=200M iso-FLOP win
 # in the literature is MoR cycle-2 at 135M: 15 unique layers x 2 passes, i.e.
 # HALF the unique parameters at the same layer-passes (2507.10524 Table 10,
 # 3.0323 -> 3.0071). This arm tests that topology at our scale:

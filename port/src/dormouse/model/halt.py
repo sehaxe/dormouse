@@ -27,7 +27,7 @@ Why the model's own CE and not a separate predictor:
 * it reuses the seam that already exists (`_per_iter_ce`), so the target cannot
   drift from the loss the trainer computes, and no second forward is paid;
 * **it never reads `targets` as the head's INPUT.** The DSpark D1 lesson
-  (`docs/reviews/verify-tails-2026-09-30.md`) is that feeding the label
+  (`docs/records/reviews/verify-tails-2026-09-30.md`) is that feeding the label
   sequence to an aux head hands it the answer one step early. Here the input is
   `step_out` (the loop's readout at iteration `i`, a function of `input_ids`
   only) — verified by `tests/test_halt.py::test_halt_input_does_not_see_targets`

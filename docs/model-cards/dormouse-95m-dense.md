@@ -266,7 +266,7 @@ mixture, on the pinned 196,608-byte window — 1.0973 bits/byte better than
 | ladder runner | [`port/scripts/recipe_ladder.sh`](../../port/scripts/recipe_ladder.sh) |
 | one-command reproduction | [`port/scripts/eval_suite.py`](../../port/scripts/eval_suite.py) · [`port/tests/test_eval_suite.py`](../../port/tests/test_eval_suite.py) |
 | parameter pin | [`port/tests/test_invariants_checkpoint.py`](../../port/tests/test_invariants_checkpoint.py) `::test_the_flagship_transformer_has_no_nonpersistent_buffer` |
-| corpus loss | [`docs/reviews/2026-11-08-merge-incident.md`](../reviews/2026-11-08-merge-incident.md) |
-| refetch + ladder record | [`docs/reviews/2026-11-08-night.md`](../reviews/2026-11-08-night.md) |
-| long-context verdict | [`docs/research/2026-11-08-long-context-eval.md`](../research/2026-11-08-long-context-eval.md) |
-| retraction evidence | [`docs/reviews/2026-11-08-data-eval-integrity.md`](../reviews/2026-11-08-data-eval-integrity.md) |
+| corpus loss | [`docs/records/reviews/2026-11-08-merge-incident.md`](../reviews/2026-11-08-merge-incident.md) |
+| refetch + ladder record | [`docs/records/reviews/2026-11-08-night.md`](../reviews/2026-11-08-night.md) |
+| long-context verdict | [`docs/records/research/2026-11-08-long-context-eval.md`](../research/2026-11-08-long-context-eval.md) |
+| retraction evidence | [`docs/records/reviews/2026-11-08-data-eval-integrity.md`](../reviews/2026-11-08-data-eval-integrity.md) |

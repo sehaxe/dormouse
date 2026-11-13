@@ -2,12 +2,12 @@
 #
 # Rationale (measured, 2026-11-06):
 #   * a 13.5M vanilla decoder beat our 102.7M KDA/CSA/mHC/Engram block by 0.126 BPB
-#     at equal bytes on all eight eval windows (docs/reviews/2026-11-06-control-transformer.md);
+#     at equal bytes on all eight eval windows (docs/records/reviews/2026-11-06-control-transformer.md);
 #   * loops lose at iso-FLOPs: each recurrence is worth 0.46 of a unique block
 #     (arXiv 2604.21106v3), so 1 unique layer x 3 iterations is 14% of a 12-layer
-#     model at the same layer-passes (docs/research/2026-11-06-depth-recurrence.md);
+#     model at the same layer-passes (docs/records/research/2026-11-06-depth-recurrence.md);
 #   * nothing beats a dense transformer at <=200M params in a compute-matched test
-#     (docs/research/2026-11-06-architecture-at-100m.md).
+#     (docs/records/research/2026-11-06-architecture-at-100m.md).
 #
 # Sizing: keep MFLOP/byte at or below the old flagship's 137.4 so the throughput
 # comparison is honest. With L=12, d=832 (13 heads x 64), f=3072: params ~94.6M, 6N/patch over a

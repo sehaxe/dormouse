@@ -4,7 +4,7 @@
 and from every plan source, and the trainer's own gate
 (`train.data.eval_train_overlap`) verifies it by inode at startup: two paths
 can name one file, and a BPB scored on bytes the run read is not held out
-(`docs/reviews/2026-11-08-data-eval-integrity.md` — the `off=100,000,000`
+(`docs/records/reviews/2026-11-08-data-eval-integrity.md` — the `off=100,000,000`
 window was scored while the run's cursor had already passed 108.9 MB).
 
 This module is that predicate without the streams: a path comparison, shared

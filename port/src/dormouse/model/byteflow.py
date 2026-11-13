@@ -39,7 +39,7 @@ byte-level LM. Three options were on the table:
   patches instead of T bytes, which is the whole point of the architecture
   (~3-5x compression; the burn A/B measured the compression itself as the win —
   canon at equal params 3.466 vs plain bytes 3.947 BPB, and the full-arm
-  dormouse `small` LOSES at 6.498, `docs/reviews/byteflow-ab-2026-10-02.md`).
+  dormouse `small` LOSES at 6.498, `docs/records/reviews/byteflow-ab-2026-10-02.md`).
 * **C — the rate as an auxiliary score**: keep the byte model and add `ΔR` as
   an extra loss/regularizer. Rejected: what the paper buys is the compressed
   SEQUENCE, not a score; an aux term leaves the loop paying for every byte.

@@ -39,7 +39,7 @@ def wsd_lr(
     """The learning rate at `step` (0-based), in `[final_frac·peak, peak]`.
 
     `final_frac=0.0` is a FULL cooldown to zero — the Ripple-65B ladder v1.5 arm
-    (`docs/reviews/2026-11-08-ripple-65b.md`), which is why the bound below is
+    (`docs/records/reviews/2026-11-08-ripple-65b.md`), which is why the bound below is
     `>= 0` rather than `> 0`: a schedule that ends at 0.1×peak is not the same
     arm as one that ends at 0, and the difference is measurable at 95M.
     """

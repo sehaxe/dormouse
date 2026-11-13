@@ -6,7 +6,7 @@ With the historical `scale = sqrt(max(1, rows/cols))` that put `[832,3072]` at
 5.4e-6 against AdamW's 3.0e-4 — a 55x deficit — while `[3072,832]` was off by
 only 15x. The factorised bank's `v [64,2730]` was therefore punished 3.5x harder
 than a dense matrix of the same model, which contaminated every bank-vs-dense
-A/B on record (`docs/reviews/2026-11-07-muon-audit.md` §D2, §2.2).
+A/B on record (`docs/records/reviews/2026-11-07-muon-audit.md` §D2, §2.2).
 
 The gate is a measurement, not a formula: one real optimizer step on each shape,
 then `RMS(dW) / lr` read off the parameter delta. `shape_fair` must land inside

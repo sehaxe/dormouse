@@ -14,16 +14,16 @@ action plan; §6 is the owner's decision list.
 |---|---|
 | KDA grad flow proven on the trainer's backend — CPU/CUDA bit-for-bit, all 11 groups | `tests/kda_param_grads_cuda.rs`, `d8fa449` (2026-10-01) |
 | TSCT retraction wired + instrumented: scalar 75.65 ms → batched 19.69 ms (3.8x), flat slope 2-6 NS iters | `.bulba/goal.md` STATUS DONE §4, `retract_seam.rs` |
-| bf16 44.06 / f16 44.04 TFLOP/s at the cuBLAS ceiling on 0.22 (after the `cubecl-ir` patch re-land); fp32 17-20 | 2026-10-10/11 tables in `docs/reviews/2026-10-09-bug-list-022.md`, AGENTS §2.1 |
-| The 0.22 corruption root-caused: a kernel reads memory nobody wrote; the persistent pool decides what is read | `docs/research/2026-10-11-022-reads-unwritten-memory.md` |
+| bf16 44.06 / f16 44.04 TFLOP/s at the cuBLAS ceiling on 0.22 (after the `cubecl-ir` patch re-land); fp32 17-20 | 2026-10-10/11 tables in `docs/records/reviews/2026-10-09-bug-list-022.md`, AGENTS §2.1 |
+| The 0.22 corruption root-caused: a kernel reads memory nobody wrote; the persistent pool decides what is read | `docs/records/research/2026-10-11-022-reads-unwritten-memory.md` |
 | The measured config workaround: `persistent_memory = "disabled"` + `allocator = "sync"` → 2/3-3/3 clean vs 9/9 corrupted | same doc, the 2026-10-11 table |
 | `CE_CEILING = 100` guard validated end to end — caught 3/3 corrupted runs at step 1 | same doc, retraction section |
 | ByteFlow canon at equal params: 3.466 vs plain-bytes 3.947 (3 seeds, 2k steps); full-arm `small` LOSES at 6.498 | `benches/history.tsv:157-159`, trio 2026-10-04 |
 | ByteFlow 100k: held-out **2.255** BPB on 409 MB — 0.325 below the 5-gram line (2.580, 8 MB fit) | `AGENT_CONTEXT.md:65`; anchors `history.tsv:160-161` |
 | JEPA aux beats pure CE 3/3 seeds | `d8062d1`; the one arm with a positive verdict |
 | Muon+ default optimizer, routing validated at startup; host-RAM Engram works (`--engram-ram`) | AGENTS §3.5, §3.7 |
-| φ = 0.46: one recurrence buys 0.46 of a parameter (iso-depth law) → weight-shared depth is worth keeping | `docs/research/2026-10-11-recurrence-equivalence.md` (arXiv:2604.21106) |
-| Every major bet against the published record: Muon hybrid confirmed (8-bit state at our scale 2509.23106; 4-bit Muon measured on an RTX 5090, 2607.04422); host-Engram confirmed twice (2608.30320, 2610.20456); **"20-25%" and the slot-count law REFUTED — allocation is swept, not cited**; the ByteFlow criterion is unpublished → judge against boundary dependence, not entropy (2610.11790; BLT = 2412.09871); fp32 KDA state; WSD + wind-tunnel for overtraining | `docs/research/2026-10-15-1b-tech-verification.md` (69 arXiv IDs, verdict table first) |
+| φ = 0.46: one recurrence buys 0.46 of a parameter (iso-depth law) → weight-shared depth is worth keeping | `docs/records/research/2026-10-11-recurrence-equivalence.md` (arXiv:2604.21106) |
+| Every major bet against the published record: Muon hybrid confirmed (8-bit state at our scale 2509.23106; 4-bit Muon measured on an RTX 5090, 2607.04422); host-Engram confirmed twice (2608.30320, 2610.20456); **"20-25%" and the slot-count law REFUTED — allocation is swept, not cited**; the ByteFlow criterion is unpublished → judge against boundary dependence, not entropy (2610.11790; BLT = 2412.09871); fp32 KDA state; WSD + wind-tunnel for overtraining | `docs/records/research/2026-10-15-1b-tech-verification.md` (69 arXiv IDs, verdict table first) |
 | Instrument layer: NaN firewall, CE ceiling, `engram=`/`fused kda=` counters, eval window printed, `--fit` anchors, determinism harness | AGENTS §2.6, §3.7; `tools/determinism.py` |
 
 ### 1.2 Open debts this plan pays
@@ -35,7 +35,7 @@ action plan; §6 is the owner's decision list.
 | Pool-cost trade never measured on CUDA (the "zero cost" reading was a CPU-backend artifact) | same |
 | MoE is DENSE: the LoopBlock runs all experts per token (`loop_block.rs:982-997`); `moe_topk` exists, the dispatch lane unrun | §2.1 below — this is load-bearing for 1B |
 | The fused KDA adjoint is wrong + non-deterministic → the trainer runs the tensor path (correct; ~205 ms of a ~480 ms step) | AGENTS §3.3 |
-| Upstream A1-A3 drafted, not filed (token here is read-only) | `docs/reviews/upstream-issue-autotune-candidate-coin-flip.md` |
+| Upstream A1-A3 drafted, not filed (token here is read-only) | `docs/records/reviews/upstream-issue-autotune-candidate-coin-flip.md` |
 | No control re-baselined on 0.22; the A/B budget unknown post-`8fa5d4c` | AGENTS §3.3/§3.4 |
 | `max_ortho`'s 1e-3 threshold will mis-latch at 1B: it thresholds a worst-case-over-more-factors statistic whose natural scale is 1/sqrt(m) | `benches/history.tsv:165` (moe-dev 2026-10-03) |
 
@@ -228,7 +228,7 @@ at scale") has never been measured. Iso-tokens A/B at 100M:
 ### Phase 4 — the TSCT lane: TSCT2 + LittleBit (parallel, GPU-light)
 
 The TSCT program already has a pre-registered design with gates and a
-kill-switch (`docs/reviews/tsct2-design-2026-10-04.md`): fine-grained low-rank
+kill-switch (`docs/records/reviews/tsct2-design-2026-10-04.md`): fine-grained low-rank
 experts (r=16-64, E=64-1024, k=2-4) next to an always-on shared expert of rank
 192-256 (R_act ≥ 192, the CoLA-parity zone), routing in the latent space,
 Gram-space retraction driven by accumulated Ση_t with a spectral latch, bf16
@@ -327,7 +327,7 @@ the framework does not follow.
 
 ### 4.1 The spike's measured answer (2026-10-15)
 
-Full report: `docs/research/2026-10-15-torch-spike.md` (torch 2.13.0+cu129,
+Full report: `docs/records/research/2026-10-15-torch-spike.md` (torch 2.13.0+cu129,
 CPython 3.12.15 via uv, this card, pre-flight before each of 13 GPU runs).
 The verdict table against the owner's ordered criteria:
 
@@ -467,7 +467,7 @@ Consequences, stated honestly:
    The owner left this to me; the on-card reading is the flag-first one.
 4. **Upstream issue**: provide a repo-scope GitHub token (the drafted text is
    ready), or file it yourself from
-   `docs/reviews/upstream-issue-autotune-candidate-coin-flip.md`.
+   `docs/records/reviews/upstream-issue-autotune-candidate-coin-flip.md`.
 5. **LittleBit lane**: design note + 9M A/B now (GPU-light, parallel), or after
    the first model ships.
 
@@ -531,7 +531,7 @@ grouped MoE, fp8 experts).
 - Precision plan at init: bf16 activations/weights, fp32 KDA state + softmax +
   loss; the quant ladder (fp8 → NVFP4 → LittleBit sign+scales) exists as
   config exactly as the burn side spelled it
-  (`docs/reviews/littlebit-design-2026-10-15.md` gates carry over verbatim).
+  (`docs/records/reviews/littlebit-design-2026-10-15.md` gates carry over verbatim).
 - Continuing invariants from the burn lessons (ADR-0011/0016/0018/0021): the
   instrument layer is day-one code, not an addition — every degradation
   carries a LOUD/COUNTED/SILENT mark, device counters are read at declared
@@ -567,7 +567,7 @@ grouped MoE, fp8 experts).
 
 ### 7.1 The post-training lane (SFT → RLVR → self-evolve; owner: RL in the framework, first-class)
 
-Grounded by `docs/research/2026-10-15-agentic-post-training.md` (SOTA read;
+Grounded by `docs/records/research/2026-10-15-agentic-post-training.md` (SOTA read;
 the owner's `docs/architecture/post-training.md` was the start, confirmed OR
 corrected there). The research's own headline: **no paper does agentic RL at
 ≤1B total / ≤100M active** — smallest published points are 0.5-3B — so every
@@ -585,7 +585,7 @@ mechanism below is a transfer, and the queue starts cheapest-provable:
    bet: rank-r ES ~100× cheaper, routers/harness only) + the SEED-shaped
    skill loop (2607.14777) with adaptive retirement (2609.20784) + anchored
    self-play (2607.03523 anti-drift).
-4. Data side rides `docs/research/2026-10-15-data-strategy.md`: verifier
+4. Data side rides `docs/records/research/2026-10-15-data-strategy.md`: verifier
    tasks synthesis → solvability screen → anti-hack; agent traces as SFT
    spans (SWE-Gym/Open-SWE/ToolACE, Apache-2.0).
 
@@ -636,7 +636,7 @@ is reachable at ~2.6× the step time. The enabler is FLA's own `initial_state`
 on `chunk_kda` (StateFlow pattern, not truncated BPTT), plus the dropless
 Triton grouped GEMM (empty-block exit in-kernel; 37.9× the naive loop).
 
-**The audit** (`docs/reviews/2026-10-17-port-audit.md`, 3 CRITICAL / 15 MAJOR
+**The audit** (`docs/records/reviews/2026-10-17-port-audit.md`, 3 CRITICAL / 15 MAJOR
 / 14 MINOR) found and the same day fixed: a per-forward device sync in the
 counter fast path, `torch.compile` checkpoints no loader could read, the b1
 recipe's capacity claim falsified by its own counter (77% of assignments

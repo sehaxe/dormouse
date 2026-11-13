@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 """S-NIAH-8: exact 8-byte retrieval through the state-carrying path (gates A-D).
 
-WHAT THIS IS. `docs/research/2026-11-08-long-context-eval.md` §4 pre-registers the
+WHAT THIS IS. `docs/records/research/2026-11-08-long-context-eval.md` §4 pre-registers the
 cheapest honest 1M protocol. This script is its RUNNER for gate D (retrieval),
 its controls, and the gate C rank probe; gates A (artifact) and B (state carry)
 are preflights it refuses on, because a number from a failed precondition is a

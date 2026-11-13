@@ -1,7 +1,7 @@
 # TSCT, ternary only — the specification of record
 
 **Date:** 2026-11-09. **Status:** canonical spec. It supersedes the
-`fp8 → NVFP4 → ternary` ladder in `docs/reviews/littlebit-design-2026-10-15.md`
+`fp8 → NVFP4 → ternary` ladder in `docs/records/reviews/littlebit-design-2026-10-15.md`
 as the plan for TSCT: the owner's directive is that **TSCT is ternary, full
 stop** — `sign`/binary, fp8 and NVFP4 are not rungs of this design and are not
 built. Everything below is either a measurement with a source, arithmetic shown
@@ -52,12 +52,12 @@ binary; it buys a zero state, which is the compressibility and sparsity story.
 
 | claim | number | conditions | source |
 |---|---|---|---|
-| TSCT is BPB-neutral at equal parameters | **+0.0042** BPB | 95M, 120 MB, b24, lr 3e-4, muon×12, seed 1: 1.5067 vs 1.5052 | `docs/reviews/2026-11-09-architecture-matrix.md` |
-| Ternary from step 0 through a hard STE costs quality | **+0.050** BPB (ternary), +0.087 (binary) | medium preset, vs bf16 factors | `tsct.py:47`, `docs/reviews/tsct2-design-2026-10-04.md` |
-| The model's matrices are **not** low-rank in a useful sense | rank 64 holds **43.4 %** of `down`'s energy; 99 % energy needs **941 of 1024** singular values | trained `medium` checkpoint, CPU SVD | `docs/research/2026-11-07-tsct-ceiling.md` §1 |
+| TSCT is BPB-neutral at equal parameters | **+0.0042** BPB | 95M, 120 MB, b24, lr 3e-4, muon×12, seed 1: 1.5067 vs 1.5052 | `docs/records/reviews/2026-11-09-architecture-matrix.md` |
+| Ternary from step 0 through a hard STE costs quality | **+0.050** BPB (ternary), +0.087 (binary) | medium preset, vs bf16 factors | `tsct.py:47`, `docs/records/reviews/tsct2-design-2026-10-04.md` |
+| The model's matrices are **not** low-rank in a useful sense | rank 64 holds **43.4 %** of `down`'s energy; 99 % energy needs **941 of 1024** singular values | trained `medium` checkpoint, CPU SVD | `docs/records/research/2026-11-07-tsct-ceiling.md` §1 |
 | A factored bank does not beat dense on BPB at 95M | −0.067 in dense's favour at equal active MAC (600 steps, 3 seeds) | bank E=512 vs dense 69.3M | same, §0 |
 | Factored FFN shrinks the block 5.0× in params, 1.72× in MAC | 753 664 vs 3 769 664 params; 4.21 vs 7.23 MMAC/byte | d=832, f=3072, r=64 (live shape) | `dormouse info configs/flagship3_dense.toml` |
-| Ternary factors fit NVFP4 e2m1 exactly | — | so a 4-bit hardware path can carry them, if one existed | `docs/research/2026-10-15-tsct-super-kernel.md` |
+| Ternary factors fit NVFP4 e2m1 exactly | — | so a 4-bit hardware path can carry them, if one existed | `docs/records/research/2026-10-15-tsct-super-kernel.md` |
 | **End-to-end decode speed with TSCT** | **UNMEASURED** | arithmetic says 1.6× fewer bytes per byte-step (95.0M → 58.4M) | absence, not a zero |
 
 ## 4. What "ideal" means — the objective, stated so it can fail
@@ -99,7 +99,7 @@ loses at fixed size.
 3. **One residual term** (rank 32, same scheme) if T-B shows the primary term
    cannot reach +0.02 — the LittleBit paper's own remedy, ~+41 KB per expert.
 4. **Packed at rest, dequantised per step** for compute: no ternary MMA exists on
-   sm_120 (tcgen05 is B200-only; `docs/research/2026-10-15-tsct-super-kernel.md`),
+   sm_120 (tcgen05 is B200-only; `docs/records/research/2026-10-15-tsct-super-kernel.md`),
    so the kernel story is "fewer bytes through HBM", not "faster MACs".
 5. **Export = the packed form + the decoder**, checked by re-loading into a fresh
    process and comparing logits to the training-time forward (the same gate the

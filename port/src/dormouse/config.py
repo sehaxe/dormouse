@@ -123,7 +123,7 @@ PROGRESS_KEYS = (
 #:
 #: m400/medium: `muon_state_dtype=bf16` is the 2026-11-05 optimizer-region arm
 #: (the 100-step CPU gate and the launch census are in
-#: `docs/reviews/2026-11-05-opt-region.md`); `muon_chunk_elems=1<<26` is the
+#: `docs/records/reviews/2026-11-05-opt-region.md`); `muon_chunk_elems=1<<26` is the
 #: same geometry's lockstep cap — it halves the chunk count (18 -> 14 at m400)
 #: and keeps the peak intermediate at half of the b1-cap OOM size. b1 and the
 #: smaller presets keep the historical schema values.
@@ -403,7 +403,7 @@ MUON_COLROW_3D = ("frobenius", "colrow")
 #: (arXiv:2509.23106's compute-high/store-low rung; stochastic rounding is the
 #: NEXT rung and is not implemented) / the Newton–Schulz CHAIN run in bf16 with
 #: explicit fp32 in/out casts (nanogpt's practice, row 4 of
-#: `docs/research/2026-10-16-muon-orthogonalization-cost.md`). Both are opt-in
+#: `docs/records/research/2026-10-16-muon-orthogonalization-cost.md`). Both are opt-in
 #: and approximate by design; a name that is not here is LOUD.
 OPT_DTYPES = ("fp32", "bf16")
 #: The `mm_dtype` literals — the COMPUTE precision of the 2-D GEMMs
@@ -413,7 +413,7 @@ OPT_DTYPES = ("fp32", "bf16")
 #: compute dtype, cuBLAS bf16 tensor cores. `fp8` routes `mm_mixed`'s 2-D
 #: products through `torch._scaled_mm` (e4m3 × e4m3 → bf16 out) with per-tensor
 #: amax scales computed from the bf16 operand — the spike's measured 1.6-1.8×
-#: on 2-D GEMMs (`docs/research/2026-10-15-torch-spike.md` phase 2; grouped fp8
+#: on 2-D GEMMs (`docs/records/research/2026-10-15-torch-spike.md` phase 2; grouped fp8
 #: is ABSENT on sm_120 and is not attempted). A COMPUTE rung: the fp32 masters,
 #: the checkpoint and the optimizer are untouched. **On torch 2.13 the lane is
 #: FORWARD-ONLY** — `_scaled_mm` registers no derivative (`RuntimeError:
@@ -482,7 +482,7 @@ class ModelConfig:
     #: `scripts/control_transformer.py`'s block, run inside this model so the
     #: trainer/data/eval/optimizer are shared — the 2026-11-06 control measured
     #: 0.13-0.37 BPB BETTER than the KDA loop at equal bytes
-    #: (`docs/reviews/2026-11-06-control-transformer.md`), so the architecture
+    #: (`docs/records/reviews/2026-11-06-control-transformer.md`), so the architecture
     #: must be selectable, not assumed.
     #:
     #: The two forms share the token embedding, the final norm, the byte head
@@ -500,7 +500,7 @@ class ModelConfig:
     #: ---- THE RECIPE KNOBS (unique stack only; every one defaults OFF) ----
     #: The 2026-11-06 Ripple-65B ladder compounded SIX cheap recipe changes into
     #: 16x compute efficiency at 4B on code CE
-    #: (`docs/reviews/2026-11-08-ripple-65b.md`), which is larger than any
+    #: (`docs/records/reviews/2026-11-08-ripple-65b.md`), which is larger than any
     #: architectural delta measured in
     #: this repo. These four are the cheap, independent members of that list;
     #: each is one A/B at 95M and none of them changes a default.
@@ -1083,7 +1083,7 @@ class ModelConfig:
     use_attnres: bool = False
     #: mHC (`2512.24880`, DeepSeek 2025): the residual becomes TWO streams
     #: mixed by a doubly-stochastic (Sinkhorn-projected) matrix, at the LOOP
-    #: BOUNDARY (the paper's K=2 placement, `docs/reviews/mhc-2026-09-30.md`).
+    #: BOUNDARY (the paper's K=2 placement, `docs/records/reviews/mhc-2026-09-30.md`).
     #: The iso-depth scaling study (`2604.21106`) measures hyperconnections
     #: raising the recurrence-equivalence exponent φ 0.453 -> 0.646, which is
     #: exactly the "deeper loops stop paying" wall we hit at iteration 4.
@@ -1150,7 +1150,7 @@ class ModelConfig:
     #: the flag is named for the arm it fuses, not for the ranking.
     fused_kda_tail: bool = False
     #: LOOM (`2610.01153`, 2026-10-01; scanned in
-    #: `docs/research/2026-10-16-new-tech-scan.md` §2.1, whose row names our
+    #: `docs/records/research/2026-10-16-new-tech-scan.md` §2.1, whose row names our
     #: own `max_iter 4` / operating depth 2 as exactly the regime that paper
     #: measures as stuck at two loops). A REAL arm, not a stub:
     #: `LoopBlock` applies one learned per-iteration gate to the RMS-normalized
@@ -1287,7 +1287,7 @@ class ModelConfig:
     #: doing the work of two. 0.01 is the Switch value. OFF, and it consumes RNG
     #: only when on, so every existing pin and RNG stream is untouched.
     moe_router_jitter: float = 0.0
-    #: **RECOMMENDED (`docs/reviews/2026-11-10-moe-package-bench.md` §8):** the
+    #: **RECOMMENDED (`docs/records/reviews/2026-11-10-moe-package-bench.md` §8):** the
     #: padded arm's bill is exactly `E·cap` bank rows against `n·k` assignments,
     #: so `1.25` computes 1.25x the assigned rows and `2.0` computes 2x. Use
     #: **1.25 with `moe_qb=true`** — Quantile Balancing (Kimi K3 §2.3.3) holds
@@ -1313,7 +1313,7 @@ class ModelConfig:
     #: `moe_aux_coef · E · Σ_e f_e · P_e` to the training loss (differentiable
     #: through the router only).
     #: Why `prop` exists (measured 2026-11-04, see
-    #: `docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md`):
+    #: `docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md`):
     #: `m400` at step 149 999 carries a saved bias of
     #: `[-218.27, +72.67]` and its router keeps **9 of 512** experts alive
     #: (top-10 = 100% of all assignments). The bias-less router reads 80/512, so
@@ -1357,7 +1357,7 @@ class ModelConfig:
     #: it on.
     moe_routing_health: bool = False
     #: Which expert-pass arm the routed forward runs, and the A/B switch
-    #: (`docs/research/2026-10-15-tsct-super-kernel.md` step 2):
+    #: (`docs/records/research/2026-10-15-tsct-super-kernel.md` step 2):
     #: `padded` = the cap-padded `[E, cap, ·]` bank of bmms — the reference and
     #: the fallback every other arm is compared against; `triton` = the unpadded
     #: grouped GEMM (`model/moe_kernels.py`, one program per ragged row-block,
@@ -1491,7 +1491,7 @@ class ModelConfig:
     #: expert row of `packed_v` exactly as it scales an unpacked `v`.
     tsct_packed: bool = False
     #: The expert GLU's activation, the 2026-10-16 activation tournament arm
-    #: (`docs/research` scan; formula sources named in `experts.expert_glu`):
+    #: (`docs/records/research` scan; formula sources named in `experts.expert_glu`):
     #: `silu` = SwiGLU's gate, the control and every number on record;
     #: `situ` = Kimi K3's Sigmoid-Tanh-Unit GLU (arXiv 2607.24653 Eq. 12) —
     #: both factors soft-capped, ‖·‖∞ ≤ β1·β2, matches SwiGLU to first order at
@@ -1544,7 +1544,7 @@ class ModelConfig:
     #: MemGLU's RMS-calibration constant — the authors' 9M-scale value
     #: (`2608.07323` appendix table: 0.6039096539628113).
     memglu_c0: float = 0.6039096539628113
-    #: SL1 of `docs/research/2026-10-16-budget-savers.md` §5: park the routed
+    #: SL1 of `docs/records/research/2026-10-16-budget-savers.md` §5: park the routed
     #: expert pass's saved activations in HOST RAM instead of VRAM
     #: (`experts._expert_pass`: `checkpoint(use_reentrant=False)` with
     #: `saved_tensors_hooks` inside). Loss and gradients are EXACT — the values
@@ -1642,7 +1642,7 @@ class ModelConfig:
     #: a head. `loss = CE + sigreg_weight · sigreg_loss(z)`, `z` the strided
     #: sample of the state `lm_head` reads — no teacher, no predictor, no mask,
     #: no second forward, no parameters, no detach. 0.0 = off. The research
-    #: doc's ONE arm to run first (`docs/research/2026-10-16-jepa-into-dormouse.md`
+    #: doc's ONE arm to run first (`docs/records/research/2026-10-16-jepa-into-dormouse.md`
     #: §3; the burn `l1 + 0.1·koleo` bundle cannot attribute its own 0.082 BPB).
     #: The suggested grid is 0.005 / 0.05 / 0.1 — publish which.
     sigreg_weight: float = 0.0
@@ -1792,7 +1792,7 @@ class ModelConfig:
     #: Activation columns per scale: 0 = one scale per token (row), else one per
     #: group of `act_group` columns — OUR convention (the a4.8 paper has no
     #: groups; see `model/act_quant.py`'s table and
-    #: `docs/research/2026-10-18-act4.md` §3.1). Must divide `d_model`,
+    #: `docs/records/research/2026-10-18-act4.md` §3.1). Must divide `d_model`,
     #: because the quantizer reshapes the activations to `[..., d/group, group]`
     #: and a non-divisor fails on the first forward, far from the flag (`validate`
     #: refuses it, mirroring `config/validation.rs:220-231`).
@@ -2123,7 +2123,7 @@ class TrainConfig:
     #: THE EVAL WINDOW, in SCORED BYTES. 196 608 = 24 x 8 x 1024: the burn
     #: flagship's b24 window, and the width that moved the SAME checkpoint
     #: +0.045..+0.050 BPB against the old 65 536
-    #: (docs/reviews/2026-11-06-bpb-accounting.md §3). A BPB is only comparable
+    #: (docs/records/reviews/2026-11-06-bpb-accounting.md §3). A BPB is only comparable
     #: within one window, so this field is the only source of that width.
     #: REFUSED below 65 536: one 64 KB window has a 95% interval of about
     #: +-0.19 BPB on this corpus — a narrower number is not a measurement.
@@ -2148,7 +2148,7 @@ class TrainConfig:
     #: quality literature (arXiv:2606.00371 §3.2, 3 seeds, exact-SVD control)
     #: is NON-MONOTONE with a <0.003 BPB spread -> a tie prediction, and this
     #: port's own 3-iteration NS sits 1.17e-15 from the manifold at a 10:1
-    #: spectral spread (docs/reviews/..., 2026-10-15). A change of this
+    #: spectral spread (docs/records/reviews/..., 2026-10-15). A change of this
     #: default goes through the standing 3-seed A/B, not a sentence. It is a
     #: PROGRESS KEY (`PROGRESS_KEYS`): an A/B may change it on a resume, and
     #: `train/loop.py` re-applies it after the checkpoint's optimizer state is
@@ -2215,7 +2215,7 @@ class TrainConfig:
     #: docs, and the gate in `tests/test_muon_fast.py` holds the update to 1e-2
     #: relative against the fp32 arm). The SCHEMA default stays `fp32`; the
     #: measured presets override it through `PRESET_TRAIN_DEFAULTS` (m400 and
-    #: medium are `bf16` since 2026-11-05 — `docs/reviews/2026-11-05-opt-region.md`
+    #: medium are `bf16` since 2026-11-05 — `docs/records/reviews/2026-11-05-opt-region.md`
     #: carries the 100-step CPU gate, which is a TOLERANCE gate, not bit
     #: equality). The snapshot records the resolved value, so a live run's
     #: semantics and its resume do not move; an older fp32 snapshot resumes
@@ -2234,7 +2234,7 @@ class TrainConfig:
     #: across caps), so the only thing a resume changes is the launch count.
     muon_chunk_elems: int = 1 << 25
     #: The Muon half's LR as a MULTIPLE of `lr` (the AdamW half's). Measured
-    #: 2026-11-06 (`docs/reviews/2026-11-06-optimizer-audit.md`): at a shared LR
+    #: 2026-11-06 (`docs/records/reviews/2026-11-06-optimizer-audit.md`): at a shared LR
     #: the Muon update is 8x-52x smaller in RMS than AdamW's on this model's
     #: real shapes and delivers 0.7%-17% of its first-order loss decrease — an
     #: effective LR of 3e-6..8e-5 instead of 5e-4. Muon's published default is
@@ -2265,7 +2265,7 @@ class TrainConfig:
     #: 15x…55x deficit that was NOT uniform across shapes, so the factorised bank
     #: (`v [64,2730]`, 52.3x) was punished 3.5x harder than a dense matrix
     #: (`[3072,832]`, 15.0x). That asymmetry contaminated every bank-vs-dense A/B.
-    #: Measured: `docs/reviews/2026-11-07-muon-audit.md` §D2.
+    #: Measured: `docs/records/reviews/2026-11-07-muon-audit.md` §D2.
     #: DEFAULT IS `uniform` UNTIL THE A/B LANDS. `shape_fair` multiplies the step
     #: by ~sqrt(cols) (28.8x on [832,832], 55x on [832,3072]), which is a much
     #: larger change than the measured optimum `muon_lr_mult=12`; flipping the
@@ -2278,7 +2278,7 @@ class TrainConfig:
     #: The Newton–Schulz CHAIN's dtype (`OPT_DTYPES`): `fp32` (the default) is
     #: every number on record; `bf16` runs the polynomial — BOTH arms, `classic`
     #: and `gram` — in bf16 with explicit fp32 in/out casts (nanogpt's practice;
-    #: row 4 of `docs/research/2026-10-16-muon-orthogonalization-cost.md`,
+    #: row 4 of `docs/records/research/2026-10-16-muon-orthogonalization-cost.md`,
     #: predicted −100…−200 ms/step at b1, NOT measured on this card yet). The
     #: orthogonality bound it must keep is gated in `tests/test_muon_fast.py`.
     ns_dtype: str = "fp32"
@@ -2358,7 +2358,7 @@ class TrainConfig:
     #: tables — a partial SF, said here rather than discovered from a curve.
     #: A 2k-step A/B is predicted to TIE — the published gains are stated
     #: at ≥1000 tokens/param, far past a 2 000-step arm, and a tie is the
-    #: designed outcome (`docs/research/2026-10-16-sf-muon.md` §4), so the
+    #: designed outcome (`docs/records/research/2026-10-16-sf-muon.md` §4), so the
     #: verdict must read the `X`↔`Y` gap and the LR-schedule-free claim, not the
     #: endpoint alone. `scripts/ab_muon_variants.py` is the driver.
     muon_sf: bool = False
@@ -2382,7 +2382,7 @@ class TrainConfig:
     #: CONVEX set, and the closest-point projection onto Stiefel is not one.
     #: This port also has no `retract_tsct` call site at all (the Rust loop's
     #: per-step retraction was not ported), so `true` could only be an inert
-    #: knob here — the S3 gap in `docs/research/2026-10-16-sf-muon.md:82-93`.
+    #: knob here — the S3 gap in `docs/records/research/2026-10-16-sf-muon.md:82-93`.
     #: The legal setting is therefore `false`, and it is explicit in the run's
     #: own snapshot rather than a fact a reader has to recover from the loop.
     muon_sf_retract: bool = False
@@ -2392,7 +2392,7 @@ class TrainConfig:
     #: direct attack on the measured bottleneck — the optimizer is 44-53% of a
     #: b1 step and the step is HOST-DISPATCH-BOUND (the card is idle 87% of a
     #: warm step; 46 341 `aten::mm` launches per step at b8·s512) — and it is
-    #: the P0 idea of `docs/research/2026-10-17-olmo-core-ideas.md` §2.1,
+    #: the P0 idea of `docs/records/research/2026-10-17-olmo-core-ideas.md` §2.1,
     #: reimplemented from `microsoft/dion` `dion/cuda_graph.py`.
     #:
     #: **`false` by default, and the default path is byte-identical to its
@@ -4812,7 +4812,7 @@ def validate(model: ModelConfig) -> None:
             f"sigreg_weight={model.sigreg_weight} is negative: it is the "
             f"multiplier on the SIGReg term, not a sign to flip. Escape: 0.0 "
             f"(off) or a positive weight (the research doc's grid: 0.005, 0.05, "
-            f"0.1 — docs/research/2026-10-16-jepa-into-dormouse.md §3)."
+            f"0.1 — docs/records/research/2026-10-16-jepa-into-dormouse.md §3)."
         )
     if model.jepa_weight < 0.0:
         loud(
@@ -5246,14 +5246,14 @@ def _refuse_ladder_rung(rung: str) -> str:
 
     GROUPED, not a fallback. What remains refused (`fp16/lbit`) is a
     TRAINING-time change — LittleBit's gates G-A..G-D
-    (`docs/reviews/littlebit-design-2026-10-15.md`) must close first.
+    (`docs/records/reviews/littlebit-design-2026-10-15.md`) must close first.
     """
     storage = ("ternary",)
     if rung in storage:
         return rung
     known = {"fp16", "fp4", "int4", "int8", "lbit"}
     hint = (
-        " (a training-time rung: docs/reviews/littlebit-design-2026-10-15.md "
+        " (a training-time rung: docs/records/reviews/littlebit-design-2026-10-15.md "
         "carries the gates that must close first)"
         if rung in known
         else ""
@@ -5562,7 +5562,7 @@ def rl_config(tcfg: TrainConfig) -> RLConfig:
 
 #: The floor of a defensible held-out eval window (`TrainConfig.eval_bytes`).
 #: One 64 KB window has a 95 % interval of about ±0.19 BPB on this corpus
-#: (docs/reviews/2026-11-06-bpb-accounting.md §3), so a narrower window is a
+#: (docs/records/reviews/2026-11-06-bpb-accounting.md §3), so a narrower window is a
 #: reading of one document, not a BPB. ONE definition: `train/data.py` imports
 #: this for the loader and `validate_train` refuses below it.
 MIN_EVAL_BYTES = 65_536
@@ -5772,7 +5772,7 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"at the FAST iterate Z, and a non-positive value leaves the theorem's "
             f"precondition unmet — arXiv:2605.23061v1 Lemma 3.1 is what lifts the "
             f"bounded-diameter assumption of the SF-Spectral bound "
-            f"(`docs/research/2026-10-16-sf-muon.md:77-81`, S2). The decay is "
+            f"(`docs/records/research/2026-10-16-sf-muon.md:77-81`, S2). The decay is "
             f"`Z <- (1 - lr*wd)*Z - eta_hat*P_hat` (Alg 1 line 17), so it is NOT the "
             f"AdamW group's `wd`. Escape: muon_sf_wd>0 (the arm's 0.01), or "
             f"muon_sf=false."
@@ -5837,7 +5837,7 @@ def validate_train(tcfg: TrainConfig) -> None:
             "X=(1-c)U1+c*U2 of retracted factors has column norms <= 1 with "
             "equality only when the two agree — so the averaged iterate is not on "
             "the manifold the factor contract assumes "
-            "(`docs/research/2026-10-16-sf-muon.md:82-93`, S3). This port's loop "
+            "(`docs/records/research/2026-10-16-sf-muon.md:82-93`, S3). This port's loop "
             "has no `retract_tsct` call site at all, so with muon_sf=false the flag "
             "would be inert too. Escape: muon_sf_retract=false (the default, and "
             "the legal arm)."

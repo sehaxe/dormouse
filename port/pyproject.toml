@@ -60,7 +60,7 @@ select = ["E", "F", "I", "W", "UP", "B"]
 testpaths = ["tests"]
 addopts = "-q"
 # `slow` = the inductor/compile gates: 32% of the suite's wall time
-# (docs/reviews/2026-11-08-suite-speed.md). Deselect with `-m "not slow"` while
+# (docs/records/reviews/2026-11-08-suite-speed.md). Deselect with `-m "not slow"` while
 # iterating; the gate still runs everything.
 markers = [
     "slow: real inductor compilation / compile-boundary gates",

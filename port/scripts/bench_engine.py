@@ -20,13 +20,13 @@ THE LEDGER. `flops_per_byte` is `scripts/mod_ledger.ledger(cfg, capacity=
 cfg.mod_capacity, seq_len=T).total` (training MFLOP/byte, x3 over the forward),
 not a new formula. For the default `flagship3_dense` at s1024 it reproduces the
 repo's measured `691.37 MFLOP/byte` (FlopCounterMode,
-`docs/reviews/2026-11-06-control-transformer.md` §1). At s512 the T-term is
+`docs/records/reviews/2026-11-06-control-transformer.md` §1). At s512 the T-term is
 smaller, so the bill is shape-dependent — one reason a speed claim must name
 its shape.
 
 THREE MFU LEDGERS EXIST in this repo (attention-only / full `macs_per_token` /
 MoE dense-down; they disagree by up to 3.9x —
-`docs/research/2026-11-05-small-model-mfu.md` §0.2), and the DENOMINATOR is
+`docs/records/research/2026-11-05-small-model-mfu.md` §0.2), and the DENOMINATOR is
 also contested (§0.3: 45.7 measured on a 5060 Ti, 47.7 pinned by
 `bench_compile.py` for this box, 88.7 the 5070 Ti's FP16/FP32-accum spec).
 Every row records `ledger` and `peak_tflops`; a number without both is not a
@@ -72,7 +72,7 @@ from dormouse.config import ModelConfig, load_preset, load_run  # noqa: E402
 from dormouse.instrument import LoudError  # noqa: E402
 
 #: This box's pinned bf16 denominator (`scripts/bench_compile.py:PEAK_TFLOPS`;
-#: `docs/research/2026-11-05-small-model-mfu.md` §0.3 says the true 5070 Ti
+#: `docs/records/research/2026-11-05-small-model-mfu.md` §0.3 says the true 5070 Ti
 #: FP16/FP32-accum rate may be ~88.7 and 45.7 is a 5060 Ti measurement).
 PEAK_TFLOPS = 47.7
 

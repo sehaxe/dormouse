@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The recipe ladder: five cheap knobs from Ripple-65B's v1.0→v1.6 (16x compute
 # efficiency at 4B), each its own arm at 95M on byte units, plus an all-on arm.
-# Source: docs/reviews/2026-11-08-ripple-65b.md.
+# Source: docs/records/reviews/2026-11-08-ripple-65b.md.
 #
 # Fixed budget per arm: BYTES (default 120 MB) at b=8, s=1024, lr=3e-4,
 # muon_lr_mult=12, mix_v7 with doc_masking=false — the same data treatment as
@@ -28,7 +28,7 @@ mkdir -p "$OUT"
 BYTES=${BYTES:-120000000}
 BATCH=${BATCH:-8}
 LR=${LR:-3e-4}
-# The corpus was deleted 2026-11-08 (docs/reviews/2026-11-08-merge-incident.md).
+# The corpus was deleted 2026-11-08 (docs/records/reviews/2026-11-08-merge-incident.md).
 # MIX/EVAL let the ladder run on the refetched sources; a run on those is a NEW
 # number and the caller must tag it (RUN_TAG).
 MIX=${MIX:-configs/mix_v7.toml}

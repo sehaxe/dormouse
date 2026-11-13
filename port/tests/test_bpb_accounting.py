@@ -1,6 +1,6 @@
 """Gates for the BPB accounting: fin is the headline, the window and offset are pinned.
 
-Background (`docs/reviews/2026-11-06-bpb-accounting.md`): the logged `bpb` was
+Background (`docs/records/reviews/2026-11-06-bpb-accounting.md`): the logged `bpb` was
 the depth-AVERAGED training objective while generation reads the FINAL readout
 (1.729 headline vs 1.617 fin on one checkpoint), the eval scored a 65 536-byte
 window that was never named as a choice, and `bytes_seen` ignored `grad_accum`

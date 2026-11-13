@@ -8,7 +8,7 @@
 # mix: `block_stack="3:1"` builds `[K,K,K,A]×3` from the SAME two block modules,
 # runs each once, and scores ONE final CE.
 #
-# WHY d=890 (the FLOP-matched width, docs/research/2026-11-07-frontier-vs-vanilla.md §2.2):
+# WHY d=890 (the FLOP-matched width, docs/records/research/2026-11-07-frontier-vs-vanilla.md §2.2):
 # attention is 122.7 MFLOP/byte of C0's 692.9 at d=832; making 75% of it linear
 # saves 92.0 MFLOP/byte, which buys +15.3M parameters at 6 FLOP/param/token.
 # 95.0M × 1.16 = 110.2M, and d=890 at the same FFN ratio lands there. So B1 is

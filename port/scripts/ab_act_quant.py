@@ -30,7 +30,7 @@ The former `int8`, `fp4`, `mxfp8` and `v2_int8` arms were deleted 2026-11-13
 **The companion key** (`config.py:398`): `act_group` — columns per scale,
 `0` = one scale per token, else a per-group scale. `0` is the default and
 is held across every arm here, so the arms differ in the FORMAT alone. NOTE
-(2026-10-18 research, `docs/research/2026-10-18-act4.md` §3.1): the "a4.8 FFN
+(2026-10-18 research, `docs/records/research/2026-10-18-act4.md` §3.1): the "a4.8 FFN
 group recipe" was OUR mis-attribution — the a4.8 paper (`2411.04965`) has no
 groups ("group" appears zero times); its scales are γ=max|X| (8-bit) and
 β=2·mean|X| (INT4 FFN-down). The training literature's granularity is block

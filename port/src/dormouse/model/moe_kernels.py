@@ -1,5 +1,5 @@
 """Triton grouped GEMMs for the dual-latent GLU expert pass — the ONE kernel
-this port owns (`docs/research/2026-10-15-tsct-super-kernel.md`, op 3).
+this port owns (`docs/records/research/2026-10-15-tsct-super-kernel.md`, op 3).
 
 The padded arm (`experts._padded_dispatch`) gathers every kept row into ONE
 zero-filled `[E, cap, d]` bank and runs the bank as three batched matmuls. Half
@@ -10,7 +10,7 @@ and hands over `offs [E+1]`, the kept-row boundaries; one program computes one
 (expert, row-block) of that expert's RAGGED rows, and the GLU is fused into the
 second GEMM's input through registers.
 
-House rules (`docs/research/2026-10-15-tsct-super-kernel.md` §4):
+House rules (`docs/records/research/2026-10-15-tsct-super-kernel.md` §4):
 
 * **pure torch in/out.** Plain tensors in, a plain tensor out; the layout
   contract is the docstring of each op and is `assert`ed.
@@ -84,7 +84,7 @@ Layout contract (all CUDA, contiguous, `E` experts, latent `r`):
 Tiles: measured on this card at the b1 shape by `scripts/bench_moe_kernel.py`
 (see that file for the table that picked them); they are module constants on
 purpose — a Triton `autotune` inside a training loop re-tunes whenever a shape
-key moves, which is the treadmill `docs/research/2026-10-15-tsct-super-kernel.md`
+key moves, which is the treadmill `docs/records/research/2026-10-15-tsct-super-kernel.md`
 §5.1 bans. Re-measure and edit the constants, do not add a decorator. `num_warps`
 is 4 on the fused kernel and 8 on the three adjoint kernels — both measured, both
 in the bench table; `BLOCK_F`/`BLOCK_N` are the ones that mattered. These numbers

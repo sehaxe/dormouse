@@ -67,12 +67,12 @@ failure. The extrapolation-free facts are 0.258 at matched bytes and 0.126 on
 
 ## Evidence
 
-- `docs/reviews/2026-11-06-control-transformer.md` §4, §6, §8 — the 0.258 /
+- `docs/records/reviews/2026-11-06-control-transformer.md` §4, §6, §8 — the 0.258 /
   0.126 / 0.12-0.32 frames and their caveats.
-- `docs/reviews/2026-11-05-architecture-review-dense.md` §0.2-0.3, "What
+- `docs/records/reviews/2026-11-05-architecture-review-dense.md` §0.2-0.3, "What
   survives" — equal-MAC, live-expert counts, the 81M/equal-compute mislabels.
-- `docs/research/2026-11-06-architecture-at-100m.md` §4, §S4.
-- `docs/research/2026-11-08-long-context-eval.md` §0, §4.6, §5.
-- `docs/reviews/2026-11-08-night.md` §5b; `port/configs/flagship3_dense.toml`;
+- `docs/records/research/2026-11-06-architecture-at-100m.md` §4, §S4.
+- `docs/records/research/2026-11-08-long-context-eval.md` §0, §4.6, §5.
+- `docs/records/reviews/2026-11-08-night.md` §5b; `port/configs/flagship3_dense.toml`;
   `port/src/dormouse/config.py` (`ModelConfig.block_form`,
   `_KDA_ONLY_FORM_FLAGS`, `validate_block_form`); `.bulba/plan.md`.

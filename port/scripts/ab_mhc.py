@@ -20,7 +20,7 @@ COMMON: `medium`, 2000 steps, b8 x s512, the `mix_big` plan, bf16 + triton MoE +
   differ in ONE statement — the loop-boundary residual write.
 
 **Pre-registered prediction.** The arm TIES at 2 000 steps, for three reasons,
-all on the record (`docs/reviews/mhc-2026-09-30.md`):
+all on the record (`docs/records/reviews/mhc-2026-09-30.md`):
 
 1. at init the write IS ReZero at scale 1 (`b_res = 0` → uniform mixing on
    replicated lanes, `b_pre = 10` → `H_pre≈1`, `b_post = 0` → `H_post≈1`,

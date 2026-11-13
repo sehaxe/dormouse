@@ -4,7 +4,7 @@
 # read on this path (the schema-default values that keep `small`'s arms off
 # here are chosen so validate's byteflow refusals stay quiet: no KDA, no
 # Engram, no aux, no MoE). The byteflow_* numbers are the byteflow_9m build
-# from docs/reviews/byteflow-rate-2026-10-02.md §5 — paper Table 5's BFlowNet
+# from docs/records/reviews/byteflow-rate-2026-10-02.md §5 — paper Table 5's BFlowNet
 # structure scaled to small-class size; the params the step-0 arm line prints
 # are the measured count (the A/B's honest second row is a same-budget control,
 # not this table).

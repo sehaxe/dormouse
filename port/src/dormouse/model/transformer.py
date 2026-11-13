@@ -1,7 +1,7 @@
 """A plain pre-LN transformer block — `scripts/control_transformer.py`'s Block.
 
 WHY IT IS IN THE MODEL. The 2026-11-06 control
-(`docs/reviews/2026-11-06-control-transformer.md`) trained a boring 13.5M
+(`docs/records/reviews/2026-11-06-control-transformer.md`) trained a boring 13.5M
 decoder on the trainer's own byte stream and beat the KDA/CSA/mHC/Engram block
 by 0.126 BPB on all eight eval windows (0.13-0.37 by the report's range). An A/B
 that answers "is the block form or the pipeline" therefore has to run BOTH forms

@@ -6,7 +6,7 @@
 rejected at **0.20x** on the port: dynamo recompiled on `SparseMoE._banks`' cache
 key (per-step Python values: the annealed `factor_qat_alpha`, the parameters'
 `_version` tuple), spent `config.recompile_limit`, and fell back to eager at
-**2939 ms/step against 573 eager** (`docs/research/2026-10-18-compile-moe.md`).
+**2939 ms/step against 573 eager** (`docs/records/research/2026-10-18-compile-moe.md`).
 That key now sits behind `@torch.compiler.disable`, on `_banks` and on
 `QuantCache.refresh_stacked`; this script re-measures the two settings the fix
 makes legal again.

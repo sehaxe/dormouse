@@ -2,7 +2,7 @@
 # The question: with a WORKING Muon (muon_lr_mult tuned) and a dense FFN, does
 # the linear-attention block beat a dense transformer at equal params and bytes?
 # Every earlier KDA verdict was measured with the Muon LR bug
-# (docs/reviews/2026-11-07-muon-audit.md), so this arm is new information.
+# (docs/records/reviews/2026-11-07-muon-audit.md), so this arm is new information.
 d_model = 832
 n_heads = 13
 head_dim = 64

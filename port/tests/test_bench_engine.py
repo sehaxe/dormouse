@@ -64,7 +64,7 @@ def test_flop_ledger_pins_the_repo_numbers() -> None:
         training = 3*(32 768 + 5 120 + 119 296)    = 471 552 FLOP/B
     At s128 the core doubles and nothing else moves: 569 856 FLOP/B.
     `flagship3_dense` at s1024 must equal the pinned 691.37 MFLOP/byte
-    (`configs/flagship3_dense.toml`, `docs/reviews/2026-11-07-metrics.md`).
+    (`configs/flagship3_dense.toml`, `docs/records/reviews/2026-11-07-metrics.md`).
     """
     tiny = load_preset(str(TINY))
     assert bench.flops_per_byte(tiny, 64) == pytest.approx(471_552.0)

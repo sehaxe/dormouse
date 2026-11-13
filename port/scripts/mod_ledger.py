@@ -28,7 +28,7 @@ Two honest choices are spelled out rather than hidden:
    registered A/B. `all-routed` in the output prices the counterfactual where
    the core scales too, for comparison.
 2. **The flagship anchor is a MEASURED bill**, not a second formula.
-   `docs/reviews/2026-11-06-control-transformer.md:50` measured
+   `docs/records/reviews/2026-11-06-control-transformer.md:50` measured
    `45.81` forward / `137.42` fwd+bwd MFLOP/byte with FlopCounterMode on
    `checkpoints/flagship2` (b1, s1024). The config's own static ledger
    (`width.active_macs_per_token`) prices the non-attention body; the T-term is

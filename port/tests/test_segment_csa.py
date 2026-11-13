@@ -9,7 +9,7 @@ window's first token (`pos = (count + arange(t)) // chunk + n`), the `key < pos`
 mask and the pooled keys are the one-shot ones.
 
 Gates (each proven red on a scratch mutation, reported in
-`docs/reviews/2026-11-08-segment-csa.md`):
+`docs/records/reviews/2026-11-08-segment-csa.md`):
 
 1. `segment_len=0` is bit-identical to clean main (`3f15810e…`/`02548e27…`,
    captured from `d1b2c2e`), and the one-shot path never enters

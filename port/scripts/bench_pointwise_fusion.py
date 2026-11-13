@@ -13,7 +13,7 @@ steps so they cannot perturb each other:
 * a `TorchDispatchMode` census → for every aten op the step runs, the bytes it
   READS + WRITES. A view (`data_ptr` shared with an input) costs 0; everything
   else costs `sum(in bytes) + sum(out bytes)`, the same convention
-  `scripts/pass_census.py` and `docs/reviews/2026-11-08-kernel-audit.md` use, so
+  `scripts/pass_census.py` and `docs/records/reviews/2026-11-08-kernel-audit.md` use, so
   the totals here are comparable to the audit's 52.5 GB/step seam.
 
 Both run after 20 warm steps. `--fused` installs
@@ -51,7 +51,7 @@ from dormouse.cli import _device, _model  # noqa: E402
 from dormouse.config import load_run, validate_train  # noqa: E402
 from dormouse.train.optim import MixOptimizer  # noqa: E402
 
-#: The card's measured HBM ceiling (docs/reviews/2026-11-08-kernel-audit.md §3).
+#: The card's measured HBM ceiling (docs/records/reviews/2026-11-08-kernel-audit.md §3).
 BW_BYTES_S = 1.9e12
 
 #: A fusion deletes PASSES. These are the ops that are a pass over a tensor:
@@ -341,7 +341,7 @@ def main() -> int:
     if a.mode == "meta":
         # CPU-only cross-check of the byte table: meta tensors carry the real
         # shapes and dtypes, so the census arithmetic is exact without the card
-        # (the method `docs/reviews/2026-11-08-kernel-audit.md` §2 used). No
+        # (the method `docs/records/reviews/2026-11-08-kernel-audit.md` §2 used). No
         # timing is read here, and SDPA falls back to the math backend on meta,
         # so the attention rows are NOT the card's — they are excluded from the
         # pointwise seam by `_class` anyway.

@@ -65,11 +65,11 @@ router has not collapsed yet (sign 130/512 live, prop 126/512, top-10 ~47%).
 
 ## Evidence
 
-- `docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md` — the m400
+- `docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md` — the m400
   measurement, the mechanism, the gate `test_the_sign_arm_winds_past_the_clamp_and_prop_does_not`, unrun 2k.
-- `docs/reviews/2026-11-04-lfb-divergence.md`,
-  `docs/reviews/2026-11-04-dead-capacity-audit.md` — another instrument;
-  `docs/reviews/2026-11-08-night.md` §5b and `port/scripts/train_csa8k.sh` — the
+- `docs/records/reviews/2026-11-04-lfb-divergence.md`,
+  `docs/records/reviews/2026-11-04-dead-capacity-audit.md` — another instrument;
+  `docs/records/reviews/2026-11-08-night.md` §5b and `port/scripts/train_csa8k.sh` — the
   csa8k flag and the pinned replacement.
 - `port/src/dormouse/model/experts.py::_lfb_step` — the two updates and the clamp;
   `port/src/dormouse/config.py` (`ModelConfig.moe_lb_mode/gamma/clamp`) — its default.

@@ -3,7 +3,7 @@
 
 WHY THIS MEASURES RATE, NOT KERNELS. The card's measured bf16 peak is 47.7
 TFLOP/s and the flagship's own bill is 137.42 MFLOP/byte (FlopCounterMode, one
-fwd+bwd at b1 x s1024 — `docs/reviews/2026-11-06-control-transformer.md` §1).
+fwd+bwd at b1 x s1024 — `docs/records/reviews/2026-11-06-control-transformer.md` §1).
 At b8 x s1024 x grad_accum 3 that is 3.377 TFLOP per optimizer step, so 8.5
 TFLOP/s measured is 17.8 % MFU and the remaining 82 % is this lane's target.
 Compile attacks exactly that: one fused inductor graph per block instead of the
@@ -86,7 +86,7 @@ from _lane import preflight  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
-#: The card's MEASURED bf16 peak (`docs/research/2026-11-05-small-model-mfu.md`
+#: The card's MEASURED bf16 peak (`docs/records/research/2026-11-05-small-model-mfu.md`
 #: §0.3: the 5060 Ti purchase report's 45.7 and this box's 47.7). The MFU
 #: denominator: a different number is a different claim, so it is a constant
 #: here and pinned by `tests/test_bench_compile.py`.

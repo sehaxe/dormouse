@@ -90,11 +90,11 @@ on-device empty-block exit), and the measured cost of the b1 pass is CHROME,
 not the gather: `_banks()` ~15 ms host + ~4 ms of `.to()` copies, the fp32
 weight multiply 6.7 ms, the scatter 5.5 ms against a 6.7 ms bmm chain
 (`.bulba/memory.md:312`, 2026-10-15). The research doc's "up to 15-25% step IF
-the pass is unlanded" (`docs/research/2026-10-18-throughput-leftovers.md` §4.2)
+the pass is unlanded" (`docs/records/research/2026-10-18-throughput-leftovers.md` §4.2)
 is therefore NOT met. Honest expectation here: **<=1% of the step, most likely
 <0.5%** — the bytes removed are 7% of a forward whose 2 001 MB of traffic runs
 inside a measured 16.5 ms (`configs/b1.toml:47`), i.e. at ~32% of this card's
-~450 GB/s ceiling (the figure `docs/research/2026-10-15-tsct-super-kernel.md:54`
+~450 GB/s ceiling (the figure `docs/records/research/2026-10-15-tsct-super-kernel.md:54`
 uses), and part of the bank re-read is served by L2 — so bytes removed do not
 convert one-for-one into time.
 
@@ -224,7 +224,7 @@ class Shape:
 #: The two shapes this file prices. `medium` is `configs/medium.toml` at the
 #: batch/seq this analysis was asked for (b24·s1024, 24 576 tokens); `b1` is
 #: `configs/b1.toml` at the b1 profile's own shape (b8·s1024, 8 192 tokens ->
-#: 16 384 rows, `docs/reviews/2026-10-16-b1-profile.md:9` and the 16 384-row
+#: 16 384 rows, `docs/records/reviews/2026-10-16-b1-profile.md:9` and the 16 384-row
 #: fixtures of `scripts/bench_moe_dropless.py:51`).
 SHAPES = (
     Shape("medium-b24-s1024", tokens=24 * 1024, topk=2, experts=256, d=1024, f=2730, rank=64),

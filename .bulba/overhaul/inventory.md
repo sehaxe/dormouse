@@ -49,7 +49,7 @@ frozen Rust lane.
 | # | slice | lines removed (est.) | risk | gate |
 |---|---|---:|---|---|
 | S1 | Frozen Rust lane: `crates/` + `vendor/` from `main`; keep an archive-branch pointer | **~148,800** | high (doc citations, provenance) | Python suite unchanged; `check_doc_refs` green after ref updates; Rust CI jobs removed |
-| S2 | Script harness: one shared A/B+bench driver, declarative experiment specs; keep every documented result reproducible | **~15,000–18,000** | medium | re-run 2 known A/B tables (`ab_rank`, `ab_sigreg`) and match `docs/reviews` |
+| S2 | Script harness: one shared A/B+bench driver, declarative experiment specs; keep every documented result reproducible | **~15,000–18,000** | medium | re-run 2 known A/B tables (`ab_rank`, `ab_sigreg`) and match `docs/records/reviews` |
 | S3 | Unwired Python: `selfplay/` 1,420 + test 706; `model/act_ckpt.py` 418 + test 455 + bench 206; 14 superseded benches 2,726; two dead config fields 45; unwired vendor crates 726 | **~6,700** | low–medium | grep no production importer; `dead_knob_audit` rc 0; full CPU suite |
 | S4 | QAT export (`model/export.py` 542): **keep**, it is a first-class product line (owner 2026-10-18) but has no CLI command — wire `dormouse export` instead of deleting | 0 (adds a command) | low | `pytest tests/test_export.py` + CLI round-trip |
 | S5 | Library spikes (only land on a measured win): Liger mHC/RMSNorm/SwiGLU/CE; stock Muon; torchao dense QAT | 1,000–3,000 if they win | medium | A/B vs the current arm at same config; counters prove the arm ran |

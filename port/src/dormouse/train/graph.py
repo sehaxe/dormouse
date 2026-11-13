@@ -3,7 +3,7 @@
 The measured problem this attacks (not a prediction): the port's b1 step is
 **host-dispatch-bound** — the card is idle 87% of a warm step (`AGENTS` §3.1,
 mean utilisation 13.3%) and the optimizer is **44-53%** of a step
-(`docs/research/2026-10-17-muon-variants.md` TL;DR), because the batched Muon
+(`docs/records/research/2026-10-17-muon-variants.md` TL;DR), because the batched Muon
 pass issues 46 341 `aten::mm` launches for ONE step at b8·s512 (the 2026-10-15
 profiler probe). One graph replay replaces the whole stage's launches with one
 launch. The GPU time is unchanged; the enqueue time is what moves.

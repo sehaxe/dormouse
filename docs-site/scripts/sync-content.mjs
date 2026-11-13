@@ -26,8 +26,8 @@ for (const [from, to, title, description] of mirror) {
 
 // ---- the archive index ----------------------------------------------------
 const folders = [
-  ['docs/reviews', 'Reviews', 'Hostile reads of a lane, written to attack it. A snapshot of a date, never maintained.'],
-  ['docs/research', 'Research', 'Measurements and literature notes. Same rule: dated, not maintained.'],
+  ['docs/records/reviews', 'Reviews', 'Hostile reads of a lane, written to attack it. A snapshot of a date, never maintained.'],
+  ['docs/records/research', 'Research', 'Measurements and literature notes. Same rule: dated, not maintained.'],
   ['docs/adr', 'Decisions', 'One record per decision, with a status. Retracted decisions stay, marked.'],
 ];
 

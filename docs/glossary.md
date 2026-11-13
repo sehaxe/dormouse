@@ -159,7 +159,7 @@ transplant**, not a reproduction, and its justification is post-training (the
 Qwen3.8 playbook: NoPE breaks SFT/RLVR), not pretrain parity. In Kimi Linear's
 hybrid the position comes from the interleaved full-attention layers
 (`fla/layers/attn.py:83,125`; `fla/models/hybrid.py:17-23`). Evidence, line
-numbers and the placement proof: `docs/reviews/rope-2026-09-30.md`;
+numbers and the placement proof: `docs/records/reviews/rope-2026-09-30.md`;
 A/B row 8 in `docs/protocols/AB-PROTOCOL.md`, **not run**.
 
 **Not** "positional encoding" in general — there is no learned or additive
@@ -445,7 +445,7 @@ no run said so.
 
 **Why the entry stays:** the divergence was real and silent, and it is the
 reason [[group]] is built from `ParamId`s. Deleted vocabulary is still
-confusable vocabulary; see `docs/reviews/dedup-optimizer-2026-10-01.md`.
+confusable vocabulary; see `docs/records/reviews/dedup-optimizer-2026-10-01.md`.
 
 **Do not say there are two optimizer policies.** There is one. `routing.rs`
 declares it and `dormouse-train::optim` installs it (`optim.rs::optimizer_groups`
@@ -559,7 +559,7 @@ REMOVED 2026-10-02. The `--guard` flag was the process-level NaN/panic
 recovery: wait 30 s, re-exec from a pinned executable image under
 `target/release/guard-image/`, resume from the last checkpoint, capped at 3
 restarts. Deleted after its detached parent exited 0 and orchestrators read a
-crashed run as a finished one (`docs/reviews/unguard-2026-10-02.md`). A failure
+crashed run as a finished one (`docs/records/reviews/unguard-2026-10-02.md`). A failure
 now exits non-zero; the NaN firewall (in-process, per step, the step masked to
 a no-op — `mask_nonfinite`, `lib.rs:281`) is unconditional and was never
 behind the flag. Dated documents still name it; that is history, not a knob.
@@ -646,7 +646,7 @@ the gate before and after every optimization.
 
 **Not** a smoke (a smoke screens NaN and slope; a canary measures step time).
 **Not** the *fake-loss canary* of the adaptive-depth research, which is an
-invariant check on a loss curve (`docs/research/2026-09-27-adaptive-depth-safe.md`).
+invariant check on a loss curve (`docs/records/research/2026-09-27-adaptive-depth-safe.md`).
 Two words, two things, one repo.
 
 ### smoke / confirm / long gate
@@ -669,7 +669,7 @@ nothing has yet passed a long gate.
 | meaning | what it is | where | state |
 |---|---|---|---|
 | **fused kernel** (correct today) | a library op that does the whole computation in one CUDA kernel instead of a chain of eager tensor ops, with a `Fused`/`Fallback` seam that says which ran | `burn_gdn2`, `burn_rmsnorm::fused`, `burn_muon_plus::fused_kernels`, `burn_spectral`; counted at `crates/dormouse-core/src/attention.rs:20` (`fused_seam_counts`) and `crates/dormouse-train/src/optim.rs:59` (`fused_kernels_skipped`) | **live**, and deliberately countable, because the fallback computes the same function and nothing else would show it (ADR-0019) |
-| **the whole-loop `fused/` module** | a hand-written CUDA autodiff op for the entire ponder loop, ~7.4k LOC, once `crates/dormouse-core/src/fused/` | **deleted.** The directory is gone, the `DM_FUSED` env var is gone (`grep -rn DM_FUSED crates/` is empty) | measured **9.21 s/step against burn's 7.05** at flagship (`docs/archive/research/2026-09-23-fused-flagship50.md:52-53`), 1.3x slower; the earlier "1.7-2.0x faster" number from ADR-0003 is **retracted** in ADR-0009 |
+| **the whole-loop `fused/` module** | a hand-written CUDA autodiff op for the entire ponder loop, ~7.4k LOC, once `crates/dormouse-core/src/fused/` | **deleted.** The directory is gone, the `DM_FUSED` env var is gone (`grep -rn DM_FUSED crates/` is empty) | measured **9.21 s/step against burn's 7.05** at flagship (`docs/records/archive/research/2026-09-23-fused-flagship50.md:52-53`), 1.3x slower; the earlier "1.7-2.0x faster" number from ADR-0003 is **retracted** in ADR-0009 |
 
 Which one is correct: **the library kernel.** The whole-loop op is gone; the
 kernel is the live concept, and the counters that exist to prove a kernel ran
@@ -720,7 +720,7 @@ still needs an owner's decision, and the fix may be a code change.
 | 13 | `bool -> float` cast | correct on this backend, verified at n=1..1000 on raw and dispatch paths (ADR-0016 bug 1) | "The `Bool -> float` cast is broken on this backend (it returns 0.0 for `true`)" — the doc comment on `GradSanitizer`, `crates/dormouse-train/src/lib.rs:300-302` | **OPEN** — a retracted claim living in a code comment is the exact ADR-0020 failure |
 | 14 | `mini Aria` | dormouse | `crates/dormouse-core/src/lib.rs:1` — "all-bf16 mini Aria on burn-fused kernels" | **OPEN** (a stale project name *and* a stale dtype claim, on the crate root) |
 | 15 | patching | not implemented; no `patch` token anywhere in the model | **Patching** was a `CONTEXT.md` glossary entry with a verdict pending (old `CONTEXT.md:33`) | **FIXED** (entry deleted — a pending verdict on an unimplemented idea is not vocabulary) |
-| 16 | routing policy | ONE policy: `routing.rs` declares it from `ParamId`s, `dormouse-train::optim` installs it. The path-marker copy in `optim.rs` was deleted by `831e3a0` (2026-09-28) | "Muon+ mixed optimizer (policy + groups in `src/optim.rs`)" plus a glossary section presenting the markers as "the live implementation", and the claim that `routing.rs` was "exercised only by tests" — reintroduced into prose by `d81d920` (2026-10-01), AFTER the code fix | **FIXED** (2026-10-01) — the second `GroupCounts` and the second module walker are cut (`docs/reviews/dedup-optimizer-2026-10-01.md`); the false "two implementations" text is gone from `routing.rs`, `optim.rs`, `AGENTS.md` §3.3, the glossary and `docs/papers/muon-plus.md` D17 |
+| 16 | routing policy | ONE policy: `routing.rs` declares it from `ParamId`s, `dormouse-train::optim` installs it. The path-marker copy in `optim.rs` was deleted by `831e3a0` (2026-09-28) | "Muon+ mixed optimizer (policy + groups in `src/optim.rs`)" plus a glossary section presenting the markers as "the live implementation", and the claim that `routing.rs` was "exercised only by tests" — reintroduced into prose by `d81d920` (2026-10-01), AFTER the code fix | **FIXED** (2026-10-01) — the second `GroupCounts` and the second module walker are cut (`docs/records/reviews/dedup-optimizer-2026-10-01.md`); the false "two implementations" text is gone from `routing.rs`, `optim.rs`, `AGENTS.md` §3.3, the glossary and `docs/papers/muon-plus.md` D17 |
 | 17 | stride | `dspark_stride` is a config field (`schema.rs:112`), no documented meaning anywhere | no document mentioned it | **OPEN** |
 | 18 | ADR index | 22 ADRs | "ADR-0001..0012" (`README.md:199` docs table) | **OPEN** (`README.md`) |
 | 19 | `nano-fused` | KDA+Engram+aux off; `DM_FUSED` exists nowhere in the tree | "KDA+Engram+aux off, single-node path", and the file's own header comment names the deleted env var (`configs/nano-fused.toml:2`, `README.md:99`) | **OPEN** — proposed rename `nano-arms-off`; not renamed here, and `cfg.rs:349` pins the current name in a test |

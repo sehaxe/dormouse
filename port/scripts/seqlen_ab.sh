@@ -14,7 +14,7 @@
 #      same wall-clock buys 0.33x the bytes.
 #
 # The break-even gate, from our OWN fitted curve (L = 0.990 + 2.282·D^-0.2895,
-# RMSE 0.002 over 9 points, docs/reviews/2026-11-09-architecture-matrix.md):
+# RMSE 0.002 over 9 points, docs/records/reviews/2026-11-09-architecture-matrix.md):
 #   losing 2/3 of the data costs 0.082 BPB at the 2 GB point (1.241 -> 1.323).
 #   So 8 KB must beat 1 KB by MORE than ~0.08 BPB to pay for its compute.
 #   Anything less and 1 KB + more data wins.

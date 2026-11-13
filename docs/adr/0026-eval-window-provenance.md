@@ -66,7 +66,7 @@ gate holds by construction, not by convention.
 
 ## Evidence
 
-- `docs/reviews/2026-11-08-data-eval-integrity.md` §1.1-1.5 (the retraction,
+- `docs/records/reviews/2026-11-08-data-eval-integrity.md` §1.1-1.5 (the retraction,
   the 4.74% web hit, the v7 "content vs seen" table, the gates), §2.1-2.2, and
   §4.3 (the JSONL gap).
 - `port/scripts/eval_window.py` — `training_paths`, `refuse_training_overlap`
@@ -75,6 +75,6 @@ gate holds by construction, not by convention.
   the inode gate and the read span; `port/src/dormouse/train/loop.py::eval_row`
   — the row's keys and the missing file/policy.
 - `docs/guides/dataset.md` — the carve and "every number on this data is a new
-  number"; `docs/reviews/2026-11-08-night.md` §1, §5.
-- `docs/research/2026-11-08-efficiency-frontier.md:68,157` — the `1.4621` point
+  number"; `docs/records/reviews/2026-11-08-night.md` §1, §5.
+- `docs/records/research/2026-11-08-efficiency-frontier.md:68,157` — the `1.4621` point
   this ADR retracts; `port/scripts/train_csa8k.sh` — the same rule at launch.

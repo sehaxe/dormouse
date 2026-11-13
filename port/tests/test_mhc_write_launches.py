@@ -1,6 +1,6 @@
 """Why `mhc_write` cost 1 395 `add` launches / 10 steps, and the arm that drops them.
 
-The 2026-11-05 kernel profile (`docs/reviews/2026-11-05-kernel-profile.md`) put
+The 2026-11-05 kernel profile (`docs/records/reviews/2026-11-05-kernel-profile.md`) put
 `mhc_write` at 23.2 ms/step, and its largest kernel family was
 `at::native::CUDAFunctor_add` — **1 395 launches / 10 steps**. That family is
 `mhc.sinkhorn_knopp`'s 20-iteration Python loop (`mhc.py`, `sinkhorn_knopp`):

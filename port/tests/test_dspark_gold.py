@@ -1,6 +1,6 @@
 """The DSpark D1 gold vector: the draft head's window is built from INPUT IDS.
 
-Pre-registered as item 2 of `docs/research/2026-10-16-jepa-dspark-alternatives.md`
+Pre-registered as item 2 of `docs/records/research/2026-10-16-jepa-dspark-alternatives.md`
 §4.1 ("the test, not a race"): *"`dspark.md` §7 test 1 (`x[i] = i`; assert the
 RNN head at `(p, s)` is fed `x[p+s]` and supervised on `x[p+s+1]`) fails on the
 current tree, needs no GPU, and gates any future draft-head decision; D9's width

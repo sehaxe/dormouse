@@ -35,7 +35,7 @@ Always three things: **a loss, a window, a budget.**
   number from before that date is a different measurement.
 - Seed noise at the current budget is **±0.011 BPB**. A delta below that is not
   a result, whatever the table says.
-- Dated records live in `docs/reviews/`; the ones that decided the recipe are
+- Dated records live in `docs/records/reviews/`; the ones that decided the recipe are
   summarised in §7.
 
 ---
@@ -140,7 +140,7 @@ The export path is what makes it shippable: pack to 2-bit codes plus one fp16
 scale per tensor, reload, and the recovered model differs from the trained one by
 0.15% of the quantizer's own error. The file is the network.
 
-Full evidence: `docs/reviews/2026-11-12-ternary-artifact.md`.
+Full evidence: `docs/records/reviews/2026-11-12-ternary-artifact.md`.
 
 ---
 
@@ -161,7 +161,7 @@ because the reason matters more than the count:
 The pattern is the argument: at a fixed budget, speed comes from writing the same
 function cheaper (width, precision, format), never from dropping work.
 
-Full matrix: `docs/reviews/2026-11-09-architecture-matrix.md`.
+Full matrix: `docs/records/reviews/2026-11-09-architecture-matrix.md`.
 
 ---
 
@@ -182,11 +182,11 @@ None of it needs a cluster. All of it needs data, which is the real constraint.
 
 | folder | what | rule |
 |---|---|---|
-| `docs/reviews/` | hostile reads of a lane, dated | a snapshot, never maintained |
-| `docs/research/` | measurements and literature notes | same |
+| `docs/records/reviews/` | hostile reads of a lane, dated | a snapshot, never maintained |
+| `docs/records/research/` | measurements and literature notes | same |
 | `docs/adr/` | one record per decision, with a status | retracted decisions stay, marked |
 | `docs/guides/` | how to run a thing on this box | kept current |
-| `docs/archive/` | history, not truth | never cite it in an argument |
+| `docs/records/archive/` | history, not truth | never cite it in an argument |
 
 Start at `docs/README.md` for the naming scheme, `docs/glossary.md` for the
 vocabulary, and `AGENTS.md` for the rules an agent must follow.

@@ -7,7 +7,7 @@ the log end to end could see, and each row names the line or counter it read:
   loss itself is non-finite; the row names the step it started;
 * **LFB divergence** — `lfb_bias range [..] is past ±10` on a load, or the
   in-training `moe_route_max_x1000`/`_top10_x1000` signature
-  (`docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md`);
+  (`docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md`);
 * **dead experts** — mean `moe_route_live / moe_route_n` against `n_experts`;
 * **LR frozen/zero** — the printed `lr` stops moving inside the WSD warmup or
   decay window that should move it, or is 0 while steps remain (the

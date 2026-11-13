@@ -4,7 +4,7 @@
 > tensor-level lane, 2026-09-30), `AGENTS.md` §3.7 (the `--seed` block, with
 > its correction and withdrawal history), `docs/protocols/AB-PROTOCOL.md`
 > ("The statistical requirement", with the superseded slot-count table),
-> `docs/reviews/ab-wave-2026-10-01.md` §0.2, `tools/determinism.py` (its own
+> `docs/records/reviews/ab-wave-2026-10-01.md` §0.2, `tools/determinism.py` (its own
 > header is the instrument's contract), and `tools/determinism/` (the
 > analysis scripts). Every number names its source; the superseded readings
 > are kept because they are the reason the current ones exist.
@@ -208,7 +208,7 @@ commands are at the end of `docs/protocols/determinism.md`. Runs land in
 sharper form the proof enables — arm seeds **paired** against control seeds
 1/2/3, so a same-seed pair starts from the same initialisation to within the
 TSCT residue, which removes the init term from the comparison instead of
-adding a second variance source (`docs/reviews/ab-wave-2026-10-01.md` §0.2).
+adding a second variance source (`docs/records/reviews/ab-wave-2026-10-01.md` §0.2).
 
 **Banned:** the 0.167 % / 12.50 % / "max 2.07e+38" readings, the 409 043
 figure (prose in five files, no test, never), and the "0–4 NaN + ~500 slots at

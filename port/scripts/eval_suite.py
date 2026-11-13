@@ -13,7 +13,7 @@ Three measurements, three artefacts, one block:
    (`param_count`), so this row costs no VRAM and agrees with `dormouse info`.
 2. **held-out BPB** — the SAME path `dormouse eval` walks (`_snapshot_run` ->
    `open_streams` -> `evaluate`), with `--eval`, `--bytes` and `--offset` pinned.
-   It prints `bpb_fin`, never `bpb_mean` (`docs/reviews/2026-11-06-bpb-accounting.md`).
+   It prints `bpb_fin`, never `bpb_mean` (`docs/records/reviews/2026-11-06-bpb-accounting.md`).
    If the card is busy, the row is a LOUD SKIP: no number is invented.
 3. **compressor anchors** — `bzip2 -9`, `xz -9`, `zstd -19` on exactly the same
    bytes. CPU-only. A missing binary is a LOUD SKIP row, never a zero (a zero

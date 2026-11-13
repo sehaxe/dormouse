@@ -90,7 +90,7 @@ checkpoint: lfb_bias range [-218.269, +72.667] over 1 module(s) is past ±10: ..
 
 Past ±10 the controller's bias overwhelms the router's own scores (±5) and the
 order freezes: on `m400` at step 149 999, 9 of 512 experts carried every
-assignment and one held 4096 of 8192 (`docs/reviews/2026-11-04-routing-collapse-CONFIRMED.md`).
+assignment and one held 4096 of 8192 (`docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md`).
 That file cannot be resumed into a healthy bank and no LR repairs it — the
 dead experts receive no gradient.
 
@@ -144,7 +144,7 @@ enough that `lr`'s `%.3e` print (0.1 %) would have shown the movement. The
 2026-11-07 defect was exactly this shape: the trainer wrote the schedule into
 the Muon group on every step, overwriting `lr × muon_lr_mult` before the
 optimizer could read it, so the knob was inert and the arm measured the knob
-off (`docs/reviews/2026-11-07-muon-audit.md`, D1).
+off (`docs/records/reviews/2026-11-07-muon-audit.md`, D1).
 
 `lr = 0` while the run declares more steps is a FAIL — every remaining step is
 a no-op. `lr = 0` at the **final** step with `min_lr_frac = 0` is the
@@ -180,7 +180,7 @@ row.
 Found by the 2026-11-08 data/eval audit: the `off=100,000,000` window on
 `best/fwedu.bin` scored bytes the run's own cursor had already passed
 (108.9–110.0 MB), so a "held-out" BPB was a training measurement
-(`docs/reviews/2026-11-08-data-eval-integrity.md`).
+(`docs/records/reviews/2026-11-08-data-eval-integrity.md`).
 
 The row resolves `eval_data` and compares it by path with `data` plus every
 `[sources]` entry of the mix plan — the same predicate as

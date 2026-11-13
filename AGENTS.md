@@ -76,7 +76,7 @@ them are still open.
   `reviews/` (hostile reads of a lane) · `decisions/` (the owner's sheets) ·
   `architecture/` (design) · `guides/` (running a thing here) · `papers/` (other
   people's formulas, **the PDFs**, and `provenance.tsv`) · `archive/`.
-  **`docs/archive/` is history, not truth: never cite it as evidence in an
+  **`docs/records/archive/` is history, not truth: never cite it as evidence in an
   argument** (§1.4) — a live document contradicting one of those means the
   archived one is wrong. Its README says what earns a place there.
   **[`docs/README.md`](docs/README.md) is the map.** Adding a document means
@@ -108,7 +108,7 @@ NaN firewall is unconditional — a masked step is skipped on device, and a
 failure that survives it stops the run for a human: the guard auto-restart
 wrapper was removed 2026-10-02 (its detached parent exited 0, orchestrators
 read failure as success, fifteen runs stacked on one GPU —
-`docs/reviews/unguard-2026-10-02.md`).
+`docs/records/reviews/unguard-2026-10-02.md`).
 
 A fused/accelerated arm must be able to show it ran: the eval line prints the
 seam counters (`fused kda=fwd/bwd norm=ran/asked muon_skipped=mom/finalize`),
@@ -187,7 +187,7 @@ from it that cost a run to learn the hard way:
 - **A file moves once.** No stub is left at the old path, and every reference to
   it is rewritten in the same commit — `python3 tools/check_doc_refs.py` is what
   proves that, and it must be green before the commit lands.
-- **A superseded document goes to `docs/archive/`, and its live replacement is
+- **A superseded document goes to `docs/records/archive/`, and its live replacement is
   named in the commit that archived it.** Archive is not a bin: §1.4's evidence
   rule still applies there, which is why an archived file may be cited as *how a
   number was taken* and never as a reason to believe it.
@@ -285,7 +285,7 @@ the file that says so is that one function.
   39.75 TFLOP/s at 5120×2048×8192 (4.32 ms) vs the 43.7 ceiling — 91 %**;
   sibling fp32 arms 8.24 / 8.89 TFLOP/s, so the win is 4.5-4.8×; correctness
   (1e-2 vs the fp32 result of the same product) green on both shapes.
-  `docs/reviews/f16-tensor-core-2026-10-01.md` has the table and the two
+  `docs/records/reviews/f16-tensor-core-2026-10-01.md` has the table and the two
   caveats that go with it: **(1) the fix is visible only through the ROOT
   workspace graph** — `vendor/dormouse-fused` has its own workspace and no
   `[patch.crates-io]`, so a test built there still runs the unpatched stack;
@@ -714,7 +714,7 @@ The defenses are installed, not optional.
   never been A/B'd, which is the debt this does not discharge.**
 - **"fused is 1.7-2.0× faster than burn" (ADR-0003).** Retracted in ADR-0009. At
   flagship the whole-loop fused op measured **9.21 s/step against burn's 7.05**
-  — 1.3× *slower* (`docs/archive/research/2026-09-23-fused-flagship50.md:52-53`). The
+  — 1.3× *slower* (`docs/records/archive/research/2026-09-23-fused-flagship50.md:52-53`). The
   `fused/` module and the `DM_FUSED` switch are now **deleted**; its kill
   switch in ADR-0009 is moot. What survives under the name "fused" is the
   library's own fused kernels, which are live and counted.
@@ -727,7 +727,7 @@ The defenses are installed, not optional.
   being fed the label sequence, so the JEPA target was wrong in every run since
   the aux heads shipped. DSpark's window shift **is** fixed (§3.3, 2026-09-29);
   verify-tails then found two more defects in the same expression, both fixed
-  with gates (`docs/reviews/verify-tails-2026-09-30.md`): `dspark_loss` did
+  with gates (`docs/records/reviews/verify-tails-2026-09-30.md`): `dspark_loss` did
   not **detach** the confidence target (the acceptance head back-propagated
   into its own target — DeepSeek's rule is a detached `c*`), and the BCE was
   spelled as the usual `log(σ)+log(1−σ)` pair while the correct stable form is
@@ -785,7 +785,7 @@ The defenses are installed, not optional.
   1/1, disabled 1/3-3/3, enforced 0/1) only moves the coin, and all cost the
   same 198-207 ms/step, so **no config change is shipped**. Until upstream
   answers (issue drafted, evidence in
-  `docs/reviews/2026-10-09-022-autotune-corruption.md`), **burn 0.22.0 is not
+  `docs/records/reviews/2026-10-09-022-autotune-corruption.md`), **burn 0.22.0 is not
   fit for an A/B or a production run** — a corrupted run looks like a slow
   arm — and `dormouse-pre4` remains the stack that produces trustworthy
   numbers. The cheapest loud detector that exists today: replay a step in
@@ -818,7 +818,7 @@ The defenses are installed, not optional.
   on the trainer's backend and its result is discarded** — ADR-0019's
   silent-fallback shape; `fused kda=0/0` on the eval line means "not on this
   path", not "the fast path is slow". Both are burn-gdn2-owner items with
-  file:line in `docs/reviews/kda-gradflow-2026-09-30.md`. The
+  file:line in `docs/records/reviews/kda-gradflow-2026-09-30.md`. The
   `DM_GDN2_BWD_TRACE` line was not release-visible; the numeric test replaces
   it — the trace could never have proven gradient *arrival*.
 - **The A/B budget has not been re-costed.** `docs/protocols/AB-PROTOCOL.md` still prices
@@ -843,7 +843,7 @@ The defenses are installed, not optional.
   `train/src/optim.rs` is deleted; `core/src/routing.rs` is the live policy
   (`optim.rs::optimizer_groups` calls it) and there is no twin. What was left
   after the cut — a second `GroupCounts` and a second module walker — is gone
-  too (`docs/reviews/dedup-optimizer-2026-10-01.md`).
+  too (`docs/records/reviews/dedup-optimizer-2026-10-01.md`).
 - **The fused RMSNorm kernel — CORRECTED 2026-09-30, and the old sentence
   understated it by a factor.** It does not merely "never engage on the
   trainer's backend": **it never produced a number on ANY device in the life of
@@ -1026,7 +1026,7 @@ payoff for a 16 GB GPU + 64 GB RAM box. **Status per item in brackets:**
    the report's −0.026 and its zero-spike result do not transfer unmeasured.
    **Every GR-shaped number before this commit is invalid**, and there were
    none: `use_gr = false` in all eight configs, so no preset, log or A/B ever
-   ran it (`docs/archive/audit-2026-09-25.md` already ruled it "A/B or delete").
+   ran it (`docs/records/archive/audit-2026-09-25.md` already ruled it "A/B or delete").
 3. **Muon+** [wired, the default optimizer]. Muon + post-polar ColRow
    normalization, fused CUDA kernels, hybrid 2D→Muon+/1D→AdamW, with the
    report's param-group routing: Muon+ ColRow on 2D linear maps; AdamW for

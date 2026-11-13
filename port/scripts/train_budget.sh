@@ -24,7 +24,7 @@ ACCUM=${ACCUM:-1}
 LR=${LR:-3e-4}
 COMPILE=${COMPILE:-0}
 # EMA OFF for the curve: the ladder's 1.4906 was measured without it, and the LR
-# research (docs/research/2026-11-08-lr-schedule.md) argues one variable at a
+# research (docs/records/research/2026-11-08-lr-schedule.md) argues one variable at a
 # time. An EMA/SWA pass is a POST-RUN fork from the checkpoint (~30 min), not a
 # knob that makes this run incomparable. EMA=0.9999 turns it on.
 EMA=${EMA:-0.0}

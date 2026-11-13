@@ -19,8 +19,8 @@ on:
       - 'site/media/**'
       - 'site/assets/**'
       - 'docs/HANDBOOK.md'
-      - 'docs/reviews/**'
-      - 'docs/research/**'
+      - 'docs/records/reviews/**'
+      - 'docs/records/research/**'
       - 'docs/adr/**'
       - '.github/workflows/docs-site.yml'
   workflow_dispatch:

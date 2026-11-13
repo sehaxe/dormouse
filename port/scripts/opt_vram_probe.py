@@ -1,7 +1,7 @@
 """The optimizer's own memory, against the allocator: state by tensor and dtype.
 
 WHY THIS EXISTS. `scripts/vram_ledger.py` prices the optimizer on paper
-(`optimizer_bytes`, `ns_workspace`) and `docs/reviews/2026-11-08-optimizer-vram.md`
+(`optimizer_bytes`, `ns_workspace`) and `docs/records/reviews/2026-11-08-optimizer-vram.md`
 found three things it cannot see: the `ns_dtype` rung has no lever in the ledger,
 the whole-step update list is not priced at all, and the ledger's activation model
 ignores `n_layers` on a multi-layer preset. This script is the measurement the

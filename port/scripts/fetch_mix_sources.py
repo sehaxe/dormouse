@@ -5,7 +5,7 @@
 """Fetch SMALL slices of the code/math/RU mixture sources as raw-text `.bin` files.
 
 The pretrain corpus is one 19.7 GB filtered-web file; the research recipe
-(`docs/research/2026-10-16-data-mixing.md` §6.1-6.2) needs ~1.5 GB of code,
+(`docs/records/research/2026-10-16-data-mixing.md` §6.1-6.2) needs ~1.5 GB of code,
 math and Russian on top of it. This fetches ~120 MB of each — enough to wire the
 mixture and run the 9.2M smoke, not the full acquisition.
 

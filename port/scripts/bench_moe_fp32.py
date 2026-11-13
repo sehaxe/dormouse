@@ -2,7 +2,7 @@
 
     uv run --extra gpu python scripts/bench_moe_fp32.py
 
-The question is the one `docs/reviews/2026-10-21-battery.md` §5 left open: the
+The question is the one `docs/records/reviews/2026-10-21-battery.md` §5 left open: the
 ByteFlow channel ran fp32 when these readings were taken (the net had no bf16
 path then; it has one since 2026-10-21, `byteflow.py`'s precision rule — this
 bench prices the fp32 lane the record was taken on), and at fp32 the shipped Triton

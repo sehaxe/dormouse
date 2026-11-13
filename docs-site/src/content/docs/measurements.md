@@ -51,11 +51,11 @@ scale: **+2.94% BPB** for ~8× fewer bytes.
 
 | what | where |
 |---|---|
-| the architecture matrix, with every arm and seed | `docs/reviews/2026-11-09-architecture-matrix.md` |
-| the ternary artifact, its cost and its two corrections | `docs/reviews/2026-11-12-ternary-artifact.md` |
-| the gated-FFN A/B (three seeds, paired) | `docs/reviews/2026-11-10-gated-ffn-ab.md` |
-| every other review, by date | `docs/reviews/` — 145 files, one per lane |
-| the literature notes behind each choice | `docs/research/` |
+| the architecture matrix, with every arm and seed | `docs/records/reviews/2026-11-09-architecture-matrix.md` |
+| the ternary artifact, its cost and its two corrections | `docs/records/reviews/2026-11-12-ternary-artifact.md` |
+| the gated-FFN A/B (three seeds, paired) | `docs/records/reviews/2026-11-10-gated-ffn-ab.md` |
+| every other review, by date | `docs/records/reviews/` — 145 files, one per lane |
+| the literature notes behind each choice | `docs/records/research/` |
 | the protocol a number must satisfy | `docs/protocols/AB-PROTOCOL.md` |
 
 ---

@@ -6,7 +6,7 @@
 # The 2026-11-06 "dense beats the loop by 0.126-0.37" verdict is NOT a block
 # comparison: the loop arm ran with the broken Muon LR (0.7-17% of the AdamW
 # half's first-order step, worth 0.248 BPB elsewhere) and no loop run ever used
-# the live multiplier (docs/reviews/2026-11-08-loop-ab-fairness.md). Every arm
+# the live multiplier (docs/records/reviews/2026-11-08-loop-ab-fairness.md). Every arm
 # here runs `muon_lr_mult=12`, the live value.
 #
 # The forms (validated with `dormouse info`, refusals in config.py):

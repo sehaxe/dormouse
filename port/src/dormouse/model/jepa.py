@@ -12,7 +12,7 @@ second forward, no mask, no EMA. The predictor is `Linear(d, d/4) → SiLU →
 Linear(d/4, d)` applied to `h[p]`; the target `h[p+h]` is DETACHED, and in a
 causal model it is a function of strictly more input than `h[p]`, so the
 predictor has a real information bottleneck rather than the burn-era
-lagged-self-distillation shape (`docs/research/2026-10-16-jepa-into-dormouse.md`
+lagged-self-distillation shape (`docs/records/research/2026-10-16-jepa-into-dormouse.md`
 §1 (b), §4 D-e).
 
 The anti-collapse term is INTERNAL, not a separate arm: a cosine predictor alone

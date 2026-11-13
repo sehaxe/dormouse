@@ -13,15 +13,15 @@ that serves each axis with the cheapest available mechanism.
 
 | # | component | what it buys | axis | status | evidence |
 |---|---|---|---|---|---|
-| 1 | **patch unit, 8 bytes/position** | 8× fewer positions per byte, ~3.8× less VRAM | compute + memory | **[proven speed]** 7.4× at b=32, **[hypothesis]** quality | `docs/research/2026-11-07-patch-compute.md`; bench in this repo |
+| 1 | **patch unit, 8 bytes/position** | 8× fewer positions per byte, ~3.8× less VRAM | compute + memory | **[proven speed]** 7.4× at b=32, **[hypothesis]** quality | `docs/records/research/2026-11-07-patch-compute.md`; bench in this repo |
 | 2 | **14 unique layers, ONE pass** | no wasted compute | compute | **[proven]** φ=0.46: one recurrence = 0.46 block | 2604.21106v4 |
 | 3 | **KDA linear attention** | O(1) state, ~0.4 B/token | memory | **[hypothesis]** +0.078 BPB at 60M | Olmo Hybrid 2604.03444v4 Table 5 |
 | 4 | **CSA fine (8-byte chunks, top-k)** + **HCA coarse (256-byte)** | exact recall up to 1M at 34 MB | memory + context | **[proven mechanism]**, **[unmeasured quality]** | `model/csa.py`; probe driver |
 | 5 | **MoD at capacity 0.5** | 0.63× FLOPs | compute | **[hypothesis]** 60M-3B | 2404.02258v1 §5.1 |
-| 6 | **Muon shape-fair + bf16 state** | correct step on every shape; −181 MiB | compute + memory | **[proven]** RMS(dW)=lr; +18% speed | `docs/reviews/2026-11-07-muon-audit.md` |
+| 6 | **Muon shape-fair + bf16 state** | correct step on every shape; −181 MiB | compute + memory | **[proven]** RMS(dW)=lr; +18% speed | `docs/records/reviews/2026-11-07-muon-audit.md` |
 | 7 | **QK-norm + z-loss + logit softcap** | allows LR 1e-3 without divergence | stability | **[proven here]** 1e-3 beats 3e-4 by 0.22 | our LR ladder |
-| 8 | **doc_masking, 96.8% of corpus** | no cross-document bleed | quality | **[proven]** boundaries verified byte-exact | `docs/reviews/2026-11-06-datapath-audit.md` |
-| 9 | **segment carry, 8 KB segments** | memory constant in context, 1M trainable | memory | **[in progress]** contract being implemented | `docs/reviews/2026-11-08-segment-csa.md` |
+| 8 | **doc_masking, 96.8% of corpus** | no cross-document bleed | quality | **[proven]** boundaries verified byte-exact | `docs/records/reviews/2026-11-06-datapath-audit.md` |
+| 9 | **segment carry, 8 KB segments** | memory constant in context, 1M trainable | memory | **[in progress]** contract being implemented | `docs/records/reviews/2026-11-08-segment-csa.md` |
 | 10 | **fine-grained MoE, low active fraction** | capacity per FLOP | compute | **[bet]** closest measurement 13.7× above us | 2402.07871v1 |
 
 ## The arithmetic of the combination

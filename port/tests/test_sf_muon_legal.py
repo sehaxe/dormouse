@@ -1,6 +1,6 @@
 """The SF-Muon arm's legal preconditions, and the re-run's verdict statistic.
 
-TASK A (`docs/reviews/2026-10-21-sf-muon-prerequisites.md`): before the SF arm
+TASK A (`docs/records/reviews/2026-10-21-sf-muon-prerequisites.md`): before the SF arm
 is judged again it has to sit inside the paper's assumption set where this port
 can put it there.
 

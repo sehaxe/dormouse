@@ -25,7 +25,7 @@
   the only measurement and the file says so instead of printing a fake 0.
 
 **What this file does NOT claim.** Every ms is a measurement of THIS box at THIS
-commit. `docs/research/2026-10-17-olmo-core-ideas.md` §2.1 predicts the direction,
+commit. `docs/records/research/2026-10-17-olmo-core-ideas.md` §2.1 predicts the direction,
 not the size, and its band is not quoted as a result.
 
 **Preflight, and it is the whole reason the script is safe to run** (`bench_opt.py`'s

@@ -214,12 +214,12 @@ def test_gate_3_hierarchy_selects_the_flat_region_when_topk_covers_it():
     # everywhere EXCEPT inside that first container. The old assertion (hier ==
     # flat everywhere) passed only because the parent mask was missing: it let
     # children of a masked parent through, which is also why forward and
-    # forward_state disagreed. See docs/reviews/2026-11-08-math-audit.md §6.3.
+    # forward_state disagreed. See docs/records/reviews/2026-11-08-math-audit.md §6.3.
     # Measured, not assumed: the first fine chunk (positions 0..csa_chunk-1)
     # matches, because no parent container is allowed yet and the level falls
     # through to the same keys; every later partially-built container differs.
     # The OLD assertion (equal everywhere) was false and passed only while the
-    # parent mask was missing — see docs/reviews/2026-11-08-math-audit.md §6.3.
+    # parent mask was missing — see docs/records/reviews/2026-11-08-math-audit.md §6.3.
     chunk = 4  # csa_chunk in `cover`
     d_first = float((yh[:, :chunk] - yf[:, :chunk]).abs().max())
     d_rest = float((yh[:, chunk:] - yf[:, chunk:]).abs().max())

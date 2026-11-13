@@ -1,6 +1,6 @@
 """The rollout runner: a byte-budgeted generation + a verifier decision.
 
-`docs/research/2026-10-15-agentic-post-training.md` §5 rung (b) is "the rollout
+`docs/records/research/2026-10-15-agentic-post-training.md` §5 rung (b) is "the rollout
 runner", and §10 step 1 says build it with the verifier, on `code`. This is the
 FUNCTION that reports the triple — `(trace, n_bytes, verdict)` — not a trainer:
 nothing here updates a weight, and the generation goes through the SAME decode

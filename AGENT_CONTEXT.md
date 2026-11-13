@@ -94,7 +94,7 @@ LoopBlock (веса общие по итерациям):
 - Все модальности (текст, картинки, аудио, ЭКГ, ДНК)
 - 1M контекста, максимум оптимизации
 - byteflow = каноническая база (временно), dormouse = ветка
-- MoE+TSCT = сверх-технология (спек: docs/reviews/tsct-spec-2026-10-03.md)
+- MoE+TSCT = сверх-технология (спек: docs/records/reviews/tsct-spec-2026-10-03.md)
 
 ---
 
@@ -113,7 +113,7 @@ LoopBlock (веса общие по итерациям):
 | `vendor/dormouse-fused/crates/burn-msa/` | sparse attention |
 | `vendor/dormouse-fused/crates/burn-byteflow/` | coding-rate патчер |
 | `tools/trio_ab.sh` | контролируемая тройка |
-| `docs/reviews/tsct-spec-2026-10-03.md` | полная спека TSCT |
+| `docs/records/reviews/tsct-spec-2026-10-03.md` | полная спека TSCT |
 | `benches/history.tsv` | ВСЕ числа с provenance |
 
 ---
@@ -157,9 +157,9 @@ LoopBlock (веса общие по итерациям):
 1. Прочитать этот файл.
 2. `.bulba/goal.md` — текущая программа и вердикты.
 3. `benches/history.tsv` — все числа.
-4. `docs/reviews/tsct-spec-2026-10-03.md` — спека сверх-технологии.
+4. `docs/records/reviews/tsct-spec-2026-10-03.md` — спека сверх-технологии.
 5. `research/questions-3-for-research-agent-2026-10-04.md` — вопросы эксперту.
-6. `docs/reviews/bpbaudit-2026-10-04.md` — честность оценки.
+6. `docs/records/reviews/bpbaudit-2026-10-04.md` — честность оценки.
 7. Проверить `git log --oneline -10` и статус дорожек.
 8. **Не запускать GPU без протокола**: `pgrep -x train` пуст И `nvidia-smi` <1GB.
 

@@ -2,7 +2,7 @@
 
 > Updated 2026-10-01. Sources: `docs/protocols/AB-PROTOCOL.md` (the
 > instrument, corrected 2026-09-28, with the 2026-09-30 hygiene additions),
-> `AGENTS.md` §1.2 and §3.4, `docs/reviews/ab-wave-2026-10-01.md` (the control
+> `AGENTS.md` §1.2 and §3.4, `docs/records/reviews/ab-wave-2026-10-01.md` (the control
 > family and the first wave verdicts), `benches/history.tsv` (every number
 > with its config+date), and `docs/guides/determinism.md` for the seed
 > precondition. Where a source's demand has been superseded by a later
@@ -81,7 +81,7 @@ two different measurements, and no run in the archive has been scored on both
 (`docs/protocols/AB-PROTOCOL.md`). The current control family and every arm in
 the 2026-10-01 wave share **81 920 B** (20 batches × batch 8 × seq 512), and
 every one of them is batch 8
-(`docs/reviews/ab-wave-2026-10-01.md:8-11`). If an A/B table has one arm at a
+(`docs/records/reviews/ab-wave-2026-10-01.md:8-11`). If an A/B table has one arm at a
 different batch size from its control, **the table is void regardless of what
 the numbers say**.
 
@@ -95,7 +95,7 @@ Four fields make a BPB a number; a sentence that omits one of them is not one.
    `(Σ CE_i + CE_final)/(T+1)` and is **not** the model's BPB. On one
    checkpoint the two differed by **0.116 BPB** (1.729 headline vs 1.617 fin);
    the gap is a function of depth, not noise
-   (`docs/reviews/2026-11-06-bpb-accounting.md` §6).
+   (`docs/records/reviews/2026-11-06-bpb-accounting.md` §6).
 2. **The window in bytes.** Quote `eval_bytes` (or `over N B` off the eval
    line), not "N batches": a batch size is a throughput knob and it changes
    the window. 196 608 B is the current default; the 65 536 B floor exists
@@ -105,7 +105,7 @@ Four fields make a BPB a number; a sentence that omits one of them is not one.
    evals are comparable only at the same offset and the same width; a
    different offset is a different sample and must be labelled as one.
 4. **The noise floor.** A same-seed rerun moved **0.043 BPB** on CUDA under a
-   shared GPU (`docs/reviews/2026-11-06-control-transformer.md` §"Caveats").
+   shared GPU (`docs/records/reviews/2026-11-06-control-transformer.md` §"Caveats").
    Measure the floor on the setup you are using, with
    `port/scripts/noise_floor.py` (two same-seed trials, prints the spread at
    the configured window/offset — measured **0.0000 BPB on the CPU tiny run**),
@@ -117,7 +117,7 @@ the *training-seed* floor is still the reason the protocol wants 3 seeds.
 
 ## The yardstick: a 3-seed control and its own spread
 
-The control family, exactly (`docs/reviews/ab-wave-2026-10-01.md` §0.1) —
+The control family, exactly (`docs/records/reviews/ab-wave-2026-10-01.md` §0.1) —
 seven night logs, two families, aux-ON and pure-CE:
 
 | log | aux | seed | BEST HELD-OUT bpb |
@@ -138,7 +138,7 @@ caught in its own brief:
 - **Pooling the families is wrong.** The brief's "control mean ≈ 6.37, spread
   ≈ 0.06" was the mean and sd of all seven logs pooled — two different
   recipes averaged together. A number about a union is not a yardstick
-  (`docs/reviews/ab-wave-2026-10-01.md` §0.1).
+  (`docs/records/reviews/ab-wave-2026-10-01.md` §0.1).
 - **The seeds are 1/2/3.** `first_run_2000_1001_0037` is a *date* (Oct 01,
   00:37), not a seed 1001 — the log filename pattern is
   `first_run_${STEPS}_$(date +%m%d_%H%M).log` (§0.2). And the wave runs the
@@ -151,7 +151,7 @@ The control's recipe, read off its config snapshot: `--preset small --batch 8
 --seq-len 512 --no-engram --steps 2000 --eval-every 500 --detach
 --timers`, aux at preset defaults (jepa 0.05 + KoLeo, dspark 0.0),
 `eval_batches 20`, `lr 1e-4 cosine`, `opt mix` (Muon+ ns=8), quant auto → Fp8,
-`max_iter 4`, 9 197 454 params (`docs/reviews/ab-wave-2026-10-01.md` §0.3).
+`max_iter 4`, 9 197 454 params (`docs/records/reviews/ab-wave-2026-10-01.md` §0.3).
 
 One confound named rather than hidden: the 3-seed control family ran
 `retract_every 1`, the wave ran `retract_every 4` (the owner's working mode).
@@ -175,7 +175,7 @@ the project's history, and it reversed a researcher recommendation by data:
 the JEPA weight-0 recommendation was reversed because the aux arms earned
 their place (`benches/history.tsv:142`).
 
-**Verdict 2 — mHC is a TIE, and a tie deletes** (`docs/reviews/ab-wave-2026-10-01.md`
+**Verdict 2 — mHC is a TIE, and a tie deletes** (`docs/records/reviews/ab-wave-2026-10-01.md`
 §6.3): 6.413/6.313/6.370, mean **6.3653** (sd 0.0502, range 0.100) vs the
 control's 6.3433. Paired same-seed deltas +0.026 / −0.001 / +0.041; mean delta
 **+0.0220 against a bar of 0.0730** — inside the control's own seed spread.
@@ -194,7 +194,7 @@ follow-up this result says nothing about.
   `probe.rs` counts `MHC`, `SITU`, `MOE_ROUTE` and `ATTNRES`, but **none of
   those four reaches the log line** (`crates/dormouse-train/src/lib.rs:1635`)
   — for four of five arms the log cannot show the arm ran, which is a §1.1
-  SILENT gap listed as owed (`docs/reviews/ab-wave-2026-10-01.md` §7.1).
+  SILENT gap listed as owed (`docs/records/reviews/ab-wave-2026-10-01.md` §7.1).
 - **`--set` is a hand-written `match` over 33 keys**
   (`crates/dormouse-core/src/config/override.rs:28-71`), not a generic
   override: `--set use_mhc=true` died in 32 seconds with `unknown config key`,
@@ -280,7 +280,7 @@ final rating.
 ## The noise floor under everything
 
 A same-seed rerun moved **0.043 BPB** on CUDA under a shared GPU
-(`docs/reviews/2026-11-06-control-transformer.md` §"Caveats"), which is why the
+(`docs/records/reviews/2026-11-06-control-transformer.md` §"Caveats"), which is why the
 protocol also wants 3 seeds. Measure the floor on your own setup with
 `port/scripts/noise_floor.py` (two trials, same seed, same window/offset) and
 compare any delta against the larger of the instrument floor and the control's

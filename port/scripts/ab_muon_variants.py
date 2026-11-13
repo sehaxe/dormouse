@@ -6,8 +6,8 @@
 **Do not run this while the card is busy** (AGENTS §1.5): the preflight refuses
 and prints a SKIP banner, and a skipped run has no numbers to quote.
 
-**Arms** (one factor each against the control, `docs/research/2026-10-17-muon-variants.md`
-§2 #2 + `docs/research/2026-10-16-sf-muon.md` §4):
+**Arms** (one factor each against the control, `docs/records/research/2026-10-17-muon-variants.md`
+§2 #2 + `docs/records/research/2026-10-16-sf-muon.md` §4):
 
 * `control`   — `muon_variant=muon`, `muon_sf=false`: the live recipe, WSD on both
                 halves. Every number on record.

@@ -19,7 +19,7 @@
 #
 # byteflow_k_tokens MUST be max_seq_len // byteflow_patch_bytes: with
 # byte_patch the stack runs every patch (K=P) so the strict prefix-causality
-# gate holds at every byte offset. See docs/reviews/2026-11-07-byteflow-dense.md.
+# gate holds at every byte offset. See docs/records/reviews/2026-11-07-byteflow-dense.md.
 
 d_model = 832
 n_heads = 13

@@ -7,7 +7,7 @@ run on any device (they are deliberately not under the `@CUDA` mark — a gate
 that is skipped everywhere it could fire is a gate that cannot fail).
 
 What is claimed here, in the order the research doc lists them
-(`docs/research/2026-10-15-tsct-super-kernel.md` op 3):
+(`docs/records/research/2026-10-15-tsct-super-kernel.md` op 3):
 
 1. **parity** — the unpadded grouped pass computes what the cap-padded bank
    computes, on the same rows, at fp32 (<=1e-5) and bf16 (<=2e-3), the bounds

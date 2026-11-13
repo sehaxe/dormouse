@@ -1,6 +1,6 @@
 """Round-1 post-training bug gates: M2, m3, m4, m5.
 
-Four findings from `docs/reviews/2026-10-24-bug-ledger.md`, each pinned by the
+Four findings from `docs/records/reviews/2026-10-24-bug-ledger.md`, each pinned by the
 gate the fix brief names and each proved to fail on a scratch revert:
 
 * **M2** — the SFT in-loop eval never rewound its byte stream, so two evals at

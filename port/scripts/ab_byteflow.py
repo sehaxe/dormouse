@@ -46,7 +46,7 @@ move the goalposts. A skipped preflight prints a SKIP banner and no table.
 steps, and the reason is in the record (`byteflow.py`'s docstring): the burn A/B
 measured the compression itself as the win at equal params (canon 3.466 vs plain
 bytes 3.947 BPB), while the full-arm dormouse `small` lost at 6.498
-(`docs/reviews/byteflow-ab-2026-10-02.md`); and the probe (`port/scripts/patch_rate.py`)
+(`docs/records/reviews/byteflow-ab-2026-10-02.md`); and the probe (`port/scripts/patch_rate.py`)
 shows why this polygon is the weak form of the bet — at K=128 over T=512 the
 mean patch is T/K = 4 bytes, the SAME as BPE's ~4 bytes/token, so the loop's
 128 patch positions buy no sequence compression, while the channel pays for a

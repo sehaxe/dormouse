@@ -1,6 +1,6 @@
 """The four cheap recipe knobs from the Ripple-65B ladder, gated one per claim.
 
-Source: `docs/reviews/2026-11-08-ripple-65b.md`. Their v1.0→v1.6 ladder
+Source: `docs/records/reviews/2026-11-08-ripple-65b.md`. Their v1.0→v1.6 ladder
 compounded six cheap changes into 16x compute efficiency at 4B, which is larger
 than any architectural delta measured in this repo. These gates exist so that
 each knob is *provably* wired — a flag that reaches no code is the config-lies

@@ -1,6 +1,6 @@
 """Model-internals audit: the dense block against its own documentation.
 
-Companion to `docs/reviews/2026-11-07-model-internals.md`. Every test is a
+Companion to `docs/records/reviews/2026-11-07-model-internals.md`. Every test is a
 NUMERIC claim about `model/transformer.py` + the dense branch of `model.py`,
 not a shape check, and each one is able to fail on its own:
 

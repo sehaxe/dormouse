@@ -1,7 +1,7 @@
 # The scaling recipe — every direction, with the arithmetic that sets it
 
 **Date:** 2026-10-23 · **Status:** recipe; the sub-1B points are measured, everything above is fitted and marked.
-**Fact base:** `docs/reviews/2026-10-23-architecture-verdict.md`, `docs/architecture/2026-10-23-final-architecture.md`.
+**Fact base:** `docs/records/reviews/2026-10-23-architecture-verdict.md`, `docs/architecture/2026-10-23-final-architecture.md`.
 
 ---
 
@@ -47,10 +47,10 @@ At 1024 the bank is a rounding error; at 3072 the *dense* side (KDA projections 
 > **RETRACTED for the recipe (2026-11-08).** The arithmetic above is still true
 > per step, but the direction was measured wrong: at equal bytes the 13.5M dense
 > control beat the 102.7M expert bank by 0.126-0.37 BPB
-> ([dense verdict](docs/reviews/2026-11-06-control-transformer.md)), and at equal
-> active MAC the bank lost by 0.067 ([review](docs/reviews/2026-11-05-architecture-review-dense.md)
+> ([dense verdict](docs/records/reviews/2026-11-06-control-transformer.md)), and at equal
+> active MAC the bank lost by 0.067 ([review](docs/records/reviews/2026-11-05-architecture-review-dense.md)
 > §0). "Expert-rich" is not the cheap direction for quality; it is the cheap
-> direction for parameters. ([claims repair](docs/reviews/2026-11-08-claims-repair.md) D7)
+> direction for parameters. ([claims repair](docs/records/reviews/2026-11-08-claims-repair.md) D7)
 
 ---
 

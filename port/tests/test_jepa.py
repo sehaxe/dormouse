@@ -204,7 +204,7 @@ def test_collapse_gate_the_internal_reg_is_load_bearing(tmp_path: Path) -> None:
     the no-reg arm is not a collapse to a POINT — its per-dim std (normalized
     rows) stays ~0.118 in both arms. It is a collapse into a DEGENERATE,
     unbounded latent, which is the documented JEPA collapse chain's
-    "target-variance rise" step (`docs/research/...-jepa-into-dormouse.md` §3's
+    "target-variance rise" step (`docs/records/research/...-jepa-into-dormouse.md` §3's
     2607.23531 order), not the final cosine-collapse step. The gate therefore
     has a TWO-SIDED band: above the floor (not a constant) and below the
     ceiling (not diverged). The no-reg arm misses the ceiling by 4-5 orders of

@@ -60,7 +60,7 @@ use_kda = true
 use_tsct = true
 use_engram = true
 use_attnres = false
-# LOOM (`2610.01153`, docs/research/2026-10-16-new-tech-scan.md §2.1): per-iteration gate on the RMS-normalized write; OFF = today's write, and the arm's A/B against a fixed-depth control is what decides the 8-12-loop claim.
+# LOOM (`2610.01153`, docs/records/research/2026-10-16-new-tech-scan.md §2.1): per-iteration gate on the RMS-normalized write; OFF = today's write, and the arm's A/B against a fixed-depth control is what decides the 8-12-loop claim.
 loom = false
 
 # burn's small runs the DENSE blend (moe_topk = 0) over 3 experts; the sparse
@@ -99,7 +99,7 @@ dspark_weight = 0.0  # gamma; >0 builds the DSpark draft head (dspark_k/stride/m
 # head — `CE + sigreg_weight * sigreg_loss(z)` on the strided sample of the
 # state lm_head reads, no teacher / no predictor / no second forward / 0 params.
 # 0.0 = the pure-CE control. The grid is 0.005 / 0.05 / 0.1 (the research doc
-# docs/research/2026-10-16-jepa-into-dormouse.md §3, the ONE arm to run first).
+# docs/records/research/2026-10-16-jepa-into-dormouse.md §3, the ONE arm to run first).
 sigreg_weight = 0.0
 act_group = 0
 

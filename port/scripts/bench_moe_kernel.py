@@ -3,7 +3,7 @@
     uv run --extra gpu python scripts/bench_moe_kernel.py
 
 The numbers this file prints are the ones the commit and
-`docs/research/2026-10-15-tsct-super-kernel.md` op 3 are judged on: parity
+`docs/records/research/2026-10-15-tsct-super-kernel.md` op 3 are judged on: parity
 against the cap-padded arm, the two arms' fwd and fwd+bwd medians interleaved in
 one process, and the peak allocated VRAM of each (the whole point of removing
 the `[E, cap, f]` round trip).

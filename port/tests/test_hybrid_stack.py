@@ -27,7 +27,7 @@ The pair `arch_hybrid31` (109,892,835 params) / `arch_dense890` (109,947,930)
 holds the parameter budget fixed at the FLOP-matched width d=890: B1 is
 ISO-FLOPs with the d=832 dense control C0 (692.2 vs 692.9 MFLOP/byte), and B2
 gives all of B1's parameters to a plain transformer. See
-`docs/reviews/2026-11-07-hybrid-stack.md`.
+`docs/records/reviews/2026-11-07-hybrid-stack.md`.
 """
 
 from __future__ import annotations
@@ -381,7 +381,7 @@ def test_the_two_new_presets_have_exact_parameter_counts():
 def test_the_hybrid_preset_is_the_iso_flop_arm():
     """B1 is ISO-FLOPs with C0 (692.9) and B2 pays +14.0% for the same params.
 
-    The ledger is the one `docs/research/2026-11-07-frontier-vs-vanilla.md` §2.2
+    The ledger is the one `docs/records/research/2026-11-07-frontier-vs-vanilla.md` §2.2
     uses: 6N per byte plus the full-attention term `12·L_attn·d·s` at s=1024.
     It is a comparison bill, not a measured FLOP count.
     """

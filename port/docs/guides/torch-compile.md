@@ -96,10 +96,10 @@ direction has the same `model`/`model_ema`/`moe` key sets.
 ## Speed: measured elsewhere, not at the live shape
 
 The compile arm's only POSITIVE reading on record is the 2026-10-15 b1 spike
-(`docs/research/2026-10-15-torch-spike.md:228-230`, torch 2.13.0+cu129,
+(`docs/records/research/2026-10-15-torch-spike.md:228-230`, torch 2.13.0+cu129,
 RTX 5060 Ti): eager **357.3 ms/step**, `dynamic=False` **298.0** (1.20x), and
 the `dynamic=True` arm this trainer wraps **273.5** (1.31x). The claims ledger
-(`docs/reviews/2026-11-07-claims-ledger.md`) lists that spike's numbers as
+(`docs/records/reviews/2026-11-07-claims-ledger.md`) lists that spike's numbers as
 UNVERIFIABLE outside the copied report — the raw logs lived in `/tmp` — so read
 them as the spike's reading, not as a promise for this recipe.
 
@@ -125,7 +125,7 @@ must be under the memory cap.
 already paid for a compile assumption once: before the `@torch.compiler.disable`
 decorator on `SparseMoE._banks`, `torch.compile(dynamic=True)` was reported at
 **0.20x** (2939 ms/step against 573 eager — the trigger recorded in
-`docs/research/2026-10-18-compile-moe.md`, not re-measured there) because a
+`docs/records/research/2026-10-18-compile-moe.md`, not re-measured there) because a
 per-step Python value in the cache key spent the recompile budget and dynamo
 fell back to eager; the decorator and its control are pinned by
 `tests/test_compile_moe.py`. If the live-shape arm is not faster, read the

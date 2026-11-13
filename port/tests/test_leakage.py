@@ -27,7 +27,7 @@ The gates:
 6. the sampler is a pure function of `(seed, step)`; the flat/shard readers are
    periodic per epoch, which is DOCUMENTED behaviour and pinned as such.
 
-Mutation evidence for every gate is in `docs/reviews/2026-11-07-leakage.md`:
+Mutation evidence for every gate is in `docs/records/reviews/2026-11-07-leakage.md`:
 reverse the shift, unmask the triangle, drop the boundary mask, remove the eval
 carve, and make the sampler draw from a global RNG — each turns its gate RED.
 """

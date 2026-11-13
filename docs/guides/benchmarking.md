@@ -94,7 +94,7 @@ exit 1 and the last error line.
 ## The ledger, and why there are three of them
 
 This repo has **three different MFU ledgers in circulation**, and they disagree
-by up to 3.9×. From `docs/research/2026-11-05-small-model-mfu.md` §0.2:
+by up to 3.9×. From `docs/records/research/2026-11-05-small-model-mfu.md` §0.2:
 
 | ledger | what it counts | MAC/token | training MFLOP/B (×6) | 100 %-MFU floor at 45.7 TF |
 |---|---|---:|---:|---:|
@@ -117,7 +117,7 @@ in every row.
 This benchmark uses the **B-class full bill**: `mod_ledger.ledger(cfg,
 capacity=cfg.mod_capacity, seq_len=T).total` (×3 for forward → forward+backward,
 the counter's own factor). For `flagship3_dense` at s1024 it reproduces the
-measured `691.37 MFLOP/byte` (`docs/reviews/2026-11-06-control-transformer.md`
+measured `691.37 MFLOP/byte` (`docs/records/reviews/2026-11-06-control-transformer.md`
 §1, FlopCounterMode), which is the strongest anchor the repo has. At other
 windows and configs it is the repo's analytic bill, not a counter run.
 

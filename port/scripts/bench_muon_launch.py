@@ -4,7 +4,7 @@
     uv run --extra gpu python scripts/bench_muon_launch.py --state fp32 --ns fp32
 
 **The number this prints is a LAUNCH count, not a wall clock only.** The port's
-step is host-dispatch-bound (`docs/reviews/2026-10-16-b1-profile.md`: a GPU
+step is host-dispatch-bound (`docs/records/reviews/2026-10-16-b1-profile.md`: a GPU
 residue of ≈0 ms against a wall that is the enqueue), so the optimizer stage's
 cost is the number of kernels it enqueues. This driver measures that number for
 the two optimizer arms and times the stage; it does not score a training run.

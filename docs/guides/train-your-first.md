@@ -3,7 +3,7 @@
 > Updated 2026-10-01. Sources: [README](../../../README.md) (Quick start),
 > `tools/first_run.sh`, `AGENTS.md` §2.4/§2.6/§3.7/§3.8,
 > [presets](presets.md) · [every flag](cli.md) · [the .dmexp file](dmexp.md),
-> `docs/protocols/AB-PROTOCOL.md`, `docs/reviews/ab-wave-2026-10-01.md`,
+> `docs/protocols/AB-PROTOCOL.md`, `docs/records/reviews/ab-wave-2026-10-01.md`,
 > `benches/history.tsv`, and the control-family log
 > `~/logs/first_run_2000_0930_1855.log` (2026-09-30) — the run whose lines are
 > quoted below. Every number names where it came from; where two sources
@@ -65,14 +65,14 @@ tools/first_run.sh 2000    # the control shape every A/B compares against
 through to `train` as additional flags (`tools/first_run.sh:21-23`). The
 checkpoint name is derived from the flags, which is how the control family got
 names like `first_run_2000--retract-every-4-` (`tools/first_run.sh:48`, and
-`docs/reviews/ab-wave-2026-10-01.md:75-79` for why the trailing `-` is a
+`docs/records/reviews/ab-wave-2026-10-01.md:75-79` for why the trailing `-` is a
 newline).
 
 What the script fixes, and why: `--preset small` (the flagship on 16 GB and
 the schema default — [presets](presets.md)), `--batch 8 --seq-len 512`,
 `--no-engram`, `--eval-every 500`, `--detach --timers --log`. The
 control family every current verdict rests on is exactly this recipe plus a
-seed (`docs/reviews/ab-wave-2026-10-01.md:68-79`). `--no-engram` keeps the
+seed (`docs/records/reviews/ab-wave-2026-10-01.md:68-79`). `--no-engram` keeps the
 first run on the pure-model path: the hashed-memory arm has its own eval
 requirements (`engram=` on the eval line, §3.2 of `AGENTS.md`) and its own
 footprint, and you want neither in your first hour. The full flag table is
@@ -94,7 +94,7 @@ optimizer: Muon+ ColRow ns=8 + head-wise Muon q/k + Adam wd0 (tables) + AdamW (r
   (`docs/guides/presets.md`, measured table). It is also the cheapest
   engagement check there is: when the mHC arm ran, the header moved to
   `params=9203609` — +6 155 params = +0.067 %, exactly the cost its report
-  quoted (`docs/reviews/ab-wave-2026-10-01.md:471-475`). If a header does not
+  quoted (`docs/records/reviews/ab-wave-2026-10-01.md:471-475`). If a header does not
   move, the arm did not run, whatever the flags said.
 - **`quant format: Fp8`** is `--quant` on auto: sm ≥ 120 → `Fp8`, forward path
   only, fp32 masters — checkpoints stay format-agnostic (`AGENTS.md` §3.7).
@@ -143,7 +143,7 @@ step    500 EVAL ce=4.449 bpb=6.418 BEST over 81920 B (fixed window) fused kda=2
 - **`over 81920 B (fixed window)`** — quote this number in any table. The
   window is `eval_batches × batch × seq_len` bytes
   (`crates/dormouse-train/src/lib.rs:1417`): 20 × 8 × 512 = 81 920 B for the
-  batch-8 recipe (`docs/reviews/ab-wave-2026-10-01.md:8-10`), 102 400 B at
+  batch-8 recipe (`docs/records/reviews/ab-wave-2026-10-01.md:8-10`), 102 400 B at
   batch 10, 20 480 B at batch 2 (`AGENTS.md` §3.1). **A BPB is only
   comparable within one window** — `--batch` is a throughput knob that also
   changes how much text the eval scores, and `--eval-batches` alone does not
@@ -166,7 +166,7 @@ step    500 EVAL ce=4.449 bpb=6.418 BEST over 81920 B (fixed window) fused kda=2
 - **`norm=0/4619`** — the fused RMSNorm kernel was asked 4 619 times and ran
   zero: `Device::cuda(0).autodiff()` refuses the dispatch demotion, so every
   training forward and eval is on this path by construction (`AGENTS.md`
-  §3.3; on a 100k run: `norm=0/911936`, `docs/reviews/ab-wave-2026-10-01.md:225-227`).
+  §3.3; on a 100k run: `norm=0/911936`, `docs/records/reviews/ab-wave-2026-10-01.md:225-227`).
   A `0` here is the *normal* reading, not a defect.
 - **`engram=<rows>/<arms>`** is the check that the eval scored the memory arm
   the training step trained. `0/0` is correct for a `--no-engram` run (a
@@ -208,10 +208,10 @@ done steps=2000 best ce=2.676 | BEST HELD-OUT bpb=6.387 at step 1500 -> checkpoi
 The `done` line is the one number you quote, with the window from the EVAL
 line beside it. Expect roughly `6.31–6.44` at 2 000 steps on this recipe —
 that is the control family's own range, 6.314–6.443 over 81 920 B
-(`docs/reviews/ab-wave-2026-10-01.md:23-31`). Best-of-a-curve is the honest
+(`docs/records/reviews/ab-wave-2026-10-01.md:23-31`). Best-of-a-curve is the honest
 reading: the 100k run's 5.545 at step 86 000 stopped descending for its last
 14 000 steps — best-of-a-plateau, not a late win
-(`docs/reviews/ab-wave-2026-10-01.md:201-208`).
+(`docs/records/reviews/ab-wave-2026-10-01.md:201-208`).
 
 ## Step 5 — resuming
 
@@ -246,17 +246,17 @@ else; handed a training checkpoint they print the conversion command and exit
 - **`--temp 0` panics** (`cannot sample empty range`) — there is no greedy
   decode yet; the one-line fix is named at
   `crates/dormouse-cli/src/bin/generate.rs:47` and is not applied
-  (`docs/reviews/ab-wave-2026-10-01.md:329-342`). Default temperature is 0.8
+  (`docs/records/reviews/ab-wave-2026-10-01.md:329-342`). Default temperature is 0.8
   ([cli.md](cli.md)).
 - **An export carries the checkpoint it was made from, not the run.** The
   100k run's export was written from the step-75 000 checkpoint — its samples
   are a step-75 000 model (held-out 5.72), not the finished 5.545-at-86 000
-  run (`docs/reviews/ab-wave-2026-10-01.md:319-327`).
+  run (`docs/records/reviews/ab-wave-2026-10-01.md:319-327`).
 
 Keep expectations calibrated: a byte-level 9.2M model at step 75 000 emits
 function-word structure (`the` ×8, no digits at temp 0.15) and otherwise
 fragments — real text is not on the other side of this pipeline yet
-(`docs/reviews/ab-wave-2026-10-01.md:359-390`).
+(`docs/records/reviews/ab-wave-2026-10-01.md:359-390`).
 
 ## What your first number does *not* mean
 
