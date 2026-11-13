@@ -3,6 +3,10 @@
 One document to read. Everything else in `docs/` is evidence: a measurement with
 a date, or a decision with a status.
 
+**The goal:** a cheap but capable chatbot — a real model you can train yourself
+on an ordinary computer, in days, and run locally afterwards. The research is
+the route: what makes a model cheaper and smarter, measured rather than assumed.
+
 The rule that shapes everything here: **a result is a comparison, not a trophy.**
 Every mechanism is measured against the same model with that mechanism removed,
 on the same held-out window, at the same budget. The absolute loss moves as soon
@@ -17,8 +21,9 @@ tokenizer. It trains from scratch on one consumer GPU (RTX 5070 Ti, 16 GB,
 sm_120), and it trains **in the format it ships in** — ternary weights from the
 first step, not a float model quantized afterwards.
 
-The bet is on density: how much model fits on one card, in one file. The budget
-is fixed first, then we ask what fits inside it.
+The bet is on density: how much model fits on one card, in one file, and how
+long it takes to train. The budget is fixed first — one consumer GPU, a few days,
+one downloadable file — and then we ask what fits inside it.
 
 ---
 
