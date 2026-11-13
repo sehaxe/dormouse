@@ -172,10 +172,10 @@ DEAD_SNAPSHOT_KEYS = {
     # field is skipped, not dropped.
     "stress": (DEAD_SNAPSHOT_COMMIT, False),
     # removed by `refactor(quant): the ladder is bf16, 4-bit activations,
-    # ternary` (quant-ladder): the S3T Bernoulli mask was its ONE consumer, and
+    # ternary` (c6cf8f3): the S3T Bernoulli mask was its ONE consumer, and
     # that rung was deleted 2026-11-13. Every snapshot on disk holds 0 (a
     # non-zero seed refuses: the arm it seeded no longer exists).
-    "factor_qat_seed": ("quant-ladder", 0),
+    "factor_qat_seed": ("c6cf8f3", 0),
     # removed by `delete the aux_fb future-byte head — a TIE` (39d0485):
     "aux_fb_weight": ("39d0485", 0.0),
     # LANE keys: live on branches this checkout does not carry, under these SAME
@@ -327,8 +327,7 @@ REMOVED_QUANT_MODES: dict[str, dict[str, str]] = {
     "factor_qat": {"ternary_s3t": "the S3T sampled arm (`ternary` is the rung)"},
     "dense_qat": {"ternary_s3t": "the S3T sampled arm (`ternary` is the rung)"},
     "act_quant": {
-        "int8": "the 8-bit activation rung (the only 8-bit code left is the "
-        "attention upgrade)",
+        "int8": "the 8-bit activation rung (the only 8-bit code left is the attention upgrade)",
         "fp4": "the e2m1 grid under its old name",
         "mxfp8": "the OCP MX e4m3 family (spec §5.2)",
         "v2_int8": "the BitNet-v2 8-bit width (the arm survives as `v2_int4`)",
