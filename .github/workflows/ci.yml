@@ -346,6 +346,9 @@ jobs:
       - name: lib tests (core + data + train)
         if: ${{ !cancelled() }}
         run: cargo test -p dormouse-core -p dormouse-data -p dormouse-train --lib
+      - name: model seam test
+        if: ${{ !cancelled() }}
+        run: cargo test -p dormouse-core --test model_seam
       - name: rustdoc
         if: ${{ !cancelled() }}
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p dormouse-core -p dormouse-data -p dormouse-train -p dormouse-cli
