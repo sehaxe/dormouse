@@ -161,6 +161,7 @@ def test_no_pair_shares_fifty_bytes_with_the_eval():
 
 
 @pytest.mark.skipif(not (CORPUS / "manifest.json").exists(), reason="no manifest in this tree")
+@pytest.mark.skipif(not _corpus_files(), reason="the v2 corpus is not built in this tree")
 def test_the_manifest_accounts_for_every_row():
     man = json.loads((CORPUS / "manifest.json").read_text())
     on_disk = {p.stem: len(_rows(p)) for p in _corpus_files()}
