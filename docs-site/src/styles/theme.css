@@ -50,16 +50,17 @@
 .stat-row {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 1px;
   margin: 2rem 0;
-  background: var(--sl-color-gray-5);
   border: 1px solid var(--sl-color-gray-5);
   border-radius: 10px;
   overflow: hidden;
 }
 .stat {
-  background: var(--sl-color-black);
   padding: 1rem 1.15rem;
+  border-left: 1px solid var(--sl-color-gray-5);
+}
+.stat:first-child {
+  border-left: 0;
 }
 .stat b {
   display: block;
