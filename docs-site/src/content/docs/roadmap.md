@@ -41,4 +41,4 @@ A cluster. Every step above fits the same one-card budget the project has always
 had; what it needs is data, and data is the constraint that actually binds.
 
 The dated queue, including what is blocked and why, is in
-[`docs/archive/`](/dormouse/docs/archive/) and in `AGENTS.md`.
+[`docs/records/archive/`](/dormouse/docs/archive/) and in `AGENTS.md`.

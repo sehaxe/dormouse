@@ -340,7 +340,8 @@ def _refuse_missing_lfb(where: str, coef: float) -> None:
 #: The bias magnitude past which the controller has LEFT the router's own logit
 #: scale (±5). Measured on `m400` at step 149 999: the saved bias spans
 #: `[-218.27, +72.67]` (mean `+34.30`) and 9 of 512 experts carry every
-#: assignment, one of them 4096 of 8192 (`docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md`).
+#: assignment, one of them 4096 of 8192
+#: (`docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md`).
 #: A checkpoint past this bound cannot be resumed: the bias is added to the
 #: logits unconditionally, so its routing is what it is.
 LB_DIVERGED = 10.0

@@ -1532,7 +1532,9 @@ def run(args) -> tuple[list[Claim], list[Claim]]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Ledger of every numeric claim in docs/records/reviews and docs/records/research."
+        description=(
+            "Ledger of every numeric claim in docs/records/reviews and docs/records/research."
+        ),
     )
     ap.add_argument("--docs", default="docs", help="docs root (scans reviews/ and research/)")
     ap.add_argument("--repo", default=".", help="root the evidence paths resolve against")
