@@ -4,9 +4,16 @@
 
 # 🐹 dormouse
 
-**A byte-level language model that trains on one consumer GPU.**
-256 symbols, no tokenizer, and one rule for every mechanism we add:
-*it must beat its own removal on held-out bits per byte, at the same budget.*
+**Train a real model on your own computer.**
+
+The goal is a cheap but capable chatbot: a model you can download, run locally,
+and afford to train yourself in days instead of months. The project is the
+research that gets there — every technique that makes a model cheaper and
+smarter, measured on one consumer GPU, and thrown out when it does not pay.
+
+Byte-level input (256 symbols, no tokenizer), trained in the format it ships in,
+with one rule for every mechanism: *it must beat its own removal on held-out
+bits per byte, at the same budget.*
 
 [![CI](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
