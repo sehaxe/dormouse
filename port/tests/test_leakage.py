@@ -434,7 +434,8 @@ def test_padding_cannot_reach_a_real_position_or_the_loss(kind):
         # off by ~1e-2; an absolute 1e-7 bar is summation-order noise and flipped
         # on the runner.
         assert torch.allclose(loss, want, rtol=1e-6, atol=1e-9), (
-            f"the loss is not the mean over selected positions: {float(loss):.6f} vs {float(want):.6f}"
+            f"the loss is not the mean over selected positions: "
+            f"{float(loss):.6f} vs {float(want):.6f}"
         )
 
 
