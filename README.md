@@ -43,7 +43,7 @@ A number here is always three things: **a loss, a window, and a budget**.
 
 We report the **comparison**, not a trophy: `−0.0145 BPB at 0.00% extra
 parameters` is a result; "1.19 bits" is a snapshot that the next architecture
-will move. Where a raw figure appears in `docs/measurements`, it is dated and
+will move. Where a raw figure appears in `docs/measurements.md`, it is dated and
 labelled as the record for that date, not as the model's identity.
 
 ## The method, in one table

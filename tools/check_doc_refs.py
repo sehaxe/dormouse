@@ -64,7 +64,17 @@ EXTS = (".md", ".rs", ".toml", ".py", ".sh", ".tsv", ".yml")
 #
 # This is the pre-existing debt the consolidation inherited. It is bounded and
 # visible; it was unbounded and invisible before this file existed.
+#: Directories that left this branch wholesale. A prefix is enough: every file
+#: under them moved together, and the documents that cite them are records.
+KNOWN_DEAD_PREFIXES = {
+	"crates/": "the Rust tree moved to the rust-lane branch on 2026-11-13; audits that cite its files are records of what it contained.",
+	"vendor/": "the vendored fused-kernel library moved to the rust-lane branch on 2026-11-13.",
+}
+
 KNOWN_DEAD = {
+	"tools/polar_probe.rs": "moved to the rust-lane branch on 2026-11-13 (main is the Python lane); the three audits that cite it are records of what it printed.",
+	"vendor/dormouse-fused/Cargo.toml": "vendor/ moved to the rust-lane branch on 2026-11-13; the decision record that cites it stays on main as history.",
+
 	"crates/dormouse-core/src/fused": "the whole-loop fused module, DELETED (ADR-0009). The glossary names it on purpose: the term `fused` means two different things and this is the one that is gone.",
 	"docs/README-model.md": "an old README section turned into its own file by a plan that never ran; the content is docs/architecture/PLAN.md",
 	"docs/20260420-flashkda-v1-deep-dive.md": "a report written outside the tree; the transcription that replaced it is docs/papers/spec-flashkda.md",
@@ -216,12 +226,17 @@ def main() -> int:
 					checked += 1
 					continue
 				# A bare path may be relative to the citing file rather than to the
-				# repo root, so a second chance before it is called missing.
-				if (ROOT / Path(f).parent / path).exists():
+				# repo root, so a second chance before it is called missing. The third
+				# chance covers the Python lane: a file under `port/` names its own
+				# tree (`configs/x.toml`), which resolves as `port/configs/x.toml`.
+				if (ROOT / Path(f).parent / path).exists() or (ROOT / "port" / path).exists():
 					checked += 1
 					continue
-				if path in KNOWN_DEAD:
-					warned.append(f"{f}:{n} -> {path}  (KNOWN_DEAD: {KNOWN_DEAD[path][:60]}…)")
+				if path in KNOWN_DEAD or any(path == p or path.startswith(p) for p in KNOWN_DEAD_PREFIXES):
+					reason = KNOWN_DEAD.get(path) or next(
+						KNOWN_DEAD_PREFIXES[p] for p in KNOWN_DEAD_PREFIXES if path.startswith(p)
+					)
+					warned.append(f"{f}:{n} -> {path}  (KNOWN_DEAD: {reason[:60]}…)")
 					continue
 				bad.append(f"{f}:{n} -> {token}")
 	print(f"doc-refs: {len(files)} files scanned, {checked} path references resolved")
