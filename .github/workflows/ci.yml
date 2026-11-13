@@ -25,14 +25,10 @@ on:
 permissions:
   contents: read
 
-# The one split that both pytest jobs use, defined once so the two halves cannot
-# drift apart: `python-test` runs `not ($PIN_SELECTOR)`, `pins` runs it. Collected
-# 2026-11-13: 2381 tests outside it, 213 inside, 2594 total — a partition, no
-# test in neither job.
-env:
-  PIN_SELECTOR: >-
-    bit_identical or byte_identical or bit_for_bit or pre_change
-    or pin or hash or shipped_bits
+# The one split that both pytest jobs use: `python-test` runs `not pins`,
+# `pins` runs the marker. Collected 2026-11-13: 2500 outside, 82 inside, 2582
+# total — a partition by behaviour (a test that compares an exact sha256,
+# state_dict or launch-count fingerprint), not a name heuristic.
 
 jobs:
   # ── python lane ────────────────────────────────────────────────────────────
@@ -80,14 +76,14 @@ jobs:
       - name: scratch dir the tests hardcode
         run: mkdir -p /tmp/opencode
       - name: pytest (CPU)
-        run: cd port && PYTHONPATH=$PWD/src uv run python -m pytest -q -p no:logging -k "not ($PIN_SELECTOR)"
+        run: cd port && PYTHONPATH=$PWD/src uv run python -m pytest -q -p no:logging -m "not pins"
 
   # Report-only ON PURPOSE. The pins are the project's own contract that a
   # disabled arm changes nothing; they break on every legitimate change and
   # are the honest cost of that contract, not a defect. Never a gate until the
   # `pins` marker exists.
   pins:
-    name: "pins (informational) :: the sha256 logits/state_dict gates (see PIN_SELECTOR in python-test)"
+    name: "pins (informational) :: exact sha256/state_dict/launch fingerprints"
     runs-on: ubuntu-latest
     timeout-minutes: 90
     continue-on-error: true
@@ -97,13 +93,18 @@ jobs:
       - name: install (frozen)
         run: cd port && uv sync --frozen
       - name: pytest (the pins)
-        run: cd port && PYTHONPATH=$PWD/src uv run python -m pytest -q -p no:logging -k "$PIN_SELECTOR"
+        run: cd port && PYTHONPATH=$PWD/src uv run python -m pytest -q -p no:logging -m pins
 
   python-gates:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # The doc-refs gate proves provenance with `sha:path` references, so the
+      # job needs the history to resolve them: at depth 1 those blobs are absent
+      # and a real, verifiable reference reads as a missing file.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
       - name: install (frozen)
         run: cd port && uv sync --frozen

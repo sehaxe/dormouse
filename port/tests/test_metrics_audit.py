@@ -123,21 +123,26 @@ def test_bpb_fin_and_mean_are_sum_nats_over_ln2_bytes(tmp_path):
         model, stream, batches, masked=False, max_iter=3
     )
     assert scored == scored_indep == batches * BATCH * SEQ
-    assert ev == pytest.approx(mean_indep, abs=1e-6)
-    assert fin == pytest.approx(fin_indep, abs=1e-6)
+    assert ev == pytest.approx(mean_indep, rel=1e-6)
+    assert fin == pytest.approx(fin_indep, rel=1e-6)
 
     row = eval_row(step=1, ev=ev, fin=fin, scored=scored, cfg=run.train, offset=0)
-    assert row["bpb_fin"] == pytest.approx(fin_indep / LN2, abs=1e-6)
-    assert row["bpb_mean"] == pytest.approx(mean_indep / LN2, abs=1e-6)
+    assert row["bpb_fin"] == pytest.approx(fin_indep / LN2, rel=1e-6)
+    assert row["bpb_mean"] == pytest.approx(mean_indep / LN2, rel=1e-6)
     assert row["bpb"] == row["bpb_fin"]
     # The depth mean is the average of the T+1 readouts, not a second reading
     # of the final one.
     assert len(per) == 3
-    assert (sum(per) + fin) / 4.0 == pytest.approx(ev, abs=1e-6)
+    assert (sum(per) + fin) / 4.0 == pytest.approx(ev, rel=1e-6)
 
 
 def test_a_masked_eval_divides_by_the_positions_it_selected(tmp_path):
-    """Variable mask counts per batch are the case mean-of-means gets wrong."""
+    """Variable mask counts per batch are the case mean-of-means gets wrong.
+
+    The two paths (streaming vs recompute-from-logits) are the same mean summed
+    in a different order, so the bar is RELATIVE: an absolute 1e-6 on a ~9-nat
+    mean is a 1e-7 relative bar and flips with the thread count.
+    """
     run = tiny_run(tmp_path, eval=True, eval_batches=2, doc_masking=True)
     data = Path(run.train.data)
     n = 4096
@@ -157,12 +162,12 @@ def test_a_masked_eval_divides_by_the_positions_it_selected(tmp_path):
     )
     assert len(set(masks)) > 1, f"the fixture must vary the per-batch mask: {masks}"
     assert scored == scored_indep == sum(masks)
-    assert ev == pytest.approx(mean_indep, abs=1e-6)
-    assert fin == pytest.approx(fin_indep, abs=1e-6)
+    assert ev == pytest.approx(mean_indep, rel=1e-6)
+    assert fin == pytest.approx(fin_indep, rel=1e-6)
 
     row = eval_row(step=1, ev=ev, fin=fin, scored=scored, cfg=run.train, offset=0)
-    assert row["bpb_fin"] == pytest.approx(fin_indep / LN2, abs=1e-6)
-    assert row["bpb_mean"] == pytest.approx(mean_indep / LN2, abs=1e-6)
+    assert row["bpb_fin"] == pytest.approx(fin_indep / LN2, rel=1e-6)
+    assert row["bpb_mean"] == pytest.approx(mean_indep / LN2, rel=1e-6)
 
 
 # ---------------------------------------------------------------- (b) bytes
