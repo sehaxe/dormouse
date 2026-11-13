@@ -56,7 +56,7 @@ scale: **+2.94% BPB** for ~8× fewer bytes.
 | the gated-FFN A/B (three seeds, paired) | `docs/reviews/2026-11-10-gated-ffn-ab.md` |
 | every other review, by date | `docs/reviews/` — 145 files, one per lane |
 | the literature notes behind each choice | `docs/research/` |
-| the protocol a number must satisfy | `docs/protocols/ab-protocol.md` |
+| the protocol a number must satisfy | `docs/protocols/AB-PROTOCOL.md` |
 
 ---
 
