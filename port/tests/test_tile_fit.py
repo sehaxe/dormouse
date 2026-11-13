@@ -61,9 +61,23 @@ EXHAUST = dict(d_model=1024, d_ff=2730, rank=512)  # nothing fits
 #: edited. `moe_kernel="triton"` so the arm under test is the one asked for; on CPU
 #: its dispatch falls back COUNTED, which is the point — the fallback must be the
 #: CPU's, not a tile's.
+#:
+#: The width is part of the pin: bf16 CPU matmuls reorder with the thread count
+#: (measured on this box: 4 and 10 threads both give `3ce3b9e7…`, one thread
+#: `5fbda133…`, two `01c49e33…`). The pin above was captured at this box's
+#: DEFAULT width, which is why it went red on the CI runner with
+#: "the bf16 forward+backward is not the clean-main one" — a width difference,
+#: not the tile search (its integer asserts passed there). `_run_sha` now fixes
+#: one thread on both sides, so the sha is a function of the code again.
+#:
+#: Measured 2026-11-13, one thread, this box (x86-64, torch 2.13.0+cu129 CPU):
+#: fp32 `d48ec81a…`, bf16 `5fbda133…`. The tile selection at these shapes is the
+#: clean-main one (`test_the_fitting_shape…` asserts TILES / BLOCK_N=128 / 24576
+#: B before it reads the sha), so the re-measured numbers are the same run the
+#: clean-main pin measured, at a declared width.
 PIN = {
-    False: "73e85beabefb3dc1274c124bd76b3d99e8e01982bffd7b6bd072eafc67686bd7",
-    True: "3ce3b9e7fc11befa1deb60e0fa582189af847ebaaa925b01dc2bd440aa828dab",
+    False: "d48ec81a875acd480212090112c9476ed09c351a37d3a888e1c3e1f638d31b7b",
+    True: "5fbda1332a856d34050b58e45fea4654bb23ba1c689a2af0f3964cdaa187e8d2",
 }
 
 GLU_SIG = (
@@ -89,19 +103,28 @@ def _run_sha(**over) -> str:
     the arm evidence: a change that sends this config down a different route
     (a tile refusal where there was none) moves the pin even if the CPU fallback
     happens to compute the same numbers.
+
+    ONE thread on both sides: bf16 CPU reductions reorder with the width (see
+    `PIN`), and the restore is `try/finally` so this file cannot leak the width
+    into the hash pins of another module.
     """
-    torch.manual_seed(0)
-    model = DormouseModel(tiny_cfg(moe_kernel="triton", **over))
-    ids = torch.arange(2 * 16, dtype=torch.long).view(2, 16) % 251
-    logits, loss, counters = model(ids, (ids + 1) % 251)
-    loss.backward()
-    h = hashlib.sha256()
-    h.update(logits.detach().contiguous().numpy().tobytes())
-    h.update(counters.line().encode())
-    for name, p in sorted(model.named_parameters()):
-        h.update(name.encode())
-        h.update(b"-" if p.grad is None else p.grad.detach().contiguous().numpy().tobytes())
-    return h.hexdigest()
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        torch.manual_seed(0)
+        model = DormouseModel(tiny_cfg(moe_kernel="triton", **over))
+        ids = torch.arange(2 * 16, dtype=torch.long).view(2, 16) % 251
+        logits, loss, counters = model(ids, (ids + 1) % 251)
+        loss.backward()
+        h = hashlib.sha256()
+        h.update(logits.detach().contiguous().numpy().tobytes())
+        h.update(counters.line().encode())
+        for name, p in sorted(model.named_parameters()):
+            h.update(name.encode())
+            h.update(b"-" if p.grad is None else p.grad.detach().contiguous().numpy().tobytes())
+        return h.hexdigest()
+    finally:
+        torch.set_num_threads(threads)
 
 
 def _first_fitting(dtype: torch.dtype, shape: dict) -> tuple[dict, int, int]:
@@ -114,6 +137,7 @@ def _first_fitting(dtype: torch.dtype, shape: dict) -> tuple[dict, int, int]:
     raise AssertionError(f"no candidate fits {dtype} {shape}; the test's own premise is wrong")
 
 
+@pytest.mark.pins
 def test_the_fitting_shape_keeps_the_shipped_tile_and_its_numbers():
     """Gate (a): a shape that fitted before picks the SAME tile and runs the same.
 
@@ -201,6 +225,7 @@ def test_the_rank_192_shape_that_crashed_now_runs_at_the_widest_tile():
     assert graded, "the forward+backward produced no gradient at all"
 
 
+@pytest.mark.pins
 def test_fp32_still_selects_a_legal_tile_and_stays_bit_identical():
     """Gate (c): fp32 keeps the measured tile and the measured two-stage charge.
 
