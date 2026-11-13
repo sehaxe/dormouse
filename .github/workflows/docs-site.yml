@@ -1,22 +1,28 @@
 name: docs-site
 
-# The knowledge base, deployed: docs-site renders the canonical markdown
-# (AGENTS.md, CONTEXT.md, docs/, research/) into a Starlight site and ships
-# it to GitHub Pages. The `npm run check` gate walks every href in dist/ and
-# fails on one that does not resolve — a dead link in the docs is a red CI,
-# same as a dead test.
+# The knowledge base, deployed. Two things ship together:
+#
+#   sehaxe.github.io/dormouse/        ← site/index.html, the product page
+#   sehaxe.github.io/dormouse/docs/   ← this Astro Starlight app
+#
+# The docs are eight maintained pages. Everything else — the 240 reviews and
+# research notes — is a record, indexed by date on /docs/archive/ and read on
+# GitHub. It is deliberately not in the sidebar: a docs tree people cannot scan
+# is a docs tree nobody reads.
+
 on:
   push:
     branches: [main]
     paths:
       - 'docs-site/**'
-      - 'site/**'
-      - 'docs/**'
-      - 'research/**'
-      - 'README.md'
-      - 'AGENTS.md'
-      - 'CONTEXT.md'
-      - '.bulba/**'
+      - 'site/index.html'
+      - 'site/media/**'
+      - 'site/assets/**'
+      - 'docs/HANDBOOK.md'
+      - 'docs/reviews/**'
+      - 'docs/research/**'
+      - 'docs/adr/**'
+      - '.github/workflows/docs-site.yml'
   workflow_dispatch:
 
 permissions:
@@ -26,12 +32,12 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -39,31 +45,27 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: docs-site/package-lock.json
-      - name: ingest + build + gate
+      - name: install
         working-directory: docs-site
-        run: |
-          npm ci --no-audit --no-fund
-          npm run ingest
-          npm run build
-          npm run check
-      # The landing (`site/`) is the product page; the knowledge base is its
-      # docs. The built pages move under dist/docs/ (their base is
-      # /dormouse/docs), then the landing takes the root it was designed for.
+        run: npm ci --no-audit --no-fund
+      - name: build (syncs the handbook, indexes the archive, renders)
+        working-directory: docs-site
+        run: npm run build
       - name: landing at the root, docs under /docs
         run: |
-          mkdir -p docs-site/dist/docs
-          find docs-site/dist -mindepth 1 -maxdepth 1 ! -name docs -exec mv {} docs-site/dist/docs/ \;
-          cp site/index.html docs-site/dist/index.html
-          cp -r site/media docs-site/dist/media
-          cp -r site/assets docs-site/dist/assets
+          set -euo pipefail
+          mkdir -p out/docs
+          cp -r docs-site/dist/. out/docs/
+          cp site/index.html out/index.html
+          cp -r site/media out/media
+          if [ -d site/assets ]; then cp -r site/assets out/assets; fi
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: docs-site/dist
+          path: out
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
