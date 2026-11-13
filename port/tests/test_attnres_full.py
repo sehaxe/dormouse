@@ -91,9 +91,13 @@ def test_the_arm_is_the_plain_residual_at_init():
         logits_off, _, _ = off(ids)
     assert torch.isfinite(logits_on).all()
     diff = (logits_on - logits_off).abs().max().item()
-    # EXACTLY zero, not "small": the write is the plain residual, not a mixture
-    # near it (the zero source absorbs `log n`, `w_i = 1`).
-    assert diff == 0.0, f"AttnRes at init moved the logits by {diff:.3e}"
+    # 1e-6, not `== 0.0`: the two paths sum the same terms in a different ORDER
+    # (`S·softmax` writes the stream in one add per source, the plain residual in
+    # another), so a runner whose CPU kernel re-associates the reduction reports
+    # 1.19e-07 where this box reports 0.0. That is float noise. A real break — an
+    # `S`-fold, a `1/S`-fold, a mixture near the residual instead of it — is
+    # 1e-2 and up, four orders above this bar.
+    assert diff <= 1e-6, f"AttnRes at init moved the logits by {diff:.3e}"
     print(f"[attnres] identity at init: max|Δlogits| = {diff:.3e}")
 
 
