@@ -365,8 +365,12 @@ def test_norm_eps_is_live_on_the_dense_form_but_only_through_the_final_norm():
     norm only. Both halves are pinned here so the caveat cannot rot.
     """
     cfg = dict(
-        block_form="transformer", max_iter=1, n_layers=2, use_kda=False,
-        use_engram=False, engram_rows=0,
+        block_form="transformer",
+        max_iter=1,
+        n_layers=2,
+        use_kda=False,
+        use_engram=False,
+        engram_rows=0,
     )
     torch.manual_seed(0)
     low = DormouseModel(tiny_cfg(norm_eps=1e-3, **cfg))

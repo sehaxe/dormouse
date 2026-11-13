@@ -127,8 +127,7 @@ def main() -> int:
             continue
         out, off, n, digest, rule = carve(src, tail, a.search, sep)
         print(
-            f"| {name} | {src.stat().st_size:,} | {out} | {off:,} | {n:,} "
-            f"| `{digest}` | {rule} |"
+            f"| {name} | {src.stat().st_size:,} | {out} | {off:,} | {n:,} | `{digest}` | {rule} |"
         )
     return 0
 

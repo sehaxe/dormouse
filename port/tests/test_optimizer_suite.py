@@ -1086,9 +1086,7 @@ def test_the_torch_adamw_path_advances_the_bias_correction_counter(monkeypatch):
 
     assert slow_o._adamw_t == 2, slow_o._adamw_t
     assert fast_o._adamw_t == 2, fast_o._adamw_t
-    for (n, a), (_, b) in zip(
-        slow_m.named_parameters(), fast_m.named_parameters(), strict=True
-    ):
+    for (n, a), (_, b) in zip(slow_m.named_parameters(), fast_m.named_parameters(), strict=True):
         assert torch.allclose(a, b, rtol=0, atol=0), (
             f"{n}: the torch path and the fused path diverged — "
             f"max|d|={float((a - b).abs().max()):.3e}"

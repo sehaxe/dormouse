@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -181,9 +180,7 @@ def main() -> int:
             out["n_muon"] = opt.n_muon
             out["n_adamw"] = opt.n_adamw
         out["grad_bytes"] = sum(
-            p.grad.numel() * p.grad.element_size()
-            for p in model.parameters()
-            if p.grad is not None
+            p.grad.numel() * p.grad.element_size() for p in model.parameters() if p.grad is not None
         )
     else:
         opt = MixOptimizer(
@@ -223,9 +220,7 @@ def main() -> int:
         out["saved_tensors"] = census["tensors"]
         out["saved_bytes"] = census["bytes"]
         out["grad_bytes"] = sum(
-            p.grad.numel() * p.grad.element_size()
-            for p in model.parameters()
-            if p.grad is not None
+            p.grad.numel() * p.grad.element_size() for p in model.parameters() if p.grad is not None
         )
         opt.step()
         torch.cuda.synchronize()

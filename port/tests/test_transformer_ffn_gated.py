@@ -114,9 +114,7 @@ def test_both_gated_presets_load_and_differ_only_in_the_activation():
     silu, situ = load_preset("arch_gated_swiglu"), load_preset("arch_gated_situ")
     assert silu.expert_act == "silu" and situ.expert_act == "situ"
     diff = {
-        f.name
-        for f in dataclasses.fields(silu)
-        if getattr(silu, f.name) != getattr(situ, f.name)
+        f.name for f in dataclasses.fields(silu) if getattr(silu, f.name) != getattr(situ, f.name)
     }
     assert diff == {"expert_act"}, diff
     assert silu.ffn_gated and situ.ffn_gated

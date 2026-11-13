@@ -1,4 +1,5 @@
 """Corrected rowwise `_scaled_mm`: error vs the fp32 reference + timing, live shape."""
+
 import sys
 
 sys.path.insert(0, "scripts")
@@ -15,7 +16,6 @@ swT = sw.reshape(1, P.N).contiguous()
 y = torch._scaled_mm(qx, qw.t(), scale_a=sx, scale_b=swT, out_dtype=torch.bfloat16)
 torch.cuda.synchronize()
 print("rowwise error vs fp32 ref:", P.err_stats(y, ref, row=0))
-t = P.bench(lambda: torch._scaled_mm(qx, qw.t(), scale_a=sx, scale_b=swT,
-                                    out_dtype=torch.bfloat16))
+t = P.bench(lambda: torch._scaled_mm(qx, qw.t(), scale_a=sx, scale_b=swT, out_dtype=torch.bfloat16))
 print("rowwise ms:", t)
 print("bf16 ms:", P.bench(lambda: x @ w.t()))

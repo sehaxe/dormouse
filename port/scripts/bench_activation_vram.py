@@ -58,7 +58,6 @@ from __future__ import annotations
 
 import argparse
 import collections
-import dataclasses
 import gc
 import json
 import statistics
@@ -98,7 +97,6 @@ ARMS: dict[str, dict[str, object]] = {
 
 def build(preset: str, batch: int, seq: int, overrides: dict[str, object], device: str):
     """The trainer's own model + optimizer for one (shape, arm) cell."""
-    import torch
 
     train = {
         "batch": batch,
@@ -206,7 +204,10 @@ def measure(
         return {
             **row,
             "status": "ok",
-            "model": {"block_form": run.model.block_form, "params": sum(p.numel() for p in model.parameters())},
+            "model": {
+                "block_form": run.model.block_form,
+                "params": sum(p.numel() for p in model.parameters()),
+            },
             "peak_gib": round(peak, 3),
             "ms_step": round(med * 1e3, 2),
             "ms_min": round(min(times) * 1e3, 2),
@@ -215,7 +216,12 @@ def measure(
             "residual_gib": round(residual / GIB, 3),
             "counters": {
                 k: counters.get(k, 0)
-                for k in ("loop_segments", "iter_checkpoint_saved", "offload_tensors", "offload_gib_x100")
+                for k in (
+                    "loop_segments",
+                    "iter_checkpoint_saved",
+                    "offload_tensors",
+                    "offload_gib_x100",
+                )
             },
             "offload": (
                 dict(model._act_offload.stats())
@@ -274,7 +280,8 @@ class _Census:
             frames = [
                 f"{Path(fr.filename).name}:{fr.lineno} {fr.name}"
                 for fr in traceback.extract_stack(limit=14)
-                if "torch/autograd" not in fr.filename and Path(fr.filename).name != Path(__file__).name
+                if "torch/autograd" not in fr.filename
+                and Path(fr.filename).name != Path(__file__).name
             ]
             self.rows.append(
                 {
@@ -339,9 +346,7 @@ def _trace_peak(preset: str, batch: int, seq: int, device: str) -> dict:
             if blk.get("state") != "active_allocated":
                 continue
             frames = [
-                _frame(f)
-                for f in (blk.get("frames") or [])
-                if "torch/autograd" not in _frame(f)
+                _frame(f) for f in (blk.get("frames") or []) if "torch/autograd" not in _frame(f)
             ][:6]
             live.append((blk.get("requested_size") or blk.get("size"), frames))
     live_total = sum(size for size, _ in live)
@@ -402,8 +407,15 @@ def _trace_peak(preset: str, batch: int, seq: int, device: str) -> dict:
 
 
 def ladder(
-    preset: str, seq: int, arm: str, batches: list[int], *, warm: int, steps: int,
-    ceiling: float, device: str,
+    preset: str,
+    seq: int,
+    arm: str,
+    batches: list[int],
+    *,
+    warm: int,
+    steps: int,
+    ceiling: float,
+    device: str,
 ) -> list[dict]:
     out = []
     for batch in batches:
@@ -411,8 +423,12 @@ def ladder(
         out.append(row)
         print(
             f"  ladder {arm:20s} b{batch:<3d} {row['status']:8s} "
-            + (f"peak={row['peak_gib']:6.3f} GiB  {row['ms_step']:8.2f} ms  {row['kb_s']:7.1f} kB/s"
-               if row["status"] == "ok" else str(row.get("reason", ""))[:90]),
+            + (
+                f"peak={row['peak_gib']:6.3f} GiB  {row['ms_step']:8.2f} ms  "
+                f"{row['kb_s']:7.1f} kB/s"
+                if row["status"] == "ok"
+                else str(row.get("reason", ""))[:90]
+            ),
             flush=True,
         )
         if row["status"] in ("OOM", "REFUSED"):
@@ -459,15 +475,21 @@ def main() -> int:
         "map": None,
         "ladder": {},
     }
-    print(f"== {args.preset} · b{args.batch} x s{args.seq} · {torch.cuda.get_device_name()} ==", flush=True)
+    print(
+        f"== {args.preset} · b{args.batch} x s{args.seq} · {torch.cuda.get_device_name()} ==",
+        flush=True,
+    )
 
     if not args.skip_map:
         try:
             out["map"] = _trace_peak(args.preset, args.batch, args.seq, device)
             m = out["map"]
-            print(f"  map: saved {m['saved_gib']:.3f} GiB in {m['saved_tensors']} tensors; "
-                  f"forward-end live {m['forward_end_gib']:.3f} GiB in {m['live_blocks']} blocks "
-                  f"(allocator peak {m['allocator_peak_gib']:.3f})", flush=True)
+            print(
+                f"  map: saved {m['saved_gib']:.3f} GiB in {m['saved_tensors']} tensors; "
+                f"forward-end live {m['forward_end_gib']:.3f} GiB in {m['live_blocks']} blocks "
+                f"(allocator peak {m['allocator_peak_gib']:.3f})",
+                flush=True,
+            )
         except Exception as e:  # the map must not cost the ladder
             out["map"] = {"status": "ERROR", "reason": f"{type(e).__name__}: {e}"}
             print(f"  map FAILED: {type(e).__name__}: {e}", flush=True)
@@ -476,12 +498,18 @@ def main() -> int:
             torch.cuda.empty_cache()
 
     for arm in [a for a in args.arms.split(",") if a]:
-        row = measure(args.preset, args.batch, args.seq, arm, warm=args.warm, steps=args.steps, device=device)
+        row = measure(
+            args.preset, args.batch, args.seq, arm, warm=args.warm, steps=args.steps, device=device
+        )
         out["arms"].append(row)
         print(
             f"  arm {arm:20s} {row['status']:8s} "
-            + (f"peak={row['peak_gib']:6.3f} GiB  {row['ms_step']:8.2f} ms  {row['kb_s']:7.1f} kB/s"
-               if row["status"] == "ok" else str(row.get("reason", ""))[:100]),
+            + (
+                f"peak={row['peak_gib']:6.3f} GiB  {row['ms_step']:8.2f} ms  "
+                f"{row['kb_s']:7.1f} kB/s"
+                if row["status"] == "ok"
+                else str(row.get("reason", ""))[:100]
+            ),
             flush=True,
         )
 
@@ -493,10 +521,20 @@ def main() -> int:
             names = [a for a in args.ladder_arms.split(",") if a] or [best["arm"]]
             batches = sorted({int(b) for b in args.batches.split(",") if b})
             for arm in names:
-                print(f"== batch ladder: arm {arm!r} (lowest peak at b{args.batch}: {best['arm']!r}, {best['peak_gib']:.3f} GiB) ==", flush=True)
+                print(
+                    f"== batch ladder: arm {arm!r} (lowest peak at b{args.batch}: "
+                    f"{best['arm']!r}, {best['peak_gib']:.3f} GiB) ==",
+                    flush=True,
+                )
                 out["ladder"][arm] = ladder(
-                    args.preset, args.seq, arm, batches,
-                    warm=args.warm, steps=args.steps, ceiling=args.ceiling_gib, device=device,
+                    args.preset,
+                    args.seq,
+                    arm,
+                    batches,
+                    warm=args.warm,
+                    steps=args.steps,
+                    ceiling=args.ceiling_gib,
+                    device=device,
                 )
 
     text = json.dumps(out, indent=2, default=str)

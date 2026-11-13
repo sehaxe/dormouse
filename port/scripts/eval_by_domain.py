@@ -194,8 +194,7 @@ def render_table(rows: list[DomainScore]) -> str:
     for r in rows:
         trained = "n/a" if r.trained is None else f"{r.trained:,}"
         lines.append(
-            f"| {r.domain} | {r.scored:,} | {r.bpb_fin:.4f} | {r.bpb_mean:.4f} "
-            f"| {trained} |"
+            f"| {r.domain} | {r.scored:,} | {r.bpb_fin:.4f} | {r.bpb_mean:.4f} | {trained} |"
         )
     return "\n".join(lines)
 

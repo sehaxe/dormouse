@@ -137,9 +137,7 @@ def test_k_two_and_three_run_and_the_readout_is_the_loops():
         assert torch.isfinite(logits).all()
         assert counters["mhc"] == model.cfg.n_layers
         assert counters["transformer_block"] == model.cfg.n_layers
-        assert param_count(model) - param_count(_build(5)) == _mhc_delta(
-            model.cfg.d_model, streams
-        )
+        assert param_count(model) - param_count(_build(5)) == _mhc_delta(model.cfg.d_model, streams)
 
     lanes = torch.randn(2, 3, 3, 16)
     # The mHC-only readout is the UNNORMALISED sum; the composition is `/K`.

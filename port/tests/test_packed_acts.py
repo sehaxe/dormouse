@@ -466,8 +466,8 @@ def test_the_backward_does_not_depend_on_which_forward_lane_ran(monkeypatch):
     import dormouse.model.packed_acts as pa
 
     torch.manual_seed(0)
-    x = (torch.randn(8, 32) * 2.0)
-    w = (torch.randn(16, 32) * 0.1)
+    x = torch.randn(8, 32) * 2.0
+    w = torch.randn(16, 32) * 0.1
     gp = torch.randn(8, 16)
 
     def run(bf16_lane: bool, device: str):

@@ -163,7 +163,7 @@ def test_b1_arithmetic_matches_the_model_and_the_preset():
     model = DormouseModel(cfg, device="meta")
     assert built(model) == want, {k: (want.get(k), built(model).get(k)) for k in want}
     assert sum(want.values()) == B1_PORT_TOTAL == param_count(model)
-    assert preset_total('b1.toml') == B1_PORT_TOTAL, 'configs/b1.toml total rotted'
+    assert preset_total("b1.toml") == B1_PORT_TOTAL, "configs/b1.toml total rotted"
 
     # The delta against plan §2.2's table, computed from the table's OWN terms:
     #   1024*(2048*64 + 64*5461 + 64) = 492 175 360  (one latent, no down-proj)
@@ -181,7 +181,7 @@ def test_small_arithmetic_matches_the_model_and_the_preset():
     want = arithmetic(cfg)
     assert built(model) == want
     assert sum(want.values()) == SMALL_PORT_TOTAL == param_count(model)
-    assert preset_total('small.toml') == SMALL_PORT_TOTAL, 'configs/small.toml total rotted'
+    assert preset_total("small.toml") == SMALL_PORT_TOTAL, "configs/small.toml total rotted"
     # The burn side's `small`, measured on ITS instantiated model (2026-10-01):
     BURN_SMALL_TOTAL = 9_197_390
     assert SMALL_PORT_TOTAL - BURN_SMALL_TOTAL == 279_603, (

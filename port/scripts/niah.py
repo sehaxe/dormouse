@@ -362,9 +362,7 @@ def carry_gate(model: torch.nn.Module, item: Item, segment: int) -> dict:
         "dloss": float(abs(lref - lgot)),
         "bytes": float(len(probe)),
         "agree": float((ref.argmax(-1) == got.argmax(-1)).float().mean()),
-        "answer_agree": bool(
-            torch.equal(ref[key_rows].argmax(-1), got[key_rows].argmax(-1))
-        ),
+        "answer_agree": bool(torch.equal(ref[key_rows].argmax(-1), got[key_rows].argmax(-1))),
         "segments": segments,
     }
 
@@ -708,7 +706,10 @@ def _control_on(a: argparse.Namespace, name: str) -> bool:
 def _items_for(a: argparse.Namespace, context: int, align: int) -> list[Item]:
     return [
         build_item(
-            a.seed + i, context, distance=a.distance, align=align,
+            a.seed + i,
+            context,
+            distance=a.distance,
+            align=align,
             distance_frac=getattr(a, "distance_frac", 0.5),
         )
         for i in range(a.items)
@@ -818,18 +819,18 @@ def main(argv: list[str] | None = None) -> int:
     gb = carry_gate(model, items[0], segment)
     rel = gb["dlogits"] / max(gb["scale"], 1e-30)
     print(
-        f"gate B: 1 pass vs 2×{segment} B segments · max|dlogits|={gb["dlogits"]:.3e} "
-        f"of scale {gb["scale"]:.3e} (rel {rel:.2e}) · dloss={gb["dloss"]:.2e} nats "
-        f"({gb["dloss"]/gb["bytes"]:.1e}/B) · "
-        f"answer bytes agree {gb["answer_agree"]} · global argmax {gb["agree"]:.1%} · "
-        f"segments={gb["segments"]}",
+        f"gate B: 1 pass vs 2×{segment} B segments · max|dlogits|={gb['dlogits']:.3e} "
+        f"of scale {gb['scale']:.3e} (rel {rel:.2e}) · dloss={gb['dloss']:.2e} nats "
+        f"({gb['dloss'] / gb['bytes']:.1e}/B) · "
+        f"answer bytes agree {gb['answer_agree']} · global argmax {gb['agree']:.1%} · "
+        f"segments={gb['segments']}",
         flush=True,
     )
     if gb["dloss"] / gb["bytes"] > 1e-6 or not gb["answer_agree"]:
         loud(
             f"gate B: the 2-segment pass is not the 1-pass forward (dloss="
             f"{gb['dloss']:.2e} nats over {gb['bytes']:.0f} B = "
-            f"{gb['dloss']/gb['bytes']:.2e} nats/byte, answer bytes agree "
+            f"{gb['dloss'] / gb['bytes']:.2e} nats/byte, answer bytes agree "
             f"{gb['answer_agree']}; the claim "
             f"reads both). The 1M number would be a different function, so the protocol "
             f"stops here. Escape: fix the carry, or do not claim 1M retrieval."

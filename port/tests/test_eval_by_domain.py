@@ -107,9 +107,7 @@ def test_trained_bytes_replays_optimizer_steps(tmp_path: Path) -> None:
     src.write_bytes(b"\x00" * 4096)
     plan = load_mix_plan(_plan(tmp_path, {"code": src}))
     cfg = replace(tiny_run(tmp_path).train, steps=10, grad_accum=2, seed=7)
-    assert trained_bytes(plan, cfg, done_steps=3) == {
-        "code": 3 * 2 * cfg.batch * (cfg.seq_len + 1)
-    }
+    assert trained_bytes(plan, cfg, done_steps=3) == {"code": 3 * 2 * cfg.batch * (cfg.seq_len + 1)}
 
 
 def test_checkpoint_step_is_the_saved_record(tmp_path: Path) -> None:

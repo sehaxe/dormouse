@@ -448,8 +448,9 @@ def main() -> None:
         swr = swr.reshape(1, N).contiguous()
 
         def mm_row(qxr=qxr, qwr=qwr, sxr=sxr, swr=swr):
-            return torch._scaled_mm(qxr, qwr.t(), scale_a=sxr, scale_b=swr,
-                                    out_dtype=torch.bfloat16)
+            return torch._scaled_mm(
+                qxr, qwr.t(), scale_a=sxr, scale_b=swr, out_dtype=torch.bfloat16
+            )
 
         try:
             yr = mm_row()

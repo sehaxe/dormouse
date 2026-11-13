@@ -141,8 +141,8 @@ def test_the_corpus_manifest_hashes_the_plan_and_source_sizes(tmp_path):
         (tmp_path / name).write_bytes(b"x" * 64)
     plan = tmp_path / "mix.toml"
     plan.write_text(
-        'max_epochs = 4.0\nseed = 1\n\n[[stage]]\nuntil_frac = 1.0\n'
-        '[stage.weights]\na = 0.5\nb = 0.5\n\n[sources]\n'
+        "max_epochs = 4.0\nseed = 1\n\n[[stage]]\nuntil_frac = 1.0\n"
+        "[stage.weights]\na = 0.5\nb = 0.5\n\n[sources]\n"
         f'a = "{tmp_path / "a.bin"}"\nb = "{tmp_path / "b.bin"}"\n'
     )
     run = tiny_run(tmp_path)
