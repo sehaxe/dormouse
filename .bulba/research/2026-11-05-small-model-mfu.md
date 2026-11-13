@@ -1,1 +1,0 @@
-../../docs/research/2026-11-05-small-model-mfu.md
