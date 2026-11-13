@@ -9,6 +9,10 @@
 #   dense   configs/flagship3_dense.toml   95,035,200 params, 127 MFLOP/byte
 #   kda     configs/arch_hybrid_kda.toml   95,875,404 params, linear attention, dense FFN
 #   moe8    configs/arch_moe8.toml         94,072,908 params, 8 experts top-2
+#   hybrid31 configs/arch_hybrid31.toml   109,892,835 params, 9 KDA + 3 attention, iso-FLOPs with dense
+#   loop2   configs/arch_loop_cycle2.toml   51,926,598 params, 6 bodies x2 passes, iso-FLOPs with dense
+#           (hybrid31 and loop2 are NOT matched-params: hybrid31 is +15.7% params
+#            at equal FLOPs; loop2 keeps ~55% of the unique params at equal FLOPs)
 #
 # Pre-registered decision rule (written before the runs):
 #   * a form wins only if its mean is below the dense control's mean by more
@@ -18,8 +22,11 @@
 #   * a form that wins on BPB but costs >1.3x wall-clock per byte is flagged,
 #     not adopted — the owner's criterion is quality per unit time, not BPB alone.
 #
-# 2 seeds x 3000 steps (73.7 MB) per arm, doc_masking on, honest metric
-# (bpb_fin, 196 608 B window at offset 0).
+# 2 seeds x 3000 steps (73.7 MB) per arm, honest metric (bpb_fin, 196 608 B
+# window at offset 0). Data paths are the 2026-11-08 refetch (`mix_refetch.toml`,
+# 6 sources, doc_masking=false): the pre-incident `fwedu.bin` / `mix4/` paths are
+# gone. The `hybrid31` arm is a separate hypothesis: iso-FLOPs with dense C0 at
+# +15.7% params, so the matched-params rule below applies to dense/kda/moe8 only.
 set -u
 cd /home/sehaxe/dormouse/port
 export PYTHONPATH=$PWD/src
@@ -27,19 +34,21 @@ export CUDA_VISIBLE_DEVICES=0
 PY=.venv/bin/python
 OUT=/home/sehaxe/logs/arch_queue
 MULT=${MULT:-12}
+ONLY=${ONLY:-dense kda moe8 hybrid31 loop2}
 mkdir -p "$OUT"
 
 run() { # tag config seed
   local tag=$1 cfg=$2 seed=$3
+  case " $ONLY " in *" $tag "*) ;; *) return 0 ;; esac
   local t0 t1
   echo "=== $tag seed=$seed $(date +%H:%M:%S)"
   t0=$(date +%s)
   $PY -u -m dormouse.cli train "$cfg" \
-    --data ../data_local/best/fwedu.bin --eval ../data_local/mix4/web_eval.bin \
+    --data ../data_local/best/fwedu_train.bin --eval ../data_local/best/fwedu_eval.bin \
     --set steps=3000 --set batch=8 --set seq_len=1024 --set grad_accum=3 \
     --set opt=mix --set lr=3e-4 --set muon_lr_mult=$MULT --set seed=$seed \
     --set eval=true --set eval_every=1500 \
-    --set mix_plan=configs/mix_v7_docmask.toml --set doc_masking=true --set log_every=1500 \
+    --set mix_plan=configs/mix_refetch.toml --set doc_masking=false --set log_every=1500 \
     --set ckpt_every=9000 --set ckpt_name="aq_${tag}_s${seed}" \
     --set out_dir=/tmp/opencode/aq_${tag}_s${seed} \
     --json-log "$OUT/${tag}_s${seed}.jsonl" > "$OUT/${tag}_s${seed}.log" 2>&1
@@ -56,6 +65,8 @@ for seed in 1 2; do
   run dense  configs/flagship3_dense.toml $seed
   run kda    configs/arch_hybrid_kda.toml $seed
   run moe8   configs/arch_moe8.toml $seed
+  run hybrid31 configs/arch_hybrid31.toml $seed
+  run loop2  configs/arch_loop_cycle2.toml $seed
 done
 
 echo "=== summary $(date +%H:%M:%S)"
@@ -80,4 +91,5 @@ if "dense" in by:
         m = statistics.mean(v)
         win = (ref - m) > max(2 * (max(v) - min(v)), 0.02)
         print(f"vs dense: {k} {m-ref:+.4f} -> {'WINS' if win else 'no win'}")
+print("note: hybrid31/loop2 are iso-FLOPs arms, not matched-params; ties go to dense")
 PY

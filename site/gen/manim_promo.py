@@ -170,9 +170,9 @@ class Promo(Scene):
         self.play(W.animate.set_fill(INK, opacity=0.72).set_stroke(INK, 0), run_time=0.5)
 
         loss = mono("loss 2.61", size=30, color=INK).move_to(RIGHT * 3.2 + UP * 1.5)
-        bpb = mono("1.19 bits / byte", size=34, color=ACCENT).move_to(RIGHT * 3.2 + UP * 0.7)
+        bpb = mono("held out, never trained on", size=30, color=ACCENT).move_to(RIGHT * 3.2 + UP * 0.7)
         self.play(FadeIn(loss), run_time=0.3)
-        self.play(Transform(loss, mono("loss 1.19 · held out", size=30, color=INK).move_to(RIGHT * 3.2 + UP * 1.5)), run_time=1.0)
+        self.play(Transform(loss, mono("loss falls", size=30, color=INK).move_to(RIGHT * 3.2 + UP * 1.5)), run_time=1.0)
         self.play(FadeIn(bpb, shift=UP * 0.1), run_time=0.5)
 
         # Muon: the spectrum flattens
@@ -216,7 +216,7 @@ class Promo(Scene):
         self.play(Create(axes), FadeIn(xz), FadeIn(mono("xz 2.31", size=18, color=DIM).next_to(xz, RIGHT, buff=0.12)), run_time=0.7)
         self.play(Create(curve), run_time=2.0)
         dot = Dot(axes.c2p(2.64, 1.19), radius=0.075, color=ACCENT)
-        lab = mono("1.19", size=38, color=ACCENT).next_to(dot, RIGHT, buff=0.2).align_to(dot, UP)
+        lab = mono("this run", size=28, color=ACCENT).next_to(dot, RIGHT, buff=0.2).align_to(dot, UP)
         self.play(FadeIn(dot, scale=1.7), FadeIn(lab, shift=RIGHT * 0.1), run_time=0.6)
         self.play(Indicate(lab, scale_factor=1.08), run_time=0.9)
         self.wait(0.5)
@@ -250,14 +250,14 @@ class Promo(Scene):
 
     # --------------------------------------------------------------- 7. close
     def part_close(self):
-        big = mono("1.19", size=170, color=INK, weight=BOLD).move_to(UP * 0.75)
-        unit = mono("bits per byte", size=34, color=DIM).next_to(big, DOWN, buff=0.2)
+        big = mono("measured", size=140, color=INK, weight=BOLD).move_to(UP * 0.75)
+        unit = mono("not guessed · every mechanism against its own removal", size=30, color=DIM).next_to(big, DOWN, buff=0.25)
         strip = VGroup(
-            mono("255 MB", size=30, color=ACCENT),
+            mono("one GPU-day", size=30, color=ACCENT),
             mono("·", size=30, color=DIMMER),
-            mono("12 000 tok/s", size=30, color=ACCENT),
+            mono("196 KB window", size=30, color=ACCENT),
             mono("·", size=30, color=DIMMER),
-            mono("one GPU", size=30, color=ACCENT),
+            mono("bits per byte", size=30, color=ACCENT),
         ).arrange(RIGHT, buff=0.45).next_to(unit, DOWN, buff=0.75)
 
         self.play(FadeIn(big, scale=0.94), run_time=0.9)

@@ -288,8 +288,8 @@
       <div class="kicker">one consumer GPU · no tokenizer</div>
       <h1>A language model small enough to <em>understand.</em></h1>
       <p class="sub">dormouse learns to read and write text one byte at a time, on a single 16 GB
-        graphics card: <b>1.19 bits per byte</b>, 8 hours of training. This page walks through what it is,
-        the ideas inside it, and what it can do.</p>
+        graphics card. Every mechanism it ships beat its own removal on held-out bits per byte —
+        this page walks through what it is, the ideas inside it, and how each one was measured.</p>
       <div class="cta">
         <a class="btn p" href="#bytes">Start reading</a>
         <a class="btn" href="https://github.com/sehaxe/dormouse">Source ↗</a>
@@ -303,7 +303,7 @@
   <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;text-transform:none;margin:14px 0 10px">The whole pipeline, in fifty seconds</h2>
   <div class="stage" style="margin-top:26px">
     <video src="media/Promo.webm" data-light="media/Promo.webm" data-dark="media/Promo_dark.webm" poster="media/Promo.jpg" preload="none" muted loop playsinline controls aria-label="the model's pipeline drawn in matrices"></video>
-    <div class="cap"><b>bytes → blocks → attention → one step → 1.19 bits per byte</b><span class="sp">no narration</span></div>
+    <div class="cap"><b>bytes → blocks → attention → one step → the loss</b><span class="sp">no narration</span></div>
   </div>
 </div></section>
 
@@ -335,7 +335,7 @@
       experiment changes exactly one thing and the result means something.</p>
     <div class="band">
       <div class="cell"><div class="v">95M</div><div class="k">parameters</div>
-        <div class="d">190 MB in bf16, 82 MB as ternary.</div></div>
+        <div class="d">bf16 masters, ternary for what ships.</div></div>
       <div class="cell"><div class="v">12</div><div class="k">layers</div>
         <div class="d">One pass, no loops.</div></div>
       <div class="cell"><div class="v">256</div><div class="k">symbols</div>
@@ -352,23 +352,25 @@
   <div class="txt">
     <div class="num">03 · the format</div>
     <h2>Three levels per weight</h2>
-    <p>After training, every weight is pushed onto three values: <span class="mono">−α</span>,
-      <span class="mono">0</span>, <span class="mono">+α</span>. One scale per tensor keeps the magnitude, and
-      the weights themselves need two bits.</p>
-    <p>That is what turns a 190 MB model into an <b>82 MB file</b> with the same behaviour, and it is the format
-      the inference path reads: no unpacking into floats, the weight is decoded inside the kernel.</p>
+    <p>The model trains <b>into</b> the format from the first step: every forward pass sees only
+      <span class="mono">−α</span>, <span class="mono">0</span>, <span class="mono">+α</span>, and a schedule anneals
+      the projection from full precision to hard ternary over the first two thousand steps. Nothing is
+      quantized after the fact — the network is never a float model wearing a smaller coat.</p>
+    <p>The optimizer still keeps one full-precision master per weight, because that is where the gradient
+      accumulates: a three-valued number is not something you can nudge. What ships is the quantized view,
+      decoded inside the kernel instead of unpacked into floats.</p>
     <div class="band">
       <div class="cell"><div class="v">2</div><div class="k">bits per weight</div>
         <div class="d">Three levels, one scale per tensor.</div></div>
-      <div class="cell"><div class="v">82 MB</div><div class="k">the shipped file</div>
-        <div class="d">Against 190 MB in bf16.</div></div>
-      <div class="cell"><div class="v">+2.9%</div><div class="k">bits per byte</div>
-        <div class="d">The measured cost of the format.</div></div>
+      <div class="cell"><div class="v">8×</div><div class="k">fewer bytes</div>
+        <div class="d">Against the same weights in bf16.</div></div>
+      <div class="cell"><div class="v">step 0</div><div class="k">trained in format</div>
+        <div class="d">QAT, not post-hoc quantization.</div></div>
     </div>
   </div>
   <div class="visual">
     <video src="media/Ternary.webm" data-light="media/Ternary.webm" data-dark="media/Ternary_dark.webm" poster="media/Ternary.jpg" preload="none" autoplay muted loop playsinline aria-label="weights snapping to three levels while the file bar shrinks"></video>
-    <div class="cap">continuous weights → three levels → 82 MB</div>
+    <div class="cap">the anneal: continuous weights → three levels, during training</div>
   </div>
 </div></div></section>
 
@@ -473,21 +475,20 @@
 <section id="curve"><div class="wrap">
   <div class="num" style="font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)">08 · the result</div>
   <h2 style="font-family:var(--sans);font-weight:600;font-size:clamp(26px,3.2vw,38px);letter-spacing:-.02em;margin:14px 0 10px">What learning looks like</h2>
-  <p class="lead" style="max-width:62ch">Bits per byte, measured on text the model never trained on. Lower is
-    better: 1.56 after the first 30 MB, <b>1.19 after 2.64 GB</b> — 6.7× compression. The strongest general
-    compressor needs 2.31 bits for the same bytes.</p>
+  <p class="lead" style="max-width:62ch">Bits per byte on text the model never trained on. The absolute height
+    moves every time the architecture changes — and it will keep moving. What is stable is the gap: the same
+    model with a mechanism removed sits visibly higher, and a classic compressor sits far above both.</p>
   <div class="visual" style="max-width:820px">
-    <video src="media/Curve.webm" data-light="media/Curve.webm" data-dark="media/Curve_dark.webm" poster="media/Curve.jpg" preload="auto" autoplay muted loop playsinline aria-label="held-out bits per byte falling to 1.19, above the xz line at 2.31"></video>
+    <video src="media/Curve.webm" data-light="media/Curve.webm" data-dark="media/Curve_dark.webm" poster="media/Curve.jpg" preload="auto" autoplay muted loop playsinline aria-label="held-out bits per byte falling over training, with a classic compressor above"></video>
     <div class="cap">held-out bits per byte against the bytes the model has read</div>
-    <div class="cap">one held-out window, one forward pass: height is the model's surprise at that byte</div>
   </div>
   <div class="band" style="max-width:820px">
-    <div class="cell"><div class="v" id="sBpb">—</div><div class="k">bits per byte</div>
-      <div class="d">Held-out English text; lower is better.</div></div>
-    <div class="cell"><div class="v" id="curveFinal">—</div><div class="k">the last point</div>
-      <div class="d">A real run, not an extrapolation.</div></div>
-    <div class="cell"><div class="v">2.31</div><div class="k">xz, for scale</div>
-      <div class="d">A general compressor on the same 196 KB.</div></div>
+    <div class="cell"><div class="v">on / off</div><div class="k">the comparison</div>
+      <div class="d">The same model, one mechanism removed.</div></div>
+    <div class="cell"><div class="v">196 KB</div><div class="k">the window</div>
+      <div class="d">Fixed, held out, and named in every table.</div></div>
+    <div class="cell"><div class="v">1 GPU-day</div><div class="k">the budget</div>
+      <div class="d">What a result is allowed to cost.</div></div>
   </div>
 </div></section>
 

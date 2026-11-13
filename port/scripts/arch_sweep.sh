@@ -33,6 +33,10 @@ SEED=${SEED:-1}
 TAG=${RUN_TAG:-}
 MIX=${MIX:-configs/mix_refetch.toml}
 DATA=${DATA:-../data_local/best/fwedu_train.bin}
+# The DENOMINATOR of the sweep. Default is the historical control; a later arm
+# that won its A/B (e.g. `arch_gated_swiglu.toml`) becomes the base for the next
+# question, so the comparison is always against the current best on record.
+BASE=${BASE:-configs/flagship3_dense.toml}
 ARMS=${ARMS:-loop4x4 loop4x4_mhc loop8x8 tsct moe32}
 STEPS=$(( BYTES / (BATCH * 1024) ))
 EVAL_EVERY=$(( STEPS / 4 ))
@@ -44,7 +48,7 @@ arm() { # tag extra-set-args...
     case " $ARMS " in *" $tag "*) ;; *) return 0 ;; esac
   fi
   echo "=== $tag steps=$STEPS batch=$BATCH bytes=$BYTES seed=$SEED $* $(date +%H:%M:%S)"
-  $PY -u -m dormouse.cli train configs/flagship3_dense.toml \
+  $PY -u -m dormouse.cli train "$BASE" \
     --data "$DATA" --eval ../data_local/best/fwedu_eval.bin \
     --set steps=$STEPS --set batch=$BATCH --set seq_len=1024 --set seed=$SEED \
     --set lr=$LR --set opt=mix --set muon_lr_mult=$MUON \
@@ -84,6 +88,10 @@ arm moe32        --set n_experts=32 --set moe_topk=2 --set moe_capacity=2.0 --se
 # model, not a different FFN).
 arm gated_silu   --set ffn_gated=true --set expert_act=silu --set d_ffn=2048 --set d_ffn_gelu=3072
 arm gated_situ   --set ffn_gated=true --set expert_act=situ --set d_ffn=2048 --set d_ffn_gelu=3072
+# Full AttnRes (N=L) on the gated base: `BASE=configs/arch_gated_swiglu.toml
+# ARMS="attnres"`. At L=12 the paper's block ablation says N=L is full and N=8
+# already saturates; we run the full variant because it costs 0.02% of the step.
+arm attnres      --set use_attnres=true
 
 $PY - "$OUT" "$TAG" <<'PY'
 import json, sys

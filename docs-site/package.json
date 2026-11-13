@@ -1,25 +1,16 @@
 {
-  "name": "dormouse-docs-site",
-  "version": "0.1.0",
+  "name": "dormouse-docs",
   "private": true,
   "type": "module",
-  "description": "The dormouse knowledge base: a Starlight view over the canonical docs, research, reviews and ADRs. Generated, never hand-edited.",
   "scripts": {
-    "ingest": "node tools/ingest.mjs",
-    "dev": "npm run ingest && astro dev",
-    "start": "npm run dev",
-    "build": "npm run ingest && astro build",
-    "preview": "astro preview",
-    "check": "node tools/check.mjs && node tools/check-mermaid.mjs",
-    "astro": "astro"
+    "dev": "astro dev",
+    "sync": "node scripts/sync-content.mjs",
+    "build": "node scripts/sync-content.mjs && astro build",
+    "preview": "astro preview"
   },
   "dependencies": {
-    "@astrojs/starlight": "0.42.5",
-    "astro": "7.3.5",
-    "astro-mermaid": "2.1.0",
-    "mermaid": "^11.12.0"
-  },
-  "allowScripts": {
-    "esbuild@0.28.2": true
+    "@astrojs/starlight": "^0.42.11",
+    "astro": "^7.4.11",
+    "sharp": "^0.34.0"
   }
 }

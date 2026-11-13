@@ -1,0 +1,95 @@
+/* The landing page's palette, carried into the docs. Warm paper, ink, one blue
+   accent — the same tokens as site/index.html so the two read as one product. */
+
+:root {
+  --sl-color-accent-low: #dbe6f8;
+  --sl-color-accent: #2a66c2;
+  --sl-color-accent-high: #1d4c93;
+
+  --sl-color-white: #1b1a17;
+  --sl-color-gray-1: #2b2a26;
+  --sl-color-gray-2: #4a4741;
+  --sl-color-gray-3: #6d675d;
+  --sl-color-gray-4: #9a9386;
+  --sl-color-gray-5: #d3ccbc;
+  --sl-color-gray-6: #e9e4d9;
+  --sl-color-black: #f6f3ec;
+
+  --sl-font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --sl-font-mono: 'DejaVu Sans Mono', ui-monospace, monospace;
+}
+
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #14243d;
+  --sl-color-accent: #7aa2e8;
+  --sl-color-accent-high: #b9cdf2;
+
+  --sl-color-white: #e8e6e1;
+  --sl-color-gray-1: #d5d3cd;
+  --sl-color-gray-2: #b6b4ae;
+  --sl-color-gray-3: #9aa0a9;
+  --sl-color-gray-4: #6c727b;
+  --sl-color-gray-5: #2a2e37;
+  --sl-color-gray-6: #1a1d23;
+  --sl-color-black: #0a0b0d;
+}
+
+/* tables are the main content here; keep them readable and quiet */
+.sl-markdown-content table {
+  font-variant-numeric: tabular-nums;
+}
+.sl-markdown-content th {
+  font-weight: 600;
+  font-size: 0.86em;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
+}
+
+/* the numbers strip on the front page */
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1px;
+  margin: 2rem 0;
+  background: var(--sl-color-gray-5);
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.stat {
+  background: var(--sl-color-black);
+  padding: 1rem 1.15rem;
+}
+.stat b {
+  display: block;
+  font-size: 1.9rem;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.stat span {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--sl-color-gray-3);
+}
+
+/* a clip with its caption, in the docs */
+.clip {
+  margin: 1.6rem 0;
+}
+.clip video {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--sl-color-gray-5);
+  background: var(--sl-color-black);
+  display: block;
+}
+.clip figcaption {
+  margin-top: 0.5rem;
+  font-size: 0.82rem;
+  color: var(--sl-color-gray-3);
+}

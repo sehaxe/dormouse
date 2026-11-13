@@ -4,8 +4,9 @@
 
 # 🐹 dormouse
 
-**A byte-level language model trained from scratch on one consumer GPU.**
-95M parameters · no tokenizer · **1.19 bits per byte** · 8.4 hours on one 16 GB card.
+**A byte-level language model that trains on one consumer GPU.**
+256 symbols, no tokenizer, and one rule for every mechanism we add:
+*it must beat its own removal on held-out bits per byte, at the same budget.*
 
 [![CI](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -23,34 +24,41 @@
 A byte-level model reads raw bytes — no tokenizer, no vocabulary, no language
 assumption. The same weights handle English, Russian, Python and binary.
 
-dormouse takes that idea and pushes on one axis: **how much model fits in one
-GPU-hour and one file**. The recipe is a dense pre-LN transformer with a gated
-FFN, trained with Muon on a single RTX 5070 Ti, and shipped in a ladder of
-formats — bf16, 4-bit activations, ternary weights.
+The project fixes the budget first and then asks what fits inside it: **one
+GPU-day for training, one file size for shipping**. Every architectural change
+is measured the same way — held-out bits per byte, against the same model with
+that change removed. If it does not move the loss, it does not ship, however
+elegant it looks.
 
-## Results
+That is why the recipe is small: eleven mechanisms were measured and dropped,
+and the numbers that decided it are in the repository, not in a blog post.
 
-Held-out bits-per-byte on a fixed English window (`best/fwedu_eval.bin`,
-196 608 bytes). A BPB is only comparable within its own window.
+## How a result is stated
 
-| run | BPB | corpus | time | note |
-|---|---:|---:|---:|---|
-| **95M gated FFN, bf16** | **1.1871** | 2.64 GB | 8.4 h | current best |
-| 95M gated FFN, ternary weights | 1.2220 | 2.64 GB | 9.5 h | **82.4 MB file**, +2.9% |
-| 95M dense GELU, bf16 | 1.1940 | 2.00 GB | 6.6 h | previous best |
-| xz (same window) | 2.31 | — | — | classic compressor |
-| uniform bytes | 8.00 | — | — | by definition |
+A number here is always three things: **a loss, a window, and a budget**.
 
-1.19 bits per byte is **6.7× compression**, and 1.1 bits/byte better than xz on
-the same text. Seed noise is ±0.011 BPB, so anything smaller is not a result.
+> *Held-out bits per byte on a fixed English window, after one pass over 2.6 GB
+> on a single RTX 5070 Ti, compared against the same model with the mechanism
+> removed.*
 
-## Speed
+We report the **comparison**, not a trophy: `−0.0145 BPB at 0.00% extra
+parameters` is a result; "1.19 bits" is a snapshot that the next architecture
+will move. Where a raw figure appears in `docs/measurements`, it is dated and
+labelled as the record for that date, not as the model's identity.
 
-- **85 kB/s** training throughput at batch 24 on one 5070 Ti — 49.7 TFLOP/s,
-  within 1% of the card's practical ceiling.
-- The full recipe (batch 24 + `torch.compile`) is **1.43×** the naive one.
-- Ternary weights export to **82.4 MB** (2.31× smaller than bf16), and the
-  packed format is what the inference path will consume.
+## The method, in one table
+
+| lever | measured against | verdict |
+|---|---|---|
+| gated FFN (SwiGLU, `d_ffn = 2/3` of the GELU width) | the GELU block at equal parameters | **−0.0145 BPB, 0.00% params** → shipped |
+| batch 24 + static `torch.compile` | the naive loop | **1.43× the step**, loss unchanged |
+| Muon (5-step Newton–Schulz, bf16) | AdamW on the same shapes | **1.92×** the step at equal quality |
+| MoE, 32 experts | dense at the same active FLOPs | +0.004 BPB → deferred until the corpus is bigger |
+| low-rank at r=64 | the dense layer at the same budget | 1.95× faster, **+28% loss** → refused |
+| attention factorisation | the dense attention | 2.57×, **+27%** → refused |
+
+The pattern is the project's whole argument: at a fixed budget, speed comes from
+writing the same function cheaper, never from dropping work.
 
 ## Quick start
 
@@ -58,7 +66,6 @@ the same text. Seed noise is ±0.011 BPB, so anything smaller is not a result.
 cd port
 uv sync
 
-# train the live recipe on the bundled slice
 PYTHONPATH=src .venv/bin/python -m dormouse.cli train configs/arch_gated_swiglu.toml \
   --data ../data_local/best/fwedu_train.bin \
   --eval ../data_local/best/fwedu_eval.bin \
@@ -67,48 +74,30 @@ PYTHONPATH=src .venv/bin/python -m dormouse.cli train configs/arch_gated_swiglu.
   --set opt=mix --set muon_lr_mult=12 --set lr=3e-4 \
   --set ns_dtype=bf16 --set muon_state_dtype=bf16
 
-# gates before a commit
 cd .. && bash scripts/gate_fast.sh
-cd port && PYTHONPATH=src .venv/bin/python -m pytest -q
+cd port && PYTHONPATH=src .venv/bin/python -m pytest -q -m "not slow and not pins"
 ```
 
 Data is not committed. `docs/guides/data-provenance.md` records every source,
-revision and licence, and `port/scripts/refetch_pretrain.py` rebuilds the slice.
+revision and licence; `port/scripts/refetch_pretrain.py` rebuilds the slice.
 
-## The recipe
-
-| piece | choice | why |
-|---|---|---|
-| block | dense pre-LN transformer, 12 layers, `d_model=832` | beat the loop/KDA arms at equal bytes |
-| FFN | gated (SwiGLU, `d_ffn=2048`) | −0.0145 BPB at **0.00%** extra parameters |
-| optimizer | Muon (5-step NS) for matrices, AdamW for the rest | 1.92× the step at equal quality |
-| precision | bf16 masters, bf16 NS, fp32 accumulate | the smallest format that still learns |
-| formats | bf16 · 4-bit activations · ternary weights | one ladder: train → export → deploy |
-
-## Roadmap
-
-1. **2B stored / ~180M active** — low-rank experts + ternary → **255 MB** file.
-2. **12 000 tok/s** locally: 45 MB read per token instead of 190 MB.
-3. **PyTorch-code specialist** — 22 GB curated corpus, execution-verified traces.
-
-## Repo map
+## What is in the tree
 
 | path | what |
 |---|---|
-| `port/` | the live Python lane: config, model, trainer, post-training, scripts, tests |
+| `port/` | the live Python lane: config, model, trainer, post-training, tests |
 | `crates/` | frozen Rust/burn lane (formula source; not the live path) |
-| `docs/` | research, reviews, architecture notes, ADRs, guides |
-| `site/` | landing page and the pitch deck |
-| `configs/` | flat TOML presets, one per experiment |
+| `docs/` | handbook, measurements, decisions, research, archive |
+| `site/` | landing page, the pitch deck, and the Manim clips |
 
-## Honest notes
+## Where to read next
 
-- The window changed on 2026-11-08 when the corpus was refetched; numbers before
-  and after that date are not comparable and each table entry names its window.
-- The 12 000 tok/s figure is a bandwidth calculation for the planned 2B model,
-  not a measured decode of today's 95M.
-- Ternary costs +2.9% BPB at this scale; it is a deployment format, not a free
-  win, and the export path is what makes it useful.
+- **[`docs/HANDBOOK.md`](docs/HANDBOOK.md)** — one document, the whole project.
+- **[Docs site](https://sehaxe.github.io/dormouse/docs/)** — the same, rendered.
+- **[`docs/measurements.md`](docs/measurements.md)** — the dated record of what
+  was measured, including what was rejected.
+- **`AGENTS.md`** — the rules an agent (or a person) must follow when changing
+  this repo.
 
 ## License
 

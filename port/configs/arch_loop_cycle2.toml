@@ -1,0 +1,44 @@
+# arch_loop_cycle2 — the loop done as a cycle, not the losing 1-body×N extreme.
+#
+# The verdict "loops lose at <=200M" was measured on `medium`/`flagship_base`:
+# ONE shared body x 3-4 iterations = 14% of a 12-layer control's layer count
+# (docs/research/2026-11-06-depth-recurrence.md). The one <=200M iso-FLOP win
+# in the literature is MoR cycle-2 at 135M: 15 unique layers x 2 passes, i.e.
+# HALF the unique parameters at the same layer-passes (2507.10524 Table 10,
+# 3.0323 -> 3.0071). This arm tests that topology at our scale:
+#
+#   6 distinct bodies x 2 passes = 12 layer-passes = the dense control's 12.
+#   The loop block's dense FFN is GATED (3*d*f), so f=2048 gives the same FFN
+#   FLOPs as the dense control's 2*d*3072; attention is the same. One pass
+#   therefore costs the dense block's FLOPs, and 6 bodies keep ~55% of the
+#   unique parameters (MoR cycle-2 kept 53% at 135M). `attn_kind="full"`
+#   removes the linear-attention confound; the loop's controller/readout are
+#   part of the loop, not a second variable.
+#
+# Pre-registered: win only if BPB is below dense C0 by >2x its own seed spread
+# AND >=0.02 BPB at matched FLOPs; a tie deletes the arm. This is a screen at
+# 73.7 MB, not a final verdict.
+d_model = 832
+n_heads = 13
+head_dim = 64
+d_ffn = 2048
+vocab = 256
+max_seq_len = 1024
+
+block_form = "kda"
+loop_blocks = 6
+max_iter = 12
+attn_kind = "full"
+use_kda = true
+
+ffn_form = "dense"
+use_tsct = false
+n_experts = 1
+moe_topk = 0
+
+use_csa = false
+use_mhc = false
+use_attnres = false
+use_engram = false
+layerrope = false
+bf16 = true

@@ -156,15 +156,15 @@ class Ternary(Clip):
         track.move_to([3.5, 1.35, 0])
         full = Rectangle(width=4.6, height=0.4, stroke_width=0, fill_color=DIMMER, fill_opacity=0.5)
         full.align_to(track, LEFT).set_y(track.get_center()[1])
-        lab = mono("190 MB · bf16", size=21, color=DIM).next_to(track, UP, buff=0.28)
+        lab = mono("bf16", size=21, color=DIM).next_to(track, UP, buff=0.28)
         self.play(FadeIn(track), FadeIn(full), FadeIn(lab), run_time=0.5)
 
-        ter = Rectangle(width=2.0, height=0.4, stroke_width=0, fill_color=ACCENT, fill_opacity=0.9)
+        ter = Rectangle(width=0.58, height=0.4, stroke_width=0, fill_color=ACCENT, fill_opacity=0.9)
         ter.align_to(track, LEFT).set_y(track.get_center()[1])
-        self.play(Transform(full, ter), Transform(lab, mono("82 MB · ternary", size=21, color=ACCENT).next_to(track, UP, buff=0.28)), run_time=1.6)
+        self.play(Transform(full, ter), Transform(lab, mono("ternary", size=21, color=ACCENT).next_to(track, UP, buff=0.28)), run_time=1.6)
 
         self.play(self.say(), run_time=0.4)
-        self.play(FadeIn(mono("2 bits per weight · 1.58 with five trits in a byte", size=17, color=DIMMER).next_to(track, DOWN, buff=0.3)), run_time=0.5)
+        self.play(FadeIn(mono("8× fewer bytes · 2 bits per weight", size=17, color=DIMMER).next_to(track, DOWN, buff=0.3)), run_time=0.5)
         self.wait(0.6)
         self.clear()
 
@@ -284,7 +284,7 @@ class Muon(Clip):
 class Curve(Clip):
     """1.19 bits per byte against the bytes seen, with the compressors for scale."""
 
-    caption = "held-out bits per byte · lower is better"
+    caption = "held-out bits per byte · the gap is the result, not the height"
 
     def construct(self):
         axes = Axes(
@@ -320,11 +320,11 @@ class Curve(Clip):
         m2 = mono("1.49", size=19, color=DIM).move_to([axes.c2p(0.30, 1.40)[0], axes.c2p(0.30, 1.40)[1] + 0.3, 0])
         self.play(FadeIn(m1), FadeIn(m2), run_time=0.5)
 
-        big = mono("1.19", size=44, color=ACCENT).move_to([axes.c2p(2.2, 1.30)[0], axes.c2p(2.2, 1.30)[1], 0])
-        self.play(FadeIn(big, shift=UP * 0.1), run_time=0.6)
+        end = Dot(axes.c2p(2.64, 1.19), radius=0.09, color=ACCENT)
+        self.play(FadeIn(end, scale=1.8), run_time=0.4)
         self.play(self.say(), run_time=0.4)
-        self.play(Indicate(big, scale_factor=1.06), run_time=0.9)
-        self.play(FadeIn(mono("2.64 GB seen · 6.7× compression", size=18, color=DIM).move_to([axes.c2p(1.6, 1.05)[0], axes.c2p(1.6, 1.05)[1], 0]), run_time=0.5))
+        self.play(Indicate(end, scale_factor=1.3), run_time=0.9)
+        self.play(FadeIn(mono("this run ends here — the next architecture moves it", size=18, color=DIM).move_to([axes.c2p(1.55, 1.05)[0], axes.c2p(1.55, 1.05)[1], 0]), run_time=0.5))
         self.wait(0.6)
         self.clear()
 

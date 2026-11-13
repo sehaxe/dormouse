@@ -258,7 +258,11 @@ fn fused_grads_match_finite_difference() {
             max_idx % shape[3],
         );
         let probe = |delta: f32| -> f32 {
-            let mut buf = inp_i.clone().into_data().bytes();
+            // `into_data()` returns an owned TensorData; binding it keeps the
+            // bytes it lends alive for the whole probe (the previous one-liner
+            // dropped the temporary and failed to compile on current rustc).
+            let mut data = inp_i.clone().into_data();
+            let mut buf = data.bytes();
             let idx = (((b * shape[1] + h) * shape[2] + t) * shape[3] + d) * 4;
             let mut val = f32::from_le_bytes(buf[idx..idx + 4].try_into().unwrap());
             val += delta;
