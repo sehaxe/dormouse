@@ -47,10 +47,11 @@ else
 fi
 
 step "rust: cargo check"
-if command -v cargo >/dev/null; then
+# `main` is the Python lane; the Rust tree lives on `rust-lane` (2026-11-13).
+if [ -f Cargo.toml ] && command -v cargo >/dev/null; then
   cargo check --workspace --quiet || fail=1
 else
-  echo "SKIP: no cargo"
+  echo "SKIP: no cargo workspace on this branch"
 fi
 
 if [ "$fail" -ne 0 ]; then

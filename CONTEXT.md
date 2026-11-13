@@ -287,9 +287,9 @@ Knowing what is *not* in the model is part of the model:
 1. this file, end to end;
 2. [`docs/glossary.md`](docs/glossary.md) §1 and §6 (the compute spine, and the
    `fused` disambiguation);
-3. `crates/dormouse-core/src/loop_block.rs:302-563` — the FROZEN lane's loop
-   body (260 lines), the formula source for the Python `LoopBlock`; the live
-   dense lane is `port/src/dormouse/model/transformer.py`;
+3. `port/src/dormouse/model/transformer.py` — the live block; the frozen Rust
+   equivalent it was ported from lives on the `rust-lane` branch
+   (`crates/dormouse-core/src/loop_block.rs`), and is not part of this tree;
 4. [`AGENTS.md`](AGENTS.md) §1 RULES and §2 MACHINE FACTS, before the first GPU
    run;
 5. `docs/protocols/AB-PROTOCOL.md` — how a mechanism gets judged, and what is in the queue.

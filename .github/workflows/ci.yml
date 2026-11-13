@@ -7,21 +7,13 @@ name: ci
 # every job in the first half of this file exercises, and a red job there
 # blocks main.
 #
-# `crates/` is FROZEN since 2026-11-07. It compiles, no work lands in it, and
-# `site/gen` — the Rust static generator — is superseded by the hand-written
-# `site/index.html`. It used to be six blocking jobs (cpu, rustfmt+clippy,
-# rustdoc, llvm-cov, cargo-deny, cargo-machete): 7 of the 13 reds in run
-# 42480254891 came from that half alone, which taught people to ignore the
-# status light. The Rust code is NOT deleted and is NOT ungated: it is one
-# `rust-frozen (informational)` job, `continue-on-error: true`, and the name
-# says so. When the lane unfreezes, split it back out job by job and drop the
-# flag — the commands are unchanged.
+# One lane. The Rust/burn tree and the vendored fused-kernel library live on
+# the `rust-lane` branch (pushed 2026-11-13, history intact); `main` is the
+# Python lane only, so nothing here compiles Rust and nothing here can go red
+# on a cargo feature that does not matter to the product.
 on:
   push:
   pull_request:
-  schedule:
-    # the frozen Rust lane's weekly check, so a break in it is still noticed
-    - cron: '17 3 * * 1'
   workflow_dispatch:
 
 # Least privilege for every job: a PR runs repo code (pytest, ruff, the docs
@@ -301,67 +293,3 @@ jobs:
           shellcheck --version | head -2
           command -v pyflakes
           pyflakes --version
-
-  # ── the frozen Rust lane (informational) ───────────────────────────────────
-  # `crates/` has been frozen since 2026-11-07: it compiles, no work lands in
-  # it, and the Python port is the live lane. This job keeps every check the six
-  # old blocking jobs ran (fmt, clippy -D warnings, lib tests, rustdoc -D
-  # warnings, the cuda compile probe) in ONE place, and `continue-on-error`
-  # makes it a report instead of a gate — the job name says which it is.
-  #
-  # The mold step is not decoration: `.cargo/config.toml` links through mold,
-  # and without it every link dies with collect2's "cannot find 'ld'".
-  #
-  # `!cancelled()` on every step after the first, not the default `success()`:
-  # run 36868694110 measured what the default does — rustfmt fails and every
-  # later step is SKIPPED, so the clippy half never reported at all. A gate that
-  # does not run is indistinguishable from a gate that passes.
-  #
-  # NOT here, and deliberately: llvm-cov (a 120-minute instrumented build for a
-  # number nobody acts on while the lane is frozen), cargo-deny and
-  # cargo-machete (both were green; their configs — deny.toml and the
-  # `cargo-machete` metadata — are untouched and come back with the lane).
-  rust-frozen:
-    name: "rust-frozen (informational) :: crates/ fmt + clippy + lib tests + rustdoc + cuda compile"
-    # The lane is frozen: it runs when someone asks for it (workflow_dispatch)
-    # or weekly, not on every push. A 20-minute cargo build on a lane that takes
-    # no changes made every push sit "in progress" long after the Python gate had
-    # finished, which reads as a failure in the run list.
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    continue-on-error: true
-    env:
-      CUDARC_CUDA_VERSION: "12050"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: install mold (repo config links through it)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mold
-      - name: rustfmt
-        # `-p` on the four crates, NOT `--all`: `cargo fmt --all` also walks
-        # local path dependencies into vendor/dormouse-fused, which is a
-        # different workspace with its own gate (fused-library.yml).
-        run: |
-          cargo fmt -p dormouse-core -p dormouse-data -p dormouse-train -p dormouse-cli -- --check
-      - name: clippy
-        if: ${{ !cancelled() }}
-        run: |
-          cargo clippy -p dormouse-core -p dormouse-data -p dormouse-train -p dormouse-cli --all-targets -- -D warnings
-      - name: lib tests (core + data + train)
-        if: ${{ !cancelled() }}
-        run: cargo test -p dormouse-core -p dormouse-data -p dormouse-train --lib
-      - name: model seam test
-        if: ${{ !cancelled() }}
-        run: cargo test -p dormouse-core --test model_seam
-      - name: rustdoc
-        if: ${{ !cancelled() }}
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p dormouse-core -p dormouse-data -p dormouse-train -p dormouse-cli
-      - name: cuda feature compile check (no GPU required)
-        if: ${{ !cancelled() }}
-        run: cargo check -p dormouse-core -p dormouse-train --features dormouse-train/cuda

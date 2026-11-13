@@ -86,9 +86,12 @@ revision and licence; `port/scripts/refetch_pretrain.py` rebuilds the slice.
 | path | what |
 |---|---|
 | `port/` | the live Python lane: config, model, trainer, post-training, tests |
-| `crates/` | frozen Rust/burn lane (formula source; not the live path) |
 | `docs/` | handbook, measurements, decisions, research, archive |
 | `site/` | landing page, the pitch deck, and the Manim clips |
+
+The Rust/burn tree and the vendored fused-kernel library are not on this
+branch: they live on **`rust-lane`** (split 2026-11-13, history intact), so this
+tree builds only Python.
 
 ## Where to read next
 
