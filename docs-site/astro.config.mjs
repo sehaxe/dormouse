@@ -18,7 +18,7 @@ export default defineConfig({
       customCss: ['./src/styles/theme.css'],
       tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 3 },
       sidebar: [
-        { label: 'Start here', items: [{ slug: 'index' }, { slug: 'handbook' }, { slug: 'quick-start' }] },
+        { label: 'Start here', items: [{ label: 'Overview', link: '/' }, { slug: 'handbook' }, { slug: 'quick-start' }] },
         {
           label: 'How it works',
           items: [{ slug: 'architecture' }, { slug: 'formats' }, { slug: 'measurements' }],
