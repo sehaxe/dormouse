@@ -1,0 +1,51 @@
+# arch_tsct95_r256 — the live 95M recipe with a factorised (TSCT) FFN, rank 256.
+#
+# THE ARM. The control is `arch_gated_swiglu.toml` at the same shape and the same
+# data budget. Its full-corpus number is 1.1871 (107,421 steps, 2.5 GB, b24,
+# s1024, compile, Muon 12). This arm asks the one question that ladder left
+# open: the +5.2% BPB that rank 256 cost at 120 MB was measured on 40-120 MB of
+# text; does that price shrink or grow when the model sees 2.5 GB?
+#
+# WHY rank 256: on the 275M ladder it was the first rank inside the owner's
+# budget (1.62x speed for +5.2%, i.e. 5.2% against a 9-12% allowance). Rank 512
+# is cheaper in quality (+2.3%) and only 1.28x, so it cannot answer the question
+# as sharply: it has less room to move in either direction.
+#
+# PARAMETERS. The FFN is 3*r*(d+f) = 3*256*(832+2048) = 2.21M per layer instead
+# of 5.11M; over 12 layers the model is ~60M against 95M. That difference IS the
+# mechanism — fewer parameters and fewer FLOPs per token — so the comparison is
+# "60M ternary-factor model vs 95M dense" at equal bytes, and speed is measured,
+# not assumed.
+#
+# THE FILE. The factors pack to ternary + per-rank scales at export; that number
+# is printed by the export step, not guessed here.
+
+d_model = 832
+n_heads = 13
+head_dim = 64
+d_ffn = 2048
+d_ffn_gelu = 3072
+rank = 256
+vocab = 256
+max_seq_len = 1024
+max_iter = 1
+loop_blocks = 1
+n_layers = 12
+
+block_form = "transformer"
+use_kda = false
+use_csa = false
+use_mhc = false
+use_attnres = false
+use_engram = false
+layerrope = false
+
+n_experts = 1
+moe_topk = 0
+use_tsct = false
+ffn_form = "tsct"
+
+ffn_gated = true
+expert_act = "silu"
+
+bf16 = true
