@@ -109,7 +109,7 @@ for (const file of html) {
 // §3.2/§3.3 because the front-page README no longer carries them.
 const CASES = [
 	['landing', 'index.html', 'A knowledge base with a retraction policy'],
-	['start-here', 'start-here/status/index.html', 'Held-out BPB'],
+	['start-here', 'start-here/status/index.html', 'Held-out bits-per-byte'],
 	['architecture', 'architecture/model/index.html', 'LoopBlock'],
 	['protocols', 'protocols/ab-protocol/index.html', 'A/B protocol'],
 	['adr', 'adr/0011-loud-failures/index.html', 'P10 Rule 5'],
