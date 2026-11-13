@@ -227,9 +227,9 @@ export const pages = [
 	// that exist; five pages whose ONLY source was a deleted section are gone
 	// rather than re-anchored onto text that is not what it says - see the
 	// site's IA.md for which content moved where.
-	{ src: 'README.md', out: 'start-here/what-is-this', slice: { from: /^## What is this$/, to: /^## Results$/ }, title: 'What this is', nav: 'What this is' },
+	{ src: 'README.md', out: 'start-here/what-is-this', slice: { from: /^## What this is$/, to: /^## Results$/ }, title: 'What this is', nav: 'What this is' },
 	{ src: 'README.md', out: 'start-here/status', slice: { from: /^## Results$/, to: /^## Quick start$/ }, title: 'Status: the measured numbers', nav: 'Status' },
-	{ src: 'README.md', out: 'start-here/quick-start', slice: { from: /^## Quick start$/, to: /^## The audits/ }, title: 'Quick start' },
+	{ src: 'README.md', out: 'start-here/quick-start', slice: { from: /^## Quick start$/, to: /^## (The recipe|Docs|License|Honest notes)/ }, title: 'Quick start' },
 	{ src: 'README.md', out: 'start-here/license', slice: { from: /^## License$/ }, title: 'License' },
 	{ src: 'AGENTS.md', out: 'start-here/agents', title: 'The agent rulebook', nav: 'The agent rulebook' },
 	// CONTRIBUTING.md is the practice-level companion to AGENTS.md §1: which
