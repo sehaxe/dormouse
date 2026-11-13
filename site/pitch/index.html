@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="stage">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Плотность — dormouse</title>
+<style>
+:root{
+  --paper:#f6f3ec; --panel:#fffdf8; --line:#e3ded2; --line2:#d3ccbc;
+  --ink:#1b1a17; --dim:#6d675d; --dimmer:#9a9386;
+  --accent:#2f6fd0; --hot:#c0392b; --good:#2e7d4f;
+  --mono:"DejaVu Sans Mono","Liberation Mono",ui-monospace,monospace;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+html[data-theme="stage"]{
+  --paper:#0a0b0d; --panel:#101216; --line:#1e2128; --line2:#2a2e37;
+  --ink:#e8e6e1; --dim:#9aa0a9; --dimmer:#7c818b;
+  --accent:#7aa2e8; --hot:#ff6b7a; --good:#5fbf7f;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--paper); color:var(--ink); font-family:var(--sans);
+  -webkit-font-smoothing:antialiased; overflow:hidden;
+}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ---------- stage ---------- */
+#stage{position:fixed;inset:0;display:grid;place-items:center;padding:2.2vmin}
+.slide{
+  position:relative; width:min(100%,177.7vh); aspect-ratio:16/9;
+  background:var(--paper); border-radius:14px; overflow:hidden;
+  display:none; box-shadow:0 30px 90px rgba(0,0,0,.45);
+}
+.slide.on{display:block}
+
+/* slide furniture */
+.pad{position:absolute;inset:0;padding:8% 8% 9%;display:flex;flex-direction:column;justify-content:center}
+.kicker{
+  font-family:var(--mono); font-size:1.05vmin; letter-spacing:.22em;
+  text-transform:uppercase; color:var(--dimmer);
+}
+.pad>.kicker{position:absolute;left:8%;top:6.6%}
+.num{position:absolute;right:8%;top:6.4%;font-family:var(--mono);font-size:1.05vmin;color:var(--dimmer);letter-spacing:.18em}
+.rule{height:1px;background:var(--line);margin:4.2vmin 0 2.6vmin}
+.foot{position:absolute;left:8%;right:8%;bottom:4.6%;display:flex;justify-content:space-between;
+  font-family:var(--mono);font-size:1vmin;letter-spacing:.16em;text-transform:uppercase;color:var(--dimmer)}
+
+/* type */
+h1{font-size:11.4vmin;line-height:.92;letter-spacing:-.045em;font-weight:650}
+h2{font-size:5.6vmin;line-height:1.04;letter-spacing:-.03em;font-weight:600;max-width:88%}
+h3{font-size:2.1vmin;line-height:1.35;letter-spacing:-.01em;font-weight:600}
+p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:64ch}
+.lede{font-size:2.5vmin;line-height:1.42;color:var(--ink);max-width:52ch}
+.big{font-size:17vmin;line-height:.86;letter-spacing:-.055em;font-weight:680;font-variant-numeric:tabular-nums}
+.big small{font-size:.24em;letter-spacing:-.01em;font-weight:500;color:var(--dim);margin-left:.5em}
+.accent{color:var(--accent)}
+.hot{color:var(--hot)}
+.good{color:var(--good)}
+.unit{font-size:.3em;letter-spacing:0;color:var(--dim);font-weight:500}
+
+/* title slide */
+.title-wrap{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 8%}
+.title-sub{margin-top:2.6vmin;font-size:2.35vmin;line-height:1.45;color:var(--dim);max-width:46ch}
+.title-meta{margin-top:4.6vmin;display:flex;gap:3.4vmin;font-family:var(--mono);font-size:1.05vmin;
+  letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer)}
+.dot{color:var(--accent)}
+
+/* grids */
+.split{display:grid;grid-template-columns:1fr 1fr;gap:6%;align-items:center;height:100%}
+.cols{display:grid;gap:2.2vmin;margin-top:4vmin}
+.two{grid-template-columns:repeat(2,1fr)}
+.three{grid-template-columns:repeat(3,1fr)}
+.four{grid-template-columns:repeat(4,1fr)}
+
+/* bars */
+.bars{margin-top:3.4vmin;display:grid;gap:1.5vmin}
+.bar{display:grid;grid-template-columns:16vmin 1fr 9vmin;align-items:center;gap:2vmin}
+.bar .lbl{font-family:var(--mono);font-size:1.15vmin;letter-spacing:.1em;color:var(--dim)}
+.bar .track{height:1.7vmin;background:var(--line);border-radius:2px;overflow:hidden}
+.bar .fill{height:100%;background:var(--dimmer);transform-origin:left;transform:scaleX(0);transition:transform .9s cubic-bezier(.16,1,.3,1)}
+.bar .fill.ours{background:var(--accent)}
+.bar .val{font-family:var(--mono);font-size:1.25vmin;color:var(--ink);text-align:right}
+.slide.on .fill{transform:scaleX(1)}
+.slide.on .d1{transition-delay:.10s}.slide.on .d2{transition-delay:.20s}
+.slide.on .d3{transition-delay:.30s}.slide.on .d4{transition-delay:.40s}
+
+/* cards */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:2.6vmin 2.2vmin}
+.card .k{font-family:var(--mono);font-size:.95vmin;letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer)}
+.card .v{font-size:3.6vmin;font-weight:620;letter-spacing:-.02em;margin-top:1.2vmin}
+.card .d{font-size:1.5vmin;line-height:1.48;color:var(--dim);margin-top:.9vmin}
+
+/* ladder (how) */
+.ladder{display:grid;grid-template-columns:repeat(4,1fr);gap:1.6vmin;margin-top:5vmin;align-items:stretch}
+.step{position:relative;border-top:2px solid var(--line2);padding-top:1.8vmin}
+.step .n{font-family:var(--mono);font-size:1vmin;letter-spacing:.18em;color:var(--dimmer)}
+.step .t{font-size:2.05vmin;font-weight:620;letter-spacing:-.015em;margin-top:1vmin;line-height:1.2}
+.step .d{font-size:1.3vmin;line-height:1.45;color:var(--dim);margin-top:1.1vmin}
+.step.hero{border-top-color:var(--accent)}
+.step.hero .n{color:var(--accent)}
+
+/* table */
+table{width:100%;border-collapse:collapse;margin-top:3.4vmin}
+th,td{text-align:left;padding:1.45vmin .6vmin;border-bottom:1px solid var(--line);font-size:1.5vmin}
+th{font-family:var(--mono);font-size:.95vmin;letter-spacing:.16em;text-transform:uppercase;color:var(--dimmer);font-weight:500}
+th:nth-child(2),th:nth-child(3){text-align:right}
+th:last-child,td:last-child{padding-left:2.4vmin}
+td.n{font-family:var(--mono);text-align:right;font-variant-numeric:tabular-nums}
+td.why{color:var(--dim)}
+.tag{font-family:var(--mono);font-size:1.05vmin;letter-spacing:.08em;padding:.25em .5em;border-radius:3px;border:1px solid var(--line2);color:var(--dim)}
+.tag.no{color:var(--hot);border-color:color-mix(in srgb,var(--hot) 40%,transparent)}
+.tag.ok{color:var(--good);border-color:color-mix(in srgb,var(--good) 40%,transparent)}
+
+/* roadmap */
+.road{display:grid;grid-template-columns:repeat(3,1fr);gap:2.4vmin;margin-top:5.4vmin}
+.road .r{border-left:2px solid var(--line2);padding-left:2vmin}
+.road .r.now{border-left-color:var(--accent)}
+.road .when{font-family:var(--mono);font-size:1.05vmin;letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer)}
+.road .what{font-size:2.45vmin;font-weight:620;margin-top:1.3vmin;letter-spacing:-.018em;line-height:1.2}
+.road .num2{font-family:var(--mono);font-size:1.45vmin;color:var(--dim);margin-top:1.3vmin;line-height:1.5}
+
+/* closing */
+.close{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 8%}
+.close h1{font-size:7.6vmin;max-width:30ch}
+.close .three{margin-top:6vmin;max-width:70%}
+
+/* chrome */
+#hud{position:fixed;left:0;right:0;bottom:0;height:2px;background:var(--line);z-index:9}
+#hud .p{height:100%;width:0;background:var(--accent);transition:width .35s ease}
+#keys{position:fixed;right:14px;bottom:14px;font-family:var(--mono);font-size:10px;letter-spacing:.14em;
+  color:var(--dimmer);z-index:10;user-select:none}
+
+/* print → PDF, one slide per page */
+@page{size:1280px 720px;margin:0}
+@media print{
+  html,body{overflow:visible;background:#fff}
+  #stage{position:static;display:block;padding:0}
+  .slide{display:block!important;width:1280px;height:720px;border-radius:0;box-shadow:none;page-break-after:always;break-after:page}
+  #hud,#keys{display:none}
+  .fill{transform:scaleX(1)!important}
+}
+</style>
+</head>
+<body>
+<div id="stage">
+
+<!-- 01 · title -->
+<section class="slide on">
+  <div class="title-wrap">
+    <div class="kicker">dormouse · byte-level · 2026</div>
+    <h1 style="margin-top:3vmin">Плотность<span class="dot">.</span></h1>
+    <div class="title-sub">Модель, которая весит как фотография —<br>и считает быстрее той, что в десять раз больше.</div>
+    <div class="title-meta">
+      <span>255 МБ</span><span>12 000 tok/s</span><span>1.19 бита на байт</span>
+    </div>
+  </div>
+  <div class="num">01 / 10</div>
+</section>
+
+<!-- 02 · the problem -->
+<section class="slide">
+  <div class="pad">
+    <div class="kicker">проблема</div>
+    <h2 style="margin-top:3vmin">Все идут вверх.<br>Мы пошли в другую сторону.</h2>
+    <div class="cols three" style="margin-top:6vmin">
+      <div class="card">
+        <div class="k">вес модели</div>
+        <div class="v hot">40 ГБ</div>
+        <div class="d">20B в bf16. Не влезает ни в ноутбук, ни в телефон, ни в одну потребительскую карту.</div>
+      </div>
+      <div class="card">
+        <div class="k">трафик на токен</div>
+        <div class="v hot">40 ГБ</div>
+        <div class="d">Декод упирается в память: каждый токен требует прочитать все веса.</div>
+      </div>
+      <div class="card">
+        <div class="k">цена входа</div>
+        <div class="v hot">датацентр</div>
+        <div class="d">Локально нельзя, приватно нельзя, дешево нельзя.</div>
+      </div>
+    </div>
+    <p style="margin-top:5.4vmin">Индустрия продаёт параметры. Пользователь платит байтами и секундами.</p>
+  </div>
+  <div class="num">02 / 10</div>
+</section>
+
+<!-- 03 · the number -->
+<section class="slide">
+  <div class="pad">
+    <div class="kicker">результат</div>
+    <div class="big" style="margin-top:4vmin">1.19<small>бита на байт</small></div>
+    <p class="lede" style="margin-top:3vmin">Байтовый трансформер на 95M, обученный на 2.5 ГБ собственного корпуса на одной видеокарте за 8 часов.</p>
+    <div class="bars">
+      <div class="bar"><div class="lbl">xz</div><div class="track"><div class="fill d1" style="width:96%"></div></div><div class="val">2.71</div></div>
+      <div class="bar"><div class="lbl">bz2</div><div class="track"><div class="fill d2" style="width:92%"></div></div><div class="val">2.59</div></div>
+      <div class="bar"><div class="lbl">5-gram</div><div class="track"><div class="fill d3" style="width:91%"></div></div><div class="val">2.57</div></div>
+      <div class="bar"><div class="lbl" style="color:var(--accent)">dormouse</div><div class="track"><div class="fill ours d4" style="width:42%"></div></div><div class="val accent">1.19</div></div>
+    </div>
+  </div>
+  <div class="num">03 / 10</div>
+</section>
+
+<!-- 04 · what it weighs -->
+<section class="slide">
+  <div class="pad">
+    <div class="kicker">что это значит на диске</div>
+    <h2 style="margin-top:2.6vmin">Вся модель — <span class="accent">255 МБ</span></h2>
+    <div class="bars" style="margin-top:4.6vmin">
+      <div class="bar"><div class="lbl">1B bf16</div><div class="track"><div class="fill d1" style="width:100%"></div></div><div class="val">2.0 ГБ</div></div>
+      <div class="bar"><div class="lbl">95M bf16</div><div class="track"><div class="fill d2" style="width:9.3%"></div></div><div class="val">190 МБ</div></div>
+      <div class="bar"><div class="lbl">95M тернар</div><div class="track"><div class="fill d3" style="width:4%"></div></div><div class="val">82 МБ</div></div>
+      <div class="bar"><div class="lbl" style="color:var(--accent)">1B / 180M активных</div><div class="track"><div class="fill ours d4" style="width:12.5%"></div></div><div class="val accent">255 МБ</div></div>
+    </div>
+    <p style="margin-top:4.6vmin">Миллиард параметров, который умещается в письмо. И это не «урезанная» модель — это та же функция, записанная плотнее.</p>
+  </div>
+  <div class="num">04 / 10</div>
+</section>
+
+<!-- 05 · speed -->
+<section class="slide">
+  <div class="pad">
+    <div class="kicker">скорость</div>
+    <div class="big" style="margin-top:3.6vmin">12 000<small>токенов в секунду</small></div>
+    <p class="lede" style="margin-top:3vmin">Одна потребительская видеокарта. Без батча, без сервера, без сети.</p>
+    <div class="bars" style="margin-top:4.2vmin">
+      <div class="bar"><div class="lbl">95M bf16</div><div class="track"><div class="fill d1" style="width:100%"></div></div><div class="val">190 МБ</div></div>
+      <div class="bar"><div class="lbl" style="color:var(--accent)">1B тернар</div><div class="track"><div class="fill ours d2" style="width:23.7%"></div></div><div class="val accent">45 МБ</div></div>
+    </div>
+    <div class="cols two" style="margin-top:4vmin">
+      <div class="card">
+        <div class="k">вес одного веса</div>
+        <div class="v accent">2 бита</div>
+        <div class="d">Тернарный вес читается в два бита, распаковка в регистрах — внутри самого ядра. Декод упирается в память, поэтому меньше байт = быстрее.</div>
+      </div>
+      <div class="card">
+        <div class="k">в 10 раз больше при 4× скорости</div>
+        <div class="v good">не компромисс</div>
+        <div class="d">Обычно «больше» значит «медленнее». Здесь наоборот: ёмкость выросла, время на токен упало.</div>
+      </div>
+    </div>
+  </div>
+  <div class="num">05 / 10</div>
+</section>
+
+<!-- 06 · how -->
+<section class="slide">
+  <div class="pad">
+    <div class="kicker">как это устроено</div>
+    <h2 style="margin-top:2.4vmin">Четыре ступени, каждая измерена отдельно</h2>
+    <div class="ladder">
+      <div class="step">
+        <div class="n">01</div>
+        <div class="t">Байт как единица</div>
+        <div class="d">Никакой токенизации. Модель видит сырые байты — работает на любом языке и на любом коде без словаря.</div>
+      </div>
+      <div class="step">
+        <div class="n">02</div>
+        <div class="t">Низкоранговые факторы</div>
+        <div class="d">Матрицы хранятся как U·diag(s)·Vᵀ. 2.7× меньше вычислений при 5% цены качества.</div>
+      </div>
+      <div class="step hero">
+        <div class="n">03</div>
+        <div class="t">Тернарные веса</div>
+        <div class="d">Три уровня {−α, 0, +α}, два бита на вес. Анниляция от полной точности к тернару — не с первого шага.</div>
+      </div>
+      <div class="step">
+        <div class="n">04</div>
+        <div class="t">Разреженные эксперты</div>
+        <div class="d">1B хранимых, 180M активных на токен. Ёмкость растёт, вычисления — нет.</div>
+      </div>
+    </div>
+    <p style="margin-top:5vmin">Ступени работают только вместе: тернар без факторов не влезает, факторы без разреженности не дают ёмкости.</p>
+  </div>
+  <div class="num">06 / 10</div>
+</section>
+
+<!-- 07 · method -->
+<section class="slide">
+  <div class="pad">
+    <div class="kicker">метод</div>
+    <h2 style="margin-top:2vmin">Одиннадцать механизмов измерены и отвергнуты</h2>
+    <table>
+      <tr><th>механизм</th><th style="text-align:right">что дал</th><th style="text-align:right">цена</th><th>вердикт</th></tr>
+      <tr><td>MoE при малом корпусе</td><td class="n">1.00×</td><td class="n">+25% времени</td><td><span class="tag no">отказ</span></td></tr>
+      <tr><td>Ранг 64 вместо 256</td><td class="n">1.95×</td><td class="n">+28% качества</td><td><span class="tag no">отказ</span></td></tr>
+      <tr><td>Факторизация attention</td><td class="n">2.57×</td><td class="n">+27% качества</td><td><span class="tag no">отказ</span></td></tr>
+      <tr><td>Низкоранговый Muon</td><td class="n">1.25×</td><td class="n">+33% качества</td><td><span class="tag no">отказ</span></td></tr>
+      <tr><td>Меньше шагов оптимизатора</td><td class="n">1.08×</td><td class="n">+10% качества</td><td><span class="tag no">отказ</span></td></tr>
+      <tr><td>Gated FFN</td><td class="n">0.00% парам.</td><td class="n">−1.2% качества</td><td><span class="tag ok">в рецепте</span></td></tr>
+    </table>
+    <p style="margin-top:3.6vmin">Мы не верим в архитектуру — мы её меряем. Поэтому продукт тонкий: в нём осталось только то, что доказало себя на живой модели.</p>
+  </div>
+  <div class="num">07 / 10</div>
+</section>
+
+<!-- 08 · the product -->
+<section class="slide">
+  <div class="pad">
+    <div class="kicker">продукт</div>
+    <h2 style="margin-top:2.4vmin">Кодер по PyTorch, который живёт на ноутбуке</h2>
+    <div class="cols three" style="margin-top:4.6vmin">
+      <div class="card">
+        <div class="k">размер</div>
+        <div class="v">255 МБ</div>
+        <div class="d">Помещается в репозиторий, в контейнер, в дистрибутив.</div>
+      </div>
+      <div class="card">
+        <div class="k">скорость</div>
+        <div class="v">12 000 tok/s</div>
+        <div class="d">Ответ на страницу — доли секунды. Без очереди и без API.</div>
+      </div>
+      <div class="card">
+        <div class="k">приватность</div>
+        <div class="v">0 сети</div>
+        <div class="d">Код не покидает машину. Работает офлайн.</div>
+      </div>
+    </div>
+    <p class="lede" style="margin-top:5vmin">Цель — 40–55% HumanEval на 2B. Это уровень моделей в 10 раз крупнее: Phi-1 показал 50.6% на 1.3B, когда данные отобраны, а не сгреблены.</p>
+  </div>
+  <div class="num">08 / 10</div>
+</section>
+
+<!-- 09 · roadmap -->
+<section class="slide">
+  <div class="pad">
+    <div class="kicker">план</div>
+    <h2 style="margin-top:2.2vmin">Три шага, каждый с числом</h2>
+    <div class="road">
+      <div class="r now">
+        <div class="when">сейчас</div>
+        <div class="what">Корпус и дистилляция</div>
+        <div class="num2">22 ГБ отобранного кода · 6 млрд токенов</div>
+      </div>
+      <div class="r">
+        <div class="when">+4 дня карты</div>
+        <div class="what">2B / 180M активных</div>
+        <div class="num2">тернар + факторы · 255 МБ</div>
+      </div>
+      <div class="r">
+        <div class="when">+2 дня</div>
+        <div class="what">Проверка на своих тестах</div>
+        <div class="num2">300 функций из репозитория · pass@1</div>
+      </div>
+    </div>
+    <div class="rule"></div>
+    <p>Ни один шаг не требует аренды: всё считается на одной видеокарте, которая уже стоит в комнате.</p>
+  </div>
+  <div class="num">09 / 10</div>
+</section>
+
+<!-- 10 · close -->
+<section class="slide">
+  <div class="close">
+    <div class="kicker">итог</div>
+    <h1 style="margin-top:3vmin">Меньше не значит слабее.<br><span class="accent">Плотнее — значит быстрее.</span></h1>
+    <div class="cols three" style="max-width:74%">
+      <div class="card"><div class="k">бит на байт</div><div class="v">1.19</div></div>
+      <div class="card"><div class="k">вес модели</div><div class="v">255 МБ</div></div>
+      <div class="card"><div class="k">токенов в секунду</div><div class="v">12 000</div></div>
+    </div>
+  </div>
+  <div class="num">10 / 10</div>
+</section>
+
+</div>
+<script>
+const slides=[...document.querySelectorAll('.slide')];
+let i=0;
+function show(n){
+  i=Math.max(0,Math.min(slides.length-1,n));
+  slides.forEach((s,k)=>s.classList.toggle('on',k===i));
+  document.querySelector('#hud .p').style.width=((i+1)/slides.length*100)+'%';
+  document.title=`${i+1}/${slides.length} — Плотность`;
+}
+addEventListener('keydown',e=>{
+  if(['ArrowRight','ArrowDown',' ','PageDown','Enter'].includes(e.key)){e.preventDefault();show(i+1)}
+  if(['ArrowLeft','ArrowUp','PageUp','Backspace'].includes(e.key)){e.preventDefault();show(i-1)}
+  if(e.key==='Home')show(0);
+  if(e.key==='End')show(slides.length-1);
+  if(e.key==='t'||e.key==='T'){
+    const r=document.documentElement;
+    r.dataset.theme=r.dataset.theme==='stage'?'paper':'stage';
+  }
+});
+addEventListener('click',e=>{ if(e.clientX>innerWidth*0.72)show(i+1); else if(e.clientX<innerWidth*0.28)show(i-1); });
+addEventListener('hashchange',()=>{const n=parseInt(location.hash.slice(1));if(!isNaN(n))show(n-1)});
+const h=parseInt(location.hash.slice(1));
+show(isNaN(h)?0:h-1);
+</script>
+<div id="hud"><div class="p"></div></div>
+<div id="keys">← → листать · T тема · Ctrl+P → PDF</div>
+</body>
+</html>
