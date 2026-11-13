@@ -19,6 +19,10 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    # the frozen Rust lane's weekly check, so a break in it is still noticed
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
 
 # Least privilege for every job: a PR runs repo code (pytest, ruff, the docs
 # gates), so the token must not be able to push.
@@ -319,6 +323,11 @@ jobs:
   # `cargo-machete` metadata — are untouched and come back with the lane).
   rust-frozen:
     name: "rust-frozen (informational) :: crates/ fmt + clippy + lib tests + rustdoc + cuda compile"
+    # The lane is frozen: it runs when someone asks for it (workflow_dispatch)
+    # or weekly, not on every push. A 20-minute cargo build on a lane that takes
+    # no changes made every push sit "in progress" long after the Python gate had
+    # finished, which reads as a failure in the run list.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     continue-on-error: true
