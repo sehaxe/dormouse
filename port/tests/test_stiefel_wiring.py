@@ -13,7 +13,6 @@ import dataclasses
 import math
 
 import pytest
-import torch
 from conftest import tiny_run
 
 from dormouse.config import ModelConfig

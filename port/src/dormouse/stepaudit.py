@@ -452,7 +452,10 @@ EXCUSED_FUNCTIONS = {
     "MixOptimizer._fast_adamw_ok": "capability probe over <=8 param groups, no tensor work",
     "MixOptimizer.set_ns_steps": "resume, once per run (a PROGRESS key repair)",
     "DormouseModel.set_recompute": "setup, once per run",
-    "_train_impl": "the step DRIVER itself — the bracket, not a loop inside a step (renamed from `train` by the 2026-11-08 run-registry wrapper)",
+    "_train_impl": (
+        "the step DRIVER itself — the bracket, not a loop inside a step "
+        "(renamed from `train` by the 2026-11-08 run-registry wrapper)"
+    ),
     "corpus_manifest": "checkpoint save, once per write: hashes the plan and stats each source",
     "zeropower_via_ns": "per-matrix NS, the retraction's inherent sequential chain",
     "_foreach_add_mixed_": "comprehension inside the batched momentum primitive",

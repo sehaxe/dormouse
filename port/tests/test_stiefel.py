@@ -8,7 +8,6 @@ and the orthonormality gate fails.
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from dormouse.train.stiefel import orthonormality_error, stiefel_retract_
