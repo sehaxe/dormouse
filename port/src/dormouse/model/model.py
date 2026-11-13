@@ -343,9 +343,7 @@ class DormouseModel(nn.Module):
             # alongside the flag (`validate_block_form`): that channel runs the
             # blocks over patches and does not thread the history.
             if cfg.use_attnres:
-                self.attnres_full = FullDepthAttnRes(
-                    d, n_layers, eps=cfg.norm_eps, device=device
-                )
+                self.attnres_full = FullDepthAttnRes(d, n_layers, eps=cfg.norm_eps, device=device)
             self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
             if cfg.tie_embeddings:
                 self.lm_head = TiedHead(self.embed)
@@ -368,9 +366,7 @@ class DormouseModel(nn.Module):
             # a previous layer has already split. Built LAST so every base
             # draw (blocks, norm, head) is the OFF model's, RNG order included.
             if cfg.use_mhc:
-                self.mhc_full = MHCMix(
-                    d, cfg.mhc_streams, device=device, sinkhorn=cfg.mhc_sinkhorn
-                )
+                self.mhc_full = MHCMix(d, cfg.mhc_streams, device=device, sinkhorn=cfg.mhc_sinkhorn)
                 # Lane representation scale `c` (see `_forward_transformer`):
                 # the composition's readout divides by K, so its lanes carry
                 # the state (`c = 1`); the mHC-ONLY readout is the raw sum, so
@@ -1564,9 +1560,7 @@ class DormouseModel(nn.Module):
         v_first = None
         mod_aux = None
         layer = 0
-        for block in stepaudit.iterations(
-            "forward.transformer_blocks", self.transformer_blocks
-        ):
+        for block in stepaudit.iterations("forward.transformer_blocks", self.transformer_blocks):
             # Eq. 3's `H_pre x_l`, applied by the caller (`mhc.py`): a convex
             # mix over the K lanes, divided by `c` so the block reads the state.
             ctx = mhc.pre_mix(streams, convex=True, scale=1.0 / c)

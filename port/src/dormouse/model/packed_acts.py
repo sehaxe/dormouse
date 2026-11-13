@@ -193,8 +193,9 @@ class _PackedActMM(torch.autograd.Function):
                 # the step boundary — a VRAM regression on the arm whose whole
                 # point is VRAM. The pack is still 1/3 of the GEMM it feeds.
                 return tuple(
-                    nvfp4_mm(rows, w, dt, counters, packed=(packed, scales, g), cache=None)
-                    .view(*x.shape[:-1], w.shape[0])
+                    nvfp4_mm(rows, w, dt, counters, packed=(packed, scales, g), cache=None).view(
+                        *x.shape[:-1], w.shape[0]
+                    )
                     for w in weights
                 )
         packed, scales, g, xq = quantize_nvfp4(x, deq_dtype=dt)

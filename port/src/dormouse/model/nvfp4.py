@@ -780,9 +780,7 @@ def nvfp4_mm(
         b, sb, gb = quantize_nvfp4(weight)
         _emulate(why[0], why[1], counters)
         return _dequant_mm(a, sa, ga, b, sb, gb, dt)
-    b, sb, gb, blocked_b = (
-        cache.pack_nvfp4(weight) if cache is not None else pack_weight(weight)
-    )
+    b, sb, gb, blocked_b = cache.pack_nvfp4(weight) if cache is not None else pack_weight(weight)
     a, sa, ga = quantize_nvfp4(x) if packed is None else packed
     try:
         return _two_level_mm(a, sa, ga, b, blocked_b, gb, dt, counters)
