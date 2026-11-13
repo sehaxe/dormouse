@@ -17,8 +17,8 @@ tokenizer. It trains from scratch on one consumer GPU (RTX 5070 Ti, 16 GB,
 sm_120), and it trains **in the format it ships in** — ternary weights from the
 first step, not a float model quantized afterwards.
 
-The bet is on density: how much model fits in one GPU-day and one file. The
-budget is fixed first, then we ask what fits inside it.
+The bet is on density: how much model fits on one card, in one file. The budget
+is fixed first, then we ask what fits inside it.
 
 ---
 

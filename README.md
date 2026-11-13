@@ -24,8 +24,7 @@
 A byte-level model reads raw bytes — no tokenizer, no vocabulary, no language
 assumption. The same weights handle English, Russian, Python and binary.
 
-The project fixes the budget first and then asks what fits inside it: **one
-GPU-day for training, one file size for shipping**. Every architectural change
+The project fixes the budget first and then asks what fits inside it: **one card, one file size**. Every architectural change
 is measured the same way — held-out bits per byte, against the same model with
 that change removed. If it does not move the loss, it does not ship, however
 elegant it looks.
