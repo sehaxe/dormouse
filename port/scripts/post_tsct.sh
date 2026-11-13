@@ -33,7 +33,7 @@ SFT_OUT=/tmp/opencode/sft_tsct_r256
     .venv/bin/python -u -m dormouse.cli sft configs/arch_tsct95_r256.toml \
       --build-sft --data "$SFT_OUT/corpus.bin" \
       --chat-data data_local/chat/ru_sft_mix.jsonl \
-      --chat-data data_local/chat/local-voice.qa \
+      --chat-data ../data_local/chat/local-voice.qa \
       --init-from "$CKPT" \
       --ckpt-name sft_tsct --out-dir "$SFT_OUT" \
       --steps 4000 --batch 8 --lr 1e-4 --holdout 300 2>&1 | tail -25
