@@ -452,6 +452,10 @@ EXCUSED_FUNCTIONS = {
     "MixOptimizer._fast_adamw_ok": "capability probe over <=8 param groups, no tensor work",
     "MixOptimizer.set_ns_steps": "resume, once per run (a PROGRESS key repair)",
     "DormouseModel.set_recompute": "setup, once per run",
+    "DormouseModel.set_act_store": (
+        "setup, once per run: walks `self.modules()` to install the packed save "
+        "mode on each block; the per-step work is on the block's own GEMM sites"
+    ),
     "_train_impl": (
         "the step DRIVER itself — the bracket, not a loop inside a step "
         "(renamed from `train` by the 2026-11-08 run-registry wrapper)"
