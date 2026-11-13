@@ -171,6 +171,11 @@ DEAD_SNAPSHOT_KEYS = {
     # again (JEPA as ONE mechanism, `model/jepa.py`); a listed key that is a
     # field is skipped, not dropped.
     "stress": (DEAD_SNAPSHOT_COMMIT, False),
+    # removed by `refactor(quant): the ladder is bf16, 4-bit activations,
+    # ternary` (quant-ladder): the S3T Bernoulli mask was its ONE consumer, and
+    # that rung was deleted 2026-11-13. Every snapshot on disk holds 0 (a
+    # non-zero seed refuses: the arm it seeded no longer exists).
+    "factor_qat_seed": ("quant-ladder", 0),
     # removed by `delete the aux_fb future-byte head — a TIE` (39d0485):
     "aux_fb_weight": ("39d0485", 0.0),
     # LANE keys: live on branches this checkout does not carry, under these SAME
@@ -269,16 +274,13 @@ EXPERT_ACTS = ("silu", "situ", "memglu")
 #: `none` = bf16 masters (every number on record); `ternary` = b1.58 STE
 #: (arXiv:2402.17764 Eq. 1, `ternary.ternarize`, per-TENSOR absmean — the
 #: axis burn-bitnet uses) with the soft-to-hard annealing burn-spectral
-#: measured ("converges better than hard STE from step one", lib.rs:75-77);
-#: `ternary_s3t` = S3T stochastic rounding (arXiv:2412.04787,
-#: `ternary.stochastic_ternary`) under the same annealing, its Bernoulli mask
-#: drawn from a process-local generator seeded by `factor_qat_seed`
-#: (reproducible within a run, NOT across a resume —
-#: `tsct.factor_qat_project`'s docstring and the line `train/loop.py` prints).
-#: TSCT is TERNARY, full stop: the non-ternary arms were deleted 2026-11-09.
+#: measured ("converges better than hard STE from step one", lib.rs:75-77).
+#: TSCT is TERNARY, full stop: the non-ternary arms were deleted 2026-11-09
+#: and the S3T sampled arm on 2026-11-13 (owner decision: bf16 masters, 4-bit
+#: activations, ternary weights; the tombstone is `REMOVED_QUANT_MODES`).
 #: A new rung lands WITH its gold test (`tests/test_factor_qat.py`) before
 #: this tuple grows.
-FACTOR_QATS = ("none", "ternary", "ternary_s3t")
+FACTOR_QATS = ("none", "ternary")
 #: The `dense_qat` literals — the DENSE path's switch. It is `FACTOR_QATS`
 #: exactly, and deliberately: `tsct.dense_qat_project` IS `factor_qat_project`
 #: (one function object), so every rung the factor path implements is the same
@@ -294,23 +296,63 @@ DENSE_QATS = FACTOR_QATS
 #: The `act_quant` literals — the a4.8 ACTIVATION formats (`model/act_quant.py`,
 #: transcribed from `crates/dormouse-core/src/act_quant.rs`): `none` = no
 #: activation quantization (every number on record); `int8`/`int4` = symmetric
-#: integer levels `2^(bits-1)-1` (127/7); `fp4` = e2m1, the OCP MX FP4 grid
+#: The `act_quant` literals — the a4.8 ACTIVATION formats (`model/act_quant.py`,
+#: transcribed from `crates/dormouse-core/src/act_quant.rs`), all 4-bit:
+#: `none` = no activation quantization (every number on record); `int4` =
+#: symmetric integer levels (`2^(bits-1)-1` = 7); `e2m1` = the OCP MX FP4 grid
 #: (8 magnitudes, `tsct._NVFP4_MAGNITUDES`) scaled onto the format's MAX, which
-#: is what makes all 8 reachable (the old 3-level bug: AGENTS §3.7 act-quant).
-#: The attention path is upgraded to >= 8 bits unconditionally
-#: (`act_quant.attn_format`), so `fp4`/`int4` never run 4-bit attention. Two
-#: imported families dodge that scale rule: `mxfp8` = the OCP MX e4m3 codec
-#: (spec §5.2, `mxfp.fake_quant_mx`; last dim padded per row to a 32-multiple
-#: when needed), `v2_int4`/`v2_int8` = BitNet v2's Hadamard-rotated integer arms
+#: is what makes all 8 reachable (the old 3-level bug: AGENTS §3.7 act-quant)
+#: — the same element grid `act_store="nvfp4"` writes, so training and
+#: deployment agree; `v2_int4` = BitNet v2's Hadamard-rotated integer arm
 #: (arXiv:2504.18415, `hadamard.v2_quantize`; needs a 2^k last dim, LOUD
-#: otherwise — the rotation of a padded row is a different basis). All three
-#: refuse a non-zero `act_group`: their grid is not the caller's to choose.
+#: otherwise — the rotation of a padded row is a different basis).
+#: The attention path is upgraded to >= 8 bits unconditionally
+#: (`act_quant.attn_format`), onto a partner that is NOT a rung here (no config
+#: may name `int8`/`v2_int8`). `v2_int4` carries its own per-token scale, so it
+#: refuses a non-zero `act_group`: its grid is not the caller's to choose.
+#: The ladder was cut to these four on 2026-11-13 (owner decision); `int8`,
+#: `fp4`, `mxfp8` and `v2_int8` were removed — see `REMOVED_QUANT_MODES`.
 #: A new format lands WITH its gold test (`tests/test_act_quant.py`) before
 #: this tuple grows.
-ACT_QUANTS = ("none", "int8", "int4", "fp4", "e2m1", "mxfp8", "v2_int4", "v2_int8")
-#: The `act_qat` literals — the DENSE-transformer block's 4-bit activation arm
-#: (`model/transformer.py`). It is NOT a second `act_quant`: `act_quant` is the
-#: loop form's fake-quant seam (fp32 block scale, no packing), while this names
+ACT_QUANTS = ("none", "int4", "e2m1", "v2_int4")
+
+#: The rungs REMOVED from the quant ladder on 2026-11-13 — `field -> {value:
+#: why}`. The owner's decision is final: the ladder is bf16 masters, 4-bit
+#: activations, ternary weights. This table is why a config that names a dead
+#: rung fails with ITS history (what it was, what replaced it, what survives)
+#: instead of a generic "invalid value": a checkpoint's `--set` and a reader
+#: both deserve to know the rung was deleted rather than mistyped.
+QUANT_REMOVED_ON = "2026-11-13"
+REMOVED_QUANT_MODES: dict[str, dict[str, str]] = {
+    "factor_qat": {"ternary_s3t": "the S3T sampled arm (`ternary` is the rung)"},
+    "dense_qat": {"ternary_s3t": "the S3T sampled arm (`ternary` is the rung)"},
+    "act_quant": {
+        "int8": "the 8-bit activation rung (the only 8-bit code left is the "
+        "attention upgrade)",
+        "fp4": "the e2m1 grid under its old name",
+        "mxfp8": "the OCP MX e4m3 family (spec §5.2)",
+        "v2_int8": "the BitNet-v2 8-bit width (the arm survives as `v2_int4`)",
+    },
+}
+
+
+def _refuse_removed_quant(field: str, value: str, survivors: tuple[str, ...]) -> None:
+    """Refuse a rung deleted on [`QUANT_REMOVED_ON`], naming the survivors.
+
+    A no-op for every surviving value, so the generic "not an arm" refusal
+    below still owns typos: this message is only for a rung that HAD a meaning.
+    """
+    why = REMOVED_QUANT_MODES.get(field, {}).get(value)
+    if why is None:
+        return
+    loud(
+        f"{field}={value!r} was REMOVED from the quant ladder on "
+        f"{QUANT_REMOVED_ON} (owner decision: bf16 masters, 4-bit activations, "
+        f"ternary weights) — it was {why}. Surviving {field}: {list(survivors)}. "
+        f"Escape: name a survivor."
+    )
+
+
 #: the activations as the INFERENCE format lays them out — e2m1 elements with
 #: an e4m3 scale per 16 columns, the NVFP4 layout (`model/nvfp4.py`). The
 #: forward runs the STE form at that width (`act_quant.fake_quant_act(x,
@@ -1466,25 +1508,16 @@ class ModelConfig:
     #: What the FORWARD does to the TSCT factor masters — the compressed-model
     #: sprint's central knob (`FACTOR_QATS`, formulas in `tsct.factor_qat_project`):
     #: `none` = bf16 masters, every number on record; `ternary` = b1.58 STE with
-    #: burn-spectral's soft-to-hard annealing; `ternary_s3t` = the S3T sampled
-    #: variant. Applies to EVERY TSCT pair the model owns: the loop
-    #: block's projections and the MoE experts' dual-latent factors alike (the
-    #: same `factor_qat_project` on both paths — one place, one test). `s` stays
-    #: fp32 in all arms: it IS the scale the annealing needs.
+    #: burn-spectral's soft-to-hard annealing. Applies to EVERY TSCT pair the model
+    #: owns: the loop block's projections and the MoE experts' dual-latent factors
+    #: alike (the same `factor_qat_project` on both paths — one place, one test).
+    #: `s` stays fp32 in all arms: it IS the scale the annealing needs.
     factor_qat: str = "none"
     #: Annealing strength, 0..=1: 0 = masters untouched (bit-identical `none`),
     #: 1 = pure quantized forward with STE. A schedule ramping this 0→1 is the
     #: burn-measured better-than-hard-STE recipe; until the schedule lands, a
     #: constant is the honest form (a 2k-step A/B can hold it fixed).
     factor_qat_alpha: float = 1.0
-    #: The `ternary_s3t` Bernoulli mask's seed (`tsct.set_factor_qat_seed`,
-    #: called once per model build). The mask is a process-local generator's
-    #: stream, not a pure function of `(seed, step)` — the projector has no step
-    #: — so this makes a run reproducible and a RESUME not (it restarts the
-    #: stream): `tsct.factor_qat_project`'s docstring owns the statement and
-    #: `train/loop.py` prints it at start. Inert (LOUD) without that arm — on
-    #: EITHER path (`factor_qat` or `dense_qat`).
-    factor_qat_seed: int = 0
     #: What the forward does to every DENSE weight master — the plain
     #: `nn.Linear`/`DenseLinear` path the factor rung does not reach (owner
     #: decision, 2026-10-18: the next training run trains in the FINAL
@@ -1754,9 +1787,8 @@ class ModelConfig:
     #: takes the a4.8 upgrade via `attn_path=True`), `DualLatentGLU.forward` (the
     #: experts) and the expert bank in `SparseMoE`. The ROUTER input and the KDA
     #: internals are out of scope by design.
-    #: Two of `ACT_QUANTS`' formats are imported rather than a4.8: `mxfp8`
-    #: (`mxfp.fake_quant_mx`) and `v2_int4`/`v2_int8` (`hadamard.v2_quantize`,
-    #: which needs a 2^k `d_model` — refused at load, not silently padded).
+    #: `v2_int4` is imported rather than a4.8 (`hadamard.v2_quantize`, which
+    #: needs a 2^k `d_model` — refused at load, not silently padded).
     act_quant: str = "none"
     #: Activation columns per scale: 0 = one scale per token (row), else one per
     #: group of `act_group` columns — OUR convention (the a4.8 paper has no
@@ -4489,13 +4521,13 @@ def validate(model: ModelConfig) -> None:
                 f"flags 0."
             )
     if model.factor_qat not in FACTOR_QATS:
+        _refuse_removed_quant("factor_qat", model.factor_qat, FACTOR_QATS)
         loud(
             f"factor_qat={model.factor_qat!r} is not an arm. Known: "
             f"{list(FACTOR_QATS)} — `none` bf16 masters, `ternary` b1.58 STE "
-            f"(arXiv 2402.17764), `ternary_s3t` S3T stochastic rounding "
-            f"(arXiv 2412.04787). Escape: name one of "
-            f"those, or land the arm and its gold test (tests/test_factor_qat.py) "
-            f"BEFORE the config can lie about it."
+            f"(arXiv 2402.17764) under burn-spectral's annealing. Escape: name "
+            f"one of those, or land the arm and its gold test "
+            f"(tests/test_factor_qat.py) BEFORE the config can lie about it."
         )
     if not 0.0 <= model.factor_qat_alpha <= 1.0:
         loud(
@@ -4504,16 +4536,15 @@ def validate(model: ModelConfig) -> None:
             f"your schedule to that range."
         )
     if model.dense_qat not in DENSE_QATS:
+        _refuse_removed_quant("dense_qat", model.dense_qat, DENSE_QATS)
         loud(
             f"dense_qat={model.dense_qat!r} is not an arm. Known: "
             f"{list(DENSE_QATS)} — the SAME projector as `factor_qat` "
             f"(`tsct.dense_qat_project` IS `factor_qat_project`), applied to "
             f"every plain nn.Linear/DenseLinear weight in the forward: `none` "
-            f"the master untouched, `ternary` b1.58 STE (arXiv 2402.17764), "
-            f"`ternary_s3t` S3T stochastic "
-            f"rounding (arXiv 2412.04787). Escape: name one of those, or land "
-            f"the arm and its gold test (tests/test_dense_qat.py) BEFORE the "
-            f"config can lie about it."
+            f"the master untouched, `ternary` b1.58 STE (arXiv 2402.17764). "
+            f"Escape: name one of those, or land the arm and its gold test "
+            f"(tests/test_dense_qat.py) BEFORE the config can lie about it."
         )
     if model.factor_qat == "none" and model.dense_qat == "none" and model.factor_qat_alpha != 1.0:
         loud(
@@ -4522,29 +4553,18 @@ def validate(model: ModelConfig) -> None:
             f"blend has nothing to blend toward. Escape: set factor_qat or "
             f"dense_qat, or leave alpha at 1.0."
         )
-    if model.factor_qat_seed != 0 and "ternary_s3t" not in (
-        model.factor_qat,
-        model.dense_qat,
-    ):
-        loud(
-            f"factor_qat_seed={model.factor_qat_seed} with "
-            f"factor_qat={model.factor_qat!r} / dense_qat={model.dense_qat!r} "
-            f"is inert — only `ternary_s3t` draws from a generator (the other "
-            f"rungs are deterministic projections), on either path. Escape: "
-            f"factor_qat='ternary_s3t' or dense_qat='ternary_s3t', or leave the "
-            f"seed at 0."
-        )
     if model.act_quant not in ACT_QUANTS:
+        _refuse_removed_quant("act_quant", model.act_quant, ACT_QUANTS)
         loud(
             f"act_quant={model.act_quant!r} is not an activation format. Known: "
-            f"{list(ACT_QUANTS)} — `none` off, `int8`/`int4` symmetric integer "
-            f"levels (int8 per-token absmax: 2B4T arXiv 2504.12285; int4 127/7 "
-            f"and the group rule are our convention — formulas in "
-            f"model/act_quant.py), `fp4` e2m1 (the OCP MX FP4 grid), `mxfp8` the "
-            f"OCP MX e4m3 codec (spec §5.2), `v2_int4`/`v2_int8` BitNet v2's "
-            f"Hadamard-rotated integer arms (arXiv 2504.18415). Escape: name one "
-            f"of those, or land the format and its gold test "
-            f"(tests/test_act_quant.py) BEFORE the config can lie about it."
+            f"{list(ACT_QUANTS)} — `none` off, `int4` symmetric 4-bit integer "
+            f"levels (7; per-token absmax is 2B4T arXiv 2504.12285, the group "
+            f"rule is our convention — formulas in model/act_quant.py), `e2m1` "
+            f"the OCP MX FP4 grid (8 magnitudes, the SAME grid `act_store` "
+            f"writes), `v2_int4` BitNet v2's Hadamard-rotated integer arm "
+            f"(arXiv 2504.18415). Escape: name one of those, or land the format "
+            f"and its gold test (tests/test_act_quant.py) BEFORE the config can "
+            f"lie about it."
         )
     if model.act_group < 0:
         loud(
@@ -4552,15 +4572,14 @@ def validate(model: ModelConfig) -> None:
             f"activation columns (0 = one scale per token). Escape: 0, or a "
             f"positive divisor of d_model={model.d_model}."
         )
-    if model.act_group != 0 and model.act_quant in ("mxfp8", "v2_int4", "v2_int8"):
+    if model.act_group != 0 and model.act_quant == "v2_int4":
         loud(
             f"act_group={model.act_group} with act_quant={model.act_quant!r} is "
-            f"inert — that format carries its own scale grid (mxfp8: 32-wide e8m0 "
-            f"blocks; v2_*: per-token absmax after the FWHT), so the group would "
-            f"be silently ignored. Escape: act_group=0, or int8/int4/fp4, whose "
-            f"scale IS the group's block max."
+            f"inert — that format carries its own scale (per-token absmax after "
+            f"the FWHT), so the group would be silently ignored. Escape: "
+            f"act_group=0, or int4/e2m1, whose scale IS the group's block max."
         )
-    if model.act_quant in ("v2_int4", "v2_int8"):
+    if model.act_quant == "v2_int4":
         d = model.d_model
         if d < 1 or (d & (d - 1)) != 0:
             loud(

@@ -1,30 +1,31 @@
-"""The activation-quantization A/B: control (`act_quant=none`) vs int8 vs int4 vs fp4.
+"""The activation-quantization A/B: control (`act_quant=none`) vs int4 vs e2m1.
 
-    uv run python scripts/ab_act_quant.py ab              # 3 seeds x 4 arms, small
+    uv run python scripts/ab_act_quant.py ab              # 3 seeds x 3 arms, small
     uv run python scripts/ab_act_quant.py ab --seeds 1    # one seed, dry check
 
 **Do not run this while the card is busy** (AGENTS §1.5): the preflight refuses
 and prints a SKIP banner, and a skipped run has no numbers to quote.
 
-**Arms** — `ModelConfig.act_quant` (`config.py:392`, the `ACT_QUANTS` rungs
-`config.py:93`, formulas in `model/act_quant.py`, transcribed from
+**Arms** — `ModelConfig.act_quant` (the `ACT_QUANTS` rungs in `config.py`,
+formulas in `model/act_quant.py`, transcribed from
 `crates/dormouse-core/src/act_quant.rs`). One factor per run, everything else
 identical:
 
 * `none` — the control: no activation quantization. Every number on record.
-* `int8` — symmetric 8-bit levels (127), per-row scale, STE. The attention path
-  is already 8 bits, so this arm quantizes the FFN experts only.
-* `int4` — symmetric 4-bit levels (7), same shape. The a4.8 upgrade
-  (`act_quant.attn_format`) keeps attention at 8 bits, so no 4-bit attention.
-* `fp4`  — e2m1 (the OCP MX FP4 grid, 8 magnitudes), block max onto the format's
-  own max 6.0. The 3-level bug of `9b343d3` is what this arm's grid fixed.
+* `int4` — symmetric 4-bit integer levels (7), per-row scale, STE. The a4.8
+  upgrade (`act_quant.attn_format`) keeps attention at 8 bits, so no 4-bit
+  attention.
+* `e2m1` — the OCP MX FP4 grid (8 magnitudes), block max onto the format's own
+  max 6.0. The 3-level bug of `9b343d3` is what this arm's grid fixed, and it is
+  the element grid `act_store="nvfp4"` writes.
 
-**`mxfp8` and `v2_int4`/`v2_int8` are NOT in this A/B, on purpose.** They were
-added by the MX/BitNet-v2 lane (`mxfp.fake_quant_mx`, `hadamard.v2_quantize`)
-and carry their own scale rules; the sm_120 compute question for them is a
-separate lane, and this queue is the a4.8 line (`act_quant.py`'s own table). They
-also REFUSE a non-zero `act_group` (`config.py:889`), so a driver that mixed them
-in could not hold one `act_group` across arms.
+**`v2_int4` is NOT in this A/B, on purpose.** It carries its own scale rule
+(`hadamard.v2_quantize`) and needs a 2^k `d_model`; `small` is 768 = 3·2^8, so
+the arm would measure a different width than the others. Its compute question is
+a separate lane.
+
+The former `int8`, `fp4`, `mxfp8` and `v2_int8` arms were deleted 2026-11-13
+(owner decision: bf16 masters, 4-bit activations, ternary weights).
 
 **The companion key** (`config.py:398`): `act_group` — columns per scale,
 `0` = one scale per token, else a per-group scale. `0` is the default and
@@ -114,9 +115,9 @@ PRESET = "small"
 #: the a4.8 FFN recipe and a second axis (see the module docstring).
 ACT_GROUP = 0
 
-#: The arms, control first so the table reads against it. `mxfp8` / `v2_*` are
+#: The arms, control first so the table reads against it. `v2_int4` is
 #: deliberately absent — the module docstring names why.
-ARMS = ("none", "int8", "int4", "fp4")
+ARMS = ("none", "int4", "e2m1")
 
 
 def _overrides(arm: str, seed: int, out: Path, args: argparse.Namespace) -> tuple[dict, dict]:

@@ -31,8 +31,9 @@ the weight form, not the schedule.
   4-bit activations, attention >= 8 bits at the activation seam too).
 * `a` (dropped, deliberately) — factors + dense with attention at int8.
   There is no int8 WEIGHT codec in `dense_qat`: `FACTOR_QATS` is
-  ternary/ternary_s3t, and `act_quant`'s `int8` is an activation
-  format applied per row/group at a different seam. Reusing it as a weight
+  `none`/`ternary`, and the `int8` that once existed on `act_quant` is an
+  activation format applied per row/group at a different seam (deleted from
+  the ladder on 2026-11-13). Reusing it as a weight
   projection needs a new `dense_qat` literal, its absmean/STE contract and its
   own gold test — not cheap, so the arm is dropped rather than approximated.
   `--arms a` refuses with this reason.

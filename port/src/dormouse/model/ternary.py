@@ -19,6 +19,11 @@ Paths: `lib.rs` = `vendor/dormouse-fused/crates/burn-spectral/src/lib.rs`;
 `.../burn-bitnet/src/quant/activations.rs`. BitNet v2 (arXiv:2504.18415 Eq. 1)
 and the 2B4T report (arXiv:2504.12285) describe the same b1.58 scheme.
 
+`stochastic_ternary` (S3T) has had NO caller since 2026-11-13: the
+`ternary_s3t` rung it fed was deleted with the quant-ladder cut
+(`config.REMOVED_QUANT_MODES`). It stays as the transcribed codec with its gold
+test, the way `activation_quant_8bit` stays as the 8-bit oracle.
+
 WHAT IS **NOT** RECOVERED (each had a home in burn, none is wired here — YAGNI
 until a lane needs it, and the caller can say which one it needs):
 

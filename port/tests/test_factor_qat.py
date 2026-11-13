@@ -9,14 +9,8 @@ The property under test is NOT "does it quantize" (that is
 - gradients still reach the fp32 masters through the STE;
 - the expert bank quantizes per-EXPERT (α_e = mean(|W_e|) of that expert),
   so a banked expert and the same expert run alone agree;
-- the config refusals are LOUD.
-
-The rung added 2026-10-16 (`ternary_s3t`) has an extra property, and it is
-the reason its tests exist rather than re-using `test_ternary.py` (which owns
-the FORMAT): `ternary_s3t` is the one rung whose mask is a drawn stream, so
-its determinism (same seed ⇒ same bits, within one run) and its limit (a new
-seed differs; the bank and the standalone path agree on the SCALE, never on
-the mask) are tested rather than described.
+- the config refusals are LOUD, and a rung the 2026-11-13 cut removed
+  (`ternary_s3t`) refuses with its removal, not as a typo.
 """
 
 from __future__ import annotations
@@ -28,7 +22,7 @@ from dormouse.config import load_run
 from dormouse.instrument import LoudError
 from dormouse.model import DormouseModel
 from dormouse.model.experts import DualLatentGLU, SparseMoE
-from dormouse.model.tsct import TSCTLinear, factor_qat_project, set_factor_qat_seed
+from dormouse.model.tsct import TSCTLinear, factor_qat_project
 
 
 def _tsct(mode: str, alpha: float = 1.0) -> TSCTLinear:
@@ -161,93 +155,8 @@ def test_config_refusals_are_loud():
         load_run("small", model_overrides={"factor_qat": "none", "factor_qat_alpha": 0.5})
     # The legal pairs load.
     load_run("small", model_overrides={"factor_qat": "ternary", "factor_qat_alpha": 0.3})
-    load_run("small", model_overrides={"factor_qat": "ternary_s3t"})
-
-
-# ---------------------------------------------------------------------------
-# ternary_s3t — the drawn mask (reproducibility, grid, and its limit)
-# ---------------------------------------------------------------------------
-
-
-def test_s3t_same_seed_is_the_same_mask_and_a_new_seed_is_not():
-    """Seed ⇒ bits, and the stream ADVANCES inside a run (that is the caveat)."""
-    torch.manual_seed(0)
-    w = torch.randn(64, 64)
-    set_factor_qat_seed(7)
-    a = factor_qat_project(w, "ternary_s3t", 1.0)
-    set_factor_qat_seed(7)
-    b = factor_qat_project(w, "ternary_s3t", 1.0)
-    set_factor_qat_seed(8)
-    c = factor_qat_project(w, "ternary_s3t", 1.0)
-    assert torch.equal(a, b), "same seed must reproduce the mask exactly"
-    assert not torch.equal(a, c), "a different seed must draw a different mask"
-    d = factor_qat_project(w, "ternary_s3t", 1.0)
-    assert not torch.equal(a, d), "one generator, advancing — a new draw per call"
-
-
-def test_s3t_factors_are_zero_or_pm_the_tensor_scale():
-    """S3T's grid, through the projector: `{0, ±mean(|W|)}`, both reachable."""
-    set_factor_qat_seed(0)
-    lin = _tsct("ternary_s3t")
-    u, _ = lin._factors()
-    a = float(lin.u.float().abs().mean())
-    zeros = u.abs() < 1e-9
-    on = (u.abs() - a).abs() < 1e-6
-    assert bool((zeros | on).all()), "S3T emits 0 or ±scale, never anything else"
-    assert bool(zeros.any()), "a stochastic mask must zero some elements"
-    assert bool((~zeros).any())
-
-
-def test_s3t_bank_and_standalone_share_the_scale_not_the_mask():
-    """The ONE divergence in the projector, pinned so it cannot silently widen.
-
-    The bank's per-slice scale is the expert's own absmean (as for `ternary`),
-    but the Bernoulli draw is one `[E, ·, ·]` stream against the standalone
-    path's per-factor draws — no RNG layout makes those identical, so parity is
-    on the SCALE only, never bit-for-bit. A future change that quietly made the
-    bank use a whole-tensor scale would fail the `a_e` assert below.
-    """
-    set_factor_qat_seed(0)
-    cfg = _moe_cfg(factor_qat="ternary_s3t")
-    model = DormouseModel(cfg)
-    moe = next(m for m in model.modules() if isinstance(m, SparseMoE))
-    gates = moe._banks(torch.float32)[0]
-    for e, expert in enumerate(moe.experts):
-        a_e = float(expert.gate_u.float().abs().mean())
-        block = gates[e]
-        on = ((block.abs() - a_e).abs() < 1e-5) | (block.abs() < 1e-7)
-        assert bool(on.all()), f"expert {e} is not on its own S3T scale"
-    mine = factor_qat_project(moe.experts[0].gate_u, "ternary_s3t", 1.0)
-    assert not torch.equal(gates[0], mine), "the mask differs; the scale is the claim"
-
-
-@pytest.mark.parametrize("mode", ["ternary_s3t"])
-def test_each_new_factor_rung_runs_is_finite_and_moves_the_logits(mode):
-    a = DormouseModel(_moe_cfg())
-    b = DormouseModel(_moe_cfg(factor_qat=mode))
-    b.load_state_dict(a.state_dict())
-    x = torch.randint(0, 256, (2, 16))
-    with torch.no_grad():
-        la, _, _ = a(x, x)
-        lb, _, _ = b(x, x)
-    assert bool(torch.isfinite(lb).all())
-    assert not torch.equal(la, lb), f"{mode} left the logits untouched"
-
-
-@pytest.mark.parametrize("mode", ["ternary_s3t"])
-def test_new_factor_rungs_keep_the_gradient_on_the_master(mode):
-    set_factor_qat_seed(0)
-    lin = _tsct(mode)
-    lin(torch.randn(4, 32)).pow(2).mean().backward()
-    for name in ("u", "v"):
-        g = getattr(lin, name).grad
-        assert g is not None and bool(torch.isfinite(g).all()) and g.abs().sum() > 0, name
-
-
-def test_config_ternary_s3t_and_the_seed_inertness():
-    load_run("small", model_overrides={"factor_qat": "ternary_s3t"})
-    load_run("small", model_overrides={"factor_qat": "ternary_s3t", "factor_qat_seed": 7})
-    with pytest.raises(LoudError, match="inert"):
-        load_run("small", model_overrides={"factor_qat": "ternary", "factor_qat_seed": 7})
-    with pytest.raises(LoudError, match="factor_qat"):
-        load_run("small", model_overrides={"factor_qat": "mxfp3"})
+    # The S3T rung is gone (2026-11-13) and says so, with the survivors.
+    with pytest.raises(LoudError) as e:
+        load_run("small", model_overrides={"factor_qat": "ternary_s3t"})
+    assert "REMOVED from the quant ladder on 2026-11-13" in str(e.value)
+    assert "Surviving factor_qat" in str(e.value)

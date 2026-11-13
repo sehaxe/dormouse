@@ -28,10 +28,10 @@ seed that stream from `(seed, step)` before each step
 (`loop.seed_router_jitter`), which also makes two runs of one config agree;
 the jitter test pins both halves.
 
-Known breaks that are NOT regressions and have no fix in this lane:
-`ternary_s3t` (the Bernoulli mask is a process-local `torch.Generator`; the
-trainer prints the disclaimer every run, and `tsct.factor_qat_project`'s
-docstring owns the statement) and any CUDA-graph capture (this lane is CPU).
+Known breaks that are NOT regressions and have no fix in this lane: any
+CUDA-graph capture (this lane is CPU). (`ternary_s3t`, whose Bernoulli mask was
+a process-local `torch.Generator` and therefore the one non-exact arm, was
+deleted on 2026-11-13 with the rest of the cut ladder.)
 """
 
 from __future__ import annotations

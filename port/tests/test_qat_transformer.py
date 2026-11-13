@@ -333,7 +333,7 @@ def test_config_refuses_a_bad_literal_and_an_unwired_block_form():
 
 def test_config_refuses_two_activation_quantizers():
     with pytest.raises(LoudError, match="TWO activation quantizers"):
-        validate(build(act_qat="e2m1", act_quant="fp4"))
+        validate(build(act_qat="e2m1", act_quant="int4"))
 
 
 def test_config_refuses_a_width_that_does_not_tile_16():

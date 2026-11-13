@@ -75,7 +75,6 @@ def test_refresh_is_detached_and_a_hit_reuses_the_tensor():
     assert cache.hits == 1
     # A different alpha or mode is a miss: the anneal moves every step.
     assert cache.refresh(w, "ternary", 0.5) is not q0
-    assert cache.refresh(w, "ternary_s3t", 1.0) is not q0
     cache.invalidate()
     assert cache.refresh(w, "ternary", 1.0) is not q0, "invalidate must force a rebuild"
 
@@ -191,19 +190,6 @@ def test_cached_model_logits_are_bit_identical_to_the_uncached_model():
         la, lb = _forward(a, x), _forward(b, x)
         assert torch.equal(la, lb), over
         assert not torch.equal(la, torch.zeros_like(la)), over
-
-
-def test_s3t_mask_is_drawn_once_per_step_not_per_forward():
-    """The cache changes s3t's stream on purpose: one mask per step (COUNTED)."""
-    torch.manual_seed(0)
-    w = torch.randn(16, 16)
-    cache = QuantCache()
-    a = factor_qat_project(w, "ternary_s3t", 1.0, cache=cache)
-    b = factor_qat_project(w, "ternary_s3t", 1.0, cache=cache)
-    assert torch.equal(a, b), "one step must reuse the drawn mask"
-    c = factor_qat_project(w, "ternary_s3t", 1.0)
-    d = factor_qat_project(w, "ternary_s3t", 1.0)
-    assert not torch.equal(c, d), "the uncached path draws per call (the old cost)"
 
 
 # ---------------------------------------------------------------------------

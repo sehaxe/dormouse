@@ -50,7 +50,6 @@ from dormouse.model.tsct import (
     DenseLinear,
     dense_qat_project,
     factor_qat_project,
-    set_factor_qat_seed,
 )
 from dormouse.train import train
 
@@ -161,19 +160,6 @@ def test_alpha_one_is_the_ternary_projection():
     assert not torch.equal(q, w)
 
 
-def test_s3t_dense_mask_is_a_seeded_stream():
-    torch.manual_seed(0)
-    w = torch.randn(16, 16)
-    set_factor_qat_seed(7)
-    a = dense_qat_project(w, "ternary_s3t", 1.0)
-    set_factor_qat_seed(7)
-    b = dense_qat_project(w, "ternary_s3t", 1.0)
-    set_factor_qat_seed(8)
-    c = dense_qat_project(w, "ternary_s3t", 1.0)
-    assert torch.equal(a, b), "same seed must reproduce the dense mask exactly"
-    assert not torch.equal(a, c), "a different seed must draw a different mask"
-
-
 # ---------------------------------------------------------------------------
 # the forward: alpha=0 identity, alpha=1 pre-quantized fixture
 # ---------------------------------------------------------------------------
@@ -240,20 +226,6 @@ def test_dense_qat_moves_the_logits_and_stays_finite():
         lb, _, _ = b(x, x)
     assert bool(torch.isfinite(lb).all())
     assert not torch.equal(la, lb), "a quantized dense forward must move the logits"
-
-
-@pytest.mark.parametrize("mode", ["ternary_s3t"])
-def test_each_dense_rung_runs_and_moves_the_logits(mode):
-    set_factor_qat_seed(0)
-    a = _model()
-    b = _model(dense_qat=mode)
-    b.load_state_dict(a.state_dict())
-    x = torch.randint(0, 256, (2, 16))
-    with torch.no_grad():
-        la, _, _ = a(x, x)
-        lb, _, _ = b(x, x)
-    assert bool(torch.isfinite(lb).all())
-    assert not torch.equal(la, lb), f"{mode} left the dense forward untouched"
 
 
 # ---------------------------------------------------------------------------
@@ -585,15 +557,16 @@ def test_config_refuses_dense_qat_with_byteflow():
     load_run("small", model_overrides={**over, "dense_qat": "none"})
 
 
-def test_config_alpha_and_seed_are_shared():
+def test_config_alpha_is_shared_and_the_s3t_rung_is_gone():
     # alpha with only the dense path on is NOT inert (it drives dense_qat).
     load_run("small", model_overrides={"dense_qat": "ternary", "factor_qat_alpha": 0.5})
     with pytest.raises(LoudError, match="inert"):
         load_run("small", model_overrides={"factor_qat_alpha": 0.5})
-    # The S3T seed is live on the dense path too.
-    load_run("small", model_overrides={"dense_qat": "ternary_s3t", "factor_qat_seed": 7})
-    with pytest.raises(LoudError, match="inert"):
-        load_run("small", model_overrides={"dense_qat": "ternary", "factor_qat_seed": 7})
+    # The S3T rung (and its `factor_qat_seed`) was deleted 2026-11-13.
+    with pytest.raises(LoudError) as e:
+        load_run("small", model_overrides={"dense_qat": "ternary_s3t"})
+    assert "REMOVED from the quant ladder on 2026-11-13" in str(e.value)
+    assert "Surviving dense_qat" in str(e.value)
 
 
 # ---------------------------------------------------------------------------

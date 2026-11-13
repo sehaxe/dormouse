@@ -78,7 +78,6 @@ expert_beta1 = 4.0
 expert_beta2 = 25.0
 factor_qat = "none"
 factor_qat_alpha = 1.0
-factor_qat_seed = 0
 dense_qat = "none"
 dense_qat_skip_attn = true
 memglu_c0 = 0.6039096539628113

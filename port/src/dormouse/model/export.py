@@ -206,9 +206,9 @@ def _weight_kinds(model: nn.Module, mode: str) -> tuple[dict[str, str], list[str
 
     LOUD on a selected weight that is not 2-D (the codec and its one per-tensor
     absmean are a MATRIX's) and on a selected rung that is not this file's
-    (`mode`): a `mxfp4`/`binary`/`ternary_s3t` master is a different
-    quantization, and storing it as 2-bit ternary codes would be a lie about the
-    artifact.
+    (`mode`): a master trained at another rung (`none`, or one the 2026-11-13
+    cut deleted) is a different quantization, and storing it as 2-bit ternary
+    codes would be a lie about the artifact.
     """
     kinds: dict[str, str] = {}
     undeclared: list[str] = []

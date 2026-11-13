@@ -32,8 +32,6 @@ from dormouse.model.act_quant import (
 )
 from dormouse.model.experts import DualLatentGLU, SparseMoE
 from dormouse.model.hadamard import v2_quantize
-from dormouse.model.mxfp import BLOCK as MX_BLOCK
-from dormouse.model.mxfp import fake_quant_mxfp8
 from dormouse.model.ternary import activation_quant_8bit
 from dormouse.model.tsct import TSCTLinear
 
@@ -54,10 +52,10 @@ def test_max_value_is_the_format_max_not_one():
     The value 1.0 is called out explicitly: normalizing a block onto 1 is the
     defect this module exists to not repeat.
     """
-    assert max_value("fp4") == 6.0
+    assert max_value("e2m1") == 6.0
     assert max_value("int4") == 7.0
     assert max_value("int8") == 127.0
-    assert max_value("fp4") != 1.0
+    assert max_value("e2m1") != 1.0
     for fmt in ACT_FORMATS:
         if fmt == "none":
             with pytest.raises(LoudError, match="no format max"):
@@ -112,7 +110,7 @@ def test_int4_per_token_error_bound_and_levels():
     assert rms < 0.15, f"int4 rms error {rms} (measured 1.267e-1)"
 
 
-def test_fp4_reaches_all_eight_magnitudes_and_scales_onto_6():
+def test_e2m1_reaches_all_eight_magnitudes_and_scales_onto_6():
     """THE anti-3-level test: every e2m1 magnitude must come back.
 
     A block whose max is `M` gets `scale = M/6`, so a value placed at `L·M/6`
@@ -124,19 +122,19 @@ def test_fp4_reaches_all_eight_magnitudes_and_scales_onto_6():
     m = 3.0
     row = torch.tensor([[m * level / 6.0 for level in mags]])
     row = torch.cat([row, -row], dim=-1)  # the sign mirror too
-    out = quantize_act(row, "fp4")
+    out = quantize_act(row, "e2m1")
     want = [m * level / 6.0 for level in mags]
     missing = [v for v in want if not bool((out - v).abs().min() < 1e-6)]
-    assert not missing, f"fp4 never emitted {missing} of {want}: the scale is not reaching 6.0"
+    assert not missing, f"e2m1 never emitted {missing} of {want}: the scale is not reaching 6.0"
     missing_neg = [v for v in want if not bool((out + v).abs().min() < 1e-6)]
-    assert not missing_neg, f"fp4 lost the negative mirror: {missing_neg}"
+    assert not missing_neg, f"e2m1 lost the negative mirror: {missing_neg}"
     # And the block max lands ON 6.0 (scale = block_max/6), not on 1.
     assert abs(float(out.abs().max()) - m) < 1e-6
     assert abs(float(out.abs().max()) - 1.0) > 0.5, "the scale normalized onto 1, not 6"
 
 
-def test_fp4_ramp_emits_the_whole_grid_and_never_0_75():
-    """The burn `fp4_reaches_every_level_through_the_public_quantizer` port.
+def test_e2m1_ramp_emits_the_whole_grid_and_never_0_75():
+    """The burn `fp4_reaches_every_level_through_the_public_quantizer` port (now `e2m1`).
 
     A 4096-step ramp over [0, 1] in ONE block: the block max is 1, so level `L`
     comes back as `L/6` — including 1.5/6, 2/6, 3/6, 4/6 and 6/6, which the
@@ -144,15 +142,15 @@ def test_fp4_ramp_emits_the_whole_grid_and_never_0_75():
     137-146`) and must never appear.
     """
     ramp = torch.linspace(0, 1, 4096).reshape(1, -1)
-    out = quantize_act(ramp, "fp4").flatten()
+    out = quantize_act(ramp, "e2m1").flatten()
     levels = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
     missing = [lv / 6 for lv in levels if not bool((out - lv / 6).abs().min() < 1e-6)]
-    assert not missing, f"fp4 through quantize_act never emitted {missing}"
+    assert not missing, f"e2m1 through quantize_act never emitted {missing}"
     assert not bool((out - 0.75 / 6).abs().min() < 1e-7), "0.75 is not an e2m1 level"
     assert abs(float(out.max()) - 1.0) < 1e-6, "the ramp max must map onto the format max"
 
 
-def test_fp4_ties_go_to_the_even_code():
+def test_e2m1_ties_go_to_the_even_code():
     """`act_quant.rs:150-170`'s tie table, pinned as literals.
 
     Ties-up (a plain `>=` ladder) disagrees with the reference at 4 of these 7
@@ -161,7 +159,7 @@ def test_fp4_ties_go_to_the_even_code():
     vals = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
     want = [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]
     row = torch.tensor([[6.0] + vals + [-v for v in vals]])
-    out = quantize_act(row, "fp4").flatten()
+    out = quantize_act(row, "e2m1").flatten()
     for i, (v, w) in enumerate(zip(vals, want, strict=True)):
         assert abs(out[1 + i].item() - w) < 1e-6, f"tie {v} → {out[1 + i].item()}, want {w}"
     # The negative mirror rounds the same way (sign is never lost).
@@ -170,14 +168,14 @@ def test_fp4_ties_go_to_the_even_code():
 
 
 def test_non_e2m1_output_is_impossible():
-    """Every fp4 output magnitude is a member of the grid (a golden of the FORMAT)."""
+    """Every e2m1 output magnitude is a member of the grid (a golden of the FORMAT)."""
     x = _randn(8, 256, seed=3) * 5.0
-    out = quantize_act(x, "fp4")
+    out = quantize_act(x, "e2m1")
     scale = x.abs().amax(dim=-1, keepdim=True) / 6.0
     mag = (out / scale).abs().flatten()
     grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     dist = (mag.unsqueeze(-1) - grid).abs().min(dim=-1).values
-    assert bool((dist < 1e-4).all()), "an fp4 output is not on the e2m1 grid"
+    assert bool((dist < 1e-4).all()), "an e2m1 output is not on the grid"
 
 
 def test_group_scales_match_a_hand_computed_per_block_reference():
@@ -202,7 +200,7 @@ def test_group_scales_match_a_hand_computed_per_block_reference():
 def test_group_equal_to_the_last_dim_is_per_token():
     """`group == d` is one block per row: exactly `group=0`, bit for bit."""
     x = _randn(6, 128, seed=7)
-    for fmt in ("int8", "int4", "fp4"):
+    for fmt in ("int8", "int4", "e2m1"):
         assert torch.equal(quantize_act(x, fmt, 128), quantize_act(x, fmt, 0))
 
 
@@ -215,7 +213,7 @@ def test_quantization_is_idempotent():
     the identity. If this ever fails, the double-armed path drifts.
     """
     x = _randn(4, 128, seed=11)
-    for fmt in ("int8", "int4", "fp4"):
+    for fmt in ("int8", "int4", "e2m1"):
         for group in (0, 32):
             once = fake_quant_act(x, fmt, group)
             assert torch.equal(fake_quant_act(once, fmt, group), once), (fmt, group)
@@ -261,7 +259,7 @@ def test_non_finite_is_left_to_the_firewall_and_non_float_inputs_are_loud():
     assert out.shape == bad.shape and bool(torch.isnan(out).any())
     inf = _randn(2, 8)
     inf[1, 0] = float("inf")
-    out = fake_quant_act(inf, "fp4")
+    out = fake_quant_act(inf, "e2m1")
     assert not bool(torch.isfinite(out).all())
     with pytest.raises(LoudError, match="float tensors"):
         quantize_act(torch.tensor([[1, 2], [3, 4]]), "int8")
@@ -274,7 +272,7 @@ def test_none_is_the_identity_and_all_zero_blocks_are_safe():
     assert fake_quant_act(x, "none") is x
     assert quantize_act(x, "none") is x
     zeros = torch.zeros(3, 16)
-    for fmt in ("int8", "int4", "fp4"):
+    for fmt in ("int8", "int4", "e2m1"):
         out = quantize_act(zeros, fmt, 8)
         assert bool(torch.isfinite(out).all()) and float(out.abs().max()) == 0.0
 
@@ -285,33 +283,37 @@ def test_none_is_the_identity_and_all_zero_blocks_are_safe():
 
 
 def test_attn_format_upgrades_every_4_bit_format():
-    """`act_quant.rs:38-46`, unconditional: fp4/int4 → int8, int8 → int8.
+    """`act_quant.rs:38-46`, unconditional: e2m1/int4 → int8, int8 → int8.
 
-    The two imported families are read the way their own source reads them:
-    `mxfp8` is already 8 bits (e4m3) and stays itself, and `v2_int4` upgrades
-    INSIDE BitNet v2 (arXiv 2504.18415's activation format is the rotated
-    integer arm at 8 bits) rather than dropping to the unrelated plain `int8`.
+    The imported family is read the way its own source reads it: `v2_int4`
+    upgrades INSIDE BitNet v2 (arXiv 2504.18415's activation format is the
+    rotated integer arm at 8 bits) rather than dropping to the unrelated plain
+    `int8`. Neither upgrade target is a ladder rung, and a rung the ladder
+    removed is not a format at all.
     """
-    assert attn_format("fp4") == "int8"
+    assert attn_format("e2m1") == "int8"
     assert attn_format("int4") == "int8"
     assert attn_format("int8") == "int8"
-    assert attn_format("mxfp8") == "mxfp8"
     assert attn_format("v2_int4") == "v2_int8"
     assert attn_format("v2_int8") == "v2_int8"
     assert attn_format("none") == "none"
     with pytest.raises(LoudError, match="not a format"):
         attn_format("int3")
+    # The 2026-11-13 removals are gone from THIS module too, not just the config.
+    for dead in ("fp4", "mxfp8"):
+        with pytest.raises(LoudError, match="not a format"):
+            attn_format(dead)
 
 
 def test_tsct_attn_path_uses_the_upgraded_format():
     """The flag that carries the a4.8 rule into a projection on the attention path.
 
-    `attn_path=True` with `act_quant="fp4"` must produce EXACTLY the `int8`
+    `attn_path=True` with `act_quant="e2m1"` must produce EXACTLY the `int8`
     forward on the same weights — that is the upgrade, not a rounding of it.
     """
     torch.manual_seed(0)
-    a = TSCTLinear(32, 32, 8, dtype=torch.float32, act_quant="fp4")
-    b = TSCTLinear(32, 32, 8, dtype=torch.float32, act_quant="fp4", attn_path=True)
+    a = TSCTLinear(32, 32, 8, dtype=torch.float32, act_quant="e2m1")
+    b = TSCTLinear(32, 32, 8, dtype=torch.float32, act_quant="e2m1", attn_path=True)
     c = TSCTLinear(32, 32, 8, dtype=torch.float32, act_quant="int8")
     b.load_state_dict(a.state_dict())
     c.load_state_dict(a.state_dict())
@@ -319,7 +321,7 @@ def test_tsct_attn_path_uses_the_upgraded_format():
     with torch.no_grad():
         ya, yb, yc = a(x), b(x), c(x)
     assert torch.equal(yb, yc), "attn_path must run the int8 format"
-    assert not torch.equal(ya, yb), "fp4 and the upgraded int8 must differ"
+    assert not torch.equal(ya, yb), "e2m1 and the upgraded int8 must differ"
     assert bool(torch.isfinite(yb).all())
 
 
@@ -330,7 +332,7 @@ def test_tsct_attn_path_uses_the_upgraded_format():
 
 def test_ste_gradient_is_one():
     """Forward quantized, backward identity: `d/dx = 1` (`act_quant.rs:103-104`)."""
-    for fmt in ("int8", "int4", "fp4"):
+    for fmt in ("int8", "int4", "e2m1"):
         for group in (0, 32):
             x = _randn(4, 64).requires_grad_(True)
             y = fake_quant_act(x, fmt, group)
@@ -388,7 +390,7 @@ def test_quantization_moves_a_model_forward_and_stays_finite():
     from conftest import tiny_model
 
     a = tiny_model()
-    b = tiny_model(act_quant="int8")
+    b = tiny_model(act_quant="e2m1")
     c = tiny_model(act_quant="int4", act_group=32)
     b.load_state_dict(a.state_dict())
     c.load_state_dict(a.state_dict())
@@ -399,10 +401,10 @@ def test_quantization_moves_a_model_forward_and_stays_finite():
         lc, _, _ = c(x, x)
     assert torch.isfinite(lb).all() and torch.isfinite(lc).all()
     assert not torch.equal(la, lb), "an armed forward must move the logits"
-    assert not torch.equal(lb, lc), "int4 and int8 are different formats"
+    assert not torch.equal(lb, lc), "int4 and e2m1 are different formats"
     # The routed/banked expert path is the one that must carry the arm: the
     # counter says it ran, so the arm cannot be silently inert here.
-    a2, b2, c2 = tiny_model(), tiny_model(act_quant="int8"), tiny_model(act_quant="int4")
+    a2, b2, c2 = tiny_model(), tiny_model(act_quant="e2m1"), tiny_model(act_quant="int4")
     b2.load_state_dict(a2.state_dict())
     c2.load_state_dict(a2.state_dict())
     with torch.no_grad():
@@ -421,8 +423,8 @@ def test_config_default_is_none_and_presets_keep_it():
     assert load_preset("small").act_quant == "none"
     assert load_preset("b1").act_quant == "none"
     assert load_run("small", model_overrides={"act_quant": "int4"}).model.act_quant == "int4"
-    grouped = load_run("small", model_overrides={"act_quant": "fp4", "act_group": 32})
-    assert (grouped.model.act_quant, grouped.model.act_group) == ("fp4", 32)
+    grouped = load_run("small", model_overrides={"act_quant": "e2m1", "act_group": 32})
+    assert (grouped.model.act_quant, grouped.model.act_group) == ("e2m1", 32)
 
 
 def test_config_unknown_act_quant_is_loud():
@@ -442,18 +444,18 @@ def test_config_act_group_validation():
     # The legal pairs load: 0, a divisor, and `group == d_model`.
     load_run("small", model_overrides={"act_quant": "int4", "act_group": 0})
     load_run("small", model_overrides={"act_quant": "int4", "act_group": 256})
-    load_run("small", model_overrides={"act_quant": "int8", "act_group": 768})
+    load_run("small", model_overrides={"act_quant": "e2m1", "act_group": 768})
 
 
 def test_moe_arm_reaches_every_expert_path():
     """The banked dense path AND the standalone module both carry the arm."""
     from conftest import tiny_cfg
 
-    cfg = tiny_cfg(act_quant="int8")
+    cfg = tiny_cfg(act_quant="e2m1")
     moe = SparseMoE(cfg)
-    assert all(e.act_quant == "int8" for e in moe.experts)
-    assert moe.shared.act_quant == "int8"
-    assert moe.act_quant == "int8"
+    assert all(e.act_quant == "e2m1" for e in moe.experts)
+    assert moe.shared.act_quant == "e2m1"
+    assert moe.act_quant == "e2m1"
     x = _randn(4, cfg.d_model)
     with torch.no_grad():
         before = moe.experts[0](x)
@@ -494,57 +496,8 @@ def test_banked_dense_bmm_quantizes_the_same_activation_as_the_module():
 
 
 # --------------------------------------------------------------------------
-# the imported families: mxfp8 (OCP MX) and v2_int4/v2_int8 (BitNet v2 FWHT)
+# the imported family: v2_int4 (BitNet v2 FWHT)
 # --------------------------------------------------------------------------
-
-
-def _mxfp8_ref(x: torch.Tensor) -> torch.Tensor:
-    """The pad rule spelled out: zero-pad the last dim per row to a 32-multiple."""
-    n = x.shape[-1]
-    pad = (-n) % MX_BLOCK
-    if pad:
-        x = torch.nn.functional.pad(x, (0, pad))
-    return fake_quant_mxfp8(x)[..., :n]
-
-
-def test_mxfp8_on_a_768_activation_is_exactly_the_mx_module():
-    """The wiring claim: the seam hands `x` to `mxfp`, it does not reimplement it.
-
-    `d_model = 768 = 24·32` is the real preset width, so this is the no-pad
-    path; the assertion is bit-equality with the module's own fake-quant, i.e.
-    the seam adds NOTHING (no second STE, no re-scale).
-    """
-    x = _randn(6, 768, seed=31)
-    got = fake_quant_act(x, "mxfp8")
-    assert torch.equal(got, fake_quant_mxfp8(x))
-    assert torch.equal(quantize_act(x, "mxfp8"), fake_quant_mxfp8(x))
-    assert not torch.equal(got, x), "the arm must quantize"
-
-
-def test_mxfp8_pads_a_non_multiple_of_32_last_dim_and_the_module_still_refuses():
-    """1000 = 31·32 + 8: padded per row here, LOUD in `mxfp` itself."""
-    x = _randn(4, 1000, seed=5)
-    got = fake_quant_act(x, "mxfp8")
-    assert got.shape == x.shape and bool(torch.isfinite(got).all())
-    assert torch.equal(got, _mxfp8_ref(x))
-    per_row = torch.cat([_mxfp8_ref(x[i : i + 1]) for i in range(4)])
-    assert torch.equal(got, per_row), "the pad must be per row, not one flat tail"
-    with pytest.raises(LoudError, match="divisible by 32"):
-        fake_quant_mxfp8(x)
-
-
-def test_mxfp8_model_forward_runs_and_moves_the_logits():
-    from conftest import tiny_model
-
-    a, b = tiny_model(), tiny_model(act_quant="mxfp8")
-    b.load_state_dict(a.state_dict())
-    x = torch.randint(0, 256, (2, 16))
-    with torch.no_grad():
-        la, _, _ = a(x, x)
-        lb, _, cnt = b(x, x)
-    assert bool(torch.isfinite(lb).all())
-    assert not torch.equal(la, lb)
-    assert cnt.get("act_quant_arms", 0) > 0, "the arm must reach the MoE, not idle"
 
 
 def test_v2_int4_forward_equals_v2_quantize_through_the_same_weights():
@@ -594,14 +547,14 @@ def test_v2_formats_refuse_a_non_power_of_two_last_dim():
 
 
 def test_own_grid_formats_ste_gradient_is_one_and_there_is_only_one_ste():
-    """`mxfp8`/`v2_*` return their module's own STE — the seam must not re-wrap.
+    """`v2_*` return their module's own STE — the seam must not re-wrap.
 
-    `fake_quant_act` hands those three through unchanged (`act_quant.py`), so the
+    `fake_quant_act` hands them through unchanged (`act_quant.py`), so the
     gradient is the identity exactly ONCE: `d/dx = 1`, and the forward value
     equals the module's fake-quant (no second `x + (dq − x).detach()` hiding
     which layer owns the estimator).
     """
-    for fmt in ("mxfp8", "v2_int4", "v2_int8"):
+    for fmt in ("v2_int4", "v2_int8"):
         x = _randn(4, 64, seed=41).requires_grad_(True)
         y = fake_quant_act(x, fmt)
         y.sum().backward()
@@ -612,14 +565,14 @@ def test_own_grid_formats_ste_gradient_is_one_and_there_is_only_one_ste():
 def test_own_grid_formats_refuse_a_group_instead_of_ignoring_it():
     """Their grid is not the caller's to choose: `act_group` is LOUD-inert."""
     x = _randn(4, 64, seed=7)
-    for fmt in ("mxfp8", "v2_int4", "v2_int8"):
+    for fmt in ("v2_int4", "v2_int8"):
         with pytest.raises(LoudError, match="INERT"):
             fake_quant_act(x, fmt, 32)
     # ... and the a4.8 formats still take a group (the control for that rule).
     assert not torch.equal(fake_quant_act(x, "int4", 32), fake_quant_act(x, "int4", 0))
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "v2_int4", "v2_int8"])
+@pytest.mark.parametrize("fmt", ["int4", "e2m1", "v2_int4"])
 def test_each_new_act_rung_runs_is_finite_and_moves_the_logits(fmt):
     from conftest import tiny_model
 
@@ -634,42 +587,41 @@ def test_each_new_act_rung_runs_is_finite_and_moves_the_logits(fmt):
     assert cnt.get("act_quant_arms", 0) > 0, f"{fmt} did not reach the MoE bank"
 
 
-def test_config_new_act_rungs_their_inert_combinations_and_the_2k_rule():
-    load_run("small", model_overrides={"act_quant": "mxfp8"})
-    # `small` is d_model=768 = 3·2^8: the rotated arms refuse at load, not on
+def test_config_the_ladder_is_four_formats_and_the_2k_rule():
+    """The surviving rungs load; `v2_int4` refuses a non-2^k width at LOAD."""
+    for fmt in ("none", "int4", "e2m1"):
+        assert load_run("small", model_overrides={"act_quant": fmt}).model.act_quant == fmt
+    assert set(ACT_FORMATS) == {"none", "int4", "e2m1", "v2_int4"}
+    # `small` is d_model=768 = 3·2^8: the rotated arm refuses at load, not on
     # the first forward, and the escape is a power-of-two width.
     with pytest.raises(LoudError, match=r"2\^k"):
         load_run("small", model_overrides={"act_quant": "v2_int4"})
-    with pytest.raises(LoudError, match=r"2\^k"):
-        load_run("small", model_overrides={"act_quant": "v2_int8"})
     ok = load_run(
         "small",
-        model_overrides={"act_quant": "v2_int8", "d_model": 512, "n_heads": 8},
+        model_overrides={"act_quant": "v2_int4", "d_model": 512, "n_heads": 8},
     )
-    assert ok.model.act_quant == "v2_int8"
-    for fmt in ("mxfp8", "v2_int4", "v2_int8"):
-        with pytest.raises(LoudError, match="inert"):
-            load_run("small", model_overrides={"act_quant": fmt, "act_group": 32})
+    assert ok.model.act_quant == "v2_int4"
+    with pytest.raises(LoudError, match="inert"):
+        load_run("small", model_overrides={"act_quant": "v2_int4", "act_group": 32})
+    # The a4.8 formats still take a group (`e2m1` is the grid `act_store` writes).
+    load_run("small", model_overrides={"act_quant": "e2m1", "act_group": 32})
+    assert max_value("e2m1") == 6.0 and max_value("v2_int4") == 7.0
+    assert attn_format("e2m1") == "int8"
+
+
+def test_config_a_removed_rung_names_its_removal_and_the_survivors():
+    """The 2026-11-13 cut: a dead rung fails with its history, not "invalid"."""
+    for dead in ("int8", "fp4", "mxfp8", "v2_int8"):
+        with pytest.raises(LoudError) as e:
+            load_run("small", model_overrides={"act_quant": dead})
+        msg = str(e.value)
+        assert "REMOVED from the quant ladder on 2026-11-13" in msg, msg
+        assert "Surviving act_quant" in msg, msg
+        for live in ("none", "int4", "e2m1", "v2_int4"):
+            assert f"'{live}'" in msg, (dead, live, msg)
+    # A typo still gets the generic refusal, never a removal story.
     with pytest.raises(LoudError, match="not an activation format"):
         load_run("small", model_overrides={"act_quant": "mxfp4"})
-    assert set(ACT_FORMATS) == {
-        "none",
-        "int8",
-        "int4",
-        "fp4",
-        "e2m1",
-        "mxfp8",
-        "v2_int4",
-        "v2_int8",
-    }
-    # `e2m1` is the format's OWN name for the same grid `fp4` has always been:
-    # one codebook, two labels, so the two spellings must agree bit for bit.
-    x = torch.randn(4, 32) * 2.0
-    assert torch.equal(quantize_act(x, "e2m1"), quantize_act(x, "fp4"))
-    assert torch.equal(fake_quant_act(x, "e2m1", 16), fake_quant_act(x, "fp4", 16))
-    assert max_value("e2m1") == max_value("fp4") == 6.0
-    assert attn_format("e2m1") == attn_format("fp4") == "int8"
-    assert max_value("mxfp8") == 448.0 and max_value("v2_int4") == 7.0
 
 
 # --------------------------------------------------------------------------
@@ -692,25 +644,21 @@ def test_config_new_act_rungs_their_inert_combinations_and_the_2k_rule():
 #: proves the move is the summation order and nothing else.
 RUNG_SHAS = {
     "none": "f00b830bb343d9642f39ac5e1ee75df24d6f1ea33cfcadb9de858fc796c2215d",
-    "int8": "0a6a766ded5bf4a508a016e1bcc3200720ab7274bee61ccf45c6a6c92cbb3b9f",
     "int4": "7d01813ae791cc30d97a921b4c98c15eea6309496adff77c89a8ac10f814d57a",
-    "fp4": "8dedcdb069026b0485f28055e20d86fda6bc49292143c3d84e6f6e57fd4509f0",
-    "mxfp8": "b1b19561a5e3fff2608aa783b197e48accd781eb9614079b3e3a9dc8bb9f4921",
+    "e2m1": "8dedcdb069026b0485f28055e20d86fda6bc49292143c3d84e6f6e57fd4509f0",
     "v2_int4": "e69d7bb77d0b35f7991a927a66c304825d7a12f0e79da10c3af286b89deb5c37",
-    "v2_int8": "ea516b425ea1d5da17d217f8ff63b5a8e29453c706658d6cfadd63c3031ae316",
 }
 
 #: `float(loss)` on the same fixture, captured with the shas above. The sha
 #: pins the LOGITS; this pins the scalar the trainer reads, so a loss taken
 #: from other logits or a wrong reduction cannot ride along under a green sha.
+#: The `e2m1` pins are the old `fp4` capture verbatim: ONE codebook, so the
+#: surviving name had to reproduce the deleted one bit for bit.
 RUNG_LOSSES = {
     "none": 6.309731960296631,
-    "int8": 6.309488296508789,
     "int4": 6.306822299957275,
-    "fp4": 6.309034824371338,
-    "mxfp8": 6.308507442474365,
+    "e2m1": 6.309034824371338,
     "v2_int4": 6.3133368492126465,
-    "v2_int8": 6.309607982635498,
 }
 
 
@@ -719,7 +667,7 @@ def _sha(t: torch.Tensor) -> str:
 
 
 def test_every_rung_is_bit_identical_to_main_on_the_fixed_fixture():
-    """No numerical change on finite inputs: logits AND loss, all seven rungs."""
+    """No numerical change on finite inputs: logits AND loss, all four rungs."""
     from conftest import tiny_cfg
 
     from dormouse.model import DormouseModel
@@ -748,15 +696,15 @@ def test_every_rung_is_bit_identical_to_main_on_the_fixed_fixture():
         torch.set_num_threads(old)
 
 
-@pytest.mark.parametrize("fmt", ["int8", "int4", "fp4"])
+@pytest.mark.parametrize("fmt", ["int4", "e2m1"])
 def test_a_training_forward_makes_no_host_read_in_the_quantizer(monkeypatch, fmt):
     """A full forward+backward with every host-read primitive raising.
 
     `moe_topk=0` is the DENSE MoE arm: the routed CPU path's
     `_naive_dispatch` has a pre-existing `.tolist()` (`experts.py:1417`,
-    outside this change), which would mask the quantizer seam. The arms
-    `mxfp8`/`v2_*` delegate to `mxfp`/`hadamard`, whose own finite guards are
-    their modules' business; this gate is `act_quant`'s own path.
+    outside this change), which would mask the quantizer seam. `v2_int4`
+    delegates to `hadamard`, whose own finite guards are its module's business;
+    this gate is `act_quant`'s own path.
     """
     from conftest import tiny_model
 

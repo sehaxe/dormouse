@@ -294,44 +294,6 @@ def mm_mixed(
     return (x if x.dtype == dt else x.to(dt)) @ w.t()
 
 
-#: The S3T Bernoulli stream (`factor_qat = "ternary_s3t"`): the projector has
-#: no step index to seed from, so the mask comes from ONE module-level
-#: generator, seeded from `ModelConfig.factor_qat_seed` and ADVANCING across
-#: calls. `factor_qat_project`'s docstring owns the full statement of what that
-#: costs (a resume restarts the stream); this is the mechanism.
-_S3T_SEED = 0
-_S3T_GENERATORS: dict[tuple[str, int], torch.Generator] = {}
-
-
-def set_factor_qat_seed(seed: int) -> None:
-    """`ModelConfig.factor_qat_seed`'s one entry point (`DormouseModel.__init__`).
-
-    Clears the stream, so a model BUILD is a stream boundary: the trainer builds
-    one model per process (the field is a run property), and a test that builds
-    two models with one seed gets the same masks rather than the seconds.
-    """
-    global _S3T_SEED
-    _S3T_SEED = int(seed)
-    _S3T_GENERATORS.clear()
-
-
-def _s3t_generator(device: torch.device | str) -> torch.Generator:
-    """The process-local S3T generator for `device` — created on first use.
-
-    Keyed by `(device, seed)` because a `torch.Generator` belongs to one device
-    and because two seeds in one process must not share a stream. Never the
-    global RNG (the port's rule: an explicit generator, ADR-0021).
-    """
-    dev = torch.device(device)
-    key = (str(dev), _S3T_SEED)
-    g = _S3T_GENERATORS.get(key)
-    if g is None:
-        g = torch.Generator(device=dev)
-        g.manual_seed(_S3T_SEED)
-        _S3T_GENERATORS[key] = g
-    return g
-
-
 def qat_values(
     w: torch.Tensor, mode: str, alpha: float, *, dim: tuple | None = None
 ) -> torch.Tensor:
@@ -348,29 +310,9 @@ def qat_values(
     """
     if mode == "none":
         return w
-    if mode not in ("ternary", "ternary_s3t"):
+    if mode != "ternary":
         raise AssertionError(f"factor_qat/dense_qat={mode!r} reached the projector with no mode")
     note_qat_values(w)  # one refresh call; `w.shape[0]` is how many tensors it covers
-    if mode == "ternary_s3t":
-        from .ternary import _check_finite, stochastic_ternary
-
-        if dim is None:
-            return stochastic_ternary(w, _s3t_generator(w.device))
-        # The per-slice S3T of `stochastic_ternary`, transposed onto `dim`
-        # (see its docstring: `p = clamp(|w|/scale, 0, 1)`, STRICT `p > u`),
-        # with the one whole-tensor draw the bank's layout gives. The finite
-        # guard is the module's own, so both paths refuse an inf/NaN master
-        # identically instead of one of them zeroing it silently.
-        _check_finite(w, "factor_qat=ternary_s3t (bank slice)")
-        a = w.float().abs().mean(dim=dim, keepdim=True).clamp_min(1e-12)
-        keep_p = (w.float() / a).abs().clamp(0.0, 1.0)
-        u = torch.rand(
-            keep_p.shape,
-            generator=_s3t_generator(w.device),
-            dtype=torch.float32,
-            device=w.device,
-        )
-        return (w.float().sign() * a * (keep_p > u)).to(w.dtype)
     if dim is None:
         from .ternary import ternarize
 
@@ -400,35 +342,13 @@ def factor_qat_project(
 
     - `none` → the master untouched (bit-identical to every number on record);
     - `ternary` → b1.58 STE (`ternary.ste_ternary_annealed`, burn-spectral's
-      measured "converges better than hard STE" annealing);
-    - `ternary_s3t` → S3T stochastic rounding (`ternary.stochastic_ternary`,
-      arXiv:2412.04787) under the SAME annealing. `dim` IS honoured here (the
-      per-slice absmean scale, exactly as `ternary` above), but the Bernoulli
-      MASK cannot be: the bank draws one `[E, ·, ·]` stream and the standalone
-      path draws per factor, and no RNG layout makes those two draw identical
-      bits. So banked and standalone agree on the SCALE (`α_e` per expert) and
-      on the estimator, not bit-for-bit on the mask — the one place in this
-      projector where the two paths diverge, said out loud rather than papered
-      over.
+      measured "converges better than hard STE" annealing).
 
-    THE DETERMINISM OF `ternary_s3t`, stated where a reader will meet it. The
-    port's rule (ADR-0021) is a mask that is a pure function of `(seed, step)`.
-    This seam has no step index — the projector is called from a forward, and
-    the forward does not know which step it is — so the S3T mask comes from ONE
-    module-level `torch.Generator`, seeded from `ModelConfig.factor_qat_seed`
-    and ADVANCING across calls. Consequences, both honest:
-      * within a run it is reproducible: same seed, same call layout, same bits
-        (the trainer builds exactly one model per process);
-      * a RESUMED run does NOT continue the mask stream — it starts a fresh
-        generator at the same seed — so a resumed run's masks differ from an
-        unbroken one's. That degradation is COUNTED, not silent: the trainer
-        prints it at start (`train/loop.py`) and `set_factor_qat_seed` carries
-        it too. The fix, if this rung ever needs one, is a step index threaded
-        into the projector;
-      * every consumer that passes a `QuantCache` (all of them inside the
-        model, wired by `DormouseModel.__init__`) refreshes the mask once per
-        optimizer step, so the mask is drawn per step, not per forward — the
-        `SparseMoE._banks` behaviour, generalized.
+    ONE RUNG, and it is DETERMINISTIC: the projection is a pure function of the
+    master, so a forward draws no RNG and a resume continues the same function.
+    The S3T sampled arm — and the process-local generator its Bernoulli mask
+    came from — was deleted 2026-11-13 (owner decision: bf16 masters, 4-bit
+    activations, ternary weights; `config.REMOVED_QUANT_MODES`).
 
     `dim` picks the absmean's aggregation axis: `None` = the whole tensor (the
     factor-per-layer reading, `ternary.ternarize`'s per-TENSOR axis); `(1, 2)`

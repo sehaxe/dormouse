@@ -1563,19 +1563,6 @@ def _train_impl(
                 f"the backward edge. Values are exact (1e-6 relative gate); "
                 f"`offload_tensors`/`offload_gib_x100` count what moved."
             )
-    if "ternary_s3t" in (run.model.factor_qat, run.model.dense_qat):
-        # The ADR-0021 caveat, said where a reader of the log meets it. The
-        # projector has no step index, so the S3T mask is a process-local
-        # generator's stream (seeded from `factor_qat_seed`): reproducible
-        # within a run, NOT continued by a resume. A degradation a reader
-        # cannot see is a defect (`tsct.factor_qat_project`).
-        log(
-            f"ternary_s3t (factor_qat={run.model.factor_qat}, "
-            f"dense_qat={run.model.dense_qat}): the S3T Bernoulli mask is a "
-            f"process-local stream seeded {run.model.factor_qat_seed} — a resumed "
-            f"run restarts it, so its masks differ from an unbroken run's. "
-            f"Reproducible within one run only."
-        )
     if cfg.engram_ram:
         # BEFORE the optimizer exists: on the host path the tables are not
         # parameters, so no group, no grad clip and no checkpoint half ever
@@ -1825,9 +1812,8 @@ def _train_impl(
         loud(
             f"factor_qat_anneal_steps={anneal_steps} with factor_qat='none' and "
             f"dense_qat='none': there is no quantizer to anneal toward (the ONE "
-            f"alpha drives both paths). Escape: set factor_qat "
-            f"(ternary|binary|mxfp4|ternary_s3t) or dense_qat, or leave the ramp "
-            f"at 0."
+            f"alpha drives both paths). Escape: set factor_qat='ternary' or "
+            f"dense_qat, or leave the ramp at 0."
         )
     total = Counters()
     window = Counters()

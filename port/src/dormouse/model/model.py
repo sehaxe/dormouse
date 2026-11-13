@@ -55,7 +55,7 @@ from .prelude import UniqueLayer
 from .qat_cache import QuantCache, attach_qat_caches, take_qat_refresh_counts
 from .sigreg import sigreg_loss, stride_sample
 from .transformer import TransformerBlock
-from .tsct import make_projection, set_factor_qat_seed
+from .tsct import make_projection
 
 
 def mhc_readout(streams: torch.Tensor, compose: bool) -> torch.Tensor:
@@ -195,12 +195,6 @@ class DormouseModel(nn.Module):
                 f"logits while the model's two CE sites read capped ones. Escape: "
                 f"mtp_weight=0.0, or logit_softcap=0.0."
             )
-        # `factor_qat_seed`'s ONE consumer (`tsct.set_factor_qat_seed`): the S3T
-        # mask stream is a process-local generator, and a model build is its
-        # boundary — the trainer builds one model per process, so the config
-        # field reaches the arm here and nowhere else (a seed with no build
-        # behind it would be the config-field-that-lies defect).
-        set_factor_qat_seed(cfg.factor_qat_seed)
         #: The byteflow arm, under ONE flag with two shapes (`byteflow.py`'s
         #: Option A/B): `bf_net` is the standalone net (no loop arm is on, so
         #: the loop is not built at all — no dormant parameter tree), `bf` is
