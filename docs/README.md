@@ -31,7 +31,7 @@ handbook disagree, the handbook is later.
 
 | directory | count | what |
 |---|---:|---|
-| [`records/reviews/`](records/reviews/) | 145 | hostile reads of a lane: what was measured, what was rejected, and why |
+| [`records/reviews/`](records/reviews/) | 145 | one lane, read from the inside: what was built and what it measured |
 | [`records/research/`](records/research/) | 94 | literature notes and one-off measurements |
 | [`records/architecture/`](records/architecture/) | 20 | design notes for a moment in the plan |
 | [`records/reports/`](records/reports/) | 4 | build and purchase write-ups |

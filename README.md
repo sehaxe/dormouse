@@ -9,13 +9,11 @@
 The goal is a cheap but capable chatbot: a model you can download, run locally,
 and afford to train yourself in days instead of months. What we maximise is
 **intelligence density** — ability per byte of file, per FLOP, per hour of
-training — so the project is the research that buys it: every technique that
-makes a model cheaper and smarter, measured on one consumer GPU, and thrown out
-when it does not pay.
+training. So the project is also the research that buys it: the techniques that
+make a model cheaper and smarter, measured on one consumer GPU.
 
-Byte-level input (256 symbols, no tokenizer), trained in the format it ships in,
-with one rule for every mechanism: *it must beat its own removal on held-out
-bits per byte, at the same budget.*
+Byte-level input (256 symbols, no tokenizer), trained in the format it ships in —
+ternary weights from the first step, so what you train is what you download.
 
 [![CI](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -105,8 +103,7 @@ tree builds only Python.
 
 - **[`docs/HANDBOOK.md`](docs/HANDBOOK.md)** — one document, the whole project.
 - **[Docs site](https://sehaxe.github.io/dormouse/docs/)** — the same, rendered.
-- **[`docs/measurements.md`](docs/measurements.md)** — the dated record of what
-  was measured, including what was rejected.
+- **[`docs/measurements.md`](docs/measurements.md)** — the dated record of runs.
 - **`AGENTS.md`** — the rules an agent (or a person) must follow when changing
   this repo.
 

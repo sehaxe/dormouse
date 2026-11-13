@@ -7,10 +7,9 @@ a date, or a decision with a status.
 on an ordinary computer, in days, and run locally afterwards. The research is
 the route: what makes a model cheaper and smarter, measured rather than assumed.
 
-The rule that shapes everything here: **a result is a comparison, not a trophy.**
-Every mechanism is measured against the same model with that mechanism removed,
-on the same held-out window, at the same budget. The absolute loss moves as soon
-as the architecture changes — and it will keep moving. The gap is the result.
+Every number here names its window and its budget, because a loss without them
+is an anecdote: the same model on a different slice of text, or at a different
+budget, gives a different number.
 
 ---
 

@@ -275,21 +275,29 @@ td.why{color:var(--dim)}
   <div class="num">06 / 10</div>
 </section>
 
-<!-- 07 · method -->
+<!-- 07 · the cost of training -->
 <section class="slide">
   <div class="pad">
-    <div class="kicker">метод</div>
-    <h2 style="margin-top:2vmin">Одиннадцать механизмов измерены и отвергнуты</h2>
-    <table>
-      <tr><th>механизм</th><th style="text-align:right">что дал</th><th style="text-align:right">цена</th><th>вердикт</th></tr>
-      <tr><td>MoE при малом корпусе</td><td class="n">1.00×</td><td class="n">+25% времени</td><td><span class="tag no">отказ</span></td></tr>
-      <tr><td>Ранг 64 вместо 256</td><td class="n">1.95×</td><td class="n">+28% качества</td><td><span class="tag no">отказ</span></td></tr>
-      <tr><td>Факторизация attention</td><td class="n">2.57×</td><td class="n">+27% качества</td><td><span class="tag no">отказ</span></td></tr>
-      <tr><td>Низкоранговый Muon</td><td class="n">1.25×</td><td class="n">+33% качества</td><td><span class="tag no">отказ</span></td></tr>
-      <tr><td>Меньше шагов оптимизатора</td><td class="n">1.08×</td><td class="n">+10% качества</td><td><span class="tag no">отказ</span></td></tr>
-      <tr><td>Gated FFN</td><td class="n">0.00% парам.</td><td class="n">−1.2% качества</td><td><span class="tag ok">в рецепте</span></td></tr>
-    </table>
-    <p style="margin-top:3.6vmin">Мы не верим в архитектуру — мы её меряем. Поэтому продукт тонкий: в нём осталось только то, что доказало себя на живой модели.</p>
+    <div class="kicker">стоимость</div>
+    <h2 style="margin-top:2vmin">Обучение — на одной карте, за дни</h2>
+    <div class="cols three" style="margin-top:5.2vmin">
+      <div class="card">
+        <div class="k">железо</div>
+        <div class="v">16 ГБ</div>
+        <div class="d">Одна потребительская видеокарта. Не кластер и не аренда.</div>
+      </div>
+      <div class="card">
+        <div class="k">время</div>
+        <div class="v">дни</div>
+        <div class="d">Полный прогон с нуля: данные, обучение, экспорт.</div>
+      </div>
+      <div class="card">
+        <div class="k">результат</div>
+        <div class="v">один файл</div>
+        <div class="d">Скачал, запустил локально, без сети и серверов.</div>
+      </div>
+    </div>
+    <p style="margin-top:5.5vmin">Всё, что дороже этих трёх чисел, — не наш путь. Поэтому модель учится сразу в том формате, в котором отгружается: то, что обучается, и есть то, что скачивают.</p>
   </div>
   <div class="num">07 / 10</div>
 </section>

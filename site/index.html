@@ -289,7 +289,7 @@
       <h1>Train a real model on <em>your own computer.</em></h1>
       <p class="sub">The goal is a cheap but capable chatbot: a model you download, run locally, and
         can afford to train in days. What we maximise is <em>intelligence density</em> — ability per
-        byte of file, per FLOP, per hour of training — and everything that does not pay is thrown out.</p>
+        byte of file, per FLOP, per hour of training.</p>
       <div class="cta">
         <a class="btn p" href="#bytes">Start reading</a>
         <a class="btn" href="https://github.com/sehaxe/dormouse">Source ↗</a>
@@ -483,12 +483,12 @@
     <div class="cap">held-out bits per byte against the bytes the model has read</div>
   </div>
   <div class="band" style="max-width:820px">
-    <div class="cell"><div class="v">on / off</div><div class="k">the comparison</div>
-      <div class="d">The same model, one mechanism removed.</div></div>
+    <div class="cell"><div class="v">256</div><div class="k">symbols</div>
+      <div class="d">The file goes in as bytes; no tokenizer.</div></div>
     <div class="cell"><div class="v">196 KB</div><div class="k">the window</div>
       <div class="d">Fixed, held out, and named in every table.</div></div>
-    <div class="cell"><div class="v">against</div><div class="k">its own removal</div>
-      <div class="d">The same model, one mechanism gone.</div></div>
+    <div class="cell"><div class="v">1 card</div><div class="k">the budget</div>
+      <div class="d">16 GB, one GPU, days.</div></div>
   </div>
 </div></section>
 
