@@ -165,6 +165,7 @@ def params_sha(model: DormouseModel) -> str:
     ],
 )
 @pytest.mark.parametrize("explicit_false", [False, True], ids=["absent", "false"])
+@pytest.mark.pins
 def test_byte_patch_off_is_bit_identical(name, base, pin_params, pin_logits, explicit_false):
     """`byte_patch=false` (the default) is today's model, bit for bit."""
     over = dict(base)

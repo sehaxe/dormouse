@@ -174,6 +174,7 @@ def test_the_measured_presets_carry_the_optimizer_recipe():
 # --- 2. the bf16-state gate --------------------------------------------------
 
 
+@pytest.mark.pins
 def test_the_bf16_state_rung_is_within_the_fp32_seed_spread_and_the_pins_hold():
     """The 100-step CPU gate. It explicitly does NOT claim bit equality."""
     fp32, fp32_params = _gate_run("fp32", seed=0)

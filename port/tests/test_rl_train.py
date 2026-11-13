@@ -611,6 +611,7 @@ def test_the_holdout_split_is_hash_disjoint_and_never_drawn(tmp_path: Path):
         split_tasks([tasks[0], tasks[0]], seed=1, holdout=1)
 
 
+@pytest.mark.pins
 def test_twenty_rollouts_hash_to_the_pinned_sha256():
     """Same seed → the same 20 rollout byte strings, pinned by digest."""
     torch.manual_seed(0)

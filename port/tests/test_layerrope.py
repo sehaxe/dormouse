@@ -144,6 +144,7 @@ def _norm_gain_elems(model: DormouseModel) -> dict[str, int]:
     return out
 
 
+@pytest.mark.pins
 def test_a_off_is_bit_identical_to_main():
     """Gate a: the OFF tree is main's state dict, logits and gradients, byte for byte."""
     assert ModelConfig().layerrope is False

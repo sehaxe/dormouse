@@ -62,7 +62,16 @@ addopts = "-q"
 # `slow` = the inductor/compile gates: 32% of the suite's wall time
 # (docs/reviews/2026-11-08-suite-speed.md). Deselect with `-m "not slow"` while
 # iterating; the gate still runs everything.
-markers = ["slow: real inductor compilation / compile-boundary gates"]
+markers = [
+    "slow: real inductor compilation / compile-boundary gates",
+    # An exact fingerprint of a previous run: a sha256 over logits, a
+    # `state_dict` or a launch transcript, or a tuple of counted launches. It
+    # fails on any LEGITIMATE re-association (summation order, thread count, a
+    # CPU kernel, a new parameter) as readily as on a real change, so it runs in
+    # an informational job (`-m pins`) instead of gating a PR. Everything that
+    # only claims a ROUTE (flag off → same formula) belongs here.
+    "pins: exact sha256/state_dict/launch fingerprint of a previous run; informational, not a PR gate",
+]
 
 [project.scripts]
 dormouse = "dormouse.cli:main"

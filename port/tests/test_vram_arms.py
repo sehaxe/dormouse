@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
 import torch
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -131,6 +132,7 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
 # --------------------------------------------------------------- 1. the OFF pin
 
 
+@pytest.mark.pins
 def test_off_is_bit_identical_to_main():
     old = torch.get_num_threads()
     torch.set_num_threads(1)

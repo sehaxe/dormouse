@@ -98,6 +98,7 @@ def _build(seed: int = 1234, **over) -> DormouseModel:
     return DormouseModel(tiny_cfg(**over))
 
 
+@pytest.mark.pins
 def test_gate_a_mtp_soft_off_is_bit_identical_to_clean_main() -> None:
     """`mtp_soft=false` is the old program: pinned state, logits, loss, grads."""
     ids, targets = _fixed_batch()
@@ -130,6 +131,7 @@ def test_gate_a_mtp_soft_off_is_bit_identical_to_clean_main() -> None:
     assert _grad_hash(k1.mtp.projs[0].weight) == PIN_K1_PROJ_GRAD
 
 
+@pytest.mark.pins
 def test_gate_a2_the_seam_is_inert_when_no_mtp_module_is_built() -> None:
     """`mtp_weight=0` builds NO MTP module: the seam flag cannot touch the tree.
 

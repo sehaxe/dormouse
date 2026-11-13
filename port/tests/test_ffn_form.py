@@ -147,6 +147,7 @@ def _wire_best_rank(dense: DormouseModel, tsct: DormouseModel, rank: int) -> Non
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.pins
 def test_bank_default_is_bit_identical_to_clean_main():
     assert _cfg().ffn_form == "bank"
     model = _built({})

@@ -126,6 +126,7 @@ def _routers(model: torch.nn.Module) -> list[tuple[str, torch.Tensor]]:
 # --- (a) capacity 1.0 is the plain transformer, bit for bit ----------------
 
 
+@pytest.mark.pins
 def test_capacity_one_is_bit_identical_to_the_plain_transformer():
     """Gate a: logits AND every gradient match clean `main` `7e921b3`."""
     threads, precision = torch.get_num_threads(), torch.get_float32_matmul_precision()

@@ -396,12 +396,14 @@ def test_the_memory_cap_splits_the_batch_without_moving_a_value(monkeypatch):
     assert all(torch.equal(a, b) for a, b in zip(refs, gots, strict=True))
 
 
+@pytest.mark.pins
 def test_the_default_step_matches_the_pinned_golden():
     model = shape_model(SHAPES)
     muon = Muon(model.parameters(), lr=1e-3, colrow_3d="colrow")
     assert run_hashes(muon, model, 10, torch.float32) == GOLDEN_DEFAULT
 
 
+@pytest.mark.pins
 def test_the_fallback_step_matches_the_pinned_golden():
     model = shape_model(SHAPES, dtype=torch.bfloat16)
     muon = Muon(
@@ -427,6 +429,7 @@ def test_the_fallback_step_matches_the_pinned_golden():
     ],
     ids=["default", "fallback"],
 )
+@pytest.mark.pins
 def test_the_transcribed_main_step_matches_the_same_golden(dtype, kwargs, golden):
     """The transcription pins its own plumbing: if it drifts, the comparison lies."""
     model = shape_model(SHAPES, dtype=dtype)
@@ -443,6 +446,7 @@ def test_the_transcribed_main_step_matches_the_same_golden(dtype, kwargs, golden
     assert got == golden
 
 
+@pytest.mark.pins
 def test_the_mix_arm_matches_the_pinned_golden():
     gen = torch.Generator().manual_seed(0)
     model = nn.Module()

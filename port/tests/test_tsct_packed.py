@@ -153,6 +153,7 @@ def _digest_at_one_thread(cfg: ModelConfig) -> tuple[str, str, float]:
 # --------------------------------------------------------------------------- #
 # A. OFF is clean main — the pins were taken before the edit
 # --------------------------------------------------------------------------- #
+@pytest.mark.pins
 def test_off_is_bit_identical_to_clean_main() -> None:
     """Gate A: the OFF arm matches its 2026-11-10 re-captured alarm (DRIFT only).
 

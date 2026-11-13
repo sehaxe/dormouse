@@ -317,6 +317,7 @@ def test_the_pre_capture_hook_runs_before_the_body(monkeypatch):
 # --- 3. the off path did not move ------------------------------------------
 
 
+@pytest.mark.pins
 def test_the_default_path_is_still_the_pinned_sha(tmp_path):
     from test_full_graph import _PRE_CHANGE_LOGITS_SHA, _PRE_CHANGE_PARAMS_SHA, _five_steps
 

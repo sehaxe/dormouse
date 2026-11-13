@@ -120,18 +120,21 @@ def _full_stack(**over) -> ModelConfig:
     return _cfg(**base)
 
 
+@pytest.mark.pins
 def test_off_is_bit_identical_to_clean_main() -> None:
     ids = torch.arange(96, dtype=torch.long).reshape(3, 32) % 251
     got = _pinned(lambda: _digest(_full_stack(), ids))
     assert got == PIN_A, f"the flag's OFF path moved: it must be a route, not a formula. got {got}"
 
 
+@pytest.mark.pins
 def test_off_bf16_is_bit_identical_to_clean_main() -> None:
     ids = torch.arange(96, dtype=torch.long).reshape(3, 32) % 251
     got = _pinned(lambda: _digest(_full_stack(bf16=True), ids))
     assert got == PIN_B, f"the bf16 OFF path moved: got {got}"
 
 
+@pytest.mark.pins
 def test_off_latent_is_bit_identical_to_clean_main() -> None:
     ids = torch.arange(64, dtype=torch.long).reshape(2, 32) % 251
     got = _pinned(lambda: _digest(_cfg(attn_latent_rank=16), ids))

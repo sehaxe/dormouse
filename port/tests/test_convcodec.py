@@ -99,6 +99,7 @@ def _logit_sha(model: DormouseModel, x: torch.Tensor, y: torch.Tensor) -> str:
     return hashlib.sha256(logits.contiguous().to(torch.float32).numpy().tobytes()).hexdigest()
 
 
+@pytest.mark.pins
 def test_default_attention_codec_stays_bit_identical():
     """`byteflow_codec` defaults to today's path, bit for bit (`21a97d2` pin)."""
     torch.manual_seed(1234)

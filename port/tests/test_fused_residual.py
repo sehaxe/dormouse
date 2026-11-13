@@ -255,6 +255,7 @@ def test_the_fused_path_never_reads_the_device() -> None:
 
 
 @pytest.mark.parametrize("on", [False, True], ids=["off", "on"])
+@pytest.mark.pins
 def test_the_off_path_is_bit_identical_to_clean_main(on: bool) -> None:
     """Pinned from a DETACHED clean-main worktree at `3d36844`.
 

@@ -143,6 +143,7 @@ def _trajectory(spec: bytes, expected: str = "4", **kw) -> Trajectory:
 # --------------------------------------------------------------------------- (1) the template
 
 
+@pytest.mark.pins
 def test_the_plain_corpus_is_bit_identical(tmp_path: Path):
     """The off-by-default gate: no tool markers, the same 23 725 bytes as main."""
     corpus = tmp_path / "sft.bin"
@@ -412,6 +413,7 @@ def _chat(url: str, **body) -> dict:
         return json.loads(r.read())
 
 
+@pytest.mark.pins
 def test_serve_without_tools_is_byte_identical(served_tight):
     body = _chat(served_tight, max_tokens=8)
     assert "tool_calls" not in body["choices"][0]["message"]

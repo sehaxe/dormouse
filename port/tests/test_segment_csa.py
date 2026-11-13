@@ -114,6 +114,7 @@ def _segmented_states(attn: CompressedSelectiveAttention, x: torch.Tensor, seg: 
 # --- 1. segment_len=0 is still the pinned one-shot path --------------------
 
 
+@pytest.mark.pins
 def test_gate_1_segment_len_zero_is_the_pinned_one_shot(monkeypatch):
     """`0` is the default and every number on record; it must not move.
 

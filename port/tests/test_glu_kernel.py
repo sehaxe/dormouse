@@ -144,6 +144,7 @@ def test_no_triton_is_a_counted_reason_not_a_skip(monkeypatch):
 # --------------------------------------------------------------------------- #
 # b. OFF is the model on record
 # --------------------------------------------------------------------------- #
+@pytest.mark.pins
 def test_the_default_is_the_pinned_dense_model_and_the_flag_is_off():
     torch.manual_seed(0)
     model = DormouseModel(_cfg())

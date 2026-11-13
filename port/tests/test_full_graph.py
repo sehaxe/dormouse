@@ -99,6 +99,7 @@ def _five_steps(tmp_path, **train_over):
     return _sha_state(model.state_dict()), _sha_tensor(logits)
 
 
+@pytest.mark.pins
 def test_the_default_path_is_byte_identical(tmp_path):
     params, logits = _five_steps(tmp_path)
     assert params == _PRE_CHANGE_PARAMS_SHA, (

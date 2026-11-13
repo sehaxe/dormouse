@@ -93,6 +93,7 @@ def test_the_flags_are_off_by_default() -> None:
     print("[defaults] moe_route_fused=False moe_permute='argsort'")
 
 
+@pytest.mark.pins
 def test_off_is_bit_identical_to_clean_main(monkeypatch: pytest.MonkeyPatch) -> None:
     """The pin FIRST: the OFF path's bits and its call graph, on one fixture."""
     moe, x = _pin_model()

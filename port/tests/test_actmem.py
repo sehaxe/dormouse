@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
 import torch
 from torch import nn
 
@@ -166,6 +167,7 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
 # --------------------------------------------------------------- OFF: the pin
 
 
+@pytest.mark.pins
 def test_off_is_bit_identical_to_the_pinned_main_run():
     """The default run is the historical graph: both shas must match exactly.
 

@@ -289,6 +289,7 @@ def test_group_grad_norms_are_counted_once_per_log_window(monkeypatch, tmp_path)
 # --- the pinned-bit gate ---------------------------------------------------------
 
 
+@pytest.mark.pins
 def test_off_defaults_are_bit_identical_to_the_pinned_main_run(tmp_path):
     """`agc_clip=0`, `adam_eps=1e-8`, `logit_softcap=0` move no bit."""
     run = tiny_run(tmp_path, steps=GOLDEN_STEPS, log_every=5, warmup_tokens=0)

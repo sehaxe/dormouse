@@ -112,6 +112,7 @@ def _module_launches(fused: bool, t: int = SEQ, state: bool = False):
 # --- 1. the off switch is the reference path -------------------------------
 
 
+@pytest.mark.pins
 def test_gate_1_off_is_bit_identical_to_main():
     assert ModelConfig(**TINY).csa_fused is False, "the new field must default off"
     assert _sha(_module(False)) == CSA_LOOP_SHA, "csa_fused=false moved the reference path"

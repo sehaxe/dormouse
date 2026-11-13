@@ -63,6 +63,7 @@ def _one_byte(model, prompt: bytes, n: int, **kw) -> bytes:
 # ------------------------------------------------------------ (1) flags off
 
 
+@pytest.mark.pins
 def test_flags_off_pins_the_transcript():
     """The default decoder's bytes, pinned; the two fast arms are opt-in."""
     torch.manual_seed(1234)

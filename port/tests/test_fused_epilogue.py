@@ -97,6 +97,7 @@ def _pinned(fn):
 # --------------------------------------------------------------------------- #
 # 0. OFF is clean main — the pins were taken before the edit
 # --------------------------------------------------------------------------- #
+@pytest.mark.pins
 def test_off_is_bit_identical_to_clean_main() -> None:
     a = _cfg(
         use_mhc=True,
@@ -116,6 +117,7 @@ def test_off_is_bit_identical_to_clean_main() -> None:
     )
 
 
+@pytest.mark.pins
 def test_off_latent_is_bit_identical_to_clean_main() -> None:
     b = _cfg(attn_latent_rank=16, fused_latent_proj=False)
     ids = torch.arange(64, dtype=torch.long).reshape(2, 32) % 251

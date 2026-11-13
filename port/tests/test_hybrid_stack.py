@@ -140,6 +140,7 @@ def _blocks(model: DormouseModel) -> list[str]:
 # --- (a) uniform is bit-identical ------------------------------------------
 
 
+@pytest.mark.pins
 def test_uniform_is_bit_identical_to_clean_main():
     """Gate a: the default `block_stack` changes no number, gradient or key."""
     threads, precision = torch.get_num_threads(), torch.get_float32_matmul_precision()

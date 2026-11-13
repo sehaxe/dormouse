@@ -190,6 +190,7 @@ def test_rank64_ffn_params_match_the_hand_formula():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.pins
 def test_off_forward_is_head_bit_identical():
     """The golden was captured from HEAD (b7c2f72) with this exact fixture."""
     golden = torch.load(PRECHANGE, weights_only=False)

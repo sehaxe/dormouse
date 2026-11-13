@@ -53,6 +53,7 @@ def _state_sha(model: torch.nn.Module) -> str:
     return h.hexdigest()
 
 
+@pytest.mark.pins
 def test_off_state_is_bit_identical_to_clean_main():
     torch.manual_seed(1234)
     model = DormouseModel(tiny_cfg())

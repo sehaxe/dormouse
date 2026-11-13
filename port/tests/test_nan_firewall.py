@@ -35,6 +35,7 @@ import hashlib
 import inspect
 from pathlib import Path
 
+import pytest
 import torch
 from conftest import tiny_run
 
@@ -90,6 +91,7 @@ class _NonFiniteLoss(torch.nn.Module):
 # --- gate 1: numerically identical training ---------------------------------
 
 
+@pytest.mark.pins
 def test_a_healthy_five_step_run_is_bit_identical_to_head(tmp_path: Path):
     """No new arithmetic may move a healthy number (the whole change is gated)."""
     run = tiny_run(tmp_path, steps=5, log_every=5, warmup_tokens=0)
@@ -214,6 +216,7 @@ def test_the_training_step_takes_no_host_read(monkeypatch, tmp_path: Path):
 # --- gate 5: the log line's loss is the eager number ------------------------
 
 
+@pytest.mark.pins
 def test_the_logged_loss_is_the_eager_number(tmp_path: Path):
     """The loss is stored on the device and read at the cadence: same digits."""
     run = tiny_run(tmp_path, steps=5, log_every=5, warmup_tokens=0)

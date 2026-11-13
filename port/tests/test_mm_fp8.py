@@ -62,6 +62,7 @@ def _bf16_after_each():
 # --- the default path is pinned ---------------------------------------------
 
 
+@pytest.mark.pins
 def test_the_default_path_is_byte_identical():
     """`mm_dtype="bf16"` must not have moved — the pre-lane hash, re-run."""
     with tempfile.TemporaryDirectory() as td:

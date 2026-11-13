@@ -97,6 +97,7 @@ def _forward(model: DormouseModel, x: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.pins
 def test_off_forward_is_head_bit_identical():
     """The golden was captured from HEAD (b7c2f72) with this exact fixture.
 

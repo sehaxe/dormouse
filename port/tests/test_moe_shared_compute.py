@@ -124,6 +124,7 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
 # --- A. the off path is clean main ------------------------------------------
 
 
+@pytest.mark.pins
 def test_a_flag_off_is_bit_identical_to_clean_main() -> None:
     print(f"[gate A] {GOLDEN_PARAMS} params, sd={GOLDEN_SD_SHA[:12]}")
     default = _build()

@@ -170,6 +170,7 @@ def _m400_cfg() -> ModelConfig:
 # --------------------------------------------------------------------------- #
 # 0. OFF is clean main — the pins were taken before the edit
 # --------------------------------------------------------------------------- #
+@pytest.mark.pins
 def test_off_is_bit_identical_to_clean_main() -> None:
     ids = torch.arange(96, dtype=torch.long).reshape(3, 32) % 251
     grad, state = _pinned(lambda: _digest(_cfg(), ids))
@@ -180,6 +181,7 @@ def test_off_is_bit_identical_to_clean_main() -> None:
     assert state == PIN_A_SD, f"the OFF state dict moved: got {state}"
 
 
+@pytest.mark.pins
 def test_off_csa_is_bit_identical_to_clean_main() -> None:
     ids = torch.arange(96, dtype=torch.long).reshape(3, 32) % 251
     grad, state = _pinned(lambda: _digest(ModelConfig(**B), ids))

@@ -114,6 +114,7 @@ def _pinned(over: dict) -> str:
 # --- 1. every new flag OFF is bit-identical to clean main ------------------
 
 
+@pytest.mark.pins
 def test_gate_1_all_flags_off_is_bit_identical_to_main():
     cases = {
         "default": ({}, PIN_DEFAULT),

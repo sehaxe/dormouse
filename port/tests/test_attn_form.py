@@ -226,6 +226,7 @@ def test_block_mac_ceiling_with_both_factorisations():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.pins
 def test_off_forward_is_head_bit_identical():
     """`attn_form` defaults to "dense": names, RNG order and logits unchanged."""
     golden = torch.load(PRECHANGE, weights_only=False)

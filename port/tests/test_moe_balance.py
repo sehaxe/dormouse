@@ -123,6 +123,7 @@ def moe_pin(coef: float) -> dict:
 # --- a. every new arm OFF is bit-identical to clean main ----------------------
 
 
+@pytest.mark.pins
 def test_off_path_is_bit_identical_to_clean_main():
     """`moe_lb_mode="sign"` + `moe_routing_health=False` IS the pre-edit program.
 
@@ -133,6 +134,7 @@ def test_off_path_is_bit_identical_to_clean_main():
     assert moe_pin(0.05) == PIN_MOE_SIGN, "the sign controller's arithmetic moved"
 
 
+@pytest.mark.pins
 def test_model_seam_off_is_bit_identical_to_clean_main():
     """The `begin_step()`/`aux` plumbing must not move a model that never asks.
 

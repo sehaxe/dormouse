@@ -85,6 +85,7 @@ def test_the_new_flags_are_off_by_default() -> None:
     print("[defaults] moe_bank_epoch=False moe_combine='torch' moe_combine_dtype='fp32'")
 
 
+@pytest.mark.pins
 def test_off_is_bit_identical_to_clean_main() -> None:
     torch.manual_seed(0)
     moe = SparseMoE(_cfg(moe_capacity=1.0), device="cpu")

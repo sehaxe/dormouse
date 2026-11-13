@@ -122,6 +122,7 @@ def _train_pin(tmp_path, **kw) -> tuple[str, str, list[str]]:
 # --------------------------------------------------------------------------- a
 
 
+@pytest.mark.pins
 def test_a_flag_off_is_bit_identical_to_main(tmp_path):
     """The pin AND the call: absent is `false`, and `false` moves no bit."""
     sd, logits, _ = _model_pin()

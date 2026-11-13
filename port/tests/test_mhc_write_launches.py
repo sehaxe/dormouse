@@ -121,6 +121,7 @@ def _region(mhc, xs, y):
 # --------------------------------------------------------------------------- #
 # 1. OFF bit-identical: the pins were taken on main before the arm existed
 # --------------------------------------------------------------------------- #
+@pytest.mark.pins
 def test_off_is_the_shipped_bits_and_the_default() -> None:
     assert ModelConfig().mhc_sinkhorn == "logsumexp"
     assert set(SINKHORN_IMPLS) == {"logsumexp", "log_softmax"}

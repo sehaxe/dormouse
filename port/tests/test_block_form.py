@@ -115,6 +115,7 @@ def _batch(seq: int = SEQ) -> tuple[torch.Tensor, torch.Tensor]:
 # --- (a) the KDA form is bit-identical -------------------------------------
 
 
+@pytest.mark.pins
 def test_kda_form_is_bit_identical_to_clean_main():
     """Gate a: selecting `"kda"` (the default) changes no number, no gradient."""
     threads, precision = torch.get_num_threads(), torch.get_float32_matmul_precision()
