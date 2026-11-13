@@ -1,0 +1,47 @@
+---
+title: dormouse
+description: A byte-level language model trained on one GPU — 1.19 bits per byte, 82 MB ternary.
+template: splash
+hero:
+  tagline: A byte-level language model trained from scratch on one 16 GB GPU. No tokenizer, and trained in the format it ships in — every mechanism measured against its own removal.
+  actions:
+    - text: Read the handbook
+      link: /dormouse/docs/handbook/
+      icon: right-arrow
+    - text: GitHub
+      link: https://github.com/sehaxe/dormouse
+      icon: external
+      variant: minimal
+---
+
+import { Image } from 'astro:assets';
+
+<div class="stat-row">
+  <div class="stat"><b>256</b><span>symbols, no tokenizer</span></div>
+  <div class="stat"><b>12</b><span>layers, one direction</span></div>
+  <div class="stat"><b>2 bit</b><span>weights, trained that way</span></div>
+  <div class="stat"><b>1 GPU</b><span>the whole budget</span></div>
+</div>
+
+<figure class="clip">
+  <video src="/dormouse/docs/media/Promo.webm" poster="/dormouse/docs/media/Promo.jpg" controls muted loop playsinline></video>
+  <figcaption>Fifty seconds: bytes → blocks → attention → one training step → the curve → the format.</figcaption>
+</figure>
+
+## What this is
+
+The input is the file itself — 256 symbols, no vocabulary, no language
+assumption. The model is a small dense transformer that learns to predict the
+next byte, and the whole point is density: how much model fits in one GPU-hour
+and one download.
+
+## Start where you are
+
+- **[The handbook](/dormouse/docs/handbook/)** — one document, the whole project.
+- **[Quick start](/dormouse/docs/quick-start/)** — run it, gate it, export it.
+- **[How it works](/dormouse/docs/architecture/)** — the code map and the two
+  invariants it enforces.
+- **[Measurements](/dormouse/docs/measurements/)** — every number with the run
+  that produced it.
+- **[Archive](/dormouse/docs/archive/)** — the 240 research notes and reviews,
+  kept whole, out of the way.

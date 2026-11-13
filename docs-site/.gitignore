@@ -5,11 +5,14 @@ node_modules/
 dist/
 .astro/
 
-# GENERATED. Every page under src/content/docs/ is built from the canonical
-# markdown at the repository root by tools/ingest.mjs (npm run ingest). It is
-# gitignored on purpose: it is a view, and a committed view is a second copy of
-# the source that can go stale without anyone noticing.
-src/content/docs/
+# TWO pages are generated at build time from their canonical source:
+#   handbook.md  ← ../docs/HANDBOOK.md
+#   archive.md   ← the file list of docs/reviews, docs/research, docs/adr
+# They are gitignored on purpose: a committed view is a second copy that can go
+# stale without anyone noticing. Everything else under src/content/docs/ is the
+# docs themselves and IS committed.
+src/content/docs/handbook.md
+src/content/docs/archive.md
 
 # Lockfile is committed; these are not.
 *.log
