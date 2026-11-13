@@ -679,14 +679,25 @@ def test_config_new_act_rungs_their_inert_combinations_and_the_2k_rule():
 #: sha256(logits) for the all-rungs fixture, captured on `main` (b2e0a1e,
 #: torch 2.13 CPU, seed 0, `use_tsct=false` so the init has no TSCT QR) BEFORE
 #: this change. `none` is the control; every rung must stay here.
+#:
+#: ONE THREAD, and the shas below are the one-thread capture. The forward is an
+#: fp32 chain whose reductions split differently per thread count, so the same
+#: model hashes to four different values at 1/2/4/10 threads (`none`:
+#: f00b830b / a06f892a / 81a37b06 / 56c32d87, max|dlogit| 1.19e-06 while
+#: `float(loss)` is identical to the last digit). The old pins were the 10-thread
+#: capture, i.e. this box's core count, and a runner with a different one reds the
+#: gate without any behaviour change. The test now fixes the reduction order, so
+#: the hash is a regression signal again. RE-PIN, not a relaxation: every
+#: RUNG_LOSSES value below is unchanged from the old capture, which is what
+#: proves the move is the summation order and nothing else.
 RUNG_SHAS = {
-    "none": "56c32d872e50e97b3ea5cebaa311af5d8b93e504bd15a887a92f327f51f89d57",
-    "int8": "b8ee2804ccdcf78b101de6c3da17222ddb90672e47d63c189607812e54fee575",
-    "int4": "f6f76f46316cfc0db6f7c0bc7b8355e3451717eea8cafd016ab28bb584b60eea",
-    "fp4": "85f392186e394cfdd5a4ec4bb462105233b0e596fefdbb5e6646c835b87256c1",
-    "mxfp8": "bcd4d53bfe5caf5823f7dac3f0b8b04a86088be40ff453b08b843bcf42270f18",
-    "v2_int4": "1f6d153118affd648775bd51718e8201489ca7503029b641e101e9374661b36c",
-    "v2_int8": "30e197f8beebd23618f6fb37066de42a4a3c459e570bfcc25b239b8e6c1c31b5",
+    "none": "f00b830bb343d9642f39ac5e1ee75df24d6f1ea33cfcadb9de858fc796c2215d",
+    "int8": "0a6a766ded5bf4a508a016e1bcc3200720ab7274bee61ccf45c6a6c92cbb3b9f",
+    "int4": "7d01813ae791cc30d97a921b4c98c15eea6309496adff77c89a8ac10f814d57a",
+    "fp4": "8dedcdb069026b0485f28055e20d86fda6bc49292143c3d84e6f6e57fd4509f0",
+    "mxfp8": "b1b19561a5e3fff2608aa783b197e48accd781eb9614079b3e3a9dc8bb9f4921",
+    "v2_int4": "e69d7bb77d0b35f7991a927a66c304825d7a12f0e79da10c3af286b89deb5c37",
+    "v2_int8": "ea516b425ea1d5da17d217f8ff63b5a8e29453c706658d6cfadd63c3031ae316",
 }
 
 #: `float(loss)` on the same fixture, captured with the shas above. The sha
@@ -713,23 +724,28 @@ def test_every_rung_is_bit_identical_to_main_on_the_fixed_fixture():
 
     from dormouse.model import DormouseModel
 
-    torch.manual_seed(0)
-    base = DormouseModel(tiny_cfg(use_tsct=False))
-    state = base.state_dict()
-    ids = torch.arange(2 * 32, dtype=torch.long).view(2, 32) % 251
-    targets = (ids + 1) % 251
-    for fmt, want in RUNG_SHAS.items():
+    old = torch.get_num_threads()
+    torch.set_num_threads(1)  # the pins are the one-thread capture (see above)
+    try:
         torch.manual_seed(0)
-        model = DormouseModel(tiny_cfg(use_tsct=False, act_quant=fmt))
-        model.load_state_dict(state)
-        with torch.no_grad():
-            logits, loss, _ = model(ids, targets)
-        got = _sha(logits)
-        assert got == want, f"act_quant={fmt} moved the logits: {got} != {want}"
-        assert float(loss) == RUNG_LOSSES[fmt], (
-            f"act_quant={fmt} moved the loss: {float(loss)!r} != {RUNG_LOSSES[fmt]!r}"
-        )
-        print(f"act_quant={fmt} logits sha {got} loss {float(loss):.9f}")
+        base = DormouseModel(tiny_cfg(use_tsct=False))
+        state = base.state_dict()
+        ids = torch.arange(2 * 32, dtype=torch.long).view(2, 32) % 251
+        targets = (ids + 1) % 251
+        for fmt, want in RUNG_SHAS.items():
+            torch.manual_seed(0)
+            model = DormouseModel(tiny_cfg(use_tsct=False, act_quant=fmt))
+            model.load_state_dict(state)
+            with torch.no_grad():
+                logits, loss, _ = model(ids, targets)
+            got = _sha(logits)
+            assert got == want, f"act_quant={fmt} moved the logits: {got} != {want}"
+            assert float(loss) == RUNG_LOSSES[fmt], (
+                f"act_quant={fmt} moved the loss: {float(loss)!r} != {RUNG_LOSSES[fmt]!r}"
+            )
+            print(f"act_quant={fmt} logits sha {got} loss {float(loss):.9f}")
+    finally:
+        torch.set_num_threads(old)
 
 
 @pytest.mark.parametrize("fmt", ["int8", "int4", "fp4"])
