@@ -296,6 +296,13 @@ def test_progress_keys_are_a_closed_set() -> None:
         "eval",
         "eval_every",
         "json_log",
+        # `torch_compile` joined 2026-11-08: it selects the EXECUTOR of the same
+        # forward, not a new experiment. The checkpoint never carries the
+        # wrapper's `_orig_mod.` prefix (both save and load strip it), so either
+        # direction of the compile boundary loads the same weights/optimizer
+        # state, and `tests/test_torch_compile.py` pins the compiled forward and
+        # gradients to the eager ones at fp32 round-off.
+        "torch_compile",
         "ema_decay",
         "decay_frac",
         "min_lr_frac",
