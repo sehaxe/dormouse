@@ -420,7 +420,9 @@ def test_padding_cannot_reach_a_real_position_or_the_loss(kind):
         logits.reshape(2, SEQ, -1)[:, :20], logits_o.reshape(2, SEQ, -1)[:, :20], rtol=0, atol=1e-5
     ), "padding changed a real position's logit"
     assert torch.allclose(loss, loss_o, rtol=0, atol=1e-7), "padding changed the masked loss"
-    assert not bool(mask[0, 20:].any()) and int(mask[0].sum()) == 19
+    assert not bool(mask[0, 20:].any()) and int(mask[0].sum()) == 19, (
+        "the padded region must be masked out and the short row must score 19 positions"
+    )
 
     # The reduction is the mean over SELECTED positions, exactly. Only the
     # transformer's loss is the final CE alone; the loop also sums per-iteration
@@ -428,7 +430,12 @@ def test_padding_cannot_reach_a_real_position_or_the_loss(kind):
     if kind == "transformer":
         ce = _per_position_ce(logits, y)
         want = ce[mask].mean()
-        assert torch.allclose(loss, want, rtol=0, atol=1e-7)
+        # RELATIVE: a wrong reduction (mean-of-means vs mean-over-selected) is
+        # off by ~1e-2; an absolute 1e-7 bar is summation-order noise and flipped
+        # on the runner.
+        assert torch.allclose(loss, want, rtol=1e-6, atol=1e-9), (
+            f"the loss is not the mean over selected positions: {float(loss):.6f} vs {float(want):.6f}"
+        )
 
 
 def test_masked_ce_mean_divides_by_selected_positions_only():
