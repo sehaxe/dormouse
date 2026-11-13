@@ -366,7 +366,7 @@ Stated explicitly because a null result is a result:
   is already the fused form.
 * **The bf16 momentum rung is not cheaper in traffic** (read bf16 → fp32 temp →
   mul → add → cast back ≈ 4 passes vs 2 in place); it is a memory lever, as
-  documented. `[M]` 285 vs 283 ms/step, `docs/architecture/2026-11-08-the-16x.md`.
+  documented. `[M]` 285 vs 283 ms/step, `docs/records/architecture/2026-11-08-the-16x.md`.
 * **`noop_contig=2`**: the invariant is broken but the cost is ~2 µs (§1).
 
 ---

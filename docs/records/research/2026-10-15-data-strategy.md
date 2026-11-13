@@ -202,7 +202,7 @@ penalty (ByT5, 2105.13626) applies to the *cost* of the shell, not to the data.
 | AgentInstruct (2407.03502) | 25M synthetic prompt/response pairs | HF `microsoft/orca-agentinstruct-1M-v1` | generative-teaching shell |
 | Qwen-AgentWorld (2606.24597) | world model / env simulator, 7 domains | **Apache-2.0** [web] | roll-out env for the post-train loop |
 
-**Post-train SFT mix (from `docs/architecture/post-training.md`):** 30–50% expert
+**Post-train SFT mix (from `docs/records/architecture/post-training.md`):** 30–50% expert
 + 30–50% synthetic-verified + 10–20% repair + 10–25% chat. **Caution:** a 1B
 byte-level model has ~no headroom for multi-turn chat *and* tool use; SmolLM2's
 1.7B needed a filtered SmolTalk (2402.02737 §5) and its own 135M/360M cut
@@ -227,7 +227,7 @@ says textbook-alone *hurts* at small budgets. So: **do not synthesize pretrain
 bulk.** Spend any synthetic budget on the **SFT/agent shell**, where AgentInstruct
 and ToolACE are the proven pattern, and on a **verifier loop** (the K2-style
 rubric + executable check from `docs/records/archive/research/2026-09-26-long-context-agentic.md:58`).
-The self-evolution taxonomy is 2608.03392 (`docs/architecture/post-training.md:36`;
+The self-evolution taxonomy is 2608.03392 (`docs/records/architecture/post-training.md:36`;
 `[sib]` reuse) — framework/memory/skills/tools/workflow/environment; it is a
 post-train structure, not a pretrain data source.
 
@@ -346,7 +346,7 @@ plus `[web]`: aclanthology.org/2022.acl-long.577 (Lee dedup), aclanthology.org/2
 (curse of multilinguality), huggingface.co/datasets/nvidia/Nemotron-CC-v2.1,
 huggingface.co/datasets/HuggingFaceFW/fineweb-2, huggingface.co/SWE-Gym,
 huggingface.co/datasets/nvidia/Open-SWE-Traces, github.com/QwenLM/Qwen-AgentWorld,
-`docs/decisions/2026-10-15-1b-readiness-plan.md`, `docs/records/research/2026-10-15-1b-tech-verification.md`,
+`docs/records/decisions/2026-10-15-1b-readiness-plan.md`, `docs/records/research/2026-10-15-1b-tech-verification.md`,
 `docs/records/archive/research/2026-09-26-byte-lm-recipes.md`, `crates/dormouse-data/src/*`.
 
 *Owed (not done — read-only pass): a line in `docs-site/tools/manifest.mjs`; the

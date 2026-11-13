@@ -229,7 +229,7 @@ and CUDA) and pinned by `tests/test_offload_experts.py`:
    backward edge — a device temporary for exactly the node that needs it, which
    is what makes the peak fall.
 
-**TSCT-2** (`docs/architecture/2026-11-05-tsct-2.md`) adds three OFF-by-default
+**TSCT-2** (`docs/records/architecture/2026-11-05-tsct-2.md`) adds three OFF-by-default
 mechanisms, all on this module because the routed counts are here:
 
 * `tsct_expert_basis` — one `w [rank, shared_rank]` per routed expert, applied
@@ -500,7 +500,7 @@ TSCT_BASIS_EXTRA_SEED = 0x7A5C2
 
 #: The pre-registered revive noise is `sigma = noise · std(v_hot)`; this is the
 #: clip on the LR multiplier (`experts.expert_lr_multipliers`), as specified in
-#: `docs/architecture/2026-11-05-tsct-2.md`.
+#: `docs/records/architecture/2026-11-05-tsct-2.md`.
 EXPERT_LR_CLIP = (0.2, 5.0)
 
 
@@ -809,7 +809,7 @@ class DualLatentGLU(nn.Module):
             up_u = up_u.index_select(1, self._shared_index[1])
         if self.w is not None:
             # TSCT-2: the expert's own `rank`-dim subspace of the wider shared
-            # plane. The LITERAL form of `docs/architecture/2026-11-05-tsct-2.md`
+            # plane. The LITERAL form of `docs/records/architecture/2026-11-05-tsct-2.md`
             # (`x @ plane @ w.T`); the banked path folds the same product into
             # the effective basis at the rebuild so the per-token MAC does not
             # move. `factor_qat` is refused with this arm by config.validate.
@@ -1183,7 +1183,7 @@ class SparseMoE(nn.Module):
                 f"without the loader). Escape: name one of those."
             )
         self.share_u = self.share_u_mode != "off"
-        #: ---- TSCT-2 (`docs/architecture/2026-11-05-tsct-2.md`) -------------
+        #: ---- TSCT-2 (`docs/records/architecture/2026-11-05-tsct-2.md`) -------------
         #: The three arms and their per-forward hooks. The checks run HERE too:
         #: a hand-built `ModelConfig` reaches this constructor without passing
         #: `config.validate`, and an arm that is silently INERT is the defect

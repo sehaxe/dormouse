@@ -1,11 +1,11 @@
 # port preset: small — the A/B polygon, same geometry as burn's configs/small.toml.
 #
-# Ported from the burn side (docs/decisions/2026-10-15-1b-readiness-plan.md §7:
+# Ported from the burn side (docs/records/decisions/2026-10-15-1b-readiness-plan.md §7:
 # "`small` at 9.2M remains the A/B polygon with a port preset of the same name"),
 # with three deliberate deviations, each named where it bites:
 #
 #  1. `bf16 = true` (burn ships false). The port's init path IS the bf16 plan
-#     (docs/architecture/bf16-plan.md): bf16 matmuls with fp32 masters, fp32
+#     (docs/records/architecture/bf16-plan.md): bf16 matmuls with fp32 masters, fp32
 #     state between arms. burn's `small.toml` predates its own 0.22 bf16
 #     measurements; on the port there is no "storage bf16, compute fp32" mode
 #     to preserve.

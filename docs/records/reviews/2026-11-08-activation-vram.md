@@ -321,7 +321,7 @@ and the two runs here bracket the same conclusion — 328.6 ms in one, 279.9 ms 
 the other, against a 273 ms base in both. The 17 % spread is host load (this box
 was running a 5.3 GiB training job for part of the window), not the arm; read
 the row as "no measurable time change". On the 1B it is the second-largest free
-saving (1.875 GiB [C], `docs/reports/2026-11-06-vram-ledger.md` §4).
+saving (1.875 GiB [C], `docs/records/reports/2026-11-06-vram-ledger.md` §4).
 
 ---
 
@@ -420,7 +420,7 @@ KDA ones:
    values (1e-6 gates in `tests/test_actmem.py` / `tests/test_vram_arms.py`). The
    ledger's 1B arithmetic prices it at **11.798 GiB** of the 1B's activation
    branch and raises the max batch from **1 → 13** [C]. Its TIME model says
-   **+33.3 %** ("3 forward units → 4", `docs/reports/2026-11-06-vram-ledger.md:226`);
+   **+33.3 %** ("3 forward units → 4", `docs/records/reports/2026-11-06-vram-ledger.md:226`);
    the 95M measurement is **+11 %**, so the ledger is conservative by ~3× — a 1B
    ETA built on it will be pessimistic, not optimistic, which is the right
    direction. There is no second candidate close to it (`selective` saves a
@@ -452,7 +452,7 @@ KDA ones:
 **Where the numbers come from, and their error bars.** The 95M multipliers are
 [M] (one run, one card, one shape, median of 7). The 1B GiB are the 2026-11-06
 ledger's arithmetic [C], which is **−9.4 %** from its own measured anchor
-(`docs/reports/2026-11-06-vram-ledger.md` §2.3), so read them as ±10 %, not to
+(`docs/records/reports/2026-11-06-vram-ledger.md` §2.3), so read them as ±10 %, not to
 the third digit. The 1B has never been run on this card (the preset says so).
 
 ---

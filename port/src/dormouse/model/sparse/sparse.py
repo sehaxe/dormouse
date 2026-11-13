@@ -1,6 +1,6 @@
 """The MSA: 1/4 arm share + the ADAPTIVE per-iteration schedule the owner set.
 
-**SOURCE**: `docs/decisions/2026-10-15-1b-readiness-plan.md` §3.5 item 4 (the
+**SOURCE**: `docs/records/decisions/2026-10-15-1b-readiness-plan.md` §3.5 item 4 (the
 MQA + block-indexer recipe, carried from the burn re-entry review
 `docs/records/reviews/msa-reentry-2026-10-02.md`), and the verdict row in
 `docs/records/research/2026-10-15-1b-tech-verification.md`: *"sparse attention indexer:

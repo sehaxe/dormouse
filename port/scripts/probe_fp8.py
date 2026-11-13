@@ -5,7 +5,7 @@ report validates it at 671B, 2.664M H800-hours, no rollbacks). Their kernel
 library (DeepGEMM) requires **SM90 or SM100** and this card is **SM120**
 (`torch.cuda.get_device_capability() == (12, 0)`), so DeepGEMM itself cannot run
 here. What can run is `torch._scaled_mm` — which the repo already uses in
-`mm_mixed`'s `mm_dtype=fp8` lane, forward only (`docs/architecture/
+`mm_mixed`'s `mm_dtype=fp8` lane, forward only (`docs/records/architecture/
 2026-10-23-1b-in-a-week.md:78`: "blocked — torch has no `_scaled_mm` backward").
 
 This probe answers three questions in order, and stops at the first NO:

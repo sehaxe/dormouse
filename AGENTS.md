@@ -556,8 +556,8 @@ The defenses are installed, not optional.
   instantiate on CPU are behind `-- --ignored`). The memory/compute split is the
   column that matters: a preset whose count is mostly rows is a lookup table
   with a model attached.
-- Russian docs, read both before touching training code: `docs/architecture/bf16-plan.md`
-  (all-bf16 rules, quant plans), `docs/architecture/post-training.md` (SFT→RLVR→distill→self-
+- Russian docs, read both before touching training code: `docs/records/architecture/bf16-plan.md`
+  (all-bf16 rules, quant plans), `docs/records/architecture/post-training.md` (SFT→RLVR→distill→self-
   evolve loop, EGGROLL).
 
 ---
@@ -978,7 +978,7 @@ Also queued: the fusion backend flip (parked — under fusion, burn's `Tensor`
 becomes the dispatch type and the vendored crates downcast the bare
 `CubeBackend`, 48 × `DispatchKindConversion` unsatisfied, ADR-0018/PLAN), the
 fused-kernel rungs, the official 100k-step baseline, and the code-domain corpus
-mixture → SFT → RLVR loop (`docs/architecture/post-training.md`).
+mixture → SFT → RLVR loop (`docs/records/architecture/post-training.md`).
 
 ## 3.5 Design playbook: what to adapt from Qwen3.8-Flash-Next (tech_report.pdf)
 
@@ -1120,7 +1120,7 @@ Ranked applicability:
    Cheap first step — log ΔE per iteration and check it correlates with the
    deleted λ_k; only then A/B as an actual halt criterion. (ADR-0013 is the
    standing objection to learned halting: fixed depth won twice.)
-3. **Post-training EBM reranker (EBRM / Residual-EBM)**: in `docs/architecture/post-training.md`'s
+3. **Post-training EBM reranker (EBRM / Residual-EBM)**: in `docs/records/architecture/post-training.md`'s
    self-evolve loop, K=8 noisy rollouts are currently picked by the PonderNet
    Q-head — an EBM scorer (segment- or sequence-level) is a drop-in upgrade for
    best-of-n selection, and EBRM-style energy refinement applies to RLVR rewards.
@@ -1346,7 +1346,7 @@ Ranked applicability:
 - The whole-loop `fused/` module is deleted; `fused_seam_counts()` and
   `fused_kernels_skipped()` are the counters that replaced it, printed on the
   eval line.
-- 5060 Ti budget rules of thumb (from `docs/architecture/bf16-plan.md`): 1B model bf16 ≈ 2 GB
+- 5060 Ti budget rules of thumb (from `docs/records/architecture/bf16-plan.md`): 1B model bf16 ≈ 2 GB
   weights, +2 GB per batch-16 s1024 step. The remaining headroom is where the
   RAM-offload playbook buys scale.
 - Launch line for the flagship recipe:

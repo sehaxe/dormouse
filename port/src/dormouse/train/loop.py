@@ -2442,7 +2442,7 @@ def _train_impl(
                     f"two consecutive windows of {cfg.log_every} steps were entirely "
                     f"non-finite (steps {step + 1 - 2 * cfg.log_every + 1}..{step + 1}); "
                     f"nan_skipped={nan_skipped}. This is the readiness plan's "
-                    f"nan_windows>=2 hard error (docs/decisions/"
+                    f"nan_windows>=2 hard error (docs/records/decisions/"
                     f"2026-10-15-1b-readiness-plan.md §3 Phase 1 item 1): a "
                     f"drowning run must stop for a human, not exit 0. Escape: lower "
                     f"lr, check the data, or bisect the arms."

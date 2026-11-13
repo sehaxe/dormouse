@@ -16,7 +16,7 @@ it sits, whether it is describing today's tree or a tree that has since been cut
    (ADR-0013). The retraction is in `AGENTS.md` §3.2; the measurement behind it
    is here, because it was never re-taken.
 2. **A document a newer document replaces** — three program plans where one
-   survives (`docs/architecture/PLAN.md`), and `tier-a-references.md`, whose
+   survives (`docs/records/architecture/PLAN.md`), and `tier-a-references.md`, whose
    table is `docs/protocols/ORACLE-TIERS.tsv` now, which is also the file
    `tools/oracle_gate.py` reads.
 3. **A process byproduct** — a survey whose verdict is recorded in `AGENTS.md`, an

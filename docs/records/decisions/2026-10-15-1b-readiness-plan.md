@@ -197,7 +197,7 @@ at scale") has never been measured. Iso-tokens A/B at 100M:
    `moe=[shares, H, dead]` gate as the utilization floor. A/B: topk 2 vs dense
    at iso-total-params, 100M rung.
 2. **The bf16 step** — storage bf16 + fp32 (or bf16+SR) masters per
-   `docs/architecture/bf16-plan.md`; the mixed-dtype rules are in-tree
+   `docs/records/architecture/bf16-plan.md`; the mixed-dtype rules are in-tree
    (KDA fused kernel and Engram kernels stay fp32 — cast at the arm boundary,
    COUNTED); Muon moments bf16 + stochastic rounding is the unblocked rung
    (bf16 matmul is proven on 0.22). Gate: the bf16 parity tests + a 60-step
@@ -568,7 +568,7 @@ grouped MoE, fp8 experts).
 ### 7.1 The post-training lane (SFT → RLVR → self-evolve; owner: RL in the framework, first-class)
 
 Grounded by `docs/records/research/2026-10-15-agentic-post-training.md` (SOTA read;
-the owner's `docs/architecture/post-training.md` was the start, confirmed OR
+the owner's `docs/records/architecture/post-training.md` was the start, confirmed OR
 corrected there). The research's own headline: **no paper does agentic RL at
 ≤1B total / ≤100M active** — smallest published points are 0.5-3B — so every
 mechanism below is a transfer, and the queue starts cheapest-provable:
@@ -589,7 +589,7 @@ mechanism below is a transfer, and the queue starts cheapest-provable:
    tasks synthesis → solvability screen → anti-hack; agent traces as SFT
    spans (SWE-Gym/Open-SWE/ToolACE, Apache-2.0).
 
-Reserved CLI surface (matches `docs/architecture/post-training.md`):
+Reserved CLI surface (matches `docs/records/architecture/post-training.md`):
 `dormouse post-train --base … --env code,math --verifier hard` — wired after
 step 2 learns anything.
 

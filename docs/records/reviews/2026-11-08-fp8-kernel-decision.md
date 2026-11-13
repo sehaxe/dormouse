@@ -16,7 +16,7 @@ The only kernel worth owning is the **quantizer**: torch's quantize (both operan
 
 ## 1. The live shape and the measurement setup
 
-Live step: `port/configs/flagship3_dense.toml` — 12 dense layers, `d_model=832`, `d_ffn=3072`, b=8, s=1024. The FFN GEMM is `[8192, 832] @ [3072, 832]^T` = 41.87 GFLOP. The step is 136 ms at b=8/s=1024 (model fwd+bwd 104 ms, optimizer 32 ms; `docs/architecture/2026-11-08-training-step.md:340-358`), and the FLOP ledger puts 567.41 of 691.37 MFLOP/byte in the block — **82% of the step's FLOPs are block GEMMs** (`port/configs/flagship3_dense.toml:24-27`).
+Live step: `port/configs/flagship3_dense.toml` — 12 dense layers, `d_model=832`, `d_ffn=3072`, b=8, s=1024. The FFN GEMM is `[8192, 832] @ [3072, 832]^T` = 41.87 GFLOP. The step is 136 ms at b=8/s=1024 (model fwd+bwd 104 ms, optimizer 32 ms; `docs/records/architecture/2026-11-08-training-step.md:340-358`), and the FLOP ledger puts 567.41 of 691.37 MFLOP/byte in the block — **82% of the step's FLOPs are block GEMMs** (`port/configs/flagship3_dense.toml:24-27`).
 
 Probes: `port/scripts/probe_fp8_kernel.py` (pass 1) and `port/scripts/probe_fp8_kernel2.py` (pass 2). Warmup 5, 30 iters, best of 3 reps, CUDA events. `gpu_lock` entered at 1738 MiB (idle); other lanes share the box, so treat absolute ms as ±10% and same-run ratios as the evidence.
 
@@ -151,7 +151,7 @@ Step projection from the measured 82% block-GEMM share of the 104 ms model time,
 | fp8 fwd + bwd, 2.0× on all GEMMs (derived) | 43 ms | 94 ms | **1.45×** |
 | fp8 fwd + bwd, minus backward quantize (~2.4 ms, derived) | — | ~96 ms | **1.42×** |
 
-**The forward-only project is worth ~1.08× on the step, not 1.37×.** The note's parenthetical "(GEMMs are 104 ms of the step)" is the misreading: 104 ms is the **whole model fwd+bwd** (`docs/architecture/2026-11-08-training-step.md:340-358`), not the GEMMs, so 136→99 ms would require halving the entire model including the backward. `[derived]` — from the measured per-GEMM ratios and the repo's 82% FLOP share; no end-to-end fp8 training step was run.
+**The forward-only project is worth ~1.08× on the step, not 1.37×.** The note's parenthetical "(GEMMs are 104 ms of the step)" is the misreading: 104 ms is the **whole model fwd+bwd** (`docs/records/architecture/2026-11-08-training-step.md:340-358`), not the GEMMs, so 136→99 ms would require halving the entire model including the backward. `[derived]` — from the measured per-GEMM ratios and the repo's 82% FLOP share; no end-to-end fp8 training step was run.
 
 ---
 

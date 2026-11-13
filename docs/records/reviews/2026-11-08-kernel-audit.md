@@ -111,7 +111,7 @@ basic_ios::clear` на 762 МБ файла), так что 40 000 шагов н�
 | `muon_fast_graph` | 57 449 | 142.6 | 2.03 | fast + `opt_graph` |
 
 `[M]` `/home/sehaxe/logs/thru/*.jsonl` (2026-11-08). Те же числа в
-`docs/architecture/2026-11-08-the-16x.md:29-38` (там контроль 283 мс).
+`docs/records/architecture/2026-11-08-the-16x.md:29-38` (там контроль 283 мс).
 **RU: bf16-NS — единственный настоящий выигрыш (1.93×), и он уже в живом
 прогоне; state bf16, compile и граф — нули.**
 
@@ -219,7 +219,7 @@ GEMM на пике, NS на 68 TFLOP/s (77% пика), не-GEMM остаток 
 | one-pass combine (`moe_combine="fused"`) | выкл (`torch`) | выкл | один Triton-проход вместо `zeros+index_add_` (три fp32-прохода); счётчик `moe_combine_fused` | `model/moe_kernels.py:1605, 1692` | **НЕТ**: MoE нет (`n_experts=1, moe_topk=0`) |
 | fused KDA tail (`fused_kda_tail`) | выкл | выкл | 2 запуска против 11 на хвосте | `model/fused_kda.py:1-40` | **НЕТ**: `use_kda=false` |
 | fused AdamW writer (`_foreach_adamw_step`) | **ВКЛ** (дефолт) | **ВКЛ** | 172.6 против 360.0 мс на всей стадии, **но 2.47e-4 BPB расхождения за 20 шагов** | `train/optim.py:2086, 2117`; `compile_f3.log` (`exit 4`) | да — и это баг, не выбор |
-| bf16 Newton–Schulz (`ns_dtype=bf16`) | **выкл** | **ВКЛ** | **1.89–1.93× шага**; +0.006 BPB = шум | `docs/architecture/2026-11-08-the-16x.md:29-38`; `logs/thru/ns_bf16.jsonl` | да |
+| bf16 Newton–Schulz (`ns_dtype=bf16`) | **выкл** | **ВКЛ** | **1.89–1.93× шага**; +0.006 BPB = шум | `docs/records/architecture/2026-11-08-the-16x.md:29-38`; `logs/thru/ns_bf16.jsonl` | да |
 | bf16 state (`muon_state_dtype=bf16`) | **выкл** | **ВКЛ** | **0.99×** по скорости; память ×0.5 | `logs/thru/state_bf16.jsonl`; `the-16x.md:31` | да (это memory-рычаг) |
 | CUDA-графы (`opt_graph`/`full_graph`) | выкл | выкл | +3%, −4%, 0; 0.99×; 0.99× | `docs/records/reviews/2026-11-05-graph-verdict.md:9-21`; `the-16x.md:36-38` | `full_graph` ещё и отказывает с `doc_masking` (`config.py:4752`) |
 | `torch.compile` | выкл | выкл | 1.00× (40 шагов), +2.7% (min-of-5), **0.49× у `dynamic=True`** | `logs/thru/compile.jsonl`; `compile_f3.log` | да, но см. §6 |

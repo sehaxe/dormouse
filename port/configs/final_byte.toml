@@ -1,5 +1,5 @@
 # The final byte-level recipe (2026-10-23). Every flag here is measured;
-# the evidence table is docs/architecture/2026-10-23-final-architecture.md.
+# the evidence table is docs/records/architecture/2026-10-23-final-architecture.md.
 # Derived from `medium` with the cross-measured stack: mHC + AttnRes + share_u.
 max_seq_len = 1024
 max_iter = 3

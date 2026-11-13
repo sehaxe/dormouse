@@ -45,7 +45,7 @@ comment can rot. The old **1,066,354,113** was the `max_iter 2` count; `af8b0c9`
 
 ## Invariants (what makes it trustworthy)
 
-From the lessons this project paid for (all in `../docs/decisions/2026-10-15-1b-readiness-plan.md`):
+From the lessons this project paid for (all in `../docs/records/decisions/2026-10-15-1b-readiness-plan.md`):
 
 - **Loud failures, no silent fallback** — every degradation is LOUD (error
   naming cause + escape) or COUNTED (a counter says so); SILENT is a defect
@@ -81,7 +81,7 @@ nothing here.
 
 ## What lives in `docs/`
 
-`docs/decisions/2026-10-15-1b-readiness-plan.md` is the live plan (b1
+`docs/records/decisions/2026-10-15-1b-readiness-plan.md` is the live plan (b1
 arithmetic, substrate verdict, the port lane §7). `docs/records/research/` carries
 the verified technology bets (Muon, ByteFlow, LittleBit, data strategy,
 agentic post-training — every claim with a source). The burn crates in

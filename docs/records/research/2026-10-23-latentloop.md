@@ -7,7 +7,7 @@ Figures 1-8), from `https://arxiv.org/html/2610.19975v1` + the alphaXiv PDF (bot
 experiment variants — the README says internal run dirs and analysis tools are omitted).
 Repo facts read from `port/src/dormouse/model/{loopblock,byteflow,model,kda}.py`,
 `port/src/dormouse/{config,train/optim}.py`, `docs/records/reviews/{launch-atlas-2026-10-02,2026-10-21-battery,2026-10-23-architecture-verdict}.md`,
-`docs/records/research/2026-10-21-adaptivity.md`, `docs/decisions/2026-10-15-1b-readiness-plan.md`,
+`docs/records/research/2026-10-21-adaptivity.md`, `docs/records/decisions/2026-10-15-1b-readiness-plan.md`,
 `docs/protocols/AB-PROTOCOL.md`.
 
 **Marking convention.** `[V]` = verified against the paper page or a file:line. `[S]` =

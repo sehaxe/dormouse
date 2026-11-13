@@ -422,7 +422,7 @@ answers it at 120 MB, where the effect is known to be ~0.004 and possibly scale-
 | knob | keep | evidence it is settled |
 |---|---|---|
 | `muon_lr_mult` | **12** | m8 vs m12 at 73.7 MB: 0.0036 = 0.3σ (inside); m16 is +0.022 (1.95σ, not clean). 12 is the plateau choice, not a measured optimum (`data-eval-integrity.md` §6; `~/logs/sweep_mult/`) [M] |
-| `ns_steps` | **5** | 3 steps costs **+0.274 BPB** at 36.9 MB = 5.4σ — a real regression (`docs/architecture/2026-11-08-the-16x.md`, `data-eval-integrity.md` §6) [M] |
+| `ns_steps` | **5** | 3 steps costs **+0.274 BPB** at 36.9 MB = 5.4σ — a real regression (`docs/records/architecture/2026-11-08-the-16x.md`, `data-eval-integrity.md` §6) [M] |
 | `ns_dtype` / `muon_state_dtype` | **bf16 / bf16** | +0.006 / +0.008 BPB, both inside 16 MB noise; the state rung measured +18% step (`2026-11-05-opt-region.md`) [M] |
 | `opt` | **mix** (Muon + AdamW), `muon_lr_mult=12` | `muon_lr_mult=12` vs AdamW: 0.147 BPB better at 49.2 MB = 6.6σ, 2 seeds vs 2 (`~/logs/night_opt3/m12_*` vs `adam_*`) [M] |
 | `decay_frac` | **0.1** | §2.3: 10% is the published minimum at 0.036-0.17B; the flagship's 0.4 tail moved 0.0046 over its last 1.18 GB, confounded with continued training [M] |

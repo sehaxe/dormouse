@@ -249,7 +249,7 @@ belong to those weights (`port/src/dormouse/train/loop.py:433-439`).
 
 A table, because "what a resume must restore" is the question a new feature gets
 wrong first. The file format itself has its own reference in
-`docs/architecture/checkpoint-format.md` (a sibling document, in flight as this
+`docs/records/architecture/checkpoint-format.md` (a sibling document, in flight as this
 is written); this table is the *step's* view of it — what a change has to touch,
 not what the payload contains.
 
@@ -284,8 +284,8 @@ same measurement; the per-arm line is what the arm's own A/B said.
 | **AttnRes** | `use_attnres` | off | −0.050 at 142M MoE on a 3.3× spread, "unmeasured" on dense (`docs/records/reviews/2026-11-05-architecture-review-dense.md:194`); the dense stack has no per-iteration slots to attend over (`port/src/dormouse/config.py:3231-3234`) |
 | **Engram** (hashed n-gram input tables) | `use_engram` | off | best buy per MAC (+2.306 BPB when ablated) but it is **half the parameters and a lookup table, not capacity** (`docs/records/research/2026-11-07-tsct-ceiling.md:68`); "79 % of the parameters, zero clean evidence" (`docs/records/reviews/2026-11-05-architecture-review-dense.md:244`), and the only comparison on record was scored by a memory-disabled eval, so the verdict was never run (`AGENTS.md` §3.2) |
 | **MoE** (TSCT expert bank) | `n_experts`, `moe_topk`, `use_tsct` | `1`, `0`, `false` | +0.067 BPB for 44.8M params — 43.6 % of the model buying 0.067 (`docs/records/research/2026-11-07-tsct-ceiling.md:68`) — and the load-balancing controller collapsed: 9 of 512 experts ran, one holding 4096 of 8192 assignments (`docs/records/reviews/2026-11-04-routing-collapse-CONFIRMED.md:12`, quoted at `port/src/dormouse/train/loop.py:335-341`) |
-| **`torch.compile`** | `torch_compile` | off | 285 ms/step against the control's 283 at the live shape, i.e. **1.00×** (`docs/architecture/2026-11-08-the-16x.md:30`, `:36`); on the MoE form it was 0.20× because of data-dependent cache guards (`docs/records/reviews/2026-10-23-architecture-verdict.md:77`) |
-| **CUDA graphs** (`opt_graph`, `full_graph`) | `opt_graph` / `full_graph` | off | 286 ms vs 283, **0.99×** (`docs/architecture/2026-11-08-the-16x.md:37`). `full_graph` would also refuse **this** config on its own: it runs the EMA update eagerly outside the capture, so a capture would re-apply the capture step's delta on every replay — `ema_decay=0.999` is a LOUD refusal (`port/src/dormouse/train/graph.py:661-668`), and `full_graph_refusal` refuses every arm it cannot replay (`:569-758`) |
+| **`torch.compile`** | `torch_compile` | off | 285 ms/step against the control's 283 at the live shape, i.e. **1.00×** (`docs/records/architecture/2026-11-08-the-16x.md:30`, `:36`); on the MoE form it was 0.20× because of data-dependent cache guards (`docs/records/reviews/2026-10-23-architecture-verdict.md:77`) |
+| **CUDA graphs** (`opt_graph`, `full_graph`) | `opt_graph` / `full_graph` | off | 286 ms vs 283, **0.99×** (`docs/records/architecture/2026-11-08-the-16x.md:37`). `full_graph` would also refuse **this** config on its own: it runs the EMA update eagerly outside the capture, so a capture would re-apply the capture step's delta on every replay — `ema_decay=0.999` is a LOUD refusal (`port/src/dormouse/train/graph.py:661-668`), and `full_graph_refusal` refuses every arm it cannot replay (`:569-758`) |
 | **segmented forward** | `segment_len` | 0 | it is a **memory** decision that may not move a model boundary (`docs/records/reviews/2026-11-08-segment-csa.md:10-14`); at 8192 bytes/step there is no VRAM to save, and a capture refuses it (`port/src/dormouse/train/graph.py:633-639`) |
 
 Three more arms exist on the same step and are also off:
@@ -312,7 +312,7 @@ another.
 
 Measured, one script, 40 steps per arm, `b=8 s=1024`, 95 035 200 params, arms run
 minutes apart on one card (`/home/sehaxe/logs/thru/*.jsonl`, tabulated at
-`docs/architecture/2026-11-08-the-16x.md:30-37`). Recomputed from `tokens_per_s`
+`docs/records/architecture/2026-11-08-the-16x.md:30-37`). Recomputed from `tokens_per_s`
 the same rows read 290 / 150 / 221 / 140 ms — within 3 %, which is why §7 keeps
 the absolute open.
 
@@ -333,9 +333,9 @@ Two readings from it, both load-bearing:
   bf16 moves the same polynomial to the tensor cores. Three iterations instead of
   five costs **+0.274 BPB** at 16.4 MB, reproduced in both dtypes — the published
   "non-monotone, a tie" result does not transfer to `[832,3072]` with a dense
-  spectrum (`docs/architecture/2026-11-08-the-16x.md:41-49`).
+  spectrum (`docs/records/architecture/2026-11-08-the-16x.md:41-49`).
 - **compile and graphs buy nothing here**, and that is a measured zero on the
-  *same* ladder, not an opinion (`docs/architecture/2026-11-08-the-16x.md:53-57`).
+  *same* ladder, not an opinion (`docs/records/architecture/2026-11-08-the-16x.md:53-57`).
 
 ### 5.2 The split at the live rung
 
@@ -406,7 +406,7 @@ Compile и graphs уже измерены как ноль **на этом** ша
 ## 7. What this document does not settle
 
 1. **Two measurements of the same arm disagree by 1.8×.** The 40-step ladder puts
-   the fp32-NS control at 283 ms/step (`docs/architecture/2026-11-08-the-16x.md:30`);
+   the fp32-NS control at 283 ms/step (`docs/records/architecture/2026-11-08-the-16x.md:30`);
    the 14 648-step ladder control on the same preset at the same batch reads
    **164 ms/step**
    (`/home/sehaxe/logs/ladder/control_refetch.jsonl`, 49 813 tok/s at step 3 662,

@@ -76,7 +76,7 @@ PYTHONPATH=src uv run python scripts/dead_knob_audit.py --preset-glob 'configs/*
   `../AGENTS.md` §2.
 - Docs follow `../docs/README.md` (one root `docs/`, dated names); don't create a
   second doc tree here.
-- `../docs/decisions/2026-10-15-1b-readiness-plan.md` is the live plan.
+- `../docs/records/decisions/2026-10-15-1b-readiness-plan.md` is the live plan.
   `.bulba/goal.md` in this directory is dated (2026-10-22) — check before trusting
   it as current.
 

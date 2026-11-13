@@ -17,7 +17,7 @@ dependency, no second `_sdpa_path` fallback, and the loop's per-iteration state
 contract is untouched.
 
 The block is fp32 on the residual stream (the port's rule: fp32 state between
-arms, `docs/architecture/bf16-plan.md`). It owns one RMSNorm, three dense
+arms, `docs/records/architecture/bf16-plan.md`). It owns one RMSNorm, three dense
 projections and NO bias — `3·d·d_ff` is the whole new parameter delta, which is
 what `tests/test_prelude.py` pins against the instantiated tree.
 

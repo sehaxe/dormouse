@@ -238,19 +238,19 @@ dated record and adds a banner. Nothing is archived.
 | # | doc:line | claim (short) | code now | wrong side | group | repair |
 |---:|---|---|---|---|---|---|
 | D1 | `docs/adr/0014-msa-cut.md:13-15` | MSA crate + `use_msa`/`msa_topk`/`msa_block` **deleted**; no run executed it | live dependency `crates/dormouse-core/Cargo.toml:45`; fields `config.py:1586-1588`; `medium_long.log:11` has `msa_blocks=588,816,384` | **document** (decision not executed) | B | banner `not executed`; keep body |
-| D2 | `docs/architecture/post-training.md:16,31-34` | "RLVR — PPO + value head"; value head, GAE, PPO clip, token-level advantage | `post/rl.py:43-46` "no value head"; two arms CRR/group `:355-372`; `grep -rn '\bPPO\b' port/src` = 0 | **document** (plan presented as code) | A | rewrite heading + lines 31-34 |
+| D2 | `docs/records/architecture/post-training.md:16,31-34` | "RLVR — PPO + value head"; value head, GAE, PPO clip, token-level advantage | `post/rl.py:43-46` "no value head"; two arms CRR/group `:355-372`; `grep -rn '\bPPO\b' port/src` = 0 | **document** (plan presented as code) | A | rewrite heading + lines 31-34 |
 | D3 | `port/README.md:40,70` | b1 = 1,066,354,113 | `test_param_count.py:26` + `b1.toml:110,127` = **1,066,358,209** | **document** (stale) | A | replace with new total; keep old as pre-`af8b0c9` |
-| D4 | `docs/decisions/2026-10-15-1b-readiness-plan.md:67,81` | b1 `max_iter 2`; total 1,066,354,113 | `b1.toml:14` `max_iter 4`; `test_param_count.py:26` = 1,066,358,209 | **document** (stale) | A | replace both; the same file `:478` already says 4 |
+| D4 | `docs/records/decisions/2026-10-15-1b-readiness-plan.md:67,81` | b1 `max_iter 2`; total 1,066,354,113 | `b1.toml:14` `max_iter 4`; `test_param_count.py:26` = 1,066,358,209 | **document** (stale) | A | replace both; the same file `:478` already says 4 |
 | D5 | `docs/adr/0003-fused-measure-then-decide.md:3,5,7` | `fused/` = 6,568 LOC; `DM_FUSED=1`; "Verdict: kept"; 1.7–2.0× | directory absent; `grep DM_FUSED crates` = 0; deleted `5abdf3c` (7,432 lines); lost 1.25× (`ADR-0009:3`) | **document** (status obsolete) | B | banner `superseded`; keep body |
-| D6 | `docs/architecture/2026-10-23-final-architecture.md:3,46-48` | "design frozen"; E=256 top-k-2 dropless bank is the final recipe | dense verdict `2026-11-05-dense-beats-bank.md:7-10`; live `arch_dense_byteflow8.toml:34,42-44` | **document** (superseded) | B | status banner + retraction note at 46-48 |
-| D7 | `docs/architecture/2026-10-23-scaling-recipe.md:45` | "wide-ish and **expert-rich**" | same dense verdict; bank not in recipe | **document** (superseded) | B | keep arithmetic; add measured retraction |
-| D8 | `docs/architecture/library-crate-fate.md:80,114` | `burn-byteflow` 1,121 lines, **DELETE**, deleted 2026-09-28 | 1,357 src + 832 t/b = 2,189; dependency `dormouse-core:50`, `dormouse-train:33`; re-added `8d61d74`, wired `48ef9ae` | **document** (snapshot stale) | B | add post-snapshot row; keep 1,121 as history |
+| D6 | `docs/records/architecture/2026-10-23-final-architecture.md:3,46-48` | "design frozen"; E=256 top-k-2 dropless bank is the final recipe | dense verdict `2026-11-05-dense-beats-bank.md:7-10`; live `arch_dense_byteflow8.toml:34,42-44` | **document** (superseded) | B | status banner + retraction note at 46-48 |
+| D7 | `docs/records/architecture/2026-10-23-scaling-recipe.md:45` | "wide-ish and **expert-rich**" | same dense verdict; bank not in recipe | **document** (superseded) | B | keep arithmetic; add measured retraction |
+| D8 | `docs/records/architecture/library-crate-fate.md:80,114` | `burn-byteflow` 1,121 lines, **DELETE**, deleted 2026-09-28 | 1,357 src + 832 t/b = 2,189; dependency `dormouse-core:50`, `dormouse-train:33`; re-added `8d61d74`, wired `48ef9ae` | **document** (snapshot stale) | B | add post-snapshot row; keep 1,121 as history |
 | D9 | `port/README.md:68` | "tests/ 117 tests" | 167 files, 2,194 collected, 1,870 `def test_` | **document** (stale) | A | replace count |
 | D10 | `port/README.md:74` | Rust "as a PyO3 extension (`ffi/`)" | no `port/ffi`, no `pyo3`, no Rust binaries | **document** (plan ≠ code) | A | replace with "not wired" |
 
 ### Group A — fix the body (current instructions/facts)
 
-#### D2 — `docs/architecture/post-training.md:16,31-34`
+#### D2 — `docs/records/architecture/post-training.md:16,31-34`
 
 **Current text:** `## RLVR — PPO + value head (not GRPO)` and the four bullets
 `Value head V(s) bf16, GAE λ0.95, PPO clip 0.2, KL 0.01`,
@@ -306,7 +306,7 @@ Line 70 replacement:
 configs/           small (9,476,993) · b1 (1,066,358,209)
 ```
 
-#### D4 — `docs/decisions/2026-10-15-1b-readiness-plan.md:67,81`
+#### D4 — `docs/records/decisions/2026-10-15-1b-readiness-plan.md:67,81`
 
 **Current:** `max_iter 2` at line 67; total `1,066,354,113` at line 81. The same file
 already records the correction at `:478` ("`configs/b1.toml` = **max_iter 4**"), so the
@@ -440,7 +440,7 @@ files total 7,432 by `wc -l` at `5abdf3c^`). This ADR is kept as the decision re
 not current state.
 ```
 
-#### D6 — `docs/architecture/2026-10-23-final-architecture.md:3,46-48`
+#### D6 — `docs/records/architecture/2026-10-23-final-architecture.md:3,46-48`
 
 **Current:** `Status: design frozen; one A/B outstanding (the ByteFlow arm)`; E=256,
 top-k 2, dropless bank as the final recipe. The 2026-11-05 dense verdict measured
@@ -470,7 +470,7 @@ design record, not the current recipe.
   above is the 2026-10-23 design record.
 ```
 
-#### D7 — `docs/architecture/2026-10-23-scaling-recipe.md:45`
+#### D7 — `docs/records/architecture/2026-10-23-scaling-recipe.md:45`
 
 **Current:** "So a large model should be **wide-ish and expert-rich**, not enormously
 deep in `d`." The arithmetic before it (width is the expensive direction; experts+rank
@@ -493,7 +493,7 @@ rank-64 MoE **2.3655** at 2.5× fewer parameters
 recommendation is **wide-ish and dense**.
 ```
 
-#### D8 — `docs/architecture/library-crate-fate.md:80,114`
+#### D8 — `docs/records/architecture/library-crate-fate.md:80,114`
 
 **Current:** the table says line counts are at `422414c` (`:55`) and the row says
 `| burn-byteflow | 1121 | 0 | – | **DELETE** | ... |` under `**deleted 2026-09-28**`.
@@ -553,7 +553,7 @@ The old `1,066,354,113` is not only in the ten. Current non-archive occurrences:
 `docs/records/research/2026-10-15-tsct-super-kernel.md:17`;
 `docs/records/research/2026-10-18-act4.md:252`;
 `docs/records/research/2026-10-16-budget-savers.md:165`;
-`docs/decisions/2026-10-15-1b-readiness-plan.md:81`; `.bulba/memory.md:307`.
+`docs/records/decisions/2026-10-15-1b-readiness-plan.md:81`; `.bulba/memory.md:307`.
 All are wrong by 4,096 against `port/configs/b1.toml:110,127` and
 `port/tests/test_param_count.py:26`; the fix is the same one-line replace plus
 "old = pre-`af8b0c9`". Do them in one commit so the number cannot be half-fixed.
@@ -563,7 +563,7 @@ already carries both numbers and needs the same note.
 
 ### 4.2 Fused "kept" outside ADR-0003
 
-`docs/architecture/PLAN.md:442` says the fused smoke is `done, kept (1.7-2.0x)` and
+`docs/records/architecture/PLAN.md:442` says the fused smoke is `done, kept (1.7-2.0x)` and
 `:456` carries the 1.7–2.0× claim. Both are retracted by ADR-0009:3 and
 `AGENTS.md:715-716`, and the directory is gone (`5abdf3c`). Add the same
 `superseded` note; do not delete the row (it is the record of the pre-deletion plan).

@@ -1,8 +1,8 @@
 # Agentic post-training for dormouse-b1 — SOTA sweep 2026-10-15
 
 **Design input for the port.** Read with
-`docs/architecture/post-training.md` (the owner's plan, the STARTING position),
-`docs/decisions/2026-10-15-1b-readiness-plan.md` §5-§6 (what the port is today:
+`docs/records/architecture/post-training.md` (the owner's plan, the STARTING position),
+`docs/records/decisions/2026-10-15-1b-readiness-plan.md` §5-§6 (what the port is today:
 PyTorch, byte-level, **1.07B total / ~57M active**, E=1024 topk-2 TSCT +
 Engram), and `docs/records/research/2026-10-15-1b-tech-verification.md` (already
 verified claims, reused here without re-checking: BLT 2412.09871, ByteFlow

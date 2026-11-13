@@ -69,7 +69,7 @@ Geometry read from the TOML files; arms from the same files. "JEPA" means
 | `base` | 1024 | 16 | 3 | 8 | 32 768 | on | on | 0.05 | 0 | 24 GB-class work; the JEPA teacher is a second full forward, so it OOMs a 16 GB card at batch 6 |
 | `swift50` | 1024 | 16 | **8** | 8 | 32 768 | on | on | 0 | 0 | many-expert experiments — note JEPA is **off** here, so it is not `base` plus experts |
 | `one_b` | 2048 | 32 | 4 | 12 | 32 768 | on | on | 0.05 | 0 | the 1 B dream; does not fit 16 GB |
-| `p150` | 4096 | 64 | 4 | 12 | 32 768 | on | on | 0.05 | 0 | the 150 M-program flagship (`docs/architecture/PLAN.md`). Overrides only — every other key is the schema default, i.e. `small`'s |
+| `p150` | 4096 | 64 | 4 | 12 | 32 768 | on | on | 0.05 | 0 | the 150 M-program flagship (`docs/records/architecture/PLAN.md`). Overrides only — every other key is the schema default, i.e. `small`'s |
 
 Two rows are worth reading twice. `swift50` has **JEPA off** where its neighbour
 `base` has it on, so it is not "`base` with more experts" — it is a different

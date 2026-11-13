@@ -40,7 +40,7 @@ stable.
 6. **Что не строить:** FSDP2/ZeRO-3, шардинг внутри матрицы, ZeRO-2 для AdamW (9 МиБ на
    1B [C]), tensor/pipeline parallel, multi-node, `full_graph` под DDP, `engram_ram` под DDP.
 7. **Дешевле одной карты:** `ns_dtype=bf16` даёт **1.89×** и уже измерен
-   (`docs/architecture/2026-11-08-the-16x.md`). Вторая карта — это ~2× на бумаге и 2–4 недели
+   (`docs/records/architecture/2026-11-08-the-16x.md`). Вторая карта — это ~2× на бумаге и 2–4 недели
    инженерии; флаг — это 1.89× за один `--set`. Порядок работ должен это отражать.
 
 ---
@@ -502,9 +502,9 @@ config flag rather than a rewrite.
 
 ## 11. Owed
 
-* `docs-site/tools/manifest.mjs`: `docs/architecture/` is an explicit page list, not a glob, so
+* `docs-site/tools/manifest.mjs`: `docs/records/architecture/` is an explicit page list, not a glob, so
   this file is not on the site until one line is added (`{ src:
-  'docs/architecture/2026-11-08-scaling-out.md', out: 'architecture/scaling-out' }`). Owed by the
+  'docs/records/architecture/2026-11-08-scaling-out.md', out: 'architecture/scaling-out' }`). Owed by the
   next docs commit; this lane was one file only.
 * `python3 tools/check_doc_refs.py` was run: **0 named paths missing** (1 275 files scanned,
   3 428 references resolved). It is green with this file in the tree.

@@ -7,7 +7,7 @@ makes a 5461-wide FFN affordable, and it is what the retraction and the Muon
 group operate on: the polar retraction is done in the FACTORED form, so fp32
 Newton-Schulz over `[64, f]` replaces "~40 s/step" over `[d, d]` (AGENTS §2.3).
 
-Precision (`docs/architecture/bf16-plan.md`): the factors are fp32 MASTERS;
+Precision (`docs/records/architecture/bf16-plan.md`): the factors are fp32 MASTERS;
 the forward casts to bf16, matmuls, and returns fp32 — softmax/loss/KDA state
 stay fp32 at the arm boundary. `quant = "none"` is the day-one format and it
 resolves to bf16 factors; `quant = "ternary"` is the ONE STORAGE rung

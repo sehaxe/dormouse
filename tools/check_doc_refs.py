@@ -76,7 +76,7 @@ KNOWN_DEAD = {
 	"vendor/dormouse-fused/Cargo.toml": "vendor/ moved to the rust-lane branch on 2026-11-13; the decision record that cites it stays on main as history.",
 
 	"crates/dormouse-core/src/fused": "the whole-loop fused module, DELETED (ADR-0009). The glossary names it on purpose: the term `fused` means two different things and this is the one that is gone.",
-	"docs/README-model.md": "an old README section turned into its own file by a plan that never ran; the content is docs/architecture/PLAN.md",
+	"docs/README-model.md": "an old README section turned into its own file by a plan that never ran; the content is docs/records/architecture/PLAN.md",
 	"docs/20260420-flashkda-v1-deep-dive.md": "a report written outside the tree; the transcription that replaced it is docs/papers/spec-flashkda.md",
 	"docs/SCT_Patent_Application.pdf": "a patent PDF read once and never committed; the lineage is in docs/papers/tsct.md",
 	"research/reviews/gdn-fwd-review.md": "a review whose file was never committed; the gdn-kda lane's two halves are docs/records/reviews/2026-09-29-gdn-kda-review.md",

@@ -1,7 +1,7 @@
 # The scaling recipe — every direction, with the arithmetic that sets it
 
 **Date:** 2026-10-23 · **Status:** recipe; the sub-1B points are measured, everything above is fitted and marked.
-**Fact base:** `docs/records/reviews/2026-10-23-architecture-verdict.md`, `docs/architecture/2026-10-23-final-architecture.md`.
+**Fact base:** `docs/records/reviews/2026-10-23-architecture-verdict.md`, `docs/records/architecture/2026-10-23-final-architecture.md`.
 
 ---
 

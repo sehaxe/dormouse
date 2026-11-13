@@ -48,7 +48,7 @@ context-management как RLVR-способность — архитектурн
   итераций + A/B волна. Приоритет — после посадки fidelity-fix.
 - **F14 (LoopCD-Hidden в generate)**: decode-only, бесплатный по тренировке.
   Приоритет — любой момент; измерить на нашем генераторе.
-- **E1**: CLM-паттерн → `docs/architecture/post-training.md` дополнение (владелец).
+- **E1**: CLM-паттерн → `docs/records/architecture/post-training.md` дополнение (владелец).
 - **A1 частично отвечен**: семейство weight-shared валидировано индустрией
   (Hyperloop, SMELT scaling laws, Training-Free Looped Transformers — все 2026);
   два известных ремонта лупинга — deep supervision (есть) + регуляция attention

@@ -6,8 +6,8 @@ instrument layer and the trainer skeleton. Everything else is a dependency:
 FLA for the gated-delta attention (optional, LOUD when absent; SDPA is the
 COUNTED fallback and the CPU test path).
 
-The port's design record is `docs/decisions/2026-10-15-1b-readiness-plan.md`
-§7 (the port lane) and `docs/architecture/bf16-plan.md` (precision).
+The port's design record is `docs/records/decisions/2026-10-15-1b-readiness-plan.md`
+§7 (the port lane) and `docs/records/architecture/bf16-plan.md` (precision).
 """
 
 from importlib.metadata import PackageNotFoundError

@@ -402,7 +402,7 @@ showed is **not web** (`:22`) — the single largest measurement error in that a
 
 **What must be reported beyond BPB:** `fin` (CE of the mean readout) and `periter=[…]`, never the
 `(ΣCE+CE_fin)/(T+1)` headline — it averages a different number of terms per depth and produced a false
-"deeper is worse" verdict for a month (`docs/decisions/2026-10-15-1b-readiness-plan.md:478-479`). And
+"deeper is worse" verdict for a month (`docs/records/decisions/2026-10-15-1b-readiness-plan.md:478-479`). And
 `ms/step` at a warm step, which is the only way variant (c) would ever be judged.
 
 ---
@@ -485,7 +485,7 @@ effect-size estimate: **low**, and it is labelled [S1] above for that reason.
   `port/configs/medium.toml`, `crates/dormouse-core/src/loop_block.rs`,
   `vendor/dormouse-fused/crates/burn-kda/src/lib.rs`, `port/scripts/{_lane,ab_mhc}.py`,
   `docs/records/research/2026-10-21-adaptivity.md`, `docs/records/reviews/2026-10-21-battery.md`,
-  `docs/records/reviews/2026-10-23-architecture-verdict.md`, `docs/decisions/2026-10-15-1b-readiness-plan.md`,
+  `docs/records/reviews/2026-10-23-architecture-verdict.md`, `docs/records/decisions/2026-10-15-1b-readiness-plan.md`,
   `~/logs/b1first_resume2.log`, `~/logs/medium_long.log`.
 - **Owed, not done** (this memo touches no source): a `docs-site/tools/manifest.mjs` line, and
   `python3 tools/check_doc_refs.py` must be green before the commit that adds it.

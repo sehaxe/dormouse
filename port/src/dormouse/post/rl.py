@@ -1,7 +1,7 @@
 """The RL stepper: MiMo-style rewards, CRR/group advantages, one policy-gradient step.
 
 Sources: `docs/records/research/2026-10-15-mimo-rl-notes.md` §3.1 (the reward node) and
-`docs/architecture/post-training.md`'s "Reward shape for token thrift" node —
+`docs/records/architecture/post-training.md`'s "Reward shape for token thrift" node —
 MiMo-V2.6 (2610.11959) Eq. 2, `R = R_test · S_sol · S_beh`, **multiplicative**, so
 a zero in ANY factor cannot be bought back by the others; plus Eq. 4's
 group-relative length penalty, gated on the group's pass rate, with prompt-mean

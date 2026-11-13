@@ -27,7 +27,7 @@ measurement · **[S]** = my inference.
 | 9 | A **compression-ratio curriculum** (low → high) helps — slightly | 2605.30080 **[A]** | H-Net 350M, FineWeb-Edu 100B: adaptive N 8.0→9.5, avg 47.3 vs fixed 46.2-47.0; robustness 29.0 vs 28.8-28.9; val BPB ≈0.828 all |
 | 10 | The byte-level encoder+decoder **doesn't shrink** with patch size, so the measured saving is **well under the nominal p×** | 2412.09871 + 2605.09630 **[F]** | "larger patch sizes only affect flops from the patch Latent Transformer"; 20× params (400M→8B) ⇒ local params ~2×; seq reduction vs measured FLOPs/byte: p=4 4.0×/3.1×, p=8 8.0×/4.5×, p=16 16×/5.7× |
 | 11 | The light-encoder/heavy-decoder split is the published choice | 2412.09871 **[F]** | Table 9: 1 encoder + 9 decoder layers 0.822 bpb vs 5+5 0.844 (with n-gram hashes) / 0.843 (without) |
-| 12 | We already ran **4 B/patch** (K=128 over 512 B) and won the 200-step smoke | [ours] | `configs/byteflow.toml` (byteflow_9m); 3.466 vs plain 3.947 equal-params, full-arm `small` loses 6.498 (`benches/history.tsv:157-159` via `docs/decisions/2026-10-15-1b-readiness-plan.md:21`); 4.82/4.90 vs 6.71/6.60 at eval@100, ~65 vs ~450 ms/step (`byteflow-ab-2026-10-02.md`) |
+| 12 | We already ran **4 B/patch** (K=128 over 512 B) and won the 200-step smoke | [ours] | `configs/byteflow.toml` (byteflow_9m); 3.466 vs plain 3.947 equal-params, full-arm `small` loses 6.498 (`benches/history.tsv:157-159` via `docs/records/decisions/2026-10-15-1b-readiness-plan.md:21`); 4.82/4.90 vs 6.71/6.60 at eval@100, ~65 vs ~450 ms/step (`byteflow-ab-2026-10-02.md`) |
 
 ## Q1 — what sizes do published patchers use and measure?
 
@@ -149,7 +149,7 @@ numbers are **[A]** or **[F]** as marked. Own-repo: `configs/byteflow.toml` (K=1
 max_bytes=512, eps2=0.5), `port/src/dormouse/config.py:268-290` (K=3200, max_bytes=8192,
 eps2=0.5), `port/src/dormouse/model/byteflow.py:519` and `:408-424`,
 `port/scripts/ab_byteflow.py` + `port/scripts/patch_rate.py`,
-`docs/records/reviews/byteflow-ab-2026-10-02.md`, `docs/decisions/2026-10-15-1b-readiness-plan.md:21`
+`docs/records/reviews/byteflow-ab-2026-10-02.md`, `docs/records/decisions/2026-10-15-1b-readiness-plan.md:21`
 (3.466/3.947/6.498 via `benches/history.tsv:157-159`), `AGENTS.md` §3.1.
 
 **SPECULATION (mine).** **S1** "optimal patch size scales with `d_global`" — from BLT's

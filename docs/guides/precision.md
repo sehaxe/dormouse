@@ -3,7 +3,7 @@
 > Updated 2026-10-01. Sources: `AGENTS.md` §2.1 (precision machine facts),
 > §2.2 (GEMM ceilings, mixed-dtype rules), §2.3 (the `max_ortho` latch),
 > §3.7 (`--quant`/`--act-quant`), §3.8, ADR-0016 (the three precision bugs and
-> their retractions), `docs/architecture/bf16-plan.md` (the Russian plan —
+> their retractions), `docs/records/architecture/bf16-plan.md` (the Russian plan —
 > linked, not translated), `docs/guides/dmexp.md` (storage vs compute), and
 > the vendored patch itself, `vendor/cubecl-fix/cubecl-ir/src/types/scalar.rs`.
 > Every number names its source; where a document and the code disagree, both
@@ -178,7 +178,7 @@ the wrong resolution is the numerical cousin of a silent fallback.
 ## Where precision saves
 
 - **VRAM.** The budget rule of thumb: 1B model bf16 ≈ 2 GB weights, +2 GB per
-  batch-16 s1024 step (`AGENTS.md` §3.8, from `docs/architecture/bf16-plan.md`
+  batch-16 s1024 step (`AGENTS.md` §3.8, from `docs/records/architecture/bf16-plan.md`
   §6). fp32 masters + an fp8 forward path buy the FLOP savings without
   touching checkpoint portability (above).
 - **Files.** The `.dmexp` measurement (20-step `small`, 9 197 390 params):
@@ -195,7 +195,7 @@ the wrong resolution is the numerical cousin of a silent fallback.
 - **The optimizer, carefully.** The bf16 plan targets Muon moments bf16 +
   stochastic rounding and MuonQ 4-bit — both **blocked by the bf16-compute
   fact above** (`AGENTS.md` §3.5, item 3). The plan itself,
-  [`docs/architecture/bf16-plan.md`](../architecture/bf16-plan.md) (Russian,
+  [`docs/records/architecture/bf16-plan.md`](../architecture/bf16-plan.md) (Russian,
   cited as written), is the all-bf16 target state: everything stored and
   computed in bf16 with f32 accumulation and no fp32 masters — reachable only
   when the backend grows a bf16 type or the matmuls route around burn.

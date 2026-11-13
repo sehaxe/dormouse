@@ -8,7 +8,7 @@ Retraction*, arXiv:2604.00733v2, 2026-04-01. Read from the PDF (`/tmp/opencode/s
 here · **[S]** speculation.
 
 **Why this file exists.** The owner's directive is that TSCT is ternary compression
-(`docs/architecture/tsct-ternary-spec.md`) and the intuition offered for it was:
+(`docs/records/architecture/tsct-ternary-spec.md`) and the intuition offered for it was:
 *"SVD formally means fewer parameters, therefore intelligence should be higher"*. That
 inference is the one thing this paper's own data refutes, so it is written down here
 before any more code is built on it.

@@ -3,7 +3,7 @@
 NEW module, not wired into any model yet (a later lane does the integration):
 this is the codec the b1 recipe's QAT stage needs — Kimi K3 §4.1.4 quantizes
 expert weights to MXFP4 and the non-expert weights/activations to MXFP8, with
-QAT starting at the SFT stage (`docs/architecture/post-training.md`).
+QAT starting at the SFT stage (`docs/records/architecture/post-training.md`).
 
 FORMAT SOURCE — **OCP *Microscaling Formats (MX) Specification*, v1.0, Sep
 2023**, fetched 2026-10-16 from

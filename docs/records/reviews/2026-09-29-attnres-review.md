@@ -76,7 +76,7 @@ Three corrections to the report's own numbers:
   blobs; its VERIFIED section and the brief both say "7 blobs".
 * **"12 open issues"** — there are 13 open (+1 closed, #1). Not material, but it is in a
   block labelled VERIFIED.
-* **"2268 lines"** in §3.3 is a **stale figure copied from `docs/architecture/library-crate-fate.md`**
+* **"2268 lines"** in §3.3 is a **stale figure copied from `docs/records/architecture/library-crate-fate.md`**
   (recorded "at `422414c`"). The report's own §1 measures `lib.rs` 517 + `fused_attnres.rs`
   1821 = **2338**. `docs/records/archive/architecture/PLAN-minimal-core.md:90` says 2060. Three documents, three numbers,
   none re-measured. AGENTS.md §1.4: "a measurement is a measurement only with the config, the
@@ -211,7 +211,7 @@ reference to `burn-attnres`**. The workspace root `Cargo.toml:12` has
 `cublas-poc, dormouse-core, dormouse-data, dormouse-train, dormouse-cli, backend-parity`. The
 only inbound edges to `burn-attnres` are inside its own workspace: `vendor/dormouse-fused/Cargo.toml:4`,
 `vendor/dormouse-fused/burn-fused/Cargo.toml:19,31,52,79`, `vendor/dormouse-fused/benches/Cargo.toml:12`.
-`docs/architecture/library-crate-fate.md:62` records fate `b / REFERENCE`; `docs/records/archive/architecture/PLAN-minimal-core.md:90`
+`docs/records/architecture/library-crate-fate.md:62` records fate `b / REFERENCE`; `docs/records/archive/architecture/PLAN-minimal-core.md:90`
 (§M2) names it as a residual-stream A/B arm that has not been run. **No dormouse number is
 retracted. This claim is the most important one in the report and it is correct.**
 
@@ -946,7 +946,7 @@ made under a bar that has no achievable form for this paper.
 ### 5. Is `burn-attnres` worth the work?
 
 **Facts, all verified from this tree.** 2402 lines (517 `lib.rs` + 1821 `fused_attnres.rs`
-+ 64 bench). Fate class **REFERENCE** (`docs/architecture/library-crate-fate.md:62`). Zero incoming edges
++ 64 bench). Fate class **REFERENCE** (`docs/records/architecture/library-crate-fate.md:62`). Zero incoming edges
 from `crates/dormouse-*` — grep over every `.toml` finds none, and `Cargo.toml:12` excludes
 `vendor/dormouse-fused` from the workspace. It *is* compiled by CI
 (`.github/workflows/fused-library.yml:163`, `--no-run` only). It **fails its own recorded

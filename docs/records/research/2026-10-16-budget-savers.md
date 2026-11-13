@@ -5,7 +5,7 @@
 **Question (owner):** beyond MoD / token-skipping, which **train-time** techniques save VRAM, wall-clock
 or data for the b1 byte-MoE (1.07B total / ~57M active, ONE 16 GB 5060 Ti, real KDA via FLA, real
 19.7 GB corpus) **without giving quality away**?
-**Builds on, does not repeat:** `docs/decisions/2026-10-15-1b-readiness-plan.md` §2/§3.5/§7 ·
+**Builds on, does not repeat:** `docs/records/decisions/2026-10-15-1b-readiness-plan.md` §2/§3.5/§7 ·
 `docs/records/research/2026-10-16-jepa-dspark-alternatives.md` (the *deferred* bucket) ·
 `docs/records/research/2026-10-15-tsct-super-kernel.md` (the 5-item ladder, its L-off columns) ·
 `port/README.md` invariants · `AGENTS.md` §2.2/§3.1 GEMM ceilings.

@@ -240,7 +240,7 @@ COAT — если придём к FP8.
 
 **Internal data repetition destroys LMs** [35] (2606.24998).
 
-**Вердикт:** Post-training lane (docs/architecture/post-training.md). Для pretraining:
+**Вердикт:** Post-training lane (docs/records/architecture/post-training.md). Для pretraining:
 online reweighting > offline, если есть бюджет на curation.
 
 ---

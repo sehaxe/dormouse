@@ -804,7 +804,7 @@ class ModelConfig:
     layerrope_init: str = "paper"
 
     # --- precision ------------------------------------------------------
-    #: bf16 activations/weights with fp32 masters (`docs/architecture/bf16-plan.md`).
+    #: bf16 activations/weights with fp32 masters (`docs/records/architecture/bf16-plan.md`).
     #: The forward matmuls run in bf16; the softmax, the loss and the TSCT
     #: latents stay fp32. Default True: the port's init path is the bf16 plan,
     #: unlike burn's `small.toml`, which still ships fp32 (listed in the port
@@ -1033,7 +1033,7 @@ class ModelConfig:
     #: by every routed expert; each expert spends `rank` of its columns. 64 at
     #: medium (d=1024) is 65 536 parameters against the control's 78.3M bank.
     share_u_rank: int = 64
-    #: ---- TSCT-2 (`docs/architecture/2026-11-05-tsct-2.md`) ----
+    #: ---- TSCT-2 (`docs/records/architecture/2026-11-05-tsct-2.md`) ----
     #: Per-expert INPUT selector inside the shared plane (see
     #: `experts.SparseMoE._banks`). `0` off. When on, the routed shared plane
     #: (`gate_u`/`up_u`) is widened from `rank` to `shared_rank` columns and each
@@ -4426,7 +4426,7 @@ def validate(model: ModelConfig) -> None:
                 f"exists to split. Escape: share_u_rank > rank (64 at medium), or "
                 f"share_u_mode='plane'."
             )
-    # ---- TSCT-2 (docs/architecture/2026-11-05-tsct-2.md) ------------------
+    # ---- TSCT-2 (docs/records/architecture/2026-11-05-tsct-2.md) ------------------
     if model.tsct_expert_basis < 0:
         loud(
             f"tsct_expert_basis={model.tsct_expert_basis} is negative: it is the "
@@ -5261,7 +5261,7 @@ def _refuse_ladder_rung(rung: str) -> str:
     loud(
         f"quant={rung!r} is not supported{hint}: the implemented rung is the "
         f"STORE level ternary (checkpoint/bank compression; compute stays "
-        f"bf16 factors with fp32 masters — docs/architecture/bf16-plan.md). "
+        f"bf16 factors with fp32 masters — docs/records/architecture/bf16-plan.md). "
         f'Escape: `quant = "none"` (bf16), `quant = "ternary"`, '
         f"or close the LittleBit gates."
     )

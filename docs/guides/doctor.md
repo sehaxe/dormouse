@@ -7,7 +7,7 @@
 > `port/src/dormouse/eval_window.py` (the overlap predicate),
 > `docs/records/reviews/2026-11-08-merge-incident.md` (the lost corpus),
 > `docs/records/reviews/2026-11-08-data-eval-integrity.md` (the window audit), and
-> `docs/architecture/2026-11-08-training-step.md` §I8 (resume drift).
+> `docs/records/architecture/2026-11-08-training-step.md` §I8 (resume drift).
 
 Nine hours of card time is too expensive to spend discovering a missing file.
 `dormouse doctor` runs the checks a training start would hit, prints one row per
@@ -119,7 +119,7 @@ strict by design: every key must be a field of this branch, or one of the
 counted `DEAD_SNAPSHOT_KEYS` at its recorded default. Dropping an unknown key
 silently would resume a different model, so it is a LOUD refusal
 (`port/src/dormouse/config.py::from_snapshot`, ADR-0021; the drift table is
-`docs/architecture/2026-11-08-training-step.md` §I8).
+`docs/records/architecture/2026-11-08-training-step.md` §I8).
 
 This is a real gate, not a nuisance: the deletion audit's C2 could not retire
 `jepa` because snapshots on disk still carry `jepa = false`, and retiring a

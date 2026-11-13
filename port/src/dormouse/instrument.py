@@ -1,6 +1,6 @@
 """The instrument layer: every degradation is LOUD or COUNTED, never silent.
 
-`docs/decisions/2026-10-15-1b-readiness-plan.md` §7 carries the burn lessons
+`docs/records/decisions/2026-10-15-1b-readiness-plan.md` §7 carries the burn lessons
 forward as day-one code (ADR-0011/ADR-0019, ADR-0018 rule 2): every degradation
 of a value, a kernel or a config field takes exactly one of three marks, and
 there is no fourth:

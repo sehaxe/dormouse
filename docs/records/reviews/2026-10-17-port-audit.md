@@ -4,7 +4,7 @@ Hostile read of `port/src`, `port/tests`, `port/scripts` against the repo's own
 rules (`AGENTS.md` §1.1 LOUD/COUNTED/SILENT, §1.2 A/B-or-death, §1.3 zero
 host-device sync, §1.4 claims name their evidence, ADR-0011/0018/0019/0021) and
 against the measured record (`docs/records/reviews/2026-10-16-b1-profile.md`,
-`docs/decisions/2026-10-15-1b-readiness-plan.md` §7).
+`docs/records/decisions/2026-10-15-1b-readiness-plan.md` §7).
 
 What was run, read-only, with the card busy (a live `b1` warm attempt held
 PID 492517):

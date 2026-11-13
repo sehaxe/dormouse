@@ -8,7 +8,7 @@ path the CLI uses (`dormouse.model.decode.decode_bytes`), so a rollout is a
 program a reader can reproduce.
 
 The byte budget is the `correct@budget(bytes)` contract from
-`docs/architecture/post-training.md`'s "Reward shape for token thrift" node:
+`docs/records/architecture/post-training.md`'s "Reward shape for token thrift" node:
 every byte the rollout touches — the prompt, the response, and each generation
 stroke — is counted, and generation stops before the budget is exceeded.
 """

@@ -454,7 +454,7 @@ part; the speculation is labelled and not used as a premise for a claim.
   verified to 3.0e-8; repo now carries the fix at `csa.py:775`.
 - `docs/records/reviews/2026-10-27-longctx-night.md:3,9,33` — longctx1 102.7M, 512K BPB 1.7634/1.6882.
 - `docs/records/reviews/2026-11-05-context-ab.md:8-12` — 8K vs 1K tie, Δ = 0.008 BPB.
-- `docs/architecture/2026-11-08-the-design.md:19,39,50-51` — "34 MB" headline; needs the
+- `docs/records/architecture/2026-11-08-the-design.md:19,39,50-51` — "34 MB" headline; needs the
   per-layer/total correction.
 
 **Method.** arXiv API + PDF extraction (`pdftotext -layout`) of the papers above, read for

@@ -52,7 +52,7 @@ and **the facade is referenced by zero manifests in this repo** (fate table's ow
   `burn_sct` — the product's TSCT is the `burn-spectral` one.
 - `research/decisions/class-b-2026-10-01.md:513` recommends delete; the crate's own
   `burn-sct/README.md:3-9` says "**Not in the dormouse build** … Recommendation: **DELETE**";
-  `docs/architecture/library-crate-fate.md:61` already carries the verdict.
+  `docs/records/architecture/library-crate-fate.md:61` already carries the verdict.
 - **COST ESTIMATE CORRECTION (a finding).** Fate:159-172 and the decision sheet:504 both
   price this at "**~10 lines**". Measured: **85 of 1771 lines** of `tsct_diag.rs` carry
   `sct_a`/`sct_b`/`burn_sct` (56 are mechanical `sct_x: None,` fillers, 2 struct fields,
@@ -73,7 +73,7 @@ and **the facade is referenced by zero manifests in this repo** (fate table's ow
   `docs/records/research/2026-09-27-adopt-vs-port.md:588`: *"the source settles the σ convention,
   **then delete this one**."* The convention IS settled — `burn-eggroll` is the paper's
   `(σ/√r)·A·Bᵀ` and survives; `burn-es` documents `σ·A·Bᵀ` and defers. Same conclusion at
-  `docs/architecture/library-crate-fate.md:75` ("They overlap each other; one should go when
+  `docs/records/architecture/library-crate-fate.md:75` ("They overlap each other; one should go when
   it starts") and `adopt-vs-port.md:388-390` (the disagreement is `√r`).
 - One citation needs straightening: `crates/burn-spectral/src/lib.rs:50` attributes the
   ternary `0.7·mean` dead zone to "(burn-es convention)". The audit that found it

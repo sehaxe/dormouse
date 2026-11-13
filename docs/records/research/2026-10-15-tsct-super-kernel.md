@@ -1,7 +1,7 @@
 # The TSCT super-kernel study — one RTX 5060 Ti, sm_120, ThunderKittens-style, inside the PyTorch port
 
 **2026-10-15.** Question the owner asked: what does "TSCT must get more optimized, never
-less" (plan `docs/decisions/2026-10-15-1b-readiness-plan.md` §7) mean MECHANICALLY on this
+less" (plan `docs/records/decisions/2026-10-15-1b-readiness-plan.md` §7) mean MECHANICALLY on this
 card, for the PyTorch port at `port/`, in October 2026. Scope: the custom compute the port
 runs itself (experts, dispatch, the TSCT quant ladder); everything else is a dependency by
 the standing principle ("use the best existing kernel"; plan §4.1). Evidence marks: **[M]**
@@ -287,7 +287,7 @@ compilation is the named-headroom number re-attributed [S until profiled]. Littl
 
 ## 7. Sources
 
-**Repo (file:line).** `docs/decisions/2026-10-15-1b-readiness-plan.md` (§2.2 shape :67-87;
+**Repo (file:line).** `docs/records/decisions/2026-10-15-1b-readiness-plan.md` (§2.2 shape :67-87;
 §4.1 spike verdict :352-368; §7 :477-486; TSCT2 quotes :253-258, :249-252);
 `docs/records/research/2026-10-15-torch-spike.md` (:60-77 env; :87-127 bench A; :130-192 bench B;
 :195-272 bench C + profiler; :360-404 memory/LOC); `.bulba/memory.md:306` (port b1 profile);

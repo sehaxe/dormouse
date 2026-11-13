@@ -1,4 +1,4 @@
-"""TSCT-2: the three mechanisms from `docs/architecture/2026-11-05-tsct-2.md`.
+"""TSCT-2: the three mechanisms from `docs/records/architecture/2026-11-05-tsct-2.md`.
 
 The structural finding, verified at `experts.py` HEAD `ecc979e`: with
 `share_u_mode='plane'` (the live m400b recipe) the routed experts share ONE

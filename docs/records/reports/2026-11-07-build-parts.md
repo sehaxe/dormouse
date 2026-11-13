@@ -313,5 +313,5 @@
 - [S29] select.by NBRB USD rate — https://select.by/kursy-valyut/natsbank-rb/dollar-na-zavtra (2026-11-05, 2.9806 BYN/USD)
 - [S30] CPU Medics SP3 carrier frame — https://www.cpumedics.com/d-c-18243-rev-t-amd-epyc-threadripper-sp3-tr4-trx4-blue-socket-cpu-carrier-frame-mount-caddy-tray (accessed 2026-11-07)
 - [S31] ServeTheHome Tyan S8030 thread (BMC 32 MB warning) — https://forums.servethehome.com/index.php?threads/tyan-s8030gm2ne.28914/page-20 (accessed 2026-11-07; community, not vendor)
-- [S32] Dormouse VRAM ledger — `docs/reports/2026-11-06-vram-ledger.md` (local, 2026-11-06)
+- [S32] Dormouse VRAM ledger — `docs/records/reports/2026-11-06-vram-ledger.md` (local, 2026-11-06)
 - [S33] Tyan S8030 Quick Installation Guide v2.0 — https://download2.mitaccomputing.com/pub/doc/S8030_QIG_v2.0.pdf (accessed 2026-11-07)
