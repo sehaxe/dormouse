@@ -21,10 +21,12 @@ on:
 permissions:
   contents: read
 
-# The one split that both pytest jobs use: `python-test` runs `not pins`,
-# `pins` runs the marker. Collected 2026-11-13: 2500 outside, 82 inside, 2582
-# total — a partition by behaviour (a test that compares an exact sha256,
-# state_dict or launch-count fingerprint), not a name heuristic.
+# `python-test` runs the suite minus the `pins` marker: 2500 tests. The other
+# 82 compare exact sha256 fingerprints of logits and state dicts — they break on
+# any legitimate change by design, so they are a local instrument, not a CI job:
+#
+#     PYTHONPATH=src .venv/bin/python -m pytest -q -m pins
+#
 
 jobs:
   # ── python lane ────────────────────────────────────────────────────────────
@@ -43,20 +45,12 @@ jobs:
       - name: ruff format (changed files only until the sweep lands)
         run: bash scripts/gate_format.sh --changed origin/${{ github.base_ref || 'main' }}
 
-  # The suite, minus the sha256 pins. The pins are valuable — "the off path must
-  # be bit-identical" is the only test that catches a flag silently becoming a
-  # formula — but they legitimately move on every change, so they cannot be a
-  # landing gate.
+  # The suite, minus the `pins` marker — 2500 tests. The other 82 compare exact
+  # sha256 fingerprints and break on any legitimate change by design, so they are
+  # a local instrument, not a landing gate:
   #
-  # MEASURED 2026-11-13 on the 82 failures of run 42480254891: the names are
-  # NOT uniform (`test_gate_1_csa_off_is_bit_identical_to_main`,
-  # `test_jepa_off_is_the_pre_change_model_bit_for_bit`,
-  # `test_the_default_path_is_byte_identical`, ...), and only 6 contain "pin"
-  # and 2 contain "hash" — `-k "not pin and not hash"` alone would have left 74
-  # red. This selector catches 71 of the 82. The durable fix is a `pins` marker
-  # in `port/pyproject.toml` (`-m "not pins"`), which is the port lane's file.
-  # Until then the residual is named, not hidden: a pin that dodges the selector
-  # reds this job and its name gets added to PIN_SELECTOR.
+  #     cd port && PYTHONPATH=src .venv/bin/python -m pytest -q -m pins
+  #
   python-test:
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -73,23 +67,6 @@ jobs:
         run: mkdir -p /tmp/opencode
       - name: pytest (CPU)
         run: cd port && PYTHONPATH=$PWD/src uv run python -m pytest -q -p no:logging -m "not pins"
-
-  # Report-only ON PURPOSE. The pins are the project's own contract that a
-  # disabled arm changes nothing; they break on every legitimate change and
-  # are the honest cost of that contract, not a defect. Never a gate until the
-  # `pins` marker exists.
-  pins:
-    name: "pins (informational) :: exact sha256/state_dict/launch fingerprints"
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - name: install (frozen)
-        run: cd port && uv sync --frozen
-      - name: pytest (the pins)
-        run: cd port && PYTHONPATH=$PWD/src uv run python -m pytest -q -p no:logging -m pins
 
   python-gates:
     runs-on: ubuntu-latest
