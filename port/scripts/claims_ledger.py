@@ -212,7 +212,7 @@ def doc_date(path: Path | str) -> str:
 
 
 INLINE_BPB = re.compile(r"(?P<v>[-−+]?\d+(?:\.\d+)?)\s*(?:BPB|bpb)\b")
-INLINE_PARAMS = re.compile(r"(?P<v>\d[\d _.,]*?)\s*(?P<suf>[KMB])?\s*params?\b")
+INLINE_PARAMS = re.compile(r"(?P<v>\d[\d _,]*(?:\.\d+)?)\s*(?P<suf>[KMB])?\s*params?\b")
 INLINE_RATIO = re.compile(
     r"(?P<v>\d+(?:\.\d+)?)\s*[×x]\s*(?P<dir>faster|slower|speedup|the speed)\b"
     r"|(?P<dir2>faster|slower)\s+(?:by\s+)?(?P<v2>\d+(?:\.\d+)?)\s*[×x]"
@@ -264,7 +264,14 @@ def _num(raw: str) -> float:
 
 
 def _params_value(raw: str, suffix: str | None) -> float:
-    v = _num(raw)
+    # The claim regexes are deliberately loose (thousand separators, footnote
+    # marks); a token that still does not parse is a claim about a number the
+    # ledger cannot read. Returning nan marks it unverifiable instead of taking
+    # the whole gate down with a ValueError.
+    try:
+        v = _num(raw)
+    except ValueError:
+        return float("nan")
     return v * {"K": 1e3, "M": 1e6, "B": 1e9}.get((suffix or "").upper(), 1.0)
 
 

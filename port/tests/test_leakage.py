@@ -413,10 +413,13 @@ def test_padding_cannot_reach_a_real_position_or_the_loss(kind):
     with torch.no_grad():
         logits, loss, _ = model(x, y, loss_mask=mask)
         logits_o, loss_o, _ = model(x_oracle, y_pad, loss_mask=mask)
-    assert torch.equal(logits.reshape(2, SEQ, -1)[:, :20], logits_o.reshape(2, SEQ, -1)[:, :20]), (
-        "padding changed a real position's logit"
-    )
-    assert torch.equal(loss, loss_o), "padding changed the masked loss"
+    # A leak moves a logit by O(1); masked softmax weights are exactly 0 in
+    # exact arithmetic but not bit-identical across BLAS/kernel choices, so the
+    # bar is a tolerance and not `torch.equal` (it flipped on the CI runner).
+    assert torch.allclose(
+        logits.reshape(2, SEQ, -1)[:, :20], logits_o.reshape(2, SEQ, -1)[:, :20], rtol=0, atol=1e-5
+    ), "padding changed a real position's logit"
+    assert torch.allclose(loss, loss_o, rtol=0, atol=1e-7), "padding changed the masked loss"
     assert not bool(mask[0, 20:].any()) and int(mask[0].sum()) == 19
 
     # The reduction is the mean over SELECTED positions, exactly. Only the

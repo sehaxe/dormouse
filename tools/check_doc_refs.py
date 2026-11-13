@@ -134,12 +134,34 @@ PATH_ALIASES = (("port/", "python/"),)
 
 
 _AT_COMMIT: dict[tuple[str, str], bool] = {}
+#: `sha:path` refs whose COMMIT is not in this clone (local-only, filtered, or
+#: rewritten). Unverifiable, not false: reported, never a failure.
+UNRESOLVED: list[str] = []
 
 
 def exists_at(commit: str, repo_rel: str) -> bool:
-	"""The blob `repo_rel` existed at `commit` (cached; one git call per pair)."""
+	"""The blob `repo_rel` existed at `commit` (cached; one git call per pair).
+
+	A commit this clone does not have cannot be checked — a provenance ref to a
+	local-only or filtered-out commit is not evidence that the path never existed.
+	Those are collected in `UNRESOLVED` and reported as a warning; a commit that
+	IS present but lacks the path is still a failure, which is the case the gate
+	exists for.
+	"""
 	key = (commit, repo_rel)
 	if key not in _AT_COMMIT:
+		known = (
+			subprocess.run(
+				["git", "cat-file", "-e", commit],
+				cwd=ROOT,
+				capture_output=True,
+			).returncode
+			== 0
+		)
+		if not known:
+			UNRESOLVED.append(f"{commit}:{repo_rel}")
+			_AT_COMMIT[key] = True
+			return True
 		_AT_COMMIT[key] = (
 			subprocess.run(
 				["git", "cat-file", "-e", f"{commit}:{repo_rel}"],
@@ -205,6 +227,10 @@ def main() -> int:
 	print(f"doc-refs: {len(files)} files scanned, {checked} path references resolved")
 	if warned:
 		print(f"known-dead references (documented in KNOWN_DEAD, not a failure): {len(warned)}")
+		if UNRESOLVED:
+			print(f"unverifiable provenance refs (commit not in this clone, not a failure): {len(UNRESOLVED)}")
+			for u in UNRESOLVED[:10]:
+				print(f"    {u}")
 	if bad:
 		print(f"NAMED PATHS THAT DO NOT EXIST: {len(bad)}")
 		for b in bad:
