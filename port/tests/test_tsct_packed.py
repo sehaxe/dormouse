@@ -648,3 +648,67 @@ def test_refusals_name_the_escape() -> None:
 
     moe = SparseMoE(ModelConfig(**{**BASE, "tsct_packed": True}), device="cpu")
     assert moe.tsct_packed and moe.packed_v.shape == (4, 8, 128)
+
+
+# --------------------------------------------------------------------------- #
+# G. a device/dtype conversion moves the VIEWS with the buffers
+#
+# Measured 2026-11-14: `cli.py` builds the model on CPU and calls `.to(cuda)`, so
+# a packed run died on its first step with `mat2 is on cpu` — the bank rebuilt
+# from the moved `packed_*` buffers, but each expert still held the OLD views
+# (`_naive_dispatch`'s per-expert call). `SparseMoE._apply` re-binds them.
+# --------------------------------------------------------------------------- #
+def _assert_views_follow(moe: SparseMoE) -> None:
+    """Each bound view IS the parent's storage, on the parent's device+dtype."""
+    for e, ex in enumerate(moe.experts):
+        pairs = [
+            (ex.v, moe.packed_v[e]),
+            (ex.gate_s, moe.packed_s[e, 0]),
+            (ex.up_s, moe.packed_s[e, 1]),
+        ]
+        if hasattr(moe, "packed_gate_u"):
+            pairs += [(ex.gate_u, moe.packed_gate_u[e]), (ex.up_u, moe.packed_up_u[e])]
+        for got, want in pairs:
+            assert got.device == want.device, f"expert {e}: {got.device} != {want.device}"
+            assert got.dtype == want.dtype, f"expert {e}: {got.dtype} != {want.dtype}"
+            assert got.data_ptr() == want.data_ptr(), (
+                f"expert {e}: the view kept the pre-conversion storage"
+            )
+
+
+def test_a_conversion_rebinds_the_expert_views() -> None:
+    """The CPU half: the same `_apply` hook `.to("cuda")` goes through."""
+    model = _build(tsct_packed=True)
+    moe = model.loop.moe
+    _assert_views_follow(moe)
+    model.to(torch.float64)
+    assert moe.packed_v.dtype is torch.float64
+    _assert_views_follow(moe)
+    model.to(torch.float32)
+    _assert_views_follow(moe)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_two_packed_steps_on_cuda_keep_the_bank_on_the_compute_device() -> None:
+    """The CUDA half: the run that crashed, two optimizer steps of it.
+
+    A CPU-built model converted to the card is the CLI's own order, so the gate
+    fails on the OLD code with `Expected all tensors to be on the same device`.
+    """
+    model = _build(tsct_packed=True).to("cuda")
+    moe = model.loop.moe
+    assert all(p.device.type == "cuda" for p in moe._packed_params)
+    _assert_views_follow(moe)
+    ids = IDS.to("cuda")
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    losses = []
+    for _ in range(2):
+        opt.zero_grad(set_to_none=True)
+        _logits, loss, _ = model(ids, targets=torch.roll(ids, -1, dims=1), counters=Counters())
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.detach()))
+    print(f"[gate G] two cuda steps: losses={losses}")
+    assert all(x == x and abs(x) != float("inf") for x in losses), losses
+    for name, t in zip(("gate_u", "up_u", "v"), moe._banks(torch.bfloat16), strict=False):
+        assert t.device.type == "cuda", f"the {name} bank slice stayed on {t.device}"

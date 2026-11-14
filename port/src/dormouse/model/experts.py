@@ -2369,6 +2369,29 @@ class SparseMoE(nn.Module):
             self._bank_cache = None
 
     # -- packed bank: one buffer per site, and a checkpoint readable both ways --
+    def _apply(self, fn, recurse=True):
+        """A `.to(...)`/`.cuda()` moves the buffers and RE-BINDS the views.
+
+        `nn.Module._apply` replaces the DATA of a registered parameter (or, under
+        `torch.__future__.overwrite_module_params_on_conversion`, the parameter
+        itself). The per-expert views bound by [`_bind_packed`] are plain tensors
+        over the OLD storage, so they do not follow: the bank rebuilds from the
+        moved `packed_*` buffers while a per-expert call (`_naive_dispatch`, the
+        standalone path) multiplies a moved `x` by a CPU `gate_u` — measured
+        2026-11-14 as `RuntimeError: ... mat2 is on cpu` on the first step of a
+        packed run, because `cli.py` builds on CPU and calls `.to(cuda)`.
+        The cached bank is on the old device/dtype too, so it goes with the
+        conversion (the load hook drops it for the same reason).
+        """
+        out = super()._apply(fn, recurse)
+        if self.tsct_packed:
+            self._bind_packed()
+            extra = (self.packed_gate_u, self.packed_up_u) if hasattr(self, "packed_gate_u") else ()
+            self._packed_params = (self.packed_v, self.packed_s, *extra)
+            self._bank_cache = None
+            self._bank_epoch += 1
+        return out
+
     def _bind_packed(self) -> None:
         """Point every expert at its row of the parent's buffers (views)."""
         gate_u = getattr(self, "packed_gate_u", None)
