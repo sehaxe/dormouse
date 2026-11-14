@@ -148,6 +148,14 @@ and decides; no speed claim exists until it runs. Counters: `moe_gather_forward`
 serve is COUNTED with its reason (`moe_gather_fallback` + `counters.why`) and
 falls through to `moe_kernel`, exactly like the triton arm's own fallback.
 
+Its SIBLING, `moe_gather_fused` (bool, OFF), fuses the SAME kernel into the
+`moe_kernel="triton"` pass itself: `_triton_dispatch` calls `gather_glu` instead
+of materializing `xg`, so the flag rides the arm a run already selected rather
+than being a dispatch of its own. Same kernel, same forward/backward asymmetry,
+same recompute. Counters: `moe_gather_fused_used` (forward calls that took the
+fused A load) and `moe_gather_fused_fallback` (+ `counters.why`) — the two
+switches are refused together LOUDLY, because only one can own the forward.
+
 ONE more switch on the routed pass, OFF by default: the **adaptive width**
 (`moe_topk_mode`, `model/adaptive_topk.py`, 2026-10-21). `off` is the constant
 `moe_topk` width every number on record runs and the module never calls the
@@ -1087,6 +1095,10 @@ class SparseMoE(nn.Module):
         #: `moe_gather_rows` (rows read through the map) — a log line without
         #: them did not run the arm it is labelled with.
         self.moe_gather = cfg.moe_gather
+        #: Gather fused INTO the `moe_kernel="triton"` GEMM's A load (see
+        #: `_gather_fused_reason` / `_gather_fused_ok`). A sub-switch of the
+        #: pass, not another arm: `_triton_dispatch` is the only reader.
+        self.moe_gather_fused = cfg.moe_gather_fused
         self.moe_offload = cfg.moe_offload
         #: The fused route head (`model/route_fused.py`): ONE kernel for
         #: softmax + LFB bias + top-k + the gate gather, instead of 4 tensor ops
@@ -3655,6 +3667,73 @@ class SparseMoE(nn.Module):
             return f"input is on {x.device.type}: the gather kernel is the CUDA path"
         return None
 
+    def _gather_fused_reason(self, x: torch.Tensor, fused_bwd: bool = True) -> str | None:
+        """`None` if the gather can be fused into THIS grouped-GEMM pass, else why not.
+
+        The `moe_gather_fused` sub-switch of `_triton_dispatch`. Config-level
+        refusals (`moe_kernel`, `bf16`, byteflow, adaptive width, `factor_qat`,
+        shared compute, `moe_gather="kernel"`) are LOUD in `config.validate`;
+        this is the CALL-level half, COUNTED (`moe_gather_fused_fallback` + the
+        reason on `counters.why`) like `_gather_reason`.
+
+        `fused_bwd=False` is refused because `_GatherGlu.backward` is the shipped
+        grouped adjoint recomputed on the same rows — the ONE backward the arm
+        has evidence for. `moe_sonic.gather_glu` needs both abilities (the kernel
+        forward and the shipped GEMM backward), so both are checked.
+        """
+        if moe_sonic._TRITON_WHY is not None:
+            return moe_sonic._TRITON_WHY
+        if moe_sonic._SHIPPED_WHY is not None:
+            return moe_sonic._SHIPPED_WHY
+        if not fused_bwd:
+            return (
+                "fused_bwd=false: the fused forward's adjoint IS the shipped grouped "
+                "GEMM recomputed on the same rows (`moe_sonic._GatherGlu`), and that "
+                "is the only backward this arm has been gated on"
+            )
+        if self.moe_shared_compute:
+            return (
+                "moe_shared_compute=true: the A operand would be the latent rows, a "
+                "shape the fused kernel's byte table and parity gates do not cover"
+            )
+        if self.expert_act != "silu":
+            return (
+                f"expert_act={self.expert_act} has no fused kernel (the gather GLU hardcodes silu)"
+            )
+        block = moe_sonic.TILES["BLOCK_K"]
+        if self.d % block:
+            return (
+                f"d_model={self.d} is not a multiple of the {block}-wide K tile the "
+                f"fused kernel was proven at (its masked tail is untested)"
+            )
+        if not x.is_cuda:
+            return f"input is on {x.device.type}: the fused gather is the CUDA path"
+        return None
+
+    def _gather_fused_ok(
+        self, x: torch.Tensor, counters: Counters | None, *, fused_bwd: bool = True
+    ) -> bool:
+        """Decide the fused A load AND count the path that was taken.
+
+        `moe_gather_fused=false` draws nothing (every existing run: no counter,
+        no reason). ON counts `moe_gather_fused_used` when the kernel takes the
+        pass and `moe_gather_fused_fallback` + `counters.why` when it cannot — a
+        reader can tell which path a step ran without a profiler, and an arm
+        that was asked for and refused never disappears (ADR-0019).
+        """
+        if not self.moe_gather_fused:
+            return False
+        why = self._gather_fused_reason(x, fused_bwd)
+        if counters is not None:
+            if why is None:
+                counters.count("moe_gather_fused_used")
+            else:
+                counters.count("moe_gather_fused_fallback")
+                note = f"gather fused: {why}"
+                prev = getattr(counters, "why", None)
+                counters.why = f"{prev}; {note}" if prev else note  # type: ignore[attr-defined]
+        return why is None
+
     def _route_fused_reason(self, x: torch.Tensor) -> str | None:
         """`None` if the fused route head can run THIS call, else why not.
 
@@ -3765,6 +3844,13 @@ class SparseMoE(nn.Module):
         The kernel, its fused backward and the combine are unchanged — the
         `d -> rank` product they used to do was already applied once, over the
         tokens, by `_shared_projection`.
+
+        `moe_gather_fused` replaces the `xg` copy with `moe_sonic.gather_glu`: the
+        kernel reads `x[toks[row]]` and the backward is the shipped adjoint
+        recomputed on the same rows. A VRAM lever (the `[R, d]` copy and its
+        re-read disappear from the fwd→bwd set), with a measured byte LOSS in the
+        backward — `_gather_fused_reason` names every refusal and
+        `_gather_fused_ok` counts which path ran.
         """
         assert moe_kernels is not None, "the triton arm cannot be dispatched without it"
         n, k = index.shape
@@ -3778,7 +3864,16 @@ class SparseMoE(nn.Module):
         offs[1:] = torch.cumsum(counts, 0)
         gate_u, up_u, v, gate_s, up_s = self._banks(dt, counters)
         cap = None if dropless else self._capacity(n, k)
-        if self.moe_shared_compute:
+        # The gather fused INTO the A load (`moe_gather_fused`): the kernel reads
+        # `x[toks[row]]`, so no `[R, d]` copy is written or re-read. Decided
+        # HERE so the fallback is the ordinary `xg` below, COUNTED with its
+        # reason by `_gather_fused_ok`. `gather_abi` is the permute's own map
+        # (`toks` IS `rows // k`, and `offs` is the same partition built above).
+        fused_gather = self._gather_fused_ok(x, counters, fused_bwd=fused_bwd)
+        xg = None
+        if fused_gather:
+            toks, _ = moe_sonic.gather_abi(index, order, keep, self.n_experts)
+        elif self.moe_shared_compute:
             self._assert_shared_compute()
             lat = self._shared_projection(x, dt, counters)
             xg = self._gather_rows(lat, owner, dt)
@@ -3786,6 +3881,7 @@ class SparseMoE(nn.Module):
         else:
             xg = self._gather_rows(x, owner, dt)
         if not fused_bwd:
+            assert xg is not None, "fused_bwd=false runs the pre-gathered control"
             y = moe_kernels.expert_gemm_glu(
                 xg, gate_u, up_u, gate_s, up_s, v, offs, cap=cap, fused_bwd=False
             )
@@ -3813,19 +3909,38 @@ class SparseMoE(nn.Module):
         rowmap = torch.full((n * k,), -1, dtype=torch.int32, device=x.device)
         rowmap[rows] = torch.arange(rows.numel(), dtype=torch.int32, device=x.device)
         ws = self._bwd_workspace()
-        y = moe_kernels.expert_gemm_glu(
-            xg,
-            gate_u,
-            up_u,
-            gate_s,
-            up_s,
-            v,
-            offs,
-            cap=cap,
-            fused_bwd=True,
-            seg=seg,
-            ws=ws,
-        )
+        if fused_gather:
+            # The arm's ONE entry point: the kernel forward (no `xg`) and the
+            # shipped adjoint recomputed on the same rows (`_GatherGlu`). The
+            # scatter (`combine`) below is the shipped one, so this changes where
+            # the A operand comes from, not how the pass closes.
+            y = moe_sonic.gather_glu(
+                x,
+                toks,
+                gate_u,
+                up_u,
+                gate_s,
+                up_s,
+                v,
+                offs,
+                cap=cap,
+                seg=seg,
+                ws=ws,
+            )
+        else:
+            y = moe_kernels.expert_gemm_glu(
+                xg,
+                gate_u,
+                up_u,
+                gate_s,
+                up_s,
+                v,
+                offs,
+                cap=cap,
+                fused_bwd=True,
+                seg=seg,
+                ws=ws,
+            )
         # `combine`'s contract is fp32 `w` (and its fused backward's `dy` is
         # built from it), so the weight is widened HERE, at the boundary. The
         # weight arrives in the COMPUTE dtype — under `bf16 = true` it is the

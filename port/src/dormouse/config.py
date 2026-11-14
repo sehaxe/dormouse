@@ -1413,6 +1413,26 @@ class ModelConfig:
     #: rows — `moe_sonic.gather_glu` says what that costs and why. No speed claim
     #: exists until `scripts/bench_gather.py` runs.
     moe_gather: str = "off"
+    #: Gather fused INTO the `moe_kernel="triton"` grouped GEMM's A load
+    #: (`moe_sonic._gather_glu_kernel`): the kernel reads `x[toks[row]]`, so the
+    #: forward never materializes (nor re-reads) the `xg = x[owner].to(dt)` copy.
+    #: This is a VRAM lever, not a speed one: the forward's `[R, d]` copy and the
+    #: GLU gate tensors disappear (126 MiB of forward allocation at medium
+    #: b24·s1024, 74 MiB at b1 b8·s1024) together with `4·R·d` bytes of HBM
+    #: traffic (192 MiB/pass at medium, 128 MiB at b1; the fp32-seam control
+    #: priced `12·R·d`), but the BACKWARD is a byte LOSS (`grad_out` is fp32 where
+    #: `dy` is bf16) and the estimate is <0.5% of step time. The paper's 4.9×
+    #: cache reduction needs a fused adjoint this wiring does not have:
+    #: `_GatherGlu` recomputes and keeps `y`, so the retained fwd→bwd set falls
+    #: 382 → 304 MiB at medium, not to 78. OFF is every number on record. Refused LOUDLY off the
+    #: route it was proven on (`moe_kernel != "triton"`, `bf16=false`,
+    #: `use_byteflow=true`, `moe_topk_mode != "off"`, `factor_qat != "none"`,
+    #: `moe_shared_compute=true`, or `moe_gather="kernel"`); a call it cannot
+    #: serve is COUNTED (`moe_gather_fused_fallback` + the reason) and runs the
+    #: ordinary gathered copy. Counters: `moe_gather_fused_used` (forward calls
+    #: that took the fused A load) and `moe_gather_fused_fallback` (with
+    #: `counters.why`) — a run labelled fused without the former did not run it.
+    moe_gather_fused: bool = False
     #: The fused ROUTE HEAD (`model/route_fused.py`): ONE kernel for the
     #: unbiased softmax, the LFB bias add, the top-k and the gathered gate,
     #: instead of 4 tensor ops over the same `[n, E]` (topk alone is 5-6 CUDA
@@ -4287,6 +4307,65 @@ def validate(model: ModelConfig) -> None:
                 f"the quantization rung, whose alpha anneals every step, and no "
                 f"gather-parity gate covers that pair. Escape: factor_qat='none', or "
                 f"moe_gather='off'."
+            )
+    if model.moe_gather_fused:
+        # The SAME route facts as `moe_gather="kernel"` (it is the same kernel),
+        # plus the two switches that make the flag inert or ambiguous. Each is
+        # refused at load: an arm asked for and never run is the defect ADR-0019
+        # bans, and the counter would otherwise carry the reason every step.
+        if model.moe_kernel != "triton":
+            loud(
+                f"moe_gather_fused=true with moe_kernel={model.moe_kernel!r}: the "
+                f"fused gather is the `triton` grouped GEMM's A load, so on any "
+                f"other arm there is no GEMM to fuse it into and the flag would be "
+                f"inert. Escape: moe_kernel='triton', or moe_gather_fused=false."
+            )
+        if model.moe_gather == "kernel":
+            loud(
+                "moe_gather_fused=true with moe_gather='kernel': both ask for the "
+                "SAME fused forward (the arm returns before `_triton_dispatch`), so "
+                "one of the two switches could never run. Escape: leave "
+                "moe_gather='off' (the fused-into-`_triton_dispatch` route), or "
+                "moe_gather_fused=false."
+            )
+        if not model.bf16:
+            loud(
+                "moe_gather_fused=true with bf16=false: the fused kernel is wired on "
+                "the bf16 tile set (`moe_sonic.TILES`, no `num_stages`); the shipped "
+                "4-byte arm halves the wide tiles and passes `num_stages=1`, a "
+                "tile/stage choice the fused arm has never launched. Escape: "
+                "bf16=true, or moe_gather_fused=false."
+            )
+        if model.use_byteflow:
+            loud(
+                "moe_gather_fused=true with use_byteflow=true: the gather ABI is the "
+                "loop stack's permute over `[tokens, d]`, and the byteflow channel "
+                "runs that loop over K patch latents — an input path the prototype's "
+                "parity gates do not cover. Escape: use_byteflow=false, or "
+                "moe_gather_fused=false."
+            )
+        if model.moe_topk_mode != "off":
+            loud(
+                f"moe_gather_fused=true with moe_topk_mode={model.moe_topk_mode!r}: "
+                f"the adaptive width moves unused slots to a sentinel expert past "
+                f"the bank, which `gather_abi`'s `offs` (a cumsum of bincount over "
+                f"the kept experts) and the kernel grid never see. Escape: "
+                f"moe_topk_mode='off', or moe_gather_fused=false."
+            )
+        if model.factor_qat != "none":
+            loud(
+                f"moe_gather_fused=true with factor_qat={model.factor_qat!r}: the "
+                f"kernel loads the DEQUANTIZED `gate_u`/`up_u`/`v` that `_banks` "
+                f"applies `factor_qat_project` to, a rung whose alpha anneals every "
+                f"step and that no gather-parity gate covers. Escape: "
+                f"factor_qat='none', or moe_gather_fused=false."
+            )
+        if model.moe_shared_compute:
+            loud(
+                "moe_gather_fused=true with moe_shared_compute=true: the A operand "
+                "would be the `[T, 2·rank]` latent rows, a shape the fused kernel's "
+                "byte table and parity gates do not price or cover. Escape: "
+                "moe_shared_compute=false, or moe_gather_fused=false."
             )
     if model.moe_combine not in MOE_COMBINES:
         loud(

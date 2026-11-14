@@ -1147,3 +1147,280 @@ def test_the_wired_arm_is_the_shipped_triton_arm(bf16):
     assert rel_out <= 1e-5, f"logits {rel_out:.3e}"
     assert rel_dx <= 1e-5, f"dx {rel_dx:.3e}"
     assert rel_max <= 1e-5, f"parameter gradients {rel_max:.3e}"
+
+
+# --------------------------------------------------------------------------
+# the SIBLING switch: `moe_gather_fused` inside `_triton_dispatch`
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bf16", [False, True])
+def test_gather_fused_is_bit_identical_to_the_pre_gathered_gemm(bf16):
+    """The fused A load is the SAME function, bit for bit — the parity gate.
+
+    `moe_gather_fused` substitutes ONE thing in `_triton_dispatch`: the A
+    operand comes from `x[toks[row]]` instead of the materialised
+    `xg = x[owner].to(dt)`. So the gate is two equalities: the map IS the gather
+    (`torch.equal` on the rows), and the SAME GEMM over either source is the
+    same bits. `fused_reference` is the kernel's own math in torch, so the
+    second equality is what a wrong gather, a wrong `offs` or a cast in the
+    wrong place would break. This is the card-less half; the kernel itself is
+    the `@CUDA` gate above.
+    """
+    moe, x, _w, index, order, keep, _d = _cpu_setup(bf16=bf16, tokens=64)
+    dt = moe._bank_dtype()
+    rows = order if keep is None else order[keep]
+    owner = rows // 2
+    toks, offs = ms.gather_abi(index, order, keep, moe.n_experts)
+    gate_u, up_u, v, gate_s, up_s = moe._banks(dt)
+
+    xg = moe._gather_rows(x, owner, dt)
+    same_toks = torch.arange(xg.shape[0], dtype=torch.int32)
+    ref = ms.fused_reference(xg, same_toks, gate_u, up_u, gate_s, up_s, v, offs)
+    got = ms.fused_reference(x, toks, gate_u, up_u, gate_s, up_s, v, offs)
+    assert torch.equal(x[toks.to(torch.int64)].to(dt), xg), "the map is not the pre-gathered copy"
+    assert torch.equal(got, ref), "the fused A load moved a bit"
+    print(
+        f"[gather fused parity] bf16={bf16} rows={toks.numel()} "
+        f"dtype={xg.dtype} torch.equal on gather and GEMM"
+    )
+
+
+def test_the_fused_map_refuses_a_reordered_index():
+    """A reordered `toks` is a DIFFERENT function — the fixture and the gate see it.
+
+    The map is applied in GATHERED (expert-major) order, not token order. A bug
+    that sorted `toks`, or scattered it the wrong way, would leave `offs` and
+    the shapes intact and only move WHO owns each row — so the fixture must be
+    order-sensitive and the gate must go red on a reorder.
+    """
+    moe, x, _w, index, order, keep, _d = _cpu_setup(bf16=False, tokens=64)
+    dt = moe._bank_dtype()
+    toks, offs = ms.gather_abi(index, order, keep, moe.n_experts)
+    gate_u, up_u, v, gate_s, up_s = moe._banks(dt)
+    xg = moe._gather_rows(x, (order if keep is None else order[keep]) // 2, dt)
+    ref = ms.fused_reference(
+        xg,
+        torch.arange(xg.shape[0], dtype=torch.int32),
+        gate_u,
+        up_u,
+        gate_s,
+        up_s,
+        v,
+        offs,
+    )
+    wrong = toks.flip(0)
+    assert not torch.equal(toks, torch.sort(toks).values), "fixture is already in token order"
+    assert not torch.equal(x[wrong.to(torch.int64)], xg), "the reorder moved no row"
+    y_wrong = ms.fused_reference(x, wrong, gate_u, up_u, gate_s, up_s, v, offs)
+    assert not torch.equal(y_wrong, ref), "a reordered map produced the same output"
+    print(
+        f"[wrong order] rows={toks.numel()}: sorted(toks) != toks, "
+        f"x[flip(toks)] != xg, output differs"
+    )
+
+
+def test_gather_fused_gathers_a_token_twice_for_dropless_routing():
+    """Dropless top-2 assigns every token to TWO experts; both rows must read it.
+
+    This is the duplicate case the copy-based path handles by construction and a
+    naive token->row dictionary would collapse. `toks` is per ROW, so the same
+    token appears twice (once per expert) and both gathered rows must be the
+    same `x` row; the GEMM then routes them to different experts.
+    """
+    moe, x, _w, index, order, keep, _d = _cpu_setup(bf16=False, tokens=32, capacity=0.0)
+    dt = moe._bank_dtype()
+    toks, offs = ms.gather_abi(index, order, keep, moe.n_experts)
+    uniq, counts = torch.unique(toks, return_counts=True)
+    assert torch.all(counts >= 2), "a dropless top-2 assignment sends every token to two experts"
+    token = int(uniq[0])
+    at = (toks == token).nonzero().flatten()
+    assert at.numel() >= 2
+    rows = x[toks[at].to(torch.int64)]
+    assert torch.equal(rows, x[token].expand_as(rows)), "a duplicated token's rows disagree"
+    gate_u, up_u, v, gate_s, up_s = moe._banks(dt)
+    xg = moe._gather_rows(x, (order if keep is None else order[keep]) // 2, dt)
+    ref = ms.fused_reference(
+        xg,
+        torch.arange(xg.shape[0], dtype=torch.int32),
+        gate_u,
+        up_u,
+        gate_s,
+        up_s,
+        v,
+        offs,
+    )
+    got = ms.fused_reference(x, toks, gate_u, up_u, gate_s, up_s, v, offs)
+    assert torch.equal(got, ref)
+    print(
+        f"[duplicate token] token={token} rows={at.tolist()} "
+        f"E={moe.n_experts} R={toks.numel()}: both rows read x[{token}]"
+    )
+
+
+def test_gather_fused_counts_the_path_it_took():
+    """`used` and `fallback` tell a reader which A load ran, per call.
+
+    OFF draws nothing (every existing run: no counter, no reason). ON on a CPU
+    tensor is a COUNTED fallback whose `why` names the device, and ON with the
+    call-level gate satisfied counts `used`. A silent fallback — the flag on
+    and the ordinary copy running with no trace — fails on the first assertion.
+    """
+    moe, x, _w, _index, _order, _keep, _d = _cpu_setup(bf16=False)
+    moe.moe_gather_fused = False
+    counters = Counters()
+    assert moe._gather_fused_ok(x, counters) is False
+    assert not counters, "OFF must draw nothing"
+
+    moe.moe_gather_fused = True
+    counters = Counters()
+    assert moe._gather_fused_ok(x, counters) is False
+    assert counters.get("moe_gather_fused_fallback") == 1, dict(counters)
+    assert "moe_gather_fused_used" not in counters
+    print(f"[fused counters] fallback=1 why={getattr(counters, 'why', '')!r}")
+
+    monkeypatch_reason = lambda *_a, **_k: None  # noqa: E731 - one-line seam
+    real = moe._gather_fused_reason
+    moe._gather_fused_reason = monkeypatch_reason
+    try:
+        counters = Counters()
+        assert moe._gather_fused_ok(x, counters) is True
+        assert counters.get("moe_gather_fused_used") == 1, dict(counters)
+        assert "moe_gather_fused_fallback" not in counters
+    finally:
+        moe._gather_fused_reason = real
+    print("[fused counters] used=1 on the satisfied gate; ON/OFF distinguishable")
+
+
+def test_gather_fused_refuses_shapes_it_was_not_proven_on():
+    """Every call-level refusal has a reason, and the reason is the gate.
+
+    These are the `moe_sonic` kernel's own limits plus the two wiring choices
+    (no shared-basis latent A operand, no `fused_bwd=false`). Config-level
+    refusals are loud in `config.validate`; these are COUNTED, so they are
+    tested as a return value, not an exception.
+    """
+    moe, x, _w, _index, _order, _keep, _d = _cpu_setup(bf16=False)
+    assert "cpu" in moe._gather_fused_reason(x)
+    assert "fused_bwd=false" in moe._gather_fused_reason(x, fused_bwd=False)
+    moe.expert_act = "gelu"
+    assert "expert_act=gelu" in moe._gather_fused_reason(x)
+    moe.expert_act = "silu"
+    moe.moe_shared_compute = True
+    assert "moe_shared_compute=true" in moe._gather_fused_reason(x)
+    moe.moe_shared_compute = False
+    moe.d = ms.TILES["BLOCK_K"] + 1
+    why = moe._gather_fused_reason(x)
+    assert "not a multiple" in why and str(ms.TILES["BLOCK_K"]) in why
+    print(f"[fused refusals] d_model={moe.d}: {why[:100]}...")
+
+
+@pytest.mark.parametrize(
+    "over,needle",
+    [
+        ({"moe_kernel": "padded"}, "moe_kernel='padded'"),
+        ({"moe_gather": "kernel"}, "moe_gather='kernel'"),
+        ({"bf16": False}, "bf16=false"),
+        ({"use_byteflow": True}, "use_byteflow=true"),
+        ({"moe_topk_mode": "entropy"}, "moe_topk_mode='entropy'"),
+        ({"factor_qat": "ternary"}, "factor_qat='ternary'"),
+        ({"moe_shared_compute": True, "share_u_mode": "plane"}, "moe_shared_compute=true"),
+    ],
+)
+def test_gather_fused_is_refused_loudly_off_its_route(over, needle):
+    """The combinations the fused kernel has no evidence for are LOUD, with escapes.
+
+    A refusal, not a clamp: the kernel is the `triton` arm's A load (so another
+    `moe_kernel` makes the flag inert), it shares `moe_gather`'s bf16/byteflow/
+    width/quant route, and it has no latent-A or non-recomputed-backward arm.
+    The message must name the escape, or it is a wall rather than a gate.
+    """
+    base = {"moe_kernel": "triton", "bf16": True, "moe_gather_fused": True}
+    base.update(over)
+    with pytest.raises(LoudError) as e:
+        validate(tiny_cfg(**base))
+    msg = str(e.value)
+    print(f"[fused refusal] {needle}: {msg[:100]}...")
+    assert needle in msg
+    assert "moe_gather_fused=false" in msg
+
+
+def test_gather_fused_cache_saving_is_the_copy_and_the_gates():
+    """The bytes this switch removes from the forward — asserted, not guessed.
+
+    Two numbers, both from the configs' own geometry through `pass_bytes`:
+
+    * the ALLOCATION delta (what the VRAM budget sees): the gathered `[R, d]`
+      copy + the three GLU gate tensors the fused kernel keeps in registers,
+      minus the `[R]` int32 row map it adds instead;
+    * the module's RETAINED-cache delta: the shipped fwd→bwd set minus the
+      wired arm's (`x` alias, `toks`, `y`), which is the same allocation delta
+      less the `x` alias the arm now holds.
+
+    The 382 -> 78 MiB (4.9x) figure in `moe_sonic`'s table is the FUSED-user
+    adjoint's (it drops `y` too); `_GatherGlu` recomputes and keeps `y`, so this
+    wiring reaches the allocation delta below, not 4.9x. `bench_gather.py` is
+    still the one that decides whether that is worth a step.
+    """
+    medium, b1 = ms.SHAPES
+    for shape, alloc, cached in (
+        (medium, 131_923_968, 81_592_320),
+        (b1, 77_529_088, 43_974_656),
+    ):
+        b = ms.pass_bytes(shape)
+        w = ms.wired_pass_bytes(shape)
+        assert b["xg_copy"] + b["gates_write"] - b["routing_metadata"] == alloc
+        assert w["shipped_cache"] - w["gather_cache"] == cached
+        assert alloc > cached, "the arm holds an `x` alias the shipped pass did not"
+        print(
+            f"[gather fused vram] {shape.name}: alloc -{alloc / 2**20:.0f} MiB, "
+            f"retained -{cached / 2**20:.0f} MiB "
+            f"({w['shipped_cache'] / 2**20:.0f} -> {w['gather_cache'] / 2**20:.0f} MiB)"
+        )
+
+
+def test_gather_fused_is_off_by_default_and_rides_the_triton_arm():
+    """Default OFF draws nothing; ON validates on the route it was proven on.
+
+    And the end-to-end CPU wiring: with the call-level gate satisfied and the
+    two Triton seams swapped for their torch twins, `_triton_dispatch` runs
+    `gather_glu` and counts `moe_gather_fused_used` — the flag changes where the
+    A operand comes from, not the pass's output.
+    """
+    assert ModelConfig().moe_gather_fused is False
+    validate(tiny_cfg())
+    validate(tiny_cfg(moe_kernel="triton", bf16=True, moe_gather_fused=True))
+    assert tiny_cfg(moe_kernel="triton", bf16=True).moe_gather_fused is False
+
+    if mk is None:
+        pytest.skip("no triton in this build: the shipped grouped GEMM is the adjoint")
+    moe, x, weight, index, order, keep, _d = _cpu_setup(bf16=False)
+    moe.moe_gather_fused = True
+    real_reason = moe._gather_fused_reason
+    moe._gather_fused_reason = lambda *_a, **_k: None
+    real_kernel, real_shipped, real_combine = ms._kernel_forward, ms._shipped_forward, mk.combine
+    ms._kernel_forward = lambda x, toks, gu, uu, gs, us, v, offs, cap=None: ms.fused_reference(
+        x, toks, gu, uu, gs, us, v, offs
+    )
+    ms._shipped_forward = lambda xg, gu, uu, gs, us, v, offs, *, cap, seg, ws: ms.fused_reference(
+        xg, torch.arange(xg.shape[0], dtype=torch.int32), gu, uu, gs, us, v, offs
+    )
+    mk.combine = _torch_combine
+    try:
+        counters = Counters()
+        with torch.no_grad():
+            out = moe._triton_dispatch(
+                x, weight, index, order, None, dropless=True, counters=counters
+            )
+    finally:
+        moe._gather_fused_reason = real_reason
+        ms._kernel_forward, ms._shipped_forward, mk.combine = (
+            real_kernel,
+            real_shipped,
+            real_combine,
+        )
+    ref = moe._naive_dispatch(x, weight, index, order, keep, Counters())
+    rel = _rel(out, ref)
+    assert counters["moe_gather_fused_used"] == 1, dict(counters)
+    print(f"[fused wiring] used=1 forward rel={rel:.1e} bound=1e-5")
+    assert rel <= 1e-5, f"the fused dispatch moved the output: {rel:.3e}"
