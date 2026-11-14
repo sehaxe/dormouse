@@ -276,7 +276,52 @@ def test_a_vram_projection_past_the_ceiling_refuses() -> None:
     assert rc == bench.EXIT_VRAM == 3
 
 
-# --- 5. the form gate ------------------------------------------------------
+# --- 5. the optimizer-route gate -------------------------------------------
+
+
+def test_the_writer_gate_feeds_both_routes_the_same_gradients() -> None:
+    """The route gate is a WRITER test, so it must hold the gradients fixed.
+
+    `_opt_routes` used to gate a 20-step free-running bpb gap at 1e-4. That
+    reading has a noise floor of the same size: this model's backward is not
+    bit-reproducible (7 of 99 gradients are bit-equal between two backwards from
+    the identical weights and batch; CUDA's reductions/atomics are not ordered
+    deterministically), and a same-route repeat measured 1.1e-04 to 1.7e-04 bpb
+    at 20 steps. The gate also fired on the REFERENCE recipe (fp32 NS, 5 steps:
+    1.24e-04), so a failure was never evidence about a precision rung.
+
+    The measurement that DOES attribute is both writers, one step, the SAME
+    captured gradients: any real writer bug (wrong bias correction, missing
+    decay, different update order) shows up there at step one.
+
+    Red on revert: gate the free-running gap again (fires on the control), or
+    re-derive each route's gradients (the 5 % perturbation below must fail the
+    gate, and would not be seen if the routes disagreed on their input).
+    """
+    device = torch.device("cpu")
+    run = bench.load_run("tiny", train_overrides={"batch": 2, "seq_len": 64, "grad_accum": 1})
+    torch.manual_seed(0)
+    model = bench._build(run, device)
+    state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    del model
+    ids = torch.randint(0, 256, (2, 64))
+
+    grads = bench._capture_grads(run, device, state, ids)
+    fused = bench._writer_params(run, device, state, grads, "fused")
+    torch_route = bench._writer_params(run, device, state, grads, "torch")
+    name, worst = bench._worst_param(fused, torch_route)
+    assert worst <= bench.PARAM_TOL, f"{name} moved {worst:.2e} on the same grads"
+
+    # A writer fed DIFFERENT gradients must fail the same gate: the comparison is
+    # sensitive to the thing it claims to measure.
+    moved = {k: (None if v is None else v * (1.0 + 5e-2)) for k, v in grads.items()}
+    bad_name, bad = bench._worst_param(
+        fused, bench._writer_params(run, device, state, moved, "torch")
+    )
+    assert bad > bench.PARAM_TOL, f"a 1e-3 gradient change went unseen at {bad_name}: {bad:.2e}"
+
+
+# --- 6. the form gate ------------------------------------------------------
 
 
 def test_the_vanilla_form_is_gated_on_block_form() -> None:
