@@ -690,23 +690,49 @@ class DormouseModel(nn.Module):
         return n
 
     def set_act_store(self, mode: str) -> int:
-        """Set `act_store` on every transformer block; return the count.
+        """Set `act_store` on the model's sites; return the count.
 
-        The arm is the STORE-ONLY lane (`model/packed_acts.py`): the forward runs
+        `nvfp4` is the STORE-ONLY lane (`model/packed_acts.py`): the forward runs
         bf16, bit for bit, and only what the backward keeps is packed — a memory
         arm, not a numerics one, hence a `TrainConfig` field applied here like
         `activation_recompute` rather than a build-time arch flag.
 
+        `codes` is the other side of the same idea: where the forward ALREADY
+        fake-quantizes (`act_qat`, the MoE expert seam), the backward rebuilds the
+        very same `x_q` from 4-bit codes, so the memory falls 4x with NO change to
+        any value or gradient — see `packed_acts.coded_act_mm`. It is a no-op on
+        the transformer block, whose `act_qat` FFN already stores packed.
+
         The historical arm ("bf16") takes no branch: it is the default every
         snapshot carries. A non-default mode refuses when the stack is not the
-        unique transformer form — the hybrid stack's KDA blocks save through the
+        form that owns its sites — the hybrid stack's KDA blocks save through the
         loop's seam and would keep their bf16 set while the log said the arm was
         on (the same reason `activation_offload` refuses there) — and when the
-        model builds no transformer block at all.
+        model builds no site at all.
         """
         from .packed_acts import check_store
 
         check_store(mode)
+        if mode == "codes":
+            # The codes rung lives on the MoE expert seam (`experts.SparseMoE`),
+            # not on the transformer block: its `act_qat` FFN already saves its
+            # operands packed. The hybrid-stack rule below is about the packed
+            # GEMM sites, so it does not apply to this rung.
+            from .experts import SparseMoE
+
+            n = 0
+            for module in self.modules():
+                if isinstance(module, SparseMoE):
+                    n += module.set_act_store(mode)
+            if n == 0:
+                loud(
+                    f"act_store={mode!r} but this model builds no `SparseMoE` "
+                    f"(block_form='kda' is where the fake-quantized per-expert GEMM "
+                    f"operand lives), so the arm would store nothing coded while the "
+                    f"log reported it on. Escape: block_form='kda', or "
+                    f"act_store='bf16'."
+                )
+            return n
         if mode != "bf16" and self.cfg.block_stack != "uniform":
             loud(
                 f"act_store={mode!r} with block_stack={self.cfg.block_stack!r}: "

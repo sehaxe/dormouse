@@ -90,6 +90,17 @@ kernel. Either way the FFN projections are not the fp8 lane's while
 attention's are, so on a `mm_dtype="fp8"` run the two lanes are still mixed.
 That combination is not refused in `config` yet — follow-up, named here rather
 than left silent.
+
+THE CODES RUNG (`act_store="codes"`, `coded_act_mm`). The store-only arm above is
+a MEMORY arm on a bf16 forward, so its `grad_W` reads a rounded operand — a
+deliberate trade. Where the forward ALREADY fake-quantizes (`act_qat`), that
+trade is available for free: the operand is `quantize_act(x)`, a deterministic
+function of 4-bit levels and one fp32 block scale, so `coded_act_mm` saves the
+CODES and rebuilds the very same `x_q` in the backward — bit-identical gradients
+for ~1/4 the bytes, no recompute and no STE change. It refuses a seam that does
+not quantize (there the codes would be a lossy rounding of an exact operand) and
+a codec whose dequantize is not `level · scale` (`act_quant.CODE_FORMATS`).
+`tests/test_act_store_codes.py` pins both the bit-identity and the saved bytes.
 """
 
 from __future__ import annotations
@@ -99,11 +110,12 @@ import torch.nn.functional as F
 
 from ..config import ACT_STORES
 from ..instrument import Counters, loud
+from .act_quant import pack_codes, unpack_codes
 from .experts import expert_glu
 from .nvfp4 import can_use_kernel, dequantize_nvfp4, nvfp4_mm, quantize_nvfp4
 from .tsct import mm_mixed
 
-__all__ = ["check_store", "packed_act_mm", "packed_glu"]
+__all__ = ["check_store", "coded_act_mm", "packed_act_mm", "packed_glu"]
 
 
 def check_store(mode: str) -> None:
@@ -118,7 +130,10 @@ def check_store(mode: str) -> None:
             f"{list(ACT_STORES)} — 'bf16' keeps every activation at 2 B (the "
             f"historical graph, bit for bit); 'nvfp4' saves the block's GEMM "
             f"inputs and GLU operands as e2m1 nibbles with one e4m3 scale per "
-            f"16, while the FORWARD still runs bf16. Escape: name one of those."
+            f"16, while the FORWARD still runs bf16; 'codes' stores the "
+            f"FAKE-QUANTIZED operand of a seam that already runs `act_qat` as "
+            f"4-bit codes plus its own fp32 block scale, so the backward rebuilds "
+            f"the forward's `x_q` exactly. Escape: name one of those."
         )
 
 
@@ -258,6 +273,79 @@ class _PackedGLU(torch.autograd.Function):
                 expert_glu(act, dg, du, beta1=beta1, beta2=beta2), (dg, du), grad
             )
         return grad_g, grad_u, None, None, None, None
+
+
+class _CodedActMM(torch.autograd.Function):
+    """`[y_i = xq @ W_iᵀ]` for a FAKE-QUANTIZED seam, `xq` saved as 4-bit CODES.
+
+    The forward quantizes `x` ONCE through `act_quant`'s own estimator, runs the
+    products on that value and keeps `(codes, scale, W)` — no bf16 `xq`. The
+    backward rebuilds it from the same levels and the same fp32 block scale,
+    i.e. the same `level · scale` multiply, so `grad_W = gradᵀ @ xq` reads the
+    operand the forward read, bit for bit, at ~1/4 the bytes. That is exactness,
+    not a trade: a fake-quantized operand IS a function of its codes and scale.
+
+    `x` is `[..., K]` and `W_i` is `[K, N_i]` (the factored expert's `U`/`plane`
+    layout: the product is `xq @ W_i`, one right-multiply); `dt` is the compute
+    dtype the caller's `@` would have used. The `W_i` are cast to `dt` here and
+    the gradient is handed back in the MASTER's dtype, so this repays exactly
+    the cast the caller writes (`w.to(dt)`).
+    """
+
+    @staticmethod
+    def forward(ctx, x, fmt, group, dt, *weights):
+        packed, scale, k = pack_codes(x, fmt, group)
+        ws = tuple(w if w.dtype is dt else w.to(dt) for w in weights)
+        ctx.meta = (fmt, group, k, tuple(x.shape[:-1]), x.dtype, tuple(w.dtype for w in weights))
+        ctx.save_for_backward(packed, scale, *ws)
+        # The SAME bytes the backward will read: one value, not two roundings.
+        xq = unpack_codes(packed, scale, k, fmt, group, dt).reshape(-1, k)
+        return tuple((xq @ w).view(*x.shape[:-1], w.shape[1]) for w in ws)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        packed, scale, *ws = ctx.saved_tensors
+        fmt, group, k, outer, xdt, wdts = ctx.meta
+        rows = unpack_codes(packed, scale, k, fmt, group, grads[0].dtype).reshape(-1, k)
+        grad_x = None
+        grad_w = []
+        for grad, w, wdt in zip(grads, ws, wdts, strict=True):
+            g = grad.reshape(-1, grad.shape[-1])
+            step = g @ w.t()
+            grad_x = step if grad_x is None else grad_x + step
+            grad_w.append((rows.t() @ g).to(wdt))
+        return (grad_x.view(*outer, k).to(xdt), None, None, None, *grad_w)
+
+
+def coded_act_mm(
+    x: torch.Tensor, fmt: str, group: int, dt: torch.dtype, *weights: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """`[y_i = xq @ W_i]` with the FAKE-QUANTIZED `xq` saved as 4-bit codes.
+
+    The `act_store="codes"` seam: it exists only where the forward ALREADY
+    fake-quantizes (`act_qat`), because there the saved operand is a function of
+    the codes and the scale. A seam that is not quantized is REFUSED — packing an
+    exact bf16 operand into a 4-bit grid would be the lossy `nvfp4` trade under a
+    name that promises exactness.
+    """
+    if fmt == "none":
+        loud(
+            "act_store='codes' at a seam that does NOT fake-quantize "
+            "(act_quant='none'): the codes rebuild `quantize_act(x)`, and with no "
+            "quantizer there is no such value — the backward's `grad_W` would read "
+            "a rounded copy of an operand the forward used exactly (the lossy "
+            "`act_store='nvfp4'` trade this arm exists to avoid). Escape: "
+            "act_qat='e2m1', or act_store='bf16'."
+        )
+    if not weights:
+        raise AssertionError("coded_act_mm needs at least one weight")
+    for w in weights:
+        if w.dim() != 2 or w.shape[0] != x.shape[-1]:
+            raise AssertionError(
+                f"coded_act_mm: x{tuple(x.shape)} does not contract with "
+                f"W{tuple(w.shape)}; the weights are [K, N] (the expert's `U`)"
+            )
+    return _CodedActMM.apply(x, fmt, group, dt, *weights)
 
 
 def packed_act_mm(

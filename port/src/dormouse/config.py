@@ -358,15 +358,18 @@ def _refuse_removed_quant(field: str, value: str, survivors: tuple[str, ...]) ->
 #: "e2m1", 16)`); the packed kernel is the bench/inference lane and is COUNTED.
 #: Two activation quantizers on one forward is refused (see `validate`).
 ACT_QATS = ("none", "e2m1")
-#: The `act_store` literals — WHERE the autograd graph keeps the transformer
-#: block's saved activations (`model/packed_acts.py`'s store-only lane). A
-#: MEMORY arm, not a numerics one: `bf16` is today's graph, bit for bit;
-#: `nvfp4` keeps the same tensors as e2m1 nibbles with one e4m3 scale per 16,
-#: so the FORWARD still runs bf16 and only the backward's `grad_W` reads the
-#: rounded copy of the saved operand. It uses `act_qat`'s codec and refuses it
-#: (one save set, two names), and it is refused with `torch_compile`, with
-#: `mm_dtype='fp8'` and on every block form it does not reach.
-ACT_STORES = ("bf16", "nvfp4")
+#: The `act_store` literals — WHERE the autograd graph keeps the saved
+#: activations. A MEMORY arm, not a numerics one: `bf16` is today's graph, bit for
+#: bit; `nvfp4` keeps the transformer block's GEMM inputs as e2m1 nibbles with one
+#: e4m3 scale per 16, so the FORWARD still runs bf16 and only the backward's
+#: `grad_W` reads the rounded copy of the saved operand. `codes` is the same idea
+#: on a seam that ALREADY fake-quantizes (`act_qat`, the MoE expert GEMM): its
+#: operand is a function of 4-bit codes and one fp32 block scale, so the backward
+#: rebuilds that operand EXACTLY — identical loss, grads and weights, ~1/4 the
+#: bytes (`model/packed_acts.coded_act_mm`). `nvfp4` refuses `act_qat` (one save
+#: set, two names); `codes` requires it. Both are refused with `torch_compile`,
+#: and on every block form whose sites they do not reach.
+ACT_STORES = ("bf16", "nvfp4", "codes")
 #: The `ns_kind` literals — the Newton–Schulz arms the Muon group runs
 #: (`optim.NS_KINDS`, which is where they are executed; the list is duplicated
 #: here the way `MOE_KERNELS` is, so the config layer does not import the
@@ -2807,6 +2810,14 @@ class TrainConfig:
     #: packed lane is not compiler-safe), with `mm_dtype='fp8'` (a different
     #: compute lane, unmeasured with the packed store) and outside
     #: `block_form='transformer'` / `block_stack='uniform'`.
+    #:
+    #: `codes` is the OTHER rung and the opposite contract: it is exact. It stores
+    #: the operand of a seam that ALREADY fake-quantizes (`act_qat`'s expert GEMM)
+    #: as 4-bit codes plus that seam's own fp32 block scale, so the backward
+    #: rebuilds the forward's `x_q` bit for bit at ~1/4 the bytes — identical loss,
+    #: gradients and weights. It therefore REQUIRES `act_qat` (and refuses a seam
+    #: that does not quantize: coding an exact operand is the `nvfp4` trade) and
+    #: lives on `block_form='kda'` (the MoE experts' per-expert GEMM).
     act_store: str = "bf16"
 
     # --- the RL lane (`post/rl.py` + `post/rl_train.py`) ----------------
@@ -5738,7 +5749,10 @@ def _check_act_store(mode: str) -> None:
             f"{list(ACT_STORES)} — `bf16` keeps every activation at 2 B (the "
             f"historical graph, bit for bit); `nvfp4` stores the block's GEMM "
             f"inputs and GLU operands as e2m1 nibbles with one e4m3 scale per "
-            f"16, while the FORWARD still runs bf16. Escape: name one of those."
+            f"16, while the FORWARD still runs bf16; `codes` stores the "
+            f"fake-quantized operand of an `act_qat` seam as 4-bit codes plus its "
+            f"own fp32 block scale, so the backward rebuilds it exactly. Escape: "
+            f"name one of those."
         )
 
 
@@ -6239,7 +6253,43 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"that is not. Escape: torch_compile=false, or act_qat='none'."
         )
     _check_act_store(tcfg.act_store)
-    if tcfg.act_store != "bf16":
+    if tcfg.act_store == "codes":
+        if model.act_qat == "none":
+            loud(
+                f"act_store='codes' with act_qat={model.act_qat!r}: the codes rebuild "
+                f"the FORWARD's own `quantize_act(x)`, so this rung needs a seam that "
+                f"fake-quantizes. On an exact operand the 4-bit store would round "
+                f"the backward's `grad_W` input — that is the lossy `act_store='nvfp4'` "
+                f"trade, under a name that promises bit-identity. Escape: "
+                f"act_qat='e2m1', or act_store='bf16'."
+            )
+        if model.block_form != "kda":
+            loud(
+                f"act_store='codes' with block_form={model.block_form!r}: the "
+                f"fake-quantized operand is the MoE experts' GEMM input "
+                f"(`DualLatentGLU`), which the not-factored loop block builds and no "
+                f"other form does — the arm would store nothing coded while the log "
+                f"reported it on. Escape: block_form='kda', or act_store='bf16'."
+            )
+        if model.moe_topk == 0 or model.moe_kernel != "naive" or model.moe_gather == "kernel":
+            loud(
+                f"act_store='codes' with moe_kernel={model.moe_kernel!r}, "
+                f"moe_topk={model.moe_topk}, moe_gather={model.moe_gather!r}: the "
+                f"packed seam is the per-expert forward (`DualLatentGLU`), and the "
+                f"banked / fused-kernel arms compute those projections without it — "
+                f"the switch would store nothing coded while the log reported it on. "
+                f"Escape: moe_kernel='naive', moe_topk > 0 and moe_gather != 'kernel' "
+                f"(the reference loop), or act_store='bf16'."
+            )
+        if tcfg.torch_compile:
+            loud(
+                "act_store='codes' with torch_compile=true: the codes lane packs "
+                "through `searchsorted` and a uint8 shift/OR pair, none of it "
+                "compiler-verified — a compiled run would silently ride the eager "
+                "fallback while reporting a compiled step. Escape: "
+                "torch_compile=false, or act_store='bf16'."
+            )
+    elif tcfg.act_store != "bf16":
         if model.block_form != "transformer":
             loud(
                 f"act_store={tcfg.act_store!r} with block_form={model.block_form!r}: "
