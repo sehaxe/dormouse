@@ -1353,7 +1353,7 @@ def sft_train(
                 f"sft step={step + 1}",
                 f"loss={last_loss:.4f}",
                 f"lr={lr:.3e}",
-                kda_field(window),
+                kda_field(window, model),
                 ce_field(cfg, drained),
                 window.line(),
             ]

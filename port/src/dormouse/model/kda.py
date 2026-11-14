@@ -90,6 +90,46 @@ from .tsct import dense_qat_kind, dense_qat_weight, qat_linear
 #: Cached warmup verdict per device TYPE: `{"cuda": (ok, why), "cpu": (ok, why)}`.
 _FLA: dict[str, tuple[bool, str]] = {}
 
+
+def backward_calls(model: torch.nn.Module) -> int:
+    """Backward passes that have RUN through every KDA mixer under `model`.
+
+    THE INSTRUMENT THAT MAKES THE ARM JUDGEABLE. The KDA arm's oldest verdict is
+    inadmissible because its run logged `fused kda=3126/0`: 3126 forwards and
+    ZERO backwards, so no gradient ever reached the attention. Nothing in this
+    port counted the backward half, which meant that defect could neither be
+    seen nor ruled out from a log line — the arm was unjudgeable by
+    construction. `kda_field` now prints this number beside the forward count.
+
+    Each [`KDAAttention`] registers a hook on its own output, so the count is
+    ONE per forward whose gradient actually arrived, and it lives on the MODULE
+    (not in a per-step `Counters`): `iter_checkpoint`/`activation_recompute`
+    recompute the body with a FRESH per-step counter object that nobody merges,
+    and a hook closing over that dead dict would quietly report zero backwards
+    — the silent-degradation mark `instrument.py` exists to forbid. On the
+    module the recompute's hook still reaches the same int.
+    """
+    return sum(int(getattr(m, "_bwd_calls", 0)) for m in model.modules())
+
+
+def take_backward_calls(model: torch.nn.Module) -> int:
+    """Read AND reset every KDA mixer's count — the log window's own number."""
+    total = 0
+    for m in model.modules():  # stepaudit-excuse: once per log window, not per step
+        n = int(getattr(m, "_bwd_calls", 0))
+        if n:
+            m._bwd_calls = 0
+            total += n
+    return total
+
+
+def reset_backward_calls(model: torch.nn.Module) -> None:
+    """Zero the count (gates and benches that measure one step at a time)."""
+    for m in model.modules():  # stepaudit-excuse: gates/benchmarks, not a step
+        if hasattr(m, "_bwd_calls"):
+            m._bwd_calls = 0
+
+
 #: FLA's `disable_recompute` (chunk.py:50, documented at :258): when True the
 #: kernel SAVES the backward intermediates instead of recomputing them —
 #: "beneficial for training small models at the cost of increased memory
@@ -209,6 +249,11 @@ class KDAAttention(nn.Module):
         assert h * cfg.head_dim == d, "validate() pins n_heads*head_dim == d_model"
         self.n_heads = h
         self.head_dim = cfg.head_dim
+        #: The backward tally (`kda.backward_calls`): one per forward whose
+        #: gradient actually arrived. Lives on the MODULE so a checkpointed
+        #: recompute's fresh `Counters` cannot swallow it — see
+        #: `kda.backward_calls`' docstring.
+        self._bwd_calls = 0
         #: GQA (`n_kv_heads`): the k/v PROJECTION width, expanded back to `h`
         #: immediately before the kernel. `0` resolves to `h` = MHA, so the OFF
         #: path is the four `d×d` projections every number on record ran.
@@ -442,14 +487,36 @@ class KDAAttention(nn.Module):
         ok, why = fla_status(x.device)
         if ok:
             counters.count("kda_fla")
-            return self._fla_path(x, state, carry=carry, counters=counters)
-        counters.count("kda_sdpa")
-        # The reason is attached to the counter object, not printed per forward:
-        # `log line` prints one `kda=` field, and the reason belongs there.
-        counters.why = why  # type: ignore[attr-defined]
-        if not carry:
-            return self._sdpa_path(x, b, t, d), None
-        return self._sdpa_path_carry(x, b, t, d, state)
+            out, st = self._fla_path(x, state, carry=carry, counters=counters)
+        else:
+            counters.count("kda_sdpa")
+            # The reason is attached to the counter object, not printed per
+            # forward: `log line` prints one `kda=` field, and the reason
+            # belongs there.
+            counters.why = why  # type: ignore[attr-defined]
+            if carry:
+                out, st = self._sdpa_path_carry(x, b, t, d, state)
+            else:
+                out, st = self._sdpa_path(x, b, t, d), None
+        return self._counted(out), st
+
+    def _counted(self, out: torch.Tensor) -> torch.Tensor:
+        """Register the backward tally on the arm's output — both arms, one seam.
+
+        `register_hook` adds no op to the graph and changes no number: it fires
+        when the gradient reaches this tensor, which is exactly "the backward
+        ran". Registered on the OUTSIDE of both paths (`_fla_path` and the SDPA
+        fallback) so the two arms cannot disagree about whether they were
+        judged.
+        """
+        if torch.is_grad_enabled() and out.requires_grad:
+            out.register_hook(self._count_backward)
+        return out
+
+    def _count_backward(self, grad: torch.Tensor) -> torch.Tensor:
+        """The gradient edge itself: one arrival = one real backward."""
+        self._bwd_calls += 1
+        return grad
 
     def step_state(
         self,

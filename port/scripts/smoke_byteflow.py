@@ -150,7 +150,7 @@ def main() -> int:
         f"nan_skipped={report['nan_skipped']} opt_steps={report['opt_steps']}\n"
         f"[summary] {ms:.1f} ms/step warm ({windows[0][0]:.1f} on window 1) "
         f"{tok:.0f} tok/s peak {peak:.2f} GiB wall {1e3 * wall / STEPS:.1f} ms/step\n"
-        f"[summary] {kda_field(counters)} {counters.line()}",
+        f"[summary] {kda_field(counters, model)} {counters.line()}",
         flush=True,
     )
     for line in evals:

@@ -108,7 +108,7 @@ def arm(seq_len: int, segment_len: int) -> dict:
             "ms": ms,
             "peak": peak,
             "loss": float(loss.detach()),
-            "kda": kda_field(counters),
+            "kda": kda_field(counters, model),
             "segments": counters.get("loop_segments", 0),
             "oom": False,
         }

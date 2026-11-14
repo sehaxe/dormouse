@@ -101,7 +101,7 @@ def test_log_line_carries_the_kda_arm_and_counters(tmp_path):
     train(DormouseModel(run.model), run, log=lines.append)
     line = lines[0]
     assert "step=1" in line and "loss=" in line and "lr=" in line
-    assert "kda=sdpa,n=2" in line, line
+    assert "kda=sdpa,n=2,b=2" in line, line
     assert "engram_rows=" in line and "rezero_write=" in line
     assert "ms/step" in line and "tok/s" in line
 

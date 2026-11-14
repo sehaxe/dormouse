@@ -109,8 +109,18 @@ def _gate_grads(grads: list[torch.Tensor], gate: torch.Tensor, *, sanitize: bool
         torch._foreach_mul_(group, gate.to(dtype))
 
 
-def kda_field(counters: Counters) -> str:
-    """`kda=<arm>,n=<calls>` — which attention arm produced this window."""
+def kda_field(counters: Counters, model: torch.nn.Module) -> str:
+    """`kda=<arm>,n=<fwd>,b=<bwd>` — which attention arm produced this window.
+
+    `n` is the arm's FORWARD count, unchanged. `b` (KDA arms only) is the
+    number of those forwards whose gradient actually arrived —
+    `kda.backward_calls`, drained here once per window. The pair is the whole
+    judgeability test: an arm with `b=0` trained nothing, which is exactly what
+    the burn crate's `fused kda=3126/0` line said about the KDA arm before
+    `tests/test_kda_bwd.py` made it a gate. `kda=full` is not a `KDAAttention`
+    call, so it prints no `b` (its attention is a different module).
+    """
+    bwd = kda.take_backward_calls(model)
     if counters.get("attn_full_forward"):
         return f"kda=full,n={counters['attn_full_forward']}"
     n = counters.get("kda_sdpa", 0) + counters.get("kda_fla", 0)
@@ -120,7 +130,7 @@ def kda_field(counters: Counters) -> str:
         arm = "sdpa"
     else:
         arm = "off"
-    return f"kda={arm},n={n}"
+    return f"kda={arm},n={n},b={bwd}"
 
 
 def mtp_field(model: torch.nn.Module) -> str:
@@ -2524,7 +2534,7 @@ def _train_impl(
                 f"step={step + 1}",
                 f"loss={last_loss:.4f}",
                 f"lr={lr:.3e}",
-                kda_field(window),
+                kda_field(window, model),
                 halt_field(model),
                 mtp_field(model),
                 mod_field(model),
