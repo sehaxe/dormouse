@@ -82,9 +82,11 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
 /* close */
 .close{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 8%}
 .close h1{font-size:9.2vmin;line-height:.96}
-.close .links{margin-top:6vmin;display:flex;gap:3.6vmin;font-family:var(--mono);font-size:1.15vmin;
-  letter-spacing:.14em;color:var(--dimmer)}
-.close .links b{color:var(--ink);font-weight:600}
+.close .links{margin-top:5.4vmin;display:flex;gap:4.2vmin;align-items:flex-start}
+.close .qr{display:flex;flex-direction:column;gap:1.4vmin;width:18vmin}
+.close .qr img{width:100%;display:block;border:1px solid var(--line);border-radius:8px;background:#f6f3ec;padding:1.1vmin}
+.close .qr span{font-family:var(--mono);font-size:.85vmin;letter-spacing:.1em;color:var(--dimmer);word-break:break-all;line-height:1.35}
+.close .qr b{display:block;font-family:var(--sans);font-size:1.6vmin;letter-spacing:-.01em;color:var(--ink);font-weight:600;margin-bottom:.6vmin}
 
 #hud{position:fixed;left:0;right:0;bottom:0;height:2px;background:color-mix(in srgb,var(--ink) 8%,transparent)}
 #hud .p{height:100%;width:0;background:var(--accent);transition:width .25s}
@@ -244,7 +246,14 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
   <div class="close">
     <div class="kicker">итог</div>
     <h1 style="margin-top:3vmin">Меньше не значит слабее.<br><span class="accent">Плотнее — значит быстрее.</span></h1>
-    <div class="links"><span><b>sehaxe.github.io/dormouse</b></span><span>docs</span><span>github</span></div>
+    <div class="links">
+      <div class="qr"><img src="../media/qr_site.svg" alt="QR: сайт">
+        <span><b>сайт</b>sehaxe.github.io/dormouse</span></div>
+      <div class="qr"><img src="../media/qr_docs.svg" alt="QR: документация">
+        <span><b>документация</b>docs</span></div>
+      <div class="qr"><img src="../media/qr_code.svg" alt="QR: код">
+        <span><b>код</b>github.com/sehaxe/dormouse</span></div>
+    </div>
   </div>
   <div class="num">10 / 10</div>
 </section>
