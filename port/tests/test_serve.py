@@ -72,6 +72,7 @@ def _raw_status(req: urllib.request.Request) -> tuple[int, dict]:
 def _chat(served, **body) -> dict:
     payload = {"messages": MSG, **body}
     req = _req(served[0] + "/v1/chat/completions", payload)
+    httpd = served[1]
     with urllib.request.urlopen(req, timeout=120) as r:
         return json.loads(r.read())
 
@@ -97,6 +98,7 @@ def test_chat_completion_has_the_openai_shape(served):
 def test_stream_is_sse_and_ends_with_done(served):
     payload = {"messages": MSG, "max_tokens": CAP, "stream": True}
     req = _req(served[0] + "/v1/chat/completions", payload)
+    httpd = served[1]
     with urllib.request.urlopen(req, timeout=120) as r:
         text = r.read().decode()
     events = [e.strip() for e in text.split("\n\n") if e.strip()]
@@ -352,3 +354,23 @@ def test_recurrent_streaming_is_one_seeded_call():
     if body and body[-1] in _STOP:
         body = body[:-1]  # the stop byte ends the reply and is never emitted as text
     assert text == body.decode("utf-8", "replace")
+
+
+def test_the_server_never_writes_the_prompt_or_the_reply(served):
+    """The privacy promise, enforced: a secret in, nothing in the log.
+
+    Our product claim is "no tracking", and a claim is only true if a test fails
+    when it stops being true. The log is the whole channel: if the prompt bytes
+    never reach it, nothing else in this process does.
+    """
+    secret = "SECRET-PROMPT-9f3a"
+    payload = {"messages": [{"role": "user", "content": secret}], "max_tokens": 2}
+    req = _req(served[0] + "/v1/chat/completions", payload)
+    httpd = served[1]
+    with urllib.request.urlopen(req, timeout=120) as r:
+        body = json.loads(r.read())
+    reply = body["choices"][0]["message"]["content"]
+    joined = "\n".join(httpd.startup_log)
+    assert secret not in joined
+    if reply:
+        assert reply not in joined
