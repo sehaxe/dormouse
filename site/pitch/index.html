@@ -71,6 +71,35 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
 .split .media .poster,.slide.video .poster{display:none}
 .slide.video .poster{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 
+
+/* tokenizer vs bytes */
+.cut{display:grid;grid-template-columns:1fr 1fr;gap:4.5vmin;margin-top:5vmin}
+.cut-col{border-top:1px solid var(--line2);padding-top:2.2vmin}
+.cut-h{font-family:var(--mono);font-size:1vmin;letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer)}
+.chips{display:flex;flex-wrap:wrap;gap:.9vmin;margin-top:2vmin;align-items:center}
+.chip{font-family:var(--mono);font-size:3vmin;padding:.55vmin 1.1vmin;border-radius:4px;
+  border:1px solid var(--line2);color:var(--ink)}
+.chip.ok{border-color:color-mix(in srgb,var(--accent) 45%,transparent);color:var(--ink)}
+.chip.brk{color:var(--hot);border-color:color-mix(in srgb,var(--hot) 45%,transparent);
+  border-style:dashed;position:relative}
+.chip.brk::after{content:"";position:absolute;left:50%;top:-8%;bottom:-8%;width:1px;
+  background:var(--hot);opacity:.55;transform:rotate(12deg)}
+.cut-note{margin-top:2.2vmin;font-size:1.65vmin;line-height:1.45;color:var(--dim);max-width:32ch}
+.mojibake{color:var(--hot);font-family:var(--mono);white-space:nowrap}
+.mojibake small{font-size:.75em}
+
+
+/* they vs us */
+.vs{display:grid;grid-template-columns:1fr 1px 1fr;gap:4.2vmin;margin-top:5vmin;align-items:start}
+.vs-col ul{margin-top:2.2vmin;list-style:none;display:grid;gap:1.4vmin;padding:0}
+.vs-col li{font-size:2.15vmin;line-height:1.3;color:var(--dim)}
+.vs-col li::before{content:"—  ";color:var(--line2)}
+.vs-col.mine li{color:var(--ink)}
+.vs-col.mine li::before{content:"—  ";color:var(--accent)}
+.vs-h{font-family:var(--mono);font-size:1vmin;letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer)}
+.vs-col.mine .vs-h{color:var(--accent)}
+.vs-mid{background:var(--line2);align-self:stretch;min-height:18vmin}
+
 /* three numbers */
 .thirds{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin-top:6vmin;border-top:1px solid var(--line)}
 .third{padding:3.2vmin 2.4vmin 0 0}
@@ -114,18 +143,28 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
   <div class="title-wrap">
     <div class="kicker">одна видеокарта · без токенизатора</div>
     <h1 style="margin-top:2.4vmin">dormouse</h1>
-    <div class="title-sub">Чат-бот, который живёт у вас на компьютере.</div>
+    <div class="title-sub">Чат-бот, который живёт у вас на компьютере,<br>а не в чужом облаке.</div>
     <div class="title-meta"><span>один файл</span><span>без сети</span><span class="dot">16 ГБ</span></div>
   </div>
   <div class="num">01 / 10</div>
 </section>
 
-<!-- 02 · the number -->
+<!-- 02 · against the cloud -->
 <section class="slide">
-  <div class="statement">
-    <div class="kicker">что это</div>
-    <div class="line"><strong>Не сервис.<br>Ваша модель.</strong></div>
-    <div class="big" style="margin-top:1vmin">0<small>запросов наружу</small></div>
+  <div class="pad">
+    <div class="kicker">против облака</div>
+    <h2 style="margin-top:2vmin">Они продают доступ.<br>Мы отдаём файл.</h2>
+    <div class="vs">
+      <div class="vs-col">
+        <div class="vs-h">сервис</div>
+        <ul><li>подписка</li><li>ключ и лимит</li><li>ваши данные уходят</li></ul>
+      </div>
+      <div class="vs-mid"></div>
+      <div class="vs-col mine">
+        <div class="vs-h">ваш компьютер</div>
+        <ul><li>скачал</li><li>запустил</li><li>ничего не уходит</li></ul>
+      </div>
+    </div>
   </div>
   <div class="num">02 / 10</div>
 </section>
@@ -145,16 +184,27 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
 
 <!-- 04 · bytes -->
 <section class="slide">
-  <div class="split">
-    <div class="txt">
-      <div class="kicker">вход</div>
-      <h2>Читает<br>букву за буквой</h2>
-      <p>Любой язык и любой код. Без словаря, без подготовки текста.</p>
-    </div>
-    <div class="media">
-      <video src="../media/Bytes.webm" id="bytes" muted loop playsinline autoplay
-        data-light="../media/Bytes.webm" data-dark="../media/Bytes_dark.webm" poster="../media/poster_Bytes.jpg"></video>
-    <img class="poster" src="../media/poster_Bytes.jpg" alt="">
+  <div class="pad">
+    <div class="kicker">вход</div>
+    <h2 style="margin-top:2vmin">Ни одной<br>сломанной буквы</h2>
+    <div class="cut">
+      <div class="cut-col bad">
+        <div class="cut-h">токенизатор</div>
+        <div class="chips">
+          <span class="chip">Пр</span><span class="chip">иве</span><span class="chip">т</span>
+          <span class="chip brk">汉</span><span class="chip brk">字</span>
+        </div>
+        <div class="cut-note">словарь нарезан под английский, и редкая письменность рвётся:
+          <span class="mojibake">汉 → æ<small>±</small>‰</span></div>
+      </div>
+      <div class="cut-col good">
+        <div class="cut-h">汉字 · байты</div>
+        <div class="chips">
+          <span class="chip ok">П</span><span class="chip ok">р</span><span class="chip ok">и</span><span class="chip ok">в</span><span class="chip ok">е</span><span class="chip ok">т</span>
+          <span class="chip ok">汉</span><span class="chip ok">字</span>
+        </div>
+        <div class="cut-note">символ всегда целиком — и на входе, и в ответе. Ломаться нечему.</div>
+      </div>
     </div>
   </div>
   <div class="num">04 / 10</div>
@@ -204,8 +254,8 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
         <div class="d">Реплика в реплику, по-русски и по-английски.</div></div>
       <div class="third"><div class="k">умеет</div><div class="v">офлайн</div>
         <div class="d">Ни сети, ни ключей, ни подписки.</div></div>
-      <div class="third"><div class="k">пока нет</div><div class="v">фактов</div>
-        <div class="d">Модель маленькая: знания и длинные ответы — следующий шаг.</div></div>
+      <div class="third"><div class="k">пока нет</div><div class="v">энциклопедии</div>
+        <div class="d">Знаний мало, зато своих. Факты — следующий шаг.</div></div>
     </div>
   </div>
   <div class="num">07 / 10</div>
