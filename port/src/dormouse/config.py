@@ -2253,6 +2253,32 @@ class TrainConfig:
     #: NS chain is per slice; `tests/test_opt_region.py` gates the bit-equality
     #: across caps), so the only thing a resume changes is the launch count.
     muon_chunk_elems: int = 1 << 25
+
+    #: Apply the expert bank's optimizer update INSIDE the backward pass, at the
+    #: moment its gradient is final (`optim.Muon.arm_in_backward`), instead of in
+    #: the end-of-step pass over the bank — the trick of Sonar-MoE
+    #: (arXiv:2611.03577), which reports -19…-22 % memory and 17…-23 % step time on
+    #: OLMoE-1B-7B with BITWISE IDENTICAL results. The mechanism that makes it
+    #: bit-identical here is that the relocation runs the SAME shape-group program
+    #: (`batched_step_from_model(only={...})`) on the same buffers; what it buys is
+    #: that a bank buffer's GRADIENT is dropped at the hook, so it does not have to
+    #: survive until the end of the step.
+    #:
+    #: `false` (the default) registers no hook, marks no parameter and changes no
+    #: bit. `true` REFUSES, loudly, every consumer that needs the bank's gradient
+    #: AFTER backward — a gradient is not final until the last micro-batch, so
+    #: `grad_accum > 1` is out; clipping needs the global norm over all gradients,
+    #: so `grad_clip`/`agc_clip` must be 0; and a CUDA-graph capture replays device
+    #: ops, not a Python hook, so `opt_graph`/`full_graph` are out. The Muon arms
+    #: whose tail needs host state (`muon_sf`) or a per-step device vector
+    #: (`tsct_expert_lr`) are refused at the optimizer.
+    #:
+    #: Counters: `optbwd_params` / `optbwd_bytes` (parameters updated at their hook
+    #: and the gradient bytes dropped there) and `optbwd_tail` (parameters the
+    #: end-of-step pass still served). A run whose `optbwd_params` is 0 did not run
+    #: the arm.
+    opt_in_backward: bool = False
+
     #: The Muon half's LR as a MULTIPLE of `lr` (the AdamW half's). Measured
     #: 2026-11-06 (`docs/records/reviews/2026-11-06-optimizer-audit.md`): at a shared LR
     #: the Muon update is 8x-52x smaller in RMS than AdamW's on this model's
@@ -5722,6 +5748,48 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"to zero and >1 would make the 'decay' an increase. "
             f"Escape: 0 <= min_lr_frac <= 1 (0.1 is the default, 0.0 is a full "
             f"anneal to zero)."
+        )
+    if tcfg.opt_in_backward and tcfg.grad_accum > 1:
+        loud(
+            f"opt_in_backward=true with grad_accum={tcfg.grad_accum}: the arm "
+            f"applies a parameter's update at its post-accumulate-grad HOOK, and "
+            f"that hook fires on the FIRST micro-batch's contribution — the "
+            f"gradient is not final until the last one. An accumulated step would "
+            f"step the bank on partial gradients and the run would be a different "
+            f"algorithm. Escape: grad_accum=1 (the arm's requirement, and the shape "
+            f"every number on record ran), or opt_in_backward=false."
+        )
+    if tcfg.opt_in_backward and tcfg.grad_clip > 0:
+        loud(
+            f"opt_in_backward=true with grad_clip={tcfg.grad_clip}: clipping is one "
+            f"global coefficient `max_norm / ||all gradients||`, and the arm's bank "
+            f"gradients are CONSUMED and dropped at their hook — the coefficient "
+            f"would be computed from a strictly smaller norm, i.e. a different clip "
+            f"on every other parameter, not a relocated one. Escape: grad_clip=0, or "
+            f"opt_in_backward=false."
+        )
+    if tcfg.opt_in_backward and tcfg.agc_clip > 0.0:
+        loud(
+            f"opt_in_backward=true with agc_clip={tcfg.agc_clip}: AGC rescales each "
+            f"parameter's OWN gradient before the step, and the arm's bank gradients "
+            f"are consumed at their hook — the AGC pass would find them gone (`None`) "
+            f"and silently clip nothing while the run reported the arm on. Escape: "
+            f"agc_clip=0, or opt_in_backward=false."
+        )
+    if tcfg.opt_in_backward and (tcfg.opt_graph or tcfg.full_graph):
+        loud(
+            f"opt_in_backward=true with opt_graph={tcfg.opt_graph}/"
+            f"full_graph={tcfg.full_graph}: a capture replays DEVICE ops, and this "
+            f"arm is a Python post-accumulate-grad hook — a replay would run no hook "
+            f"at all, so the bank would be skipped by the captured tail pass too and "
+            f"the experts would freeze mid-run. Escape: opt_graph=false and "
+            f"full_graph=false, or opt_in_backward=false."
+        )
+    if tcfg.opt_in_backward and tcfg.opt != "mix":
+        loud(
+            f"opt_in_backward=true with opt={tcfg.opt!r}: the arm IS Muon's "
+            f"shape-group step applied to the expert bank, and this optimizer routes "
+            f"every parameter to AdamW. Escape: opt='mix', or opt_in_backward=false."
         )
     if tcfg.grad_accum > 1 and tcfg.opt_graph:
         loud(

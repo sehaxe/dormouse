@@ -1627,7 +1627,20 @@ def _train_impl(
         # reads (`lfb_counts`) live on the expert bank, and the config snapshot
         # pins it there; the optimizer only applies the grouped scale vector.
         tsct_expert_lr=run.model.tsct_expert_lr,
+        # The bank's update at its post-accumulate-grad hook
+        # (`train.opt_in_backward`, DEFAULT off: no hook, no attribute, no bit).
+        # Without this kwarg the config field would be INERT — the wiring rule the
+        # dtype rungs above follow.
+        in_backward=cfg.opt_in_backward,
     )
+    if cfg.opt_in_backward:
+        log(
+            "opt_in_backward: the expert bank's Muon update runs at each bank "
+            "tensor's post-accumulate-grad hook, on the SAME shape-group program "
+            "the end-of-step pass runs, and the gradient is dropped there — it no "
+            "longer has to survive until the step ends. The tail pass serves every "
+            "other parameter. Counters: optbwd_params, optbwd_bytes, optbwd_tail."
+        )
     if run.model.tsct_expert_lr > 0 and (cfg.opt_graph or cfg.full_graph):
         # A captured region replays the FIRST step's scale vector: the counts
         # move every forward, so the recorded `[1+ΣE]` tensor would be stale.
@@ -1999,6 +2012,10 @@ def _train_impl(
             # A real training loss always does. A model that returns a bare
             # tensor (the firewall's own NaN fixture) has nothing to backprop
             # through, which is the old code's skip branch by another route.
+            # `opt_in_backward` needs the step's loss verdict BEFORE backward: its
+            # hook fires inside `backward()`, and afterwards there is nothing left
+            # to gate. A no-op when the flag is off.
+            opt.arm_in_backward(loss_finite)
             step_loss.backward()
         grads = [p.grad for p in model.parameters() if p.grad is not None]
         # A non-finite GRADIENT disables the step too (the burn 2026-09-27

@@ -1062,6 +1062,8 @@ class _MomGroup:
         "packed",
         "rows",
         "per_head",
+        "in_backward",
+        "pending",
     )
 
     def __init__(
@@ -1095,6 +1097,15 @@ class _MomGroup:
         #: `params` is `[that_parameter]` then; `mom` is `[rows, *shape]`.
         self.packed = packed
         self.rows = len(params) if rows is None else rows
+        #: `opt_in_backward`: this group is stepped from the post-accumulate-grad
+        #: hook (`Muon._ib_hook`) instead of the tail pass. Its write is gated by
+        #: the firewall's flag, computed per group from the loss's and every
+        #: member gradient's finiteness. `pending` is the countdown of members
+        #: whose gradient has not arrived yet — O(1) per hook, which matters: the
+        #: live unpacked bank is ONE group of `blocks x E` parameters, and a scan
+        #: of the group per hook would be quadratic in it.
+        self.in_backward = False
+        self.pending = 0
 
 
 def _stack_grads(params: list) -> torch.Tensor:
@@ -1272,6 +1283,7 @@ class Muon(Optimizer):
         orth_dion_rank: int = 0,
         orth_dion_power: int = ORTH_DION_POWER,
         orth_dion_oversample: int = ORTH_DION_OVERSAMPLE,
+        in_backward: bool = False,
     ) -> None:
         _check_ns_kind(ns_kind)
         _check_colrow_3d(colrow_3d)
@@ -1387,6 +1399,30 @@ class Muon(Optimizer):
         #: references an attribute that is not there.
         self._tsct_moes: list = []
         self._tsct_offset: dict[int, int] = {}
+        #: `opt_in_backward` (`MixOptimizer.in_backward`): a parameter that opts
+        #: in is stepped from its post-accumulate-grad hook, i.e. at the moment
+        #: its gradient is final, instead of from the tail pass (`arm_in_backward`
+        #: / `_step_group`). OFF is the historical path: no hook, no set, no
+        #: attribute read — `_ib_gate` stays None and every `if` below falls
+        #: through to the code that was already there.
+        self.in_backward = in_backward
+        self._ib_gate: torch.Tensor | None = None
+        self._ib_done: set[int] = set()
+        self._ib_stepped: set[int] = set()
+        self._by_id: dict[int, _MomGroup] = {}
+        self._ib_handles: list = []
+        #: The parity gate's only seam: when a test sets this to a dict, the hook
+        #: keeps the gradient it CONSUMED (gated, before it is dropped) so the
+        #: flag-on step can be compared with the flag-off step's `.grad`. `None`
+        #: (every run) allocates nothing.
+        self.keep_grads: dict[int, torch.Tensor] | None = None
+        if in_backward:
+            # ONE hook per Muon parameter, registered once here: the body is a
+            # no-op until the trainer arms a step (`arm_in_backward`), so an
+            # eval or a test backward pays one attribute check.
+            for group in self.param_groups:
+                for p in group["params"]:
+                    self._ib_handles.append(p.register_post_accumulate_grad_hook(self._ib_hook))
 
     def _build_groups(self) -> None:
         """One stacked momentum buffer per unique shape; per-param state views it.
@@ -1405,6 +1441,7 @@ class Muon(Optimizer):
         time: `sf_switch` cannot have run, there is no state yet).
         """
         self._groups = []
+        self._by_id = {}
         for gi, group in enumerate(self.param_groups):
             by_shape: dict[tuple, list] = {}
             for p in group["params"]:
@@ -1482,6 +1519,15 @@ class Muon(Optimizer):
                 grp = _MomGroup(
                     gi, shape, params, mom, v, x, z, packed=packed, rows=n, per_head=per_head
                 )
+                #: The GROUP is the unit: a shape group's Newton-Schulz runs on
+                #: one stacked buffer, so a group with one non-opted-in member is
+                #: not split (that split would change the stack, and the parity
+                #: gate below is bit-equality, not a tolerance).
+                grp.in_backward = self.in_backward and all(
+                    getattr(p, "_opt_in_backward", False) for p in params
+                )
+                for p in params:
+                    self._by_id[id(p)] = grp
                 if self._tsct_moes:
                     # ONE device row id per parameter — or per EXPERT SLICE of a
                     # packed 3-D buffer — built once at setup, never per step:
@@ -1500,6 +1546,92 @@ class Muon(Optimizer):
                     if any(ids):
                         grp.tsct_ids = torch.tensor(ids, dtype=torch.int64, device=params[0].device)
                 self._groups.append(grp)
+
+    # -- `opt_in_backward`: the update at the post-accumulate-grad hook --------
+    def arm_in_backward(self, gate: torch.Tensor | None = None) -> None:
+        """Arm THIS step's in-backward updates; the trainer calls it before backward.
+
+        `gate` is the trainer's 0-dim device flag (the NaN firewall's loss
+        finiteness for this micro-batch). `_step_group` reduces it further with
+        the group's own gradient finiteness — the same sanitize-then-multiply the
+        tail pass applies to the whole list. On a healthy step both are exactly
+        1.0, so the write is `update * 1.0`: the firewall cannot move a number
+        here. `None` arms with the identity 1.0 (a caller with no firewall).
+        """
+        if not self.in_backward:
+            return
+        self._ib_done.clear()
+        self._ib_stepped.clear()
+        self._ib_gate = gate
+        for grp in stepaudit.iterations("muon.ib_arm", self._groups):
+            grp.pending = len(grp.params) if grp.in_backward else 0
+
+    def disarm_in_backward(self) -> None:
+        """Close the step: nothing armed, nothing marked (`MixOptimizer.step`)."""
+        self._ib_gate = None
+        self._ib_done.clear()
+        self._ib_stepped.clear()
+
+    def _ib_hook(self, p: torch.Tensor) -> None:
+        """Post-accumulate-grad: `p.grad` is final for this step — step its group.
+
+        Fires inside `backward()`, once per parameter whose gradient was
+        produced. The group is stepped only when EVERY member's hook has fired (a
+        bank row whose expert saw no tokens has no gradient at all; that group
+        stays for the tail pass, exactly as before). `_step_group` gates the
+        group's gradients and drops them — the memory the feature buys back — so
+        this body stays a dict lookup, a set add and a countdown.
+        """
+        if self._ib_gate is None:
+            return
+        grp = self._by_id.get(id(p))
+        if grp is None or not grp.in_backward:
+            return
+        g = p.grad
+        if g is None:
+            return
+        if self.keep_grads is not None:
+            self.keep_grads[id(p)] = g
+        self._ib_done.add(id(p))
+        grp.pending -= 1
+        if grp.pending == 0:
+            self._step_group(grp)
+
+    @torch.no_grad()
+    def _step_group(self, grp: _MomGroup) -> None:
+        """One group's update, the SAME program the tail pass runs for it.
+
+        `batched_step_from_model(only={...})` over the group's own index is what
+        makes the flag a RELOCATION and not a second optimizer: the momentum
+        update, the Newton–Schulz chain (same chunks, same stack), the ColRow tail
+        and the write-back are the tail pass's own code on that group's own
+        buffers — `tests/test_opt_in_backward.py` pins bit-equality against the
+        unsplit pass. The consumed gradients are then dropped, which is the point:
+        a bank buffer's gradient no longer has to survive until the end of the
+        step.
+
+        The firewall is two launches per GROUP rather than the tail pass's two per
+        tensor: a vector norm is non-finite iff any element is (`grad_norm`'s own
+        argument), so one `_foreach_norm` answers the whole group, and the same
+        `nan_to_num_` + `_foreach_mul_` the tail pass runs then applies. Freeing
+        the gradients afterwards also removes them from the trainer's own
+        `_gate_grads`, so the sanitize is moved, not duplicated.
+        """
+        grads = [q.grad for q in grp.params]
+        freed = sum(g.numel() * g.element_size() for g in grads)
+        with torch.no_grad():
+            ok = self._ib_gate.to(torch.float32).clone()
+            norms = torch._foreach_norm(grads, 2, dtype=torch.float32)
+            ok.mul_(torch.stack(norms).isfinite().all().to(torch.float32))
+            for g in stepaudit.iterations("muon.ib_gate", grads):
+                g.nan_to_num_(0.0, 0.0, 0.0)
+            torch._foreach_mul_(grads, ok.to(grads[0].dtype))
+        self.batched_step_from_model(None, ok, only={id(grp)})
+        for q in stepaudit.iterations("muon.ib_free", grp.params):
+            q.grad = None
+        self._ib_stepped.add(id(grp))
+        self.counters.count("optbwd_params", len(grp.params))
+        self.counters.count("optbwd_bytes", freed)
 
     def load_state_dict(self, state_dict) -> None:  # noqa: D102 - torch's contract
         super().load_state_dict(state_dict)
@@ -1520,7 +1652,8 @@ class Muon(Optimizer):
         for group in self.param_groups:
             lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
             for p in group["params"]:
-                if p.grad is None:
+                if p.grad is None or id(p) in self._ib_done:
+                    # `_ib_done`: stepped from the hook, and its gradient dropped.
                     continue
                 g = p.grad
                 if g.ndim != 2:
@@ -1803,6 +1936,7 @@ class Muon(Optimizer):
         model,
         flag: torch.Tensor | None = None,
         expert_scales: torch.Tensor | None = None,
+        only: set[int] | None = None,
     ) -> int:
         """The shape-batched Muon pass (a no-op when the batches are trivially small).
 
@@ -1850,11 +1984,22 @@ class Muon(Optimizer):
         # `head_shape` is the `[k, d0, d1]` a per-head NS result is reassembled
         # into before the tail (`None` when the chain ran on the whole matrix).
         jobs: list[tuple[list, torch.Tensor, float, float, int, bool, object, bool, object]] = []
+        n_tail = 0
         for grp in stepaudit.iterations("muon.groups", self._groups):
+            if only is not None:
+                # `opt_in_backward`'s per-group call: ONE group, its own program.
+                if id(grp) not in only:
+                    continue
+            elif id(grp) in self._ib_stepped:
+                # Already stepped from its post-accumulate-grad hook in this
+                # step's backward, and its gradient was dropped there.
+                continue
             group = self.param_groups[grp.gi]
             lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
             scale = self._muon_scale(grp.shape[0], grp.shape[1])
             params = grp.params
+            if self.in_backward and only is None and any(p.grad is not None for p in params):
+                n_tail += len(params)
             grp.tsct_row = (
                 expert_scales.index_select(0, grp.tsct_ids)
                 if expert_scales is not None and grp.tsct_ids is not None
@@ -2034,6 +2179,8 @@ class Muon(Optimizer):
                     update.mul_(flag.to(update.dtype))
                 with torch.no_grad():
                     _foreach_add_mixed_(params_c, update)
+        if self.in_backward and only is None:
+            self.counters.count("optbwd_tail", n_tail)
         return n_batches
 
     def _orthogonalize_many(self, tensors: list[torch.Tensor], steps: int) -> list[torch.Tensor]:
@@ -2180,6 +2327,39 @@ def _is_packed_matrix_batch(p: torch.Tensor) -> bool:
     )
 
 
+def expert_bank_params(model: nn.Module) -> list[nn.Parameter]:
+    """The expert-bank parameters of every `SparseMoE` in `model`, in module order.
+
+    Duck-typed like the `tsct_expert_lr` discovery below (a model module imports
+    this file's trainer, not the other way round): a packed bank is the module's
+    `_packed_params` (one buffer per site), an unpacked one is each expert's
+    `v`/`gate_u`/`up_u`, and the SHARED expert's plane (`_shared_params`) rides
+    the same list because it is the same kind of tensor and the same step.
+
+    `opt_in_backward` uses this because the bank is what the paper's trick is
+    about: those are the tensors whose gradient is dead for the rest of the step
+    the moment they are produced.
+    """
+    out: list[nn.Parameter] = []
+    for m in model.modules():
+        if not hasattr(m, "experts"):
+            continue
+        # The SHARED expert's plane comes first and in BOTH storage forms: it is
+        # the same kind of tensor and the same step (`_packed_params` never
+        # carries it — a `share_u` bank keeps the input side as one parameter).
+        out.extend(p for p in getattr(m, "_shared_params", ()) if isinstance(p, nn.Parameter))
+        packed = getattr(m, "_packed_params", ())
+        if packed:
+            out.extend(p for p in packed if isinstance(p, nn.Parameter))
+            continue
+        for e in m.experts:
+            for name in ("v", "gate_u", "up_u"):
+                p = getattr(e, name, None)
+                if isinstance(p, nn.Parameter):
+                    out.append(p)
+    return out
+
+
 def is_muon_param(name: str, p: torch.Tensor) -> bool:
     """The membership rule, in one place, checked by a test.
 
@@ -2297,9 +2477,38 @@ class MixOptimizer:
         orth_dion_rank: int = 0,
         orth_dion_power: int = ORTH_DION_POWER,
         orth_dion_oversample: int = ORTH_DION_OVERSAMPLE,
+        in_backward: bool = False,
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
+        # `opt_in_backward` (`Muon.in_backward`): the expert bank's update runs at
+        # its post-accumulate-grad hook. Three arms cannot ride it, each for a
+        # reason the hook cannot satisfy — LOUD here, before a step runs, because
+        # a silently-inert flag is the defect class this repo names.
+        if in_backward and opt != "mix":
+            loud(
+                f"opt_in_backward=true with opt={opt!r}: the in-backward update IS "
+                f"Muon's shape-group step, and this optimizer routes every "
+                f"parameter to AdamW — the flag would be inert while the run "
+                f"reported it on. Escape: opt='mix', or opt_in_backward=false."
+            )
+        if in_backward and muon_sf:
+            loud(
+                "opt_in_backward=true with muon_sf=true: the schedule-free arm is the "
+                "one host-gated path left (`_sf_ckp`'s `s`/`c` recursion is HOST "
+                "state), so its skip is decided in `MixOptimizer.step` from a "
+                "`float(flag)` read — a post-accumulate-grad hook has no such "
+                "decision point and would advance `z`/`x` on a step the tail pass "
+                "skipped. Escape: muon_sf=false, or opt_in_backward=false."
+            )
+        if in_backward and tsct_expert_lr > 0.0:
+            loud(
+                f"opt_in_backward=true with tsct_expert_lr={tsct_expert_lr}: the "
+                f"per-expert scale is ONE device vector gathered from the counts "
+                f"in `MixOptimizer.step`, i.e. AFTER backward; a hook stepping the "
+                f"bank would write the UNSCALED update and the run would report "
+                f"the arm on. Escape: tsct_expert_lr=0, or opt_in_backward=false."
+            )
         self.muon_lr_mode = muon_lr_mode
         if not (muon_lr_mult > 0.0):
             loud(
@@ -2460,6 +2669,7 @@ class MixOptimizer:
                 orth_dion_rank=orth_dion_rank,
                 orth_dion_power=orth_dion_power,
                 orth_dion_oversample=orth_dion_oversample,
+                in_backward=in_backward,
             )
             if muon_params
             else None
@@ -2525,6 +2735,50 @@ class MixOptimizer:
         if self.muon is not None:
             self.muon._tsct_moes = self._tsct_moes
             self.muon._tsct_offset = self._tsct_offset
+        #: `opt_in_backward` (`Muon.in_backward`). The GROUP is the unit of the
+        #: step (a shape group's Newton-Schulz runs on ONE stacked buffer), so the
+        #: flag marks the bank's parameters and `_build_groups` opts a group in
+        #: only when EVERY member is one of them. Groups are built here, not
+        #: lazily on the first step, because the hook needs its `_by_id` map before
+        #: the first backward runs — otherwise step 1 would silently stay in the
+        #: tail pass and the arm would be half-on.
+        self.in_backward = bool(in_backward) and self.muon is not None
+        if self.in_backward:
+            bank = expert_bank_params(model)
+            if not bank:
+                loud(
+                    "opt_in_backward=true but the model has no expert bank (no "
+                    "SparseMoE with `experts`): the arm applies the optimizer update "
+                    "of the ROUTED EXPERTS' tensors at their gradient, and there "
+                    "is nothing here to apply it to. Escape: a model with a bank "
+                    "(`ffn_form='bank'`), or opt_in_backward=false."
+                )
+            for p in bank:
+                #: The marker `Muon._build_groups` reads. An attribute, not a set
+                #: on the optimizer: a group is rebuilt after every
+                #: `load_state_dict` and the parameters are the stable thing.
+                p._opt_in_backward = True
+            self.muon._build_groups()
+            if not any(g.in_backward for g in self.muon._groups):
+                loud(
+                    "opt_in_backward=true but no Muon shape group is made of bank "
+                    "parameters only: a group's Newton-Schulz runs on ONE stacked "
+                    "buffer, so splitting it across the hook and the tail pass "
+                    "would be a different program (the parity gate is bit "
+                    "equality, not a tolerance). Escape: tsct_packed=true (the "
+                    "bank buffers are then one parameter each), or "
+                    "opt_in_backward=false."
+                )
+
+    def arm_in_backward(self, gate: torch.Tensor | None = None) -> None:
+        """Arm this micro-batch's in-backward updates — no-op unless the flag is on.
+
+        The trainer calls this INSIDE `micro_step`, right before `backward()`: the
+        hook cannot see the step's flag afterwards, so the one thing it needs
+        from the step (the loss's finiteness) is handed over before it fires.
+        """
+        if self.in_backward:
+            self.muon.arm_in_backward(gate)
 
     def set_lr(self, lr: float, muon_lr: float | None = None) -> None:
         """Write the schedule's LR into both halves — the trainer's per-step call.
@@ -2702,6 +2956,11 @@ class MixOptimizer:
             # nine digits — the forward agreed, the update did not.
             if any(p.grad is not None for g in self.adamw.param_groups for p in g["params"]):
                 self._adamw_t += 1
+        if self.in_backward:
+            # The step is over for the hook path too: the next backward arms
+            # again, and a group whose gradient never arrived is stepped by the
+            # tail pass above (it is not in `_ib_stepped`).
+            self.muon.disarm_in_backward()
         self.steps += 1
 
     def _fast_adamw_ok(self) -> bool:

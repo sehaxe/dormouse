@@ -450,6 +450,14 @@ EXCUSED_FUNCTIONS = {
     "_shadow_params": "SF arm only (muon_sf)",
     "_eval_loss": "eval cadence, no backward",
     "MixOptimizer._fast_adamw_ok": "capability probe over <=8 param groups, no tensor work",
+    "Muon.__init__": (
+        "setup, once per run: `opt_in_backward` registers one hook per Muon "
+        "parameter, and `_build_groups` is a one-time stack of the state"
+    ),
+    "expert_bank_params": (
+        "setup, once per run: walks the model's MoE modules to find the bank the "
+        "`opt_in_backward` arm marks"
+    ),
     "MixOptimizer.set_ns_steps": "resume, once per run (a PROGRESS key repair)",
     "DormouseModel.set_recompute": "setup, once per run",
     "DormouseModel.set_act_store": (
