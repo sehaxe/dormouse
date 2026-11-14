@@ -1503,6 +1503,16 @@ class ModelConfig:
     #: builds no expert bank (the switch would be inert while the snapshot
     #: reported it on). OFF by default and bit-identical when off: no parameter
     #: is replaced, no RNG is drawn and no state-dict key appears.
+    #: OFF IS MEASURED, NOT ASSUMED (2026-11-14, cfg32 = d 2048 · E 32 · rank 710 ·
+    #: batch 8 x seq 512 · 60 steps · `opt=mix muon_lr_mult=12` ·
+    #: `torch_compile=false` · RTX 5070 Ti 16 GB, `timers=true`, one run per arm,
+    #: each arm run twice): packed costs **+11 % step time and +2.0 GB peak VRAM** —
+    #: 542 / 552 -> 597 / 616 ms/step and 11.7 / 12.1 -> 13.7 / 13.8 GB, at an
+    #: IDENTICAL parameter count (251 156 039) and the same loss curve. The arm's
+    #: premise (521 -> 5 launches per `_banks` build) is an E=512 claim; at E=32
+    #: there are 32 casts, so the launch win is ~27 launches and the step pays
+    #: more than it saves. It stays OFF until a shape where it wins is the live
+    #: one; the owner rule (2026-11-14) is "on, or measured off with the numbers".
     #: COMPOSES WITH TSCT-2: with `tsct_expert_basis` on, the shared plane is
     #: still folded per expert (`gate_u @ w_j.T`) — the selector is not a packed
     #: site — while the packed `v`/`packed_s` supply the write and the scales.
@@ -2277,6 +2287,15 @@ class TrainConfig:
     #: and the gradient bytes dropped there) and `optbwd_tail` (parameters the
     #: end-of-step pass still served). A run whose `optbwd_params` is 0 did not run
     #: the arm.
+    #:
+    #: MEASURED 2026-11-14, on the packed arm it REQUIRES (cfg32, 60 steps,
+    #: `grad_clip=0` because the arm refuses a clip, `optbwd_params=30` = 3 buffers
+    #: x 10 steps, `optbwd_bytes` 8.69 GB per window): `false` 608.7 ms/step /
+    #: 13 713 MiB peak -> `true` 602.7 ms/step / 12 124 MiB peak — **-1.0 % time,
+    #: -1.59 GB VRAM**, same loss. The arm itself is free-to-better, and it stays
+    #: OFF anyway because its PRECONDITION (`tsct_packed`) costs +11 % time and
+    #: +2.0 GB at this shape (see that field): switching the pair on would be a net
+    #: loss of ~66 ms/step. Flip it the day the packed arm wins on its own.
     opt_in_backward: bool = False
 
     #: The Muon half's LR as a MULTIPLE of `lr` (the AdamW half's). Measured
