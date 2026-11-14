@@ -2099,6 +2099,22 @@ class TrainConfig:
     #: No refusal against `mm_dtype=fp8`: that names the 2-D GEMM's compute
     #: mode, not the logits the loss reads.
     ce_fixed: bool = False
+    #: THE CHUNKED FINAL CE (`chunk_ce.chunked_cross_entropy`): the readout's
+    #: loss runs `ce_chunk` POSITIONS at a time and projects each slice to
+    #: logits inside the loss, so the `[b·t, vocab]` tensor is never
+    #: materialised — at b24·s1024 with the 32k tokenizer that tensor is 805M
+    #: values (3.22 GB fp32) and the NLL backward keeps a second copy, 3.2-6.4 GB
+    #: of peak that exists only because of the vocabulary. `0` (the default,
+    #: every number on record) is the historical un-chunked loss, bit for bit.
+    #: `> 0` is exact, not an approximation: the loss and the gradient w.r.t. the
+    #: hidden state and the head match the un-chunked path to fp32 summation
+    #: order, and `tests/test_chunk_ce.py` pins parity against `F.cross_entropy`,
+    #: invariance across three chunk sizes, `ignore_index`/`loss_mask`, and the
+    #: peak-allocation ratio at T=8192·V=32768. It reaches the STACK forms'
+    #: final readout only (`model.model._readout`); the EVAL path keeps the
+    #: un-chunked readout (no_grad, one logits copy) so held-out numbers stay
+    #: comparable, and SFT/RL refuse the field (`sft.refuse_unwired`).
+    ce_chunk: int = 0
     #: GRADIENT ACCUMULATION: micro-batch count per optimizer step. `1` (the
     #: default and every number on record) runs one forward/backward per step.
     #: `k > 1` runs `k` micro-batches of `batch` rows, divides EACH micro-loss
@@ -5896,6 +5912,41 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"zero on a coordinate whose second moment is 0 and NaN is not a floor. "
             f"Escape: adam_eps > 0 (torch's 1e-8 is the default)."
         )
+    if tcfg.ce_chunk < 0:
+        loud(
+            f"ce_chunk={tcfg.ce_chunk}: the field is a COUNT of positions per "
+            f"chunk of the final CE, so 0 is OFF and a negative value would make the "
+            f"chunk loop empty and the loss 0/0. Escape: ce_chunk >= 0 "
+            f"(0 = the un-chunked loss)."
+        )
+    if tcfg.ce_chunk > 0 and tcfg.ce_fixed:
+        loud(
+            f"ce_chunk={tcfg.ce_chunk} with ce_fixed=true: the two are different "
+            f"LOSS ARITHMETICS — the fixed CE keeps the target logit out of the "
+            f"denominator sum and DEFINES the target gradient as `-(sum of the "
+            f"others)`, and there is no chunked form of that yet, so the pair would "
+            f"run whichever branch the readout tested first and report the other flag "
+            f"as on. Escape: ce_fixed=false (with ce_chunk>0), or ce_chunk=0."
+        )
+    if tcfg.ce_chunk > 0 and tcfg.tst_bag > 1:
+        loud(
+            f"ce_chunk={tcfg.ce_chunk} with tst_bag={tcfg.tst_bag}: the bag CE "
+            f"(`losses.multihot_cross_entropy`) is computed by the TRAINER from the "
+            f"`[b·t, vocab]` logits the forward returns, so the chunked readout — "
+            f"which returns none — has nothing to hand it. Escape: tst_bag=1, or "
+            f"ce_chunk=0."
+        )
+    for capture, why in (
+        ("full_graph", "a capture records ONE launch sequence and cannot see a recompute"),
+        ("opt_graph", "the captured stage would be fed gradients from a different graph"),
+    ):
+        if tcfg.ce_chunk > 0 and getattr(tcfg, capture):
+            loud(
+                f"ce_chunk={tcfg.ce_chunk} with {capture}=true: the arm recomputes "
+                f"each chunk's logits in the backward (`torch.utils.checkpoint`), and "
+                f"{why} that a replayed graph never ran. Escape: {capture}=false, or "
+                f"ce_chunk=0."
+            )
     if not 0.0 <= tcfg.decay_frac <= 1.0:
         loud(
             f"decay_frac={tcfg.decay_frac}: it is a FRACTION of the whole run "

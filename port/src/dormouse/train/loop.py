@@ -1579,6 +1579,20 @@ def _train_impl(
             f"Counters: tst_bytes, tst_bags, tst_bag_bytes."
         )
     model.train()
+    if cfg.ce_chunk:
+        # The arm's own line: a reader must not infer from the loss curve whether
+        # the 805M-value logits tensor was ever built.
+        log(
+            f"ce_chunk={cfg.ce_chunk}: the final readout CE projects and scores "
+            f"{cfg.ce_chunk} POSITIONS per chunk (`chunk_ce.chunked_cross_entropy`), so "
+            f"the `[b*t, vocab]` logits tensor is never materialised (at b24*s1024 and "
+            f"V=32768 that tensor is 805M values - 3.22 GB fp32 - and the NLL backward "
+            f"keeps a second copy). Exact: the loss and the gradient w.r.t. the hidden "
+            f"state and the head are the un-chunked numbers to fp32 summation order "
+            f"(`tests/test_chunk_ce.py`). The step's forward returns `logits=None`, and "
+            f"the eval window keeps the un-chunked readout (`no_grad`, one copy) so its "
+            f"BPB stays comparable with every number on record."
+        )
     recompute = cfg.activation_recompute
     if recompute == "none" and cfg.iter_checkpoint:
         recompute = "full"
@@ -2073,7 +2087,7 @@ def _train_impl(
             loss = multihot_cross_entropy(logits, y.reshape(-1, bag))
         else:
             logits, loss, step_counters = model(x, y, **kw)
-        assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
+        assert logits is None or logits.shape[-1] == run.model.vocab, "logits width != vocab"
         # THE DEVICE FIREWALL (ADR-0018 rule 2). No host read decides this
         # step: `loss_finite` and the gradient norm stay on the device, the
         # masked loss makes backward's seed exactly zero, and the resulting
@@ -2329,6 +2343,14 @@ def _train_impl(
                 f"phase, bag=1)."
             )
         kw = {} if depth is None else {"depth": depth}
+        if cfg.ce_chunk:
+            # The chunked final CE (`TrainConfig.ce_chunk`, `chunk_ce.py`). Passed
+            # only when ON, so a default run's forward call is the historical one
+            # argument-for-argument. The eval path does NOT pass it: that readout
+            # runs under `no_grad` (one logits copy, no backward), and leaving it
+            # un-chunked is the reduction order every held-out number on record
+            # came from.
+            kw["ce_chunk"] = cfg.ce_chunk
         if cfg.ce_fixed:
             # The fixed CE (arXiv:2610.31642 §2). Passed only when ON, so a
             # default run's forward call is the historical one argument-for-

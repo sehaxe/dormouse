@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .. import stepaudit
+from ..chunk_ce import chunked_cross_entropy
 from ..config import ModelConfig, block_kinds, hybrid_ratio, validate_block_form
 from ..instrument import Counters, loud
 from ..losses import fixed_cross_entropy, logit_softcap
@@ -180,6 +181,12 @@ class DormouseModel(nn.Module):
     def __init__(self, cfg: ModelConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
         self.cfg = cfg
+        #: `TrainConfig.ce_chunk` for the CURRENT forward (0 = off). Set by
+        #: `forward` from its kwarg, read by `_readout` two dispatch hops below:
+        #: one field, rewritten on every forward, so it cannot go stale against
+        #: the caller's config (the `ce_fixed` kwarg is threaded instead because
+        #: it predates this — same rule, one hop).
+        self._ce_chunk = 0
         # The runtime seam a hand-built/mutated config reaches; `__post_init__`
         # and `config.validate` own the same refusals (ADR-0019).
         validate_block_form(cfg)
@@ -991,6 +998,7 @@ class DormouseModel(nn.Module):
         segment_len: int = 0,
         loss_mask: torch.Tensor | None = None,
         ce_fixed: bool = False,
+        ce_chunk: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`input_ids [b,t]` (+ `targets [b,t]`) → (logits `[b*t,vocab]`, loss, counters).
 
@@ -1026,6 +1034,15 @@ class DormouseModel(nn.Module):
         TRAIN half's (`TrainConfig.ce_fixed`), which is why it is threaded here
         rather than stored on `ModelConfig`: a checkpoint's snapshot pairs a
         model with the objective it was trained on.
+
+        `ce_chunk` (`TrainConfig.ce_chunk`, `chunk_ce.chunked_cross_entropy`) is
+        the CHUNKED final CE: the readout hands the loss the hidden states and the
+        head instead of `[b·t, vocab]` logits, and the loss projects `ce_chunk`
+        positions at a time — so the 805M-value tensor at b24·s1024 with a 32k
+        vocabulary never exists. The returned logits are `None` for that forward
+        (the arm's contract: nothing reads what was never built), and the loss
+        and gradient are the un-chunked ones to fp32 summation order. `0` (the
+        default) is the historical readout, bit for bit.
         """
         counters = Counters() if counters is None else counters
         assert input_ids.dtype in (torch.long, torch.int64), "input_ids must be integer ids"
@@ -1046,6 +1063,41 @@ class DormouseModel(nn.Module):
                     "latents, not byte positions, so a [b,t] byte mask addresses a "
                     "different sequence. Escape: use_byteflow=false, or loss_mask=None."
                 )
+        if ce_chunk and ce_fixed:
+            # `config.validate_train` refuses the pair; a hand-built forward
+            # reaches here instead (ADR-0019: the runtime seam owns the same
+            # refusal as the config).
+            loud(
+                f"ce_chunk={ce_chunk} with ce_fixed=true: the chunked CE is the "
+                f"historical `log_softmax → NLL` arithmetic and there is no chunked "
+                f"fixed CE yet, so the pair would report a loss arm it did not run. "
+                f"Escape: ce_fixed=false (with ce_chunk>0), or ce_chunk=0."
+            )
+        if ce_chunk:
+            if self.bf_net is not None or self.bf is not None:
+                loud(
+                    f"ce_chunk={ce_chunk} with use_byteflow=true: the byteflow shapes "
+                    f"score PATCH LATENTS from their own head, not byte/token "
+                    f"positions, so `_readout` is never reached and the flag would be "
+                    f"inert while the run reported it on. Escape: use_byteflow=false, "
+                    f"or ce_chunk=0."
+                )
+            if targets is None:
+                loud(
+                    f"ce_chunk={ce_chunk} with targets=None: a no-labels forward has "
+                    f"no loss to chunk and its caller reads the logits. Escape: "
+                    f"ce_chunk=0 on a decode forward."
+                )
+            if self.cfg.z_loss > 0.0 or self.cfg.mtp_weight > 0.0:
+                loud(
+                    f"ce_chunk={ce_chunk} with z_loss={self.cfg.z_loss:g}/"
+                    f"mtp_weight={self.cfg.mtp_weight:g}: both add a term on the "
+                    f"FINAL `[b·t, vocab]` logits — the tensor the chunked CE exists "
+                    f"to not build — so the arm would either silently drop the term "
+                    f"or build the tensor anyway. Escape: z_loss=0.0 and mtp_weight=0.0, "
+                    f"or ce_chunk=0."
+                )
+        self._ce_chunk = int(ce_chunk)
         if self.cfg.dense_qat != "none":
             # The dense path ran (the per-site proof is the coverage gate,
             # tests/test_dense_qat.py: every nn.Linear/DenseLinear weight in the
@@ -1367,13 +1419,32 @@ class DormouseModel(nn.Module):
         # cast is the identity on the fp32 path (`residual_dtype="fp32"`), and
         # it is what keeps the readout's storage dtype from reaching the head.
         hn = self.norm(out.to(torch.float32))
-        logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
-        if self.cfg.logit_softcap > 0.0:
-            # Gemma-2's final-logit cap (`losses.logit_softcap`): applied to
-            # the head output BEFORE the final CE, z-loss and the returned
-            # logits, so a training step and the held-out objective score the
-            # same bounded distribution. `0.0` enters no branch.
-            logits = logit_softcap(logits, self.cfg.logit_softcap)
+        # CHUNKED FINAL CE (`TrainConfig.ce_chunk`, `chunk_ce.py`): with the flag
+        # on, the head is applied INSIDE the loss, one slice of positions at a
+        # time, so the `[b·t, vocab]` logits — and the NLL backward's copy of
+        # them — are never built. `logits is None` is the arm's contract (the
+        # trainer's step never reads them). `z_loss` and MTP DO read the final
+        # logits, so `forward` refuses the flag with either; the loop's own
+        # per-iteration L_Rec (`loopblock._iter_ce`) is a separate site.
+        if self._ce_chunk and targets is not None:
+            logits = None
+            ce_final = chunked_cross_entropy(
+                hn.reshape(-1, self.cfg.d_model),
+                self.lm_head,
+                targets,
+                self._ce_chunk,
+                mask=loss_mask,
+                softcap=self.cfg.logit_softcap,
+            )
+        else:
+            logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
+            if self.cfg.logit_softcap > 0.0:
+                # Gemma-2's final-logit cap (`losses.logit_softcap`): applied to
+                # the head output BEFORE the final CE, z-loss and the returned
+                # logits, so a training step and the held-out objective score the
+                # same bounded distribution. `0.0` enters no branch.
+                logits = logit_softcap(logits, self.cfg.logit_softcap)
+            ce_final = None
         loss = None
         # Set only on the soft-MTP arm; the hard path leaves it None and keeps
         # its MTP call exactly where it was, so `mtp_soft=false` is the old
@@ -1446,18 +1517,20 @@ class DormouseModel(nn.Module):
             else:
                 logits_ntp = logits
             flat = targets.reshape(-1, 1)
-            if ce_fixed:
-                ce_final = fixed_cross_entropy(
-                    logits_ntp, targets, reduction="none", counters=counters
-                ).reshape(-1, 1)
-            else:
-                ce_final = -F.log_softmax(logits_ntp, dim=-1).gather(1, flat)
-            if loss_mask is not None:
-                # doc_masking: padding and cross-document targets carry no loss
-                # and no gradient — the same selected mean the loop used.
-                ce_final = masked_ce_mean(ce_final, loss_mask)
-            else:
-                ce_final = ce_final.mean()
+            if ce_final is None:
+                # The un-chunked branch: the head's own logits, one reduction.
+                if ce_fixed:
+                    ce_final = fixed_cross_entropy(
+                        logits_ntp, targets, reduction="none", counters=counters
+                    ).reshape(-1, 1)
+                else:
+                    ce_final = -F.log_softmax(logits_ntp, dim=-1).gather(1, flat)
+                if loss_mask is not None:
+                    # doc_masking: padding and cross-document targets carry no loss
+                    # and no gradient — the same selected mean the loop used.
+                    ce_final = masked_ce_mean(ce_final, loss_mask)
+                else:
+                    ce_final = ce_final.mean()
             if breakdown:
                 # Eval-only host reads (called under `torch.no_grad()` by
                 # `evaluate(..., breakdown=True)`; NEVER in the training path —
@@ -1764,8 +1837,30 @@ class DormouseModel(nn.Module):
         the two forms differ only in the blocks, so a second copy of the head or
         the masked/fixed CE would be a second set of rules for the same number.
         `breakdown` is the eval-only host read (never in a training step).
+
+        `self._ce_chunk > 0` takes the chunked branch: no logits tensor is built,
+        and the return is `(None, loss)`. That is why `forward` refuses the flag
+        with a no-labels forward and with the byteflow shapes.
         """
         hn = self.norm(h.to(torch.float32))
+        if targets is not None and self._ce_chunk:
+            # THE CHUNKED CE (`TrainConfig.ce_chunk`): the head is applied INSIDE
+            # the loss, one slice of positions at a time, so the `[b·t, vocab]`
+            # logits — and the NLL backward's copy of them — are never built. The
+            # softcap goes with the projection for the same reason (it is a
+            # transform of the logits the CE reads). `logits is None` is the arm's
+            # contract, not a fallback: the trainer's step never reads them.
+            loss = chunked_cross_entropy(
+                hn.reshape(-1, self.cfg.d_model),
+                self.lm_head,
+                targets,
+                self._ce_chunk,
+                mask=loss_mask,
+                softcap=self.cfg.logit_softcap,
+            )
+            if breakdown:
+                self.last_breakdown = {"fin": float(loss.detach()), "per_iter": []}
+            return None, loss
         logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
         if self.cfg.logit_softcap > 0.0:
             logits = logit_softcap(logits, self.cfg.logit_softcap)
