@@ -19,7 +19,7 @@ if DARK:
     ACCENT, HOT, GOOD = "#7AA2E8", "#FF6B7A", "#5FBF7F"
 else:
     PAPER, INK = "#F6F3EC", "#1B1A17"
-    DIM, DIMMER = "#6D675D", "#9A9386"
+    DIM, DIMMER = "#4A463E", "#6B6559"
     ACCENT, HOT, GOOD = "#2F6FD0", "#C0392B", "#2E7D4F"
 
 MONO = "DejaVu Sans Mono"

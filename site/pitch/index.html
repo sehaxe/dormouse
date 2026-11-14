@@ -7,7 +7,7 @@
 <style>
 :root{
   --paper:#f6f3ec; --panel:#fffdf8; --line:#e3ded2; --line2:#d3ccbc;
-  --ink:#1b1a17; --dim:#6d675d; --dimmer:#6f6a5f;
+  --ink:#1b1a17; --dim:#4a463e; --dimmer:#5a554b;
   --accent:#2a66c2; --hot:#c0392b; --good:#2e7d4f;
   --mono:"DejaVu Sans Mono","Liberation Mono",ui-monospace,monospace;
   --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
@@ -100,6 +100,42 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
 .vs-col.mine .vs-h{color:var(--accent)}
 .vs-mid{background:var(--line2);align-self:stretch;min-height:18vmin}
 
+
+/* ---------- drawn figures (no video, no raster) ---------- */
+.fig{display:grid;place-items:center;background:var(--paper);overflow:hidden;position:relative;height:100%}
+.slide>.fig{position:absolute;inset:0}
+.split .fig{border-left:1px solid var(--line)}
+.fig .inner{width:78%;display:grid;gap:2.4vmin}
+/* the stack */
+.stack{display:grid;grid-template-columns:repeat(12,1fr);gap:1.1vmin;align-items:end}
+.stack i{display:block;border-radius:3px;background:linear-gradient(180deg,color-mix(in srgb,var(--ink) 26%,transparent),color-mix(in srgb,var(--ink) 8%,transparent))}
+.stack i.on{background:linear-gradient(180deg,var(--accent),color-mix(in srgb,var(--accent) 45%,transparent))}
+.stack i:not(.on):nth-child(3n){background:linear-gradient(180deg,color-mix(in srgb,var(--ink) 34%,transparent),color-mix(in srgb,var(--ink) 12%,transparent))}
+.fig .note{font-family:var(--mono);font-size:1.15vmin;letter-spacing:.14em;text-transform:uppercase;color:var(--dimmer)}
+.fig .huge{font-size:3.4vmin;line-height:1.1;letter-spacing:-.02em;color:var(--ink);font-weight:600}
+/* weights -> three levels */
+.wstrip{display:grid;grid-template-columns:repeat(28,1fr);gap:.55vmin}
+.wstrip b{display:block;height:6.2vmin;border-radius:2px;background:var(--ink);opacity:.18}
+.wlev{display:grid;grid-template-columns:repeat(3,1fr);gap:2.2vmin;margin-top:1.6vmin}
+.wlev div{border:1px solid var(--line2);border-radius:8px;padding:1.6vmin 1.4vmin;text-align:center}
+.wlev .lv{font-family:var(--mono);font-size:2.4vmin;color:var(--ink)}
+.wlev .kk{font-family:var(--mono);font-size:.9vmin;letter-spacing:.16em;text-transform:uppercase;color:var(--dimmer);margin-top:.8vmin}
+.arrow{display:flex;justify-content:center;color:var(--dimmer);font-size:2.2vmin;margin:.4vmin 0;line-height:1}
+/* spectrum */
+.spec{display:grid;grid-template-columns:repeat(16,1fr);gap:.9vmin;align-items:end;height:22vmin;position:relative}
+.spec b{display:block;background:var(--accent);border-radius:2px;opacity:.92}
+.spec b.tail{background:var(--ink);opacity:.1}
+.spec .cut{position:absolute;top:-2.2vmin;bottom:-1.4vmin;border-left:1px dashed var(--hot)}
+.spec .cut span{position:absolute;left:1vmin;top:0;font-family:var(--mono);font-size:1vmin;letter-spacing:.14em;color:var(--hot);white-space:nowrap}
+
+
+/* quantised grid */
+.qgrid{display:grid;grid-template-columns:repeat(26,1fr);gap:.5vmin;margin-top:1.4vmin}
+.qgrid u{display:block;aspect-ratio:1;border-radius:1.5px;background:var(--ink);text-decoration:none}
+.qgrid.snap u{background:var(--accent)}
+.qlv{display:flex;gap:.5vmin;justify-content:space-between;margin-top:1.2vmin;
+  font-family:var(--mono);font-size:.95vmin;letter-spacing:.14em;color:var(--dimmer)}
+
 /* three numbers */
 .thirds{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin-top:6vmin;border-top:1px solid var(--line)}
 .third{padding:3.2vmin 2.4vmin 0 0}
@@ -116,6 +152,28 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
 .close .qr img{width:100%;display:block;border:1px solid var(--line);border-radius:8px;background:#f6f3ec;padding:1.1vmin}
 .close .qr span{font-family:var(--mono);font-size:.85vmin;letter-spacing:.1em;color:var(--dimmer);word-break:break-all;line-height:1.35}
 .close .qr b{display:block;font-family:var(--sans);font-size:1.6vmin;letter-spacing:-.01em;color:var(--ink);font-weight:600;margin-bottom:.6vmin}
+
+
+/* ---------- editorial layer ---------- */
+.slide{isolation:isolate}
+.slide::after{content:attr(data-n);position:absolute;right:-1%;bottom:-9%;z-index:0;
+  font-size:40vmin;line-height:.7;font-weight:700;letter-spacing:-.06em;color:transparent;
+  -webkit-text-stroke:1px var(--line2);opacity:.5;pointer-events:none;user-select:none}
+.slide .pad,.slide .close,.slide .statement,.slide .title-wrap,.slide .cap{z-index:1}
+.slide .split{position:relative;z-index:1}
+.slide.on .pad>*,.slide.on .title-wrap>*,.slide.on .statement>*,.slide.on .close>*,
+.slide.on .txt>*,.slide.on .cap>*{animation:rise .72s cubic-bezier(.16,1,.3,1) both}
+.slide.on .pad>*:nth-child(2),.slide.on .title-wrap>*:nth-child(2){animation-delay:.06s}
+.slide.on .pad>*:nth-child(3),.slide.on .title-wrap>*:nth-child(3){animation-delay:.12s}
+.slide.on .pad>*:nth-child(4),.slide.on .title-wrap>*:nth-child(4){animation-delay:.18s}
+.slide.on .txt>*:nth-child(2){animation-delay:.06s}
+.slide.on .txt>*:nth-child(3){animation-delay:.12s}
+@keyframes rise{from{opacity:0;transform:translateY(1.6vmin)}to{opacity:1;transform:none}}
+.title-rule{height:1px;background:var(--line2);width:0;margin-top:4.4vmin;
+  transition:width 1.1s cubic-bezier(.16,1,.3,1) .3s}
+.slide.on .title-rule{width:36%}
+/* accent spine on the left of the opening slide */
+.slide:first-child .title-wrap::before{content:"";position:absolute;left:4.2%;top:31%;height:16vmin;width:2px;background:var(--accent)}
 
 #hud{position:fixed;left:0;right:0;bottom:0;height:2px;background:color-mix(in srgb,var(--ink) 8%,transparent)}
 #hud .p{height:100%;width:0;background:var(--accent);transition:width .25s}
@@ -145,6 +203,7 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
     <h1 style="margin-top:2.4vmin">dormouse</h1>
     <div class="title-sub">Чат-бот, который живёт у вас на компьютере,<br>а не в чужом облаке.</div>
     <div class="title-meta"><span>один файл</span><span>без сети</span><span class="dot">16 ГБ</span></div>
+    <div class="title-rule"></div>
   </div>
   <div class="num">01 / 10</div>
 </section>
@@ -169,15 +228,14 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
   <div class="num">02 / 10</div>
 </section>
 
-<!-- 03 · promo -->
-<section class="slide video">
-  <video src="../media/Promo.webm" class="vid" id="promo" muted loop playsinline autoplay
-    data-light="../media/Promo.webm" data-dark="../media/Promo_dark.webm" poster="../media/poster_Promo.jpg"></video>
-    <img class="poster" src="../media/poster_Promo.jpg" alt="">
-  <div class="scrim"></div>
-  <div class="cap">
-    <div class="kicker">весь конвейер</div>
-    <h2>Пятьдесят секунд</h2>
+<!-- 03 · how it is built -->
+<section class="slide">
+  <div class="fig">
+    <div class="inner">
+      <div class="note">одна модель · один проход</div>
+      <div class="stack"><i class="" style="height:29.4vmin"></i><i class="" style="height:26.9vmin"></i><i class="" style="height:30.7vmin"></i><i class="" style="height:28.2vmin"></i><i class="" style="height:25.0vmin"></i><i class="on" style="height:28.8vmin"></i><i class="" style="height:27.5vmin"></i><i class="" style="height:30.1vmin"></i><i class="" style="height:25.6vmin"></i><i class="" style="height:28.2vmin"></i><i class="" style="height:29.4vmin"></i><i class="" style="height:27.5vmin"></i></div>
+      <div class="huge">12 слоёв, 832 ширины,<br>один байт за шаг.</div>
+    </div>
   </div>
   <div class="num">03 / 10</div>
 </section>
@@ -218,10 +276,14 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
       <h2>Три значения<br>вместо тысячи</h2>
       <p>Модель учится сразу в том сжатом виде, в котором уезжает к вам.</p>
     </div>
-    <div class="media">
-      <video src="../media/Ternary.webm" id="ternary" muted loop playsinline autoplay
-        data-light="../media/Ternary.webm" data-dark="../media/Ternary_dark.webm" poster="../media/poster_Ternary.jpg"></video>
-    <img class="poster" src="../media/poster_Ternary.jpg" alt="">
+    <div class="fig">
+      <div class="inner" style="width:72%">
+        <div class="note">вес · до</div>
+        <div class="qgrid"><u style="opacity:0.24"></u><u style="opacity:0.10"></u><u style="opacity:0.40"></u><u style="opacity:0.15"></u><u style="opacity:0.07"></u><u style="opacity:0.40"></u><u style="opacity:0.92"></u><u style="opacity:0.80"></u><u style="opacity:0.77"></u><u style="opacity:0.22"></u><u style="opacity:0.54"></u><u style="opacity:0.28"></u><u style="opacity:0.17"></u><u style="opacity:0.11"></u><u style="opacity:0.21"></u><u style="opacity:0.93"></u><u style="opacity:0.83"></u><u style="opacity:0.81"></u><u style="opacity:0.80"></u><u style="opacity:0.19"></u><u style="opacity:0.31"></u><u style="opacity:0.63"></u><u style="opacity:0.73"></u><u style="opacity:0.85"></u><u style="opacity:0.88"></u><u style="opacity:0.09"></u><u style="opacity:0.61"></u><u style="opacity:0.67"></u><u style="opacity:0.51"></u><u style="opacity:0.18"></u><u style="opacity:0.47"></u><u style="opacity:0.09"></u><u style="opacity:0.93"></u><u style="opacity:0.87"></u><u style="opacity:0.55"></u><u style="opacity:0.30"></u><u style="opacity:0.91"></u><u style="opacity:0.57"></u><u style="opacity:0.88"></u><u style="opacity:0.85"></u><u style="opacity:0.51"></u><u style="opacity:0.41"></u><u style="opacity:0.60"></u><u style="opacity:0.43"></u><u style="opacity:0.16"></u><u style="opacity:0.31"></u><u style="opacity:0.81"></u><u style="opacity:0.04"></u><u style="opacity:0.05"></u><u style="opacity:0.63"></u><u style="opacity:0.28"></u><u style="opacity:0.53"></u><u style="opacity:0.47"></u><u style="opacity:0.34"></u><u style="opacity:1.00"></u><u style="opacity:0.20"></u><u style="opacity:0.41"></u><u style="opacity:0.20"></u><u style="opacity:0.63"></u><u style="opacity:0.28"></u><u style="opacity:0.36"></u><u style="opacity:0.75"></u><u style="opacity:0.32"></u><u style="opacity:0.56"></u><u style="opacity:0.90"></u><u style="opacity:0.10"></u><u style="opacity:0.06"></u><u style="opacity:0.23"></u><u style="opacity:0.77"></u><u style="opacity:0.62"></u><u style="opacity:0.24"></u><u style="opacity:0.33"></u><u style="opacity:0.18"></u><u style="opacity:0.46"></u><u style="opacity:0.04"></u><u style="opacity:0.70"></u><u style="opacity:0.90"></u><u style="opacity:0.95"></u></div>
+        <div class="note" style="margin-top:3.2vmin">вес · после</div>
+        <div class="qgrid snap"><u style="opacity:0.90"></u><u style="opacity:0.90"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.90"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.90"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.42"></u><u style="opacity:0.12"></u><u style="opacity:0.42"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.90"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.42"></u><u style="opacity:0.12"></u><u style="opacity:0.90"></u><u style="opacity:0.12"></u><u style="opacity:0.42"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.12"></u><u style="opacity:0.42"></u><u style="opacity:0.12"></u><u style="opacity:0.42"></u><u style="opacity:0.12"></u><u style="opacity:0.90"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.90"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.90"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.12"></u><u style="opacity:0.12"></u><u style="opacity:0.90"></u><u style="opacity:0.90"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.42"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u><u style="opacity:0.90"></u><u style="opacity:0.42"></u></div>
+        <div class="qlv"><span>−1</span><span>0</span><span>+1</span></div>
+      </div>
     </div>
   </div>
   <div class="num">05 / 10</div>
@@ -235,10 +297,12 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
       <h2>Как сжатая<br>фотография</h2>
       <p>Главное остаётся, лишнее уходит. Поэтому файл помещается в карман.</p>
     </div>
-    <div class="media">
-      <video src="../media/Spectral.webm" id="spectral" muted loop playsinline autoplay
-        data-light="../media/Spectral.webm" data-dark="../media/Spectral_dark.webm" poster="../media/poster_Spectral.jpg"></video>
-    <img class="poster" src="../media/poster_Spectral.jpg" alt="">
+    <div class="fig">
+      <div class="inner">
+        <div class="note">энергия матрицы веса</div>
+        <div class="spec"><b class="" style="height:22.0vmin"></b><b class="" style="height:17.7vmin"></b><b class="" style="height:14.2vmin"></b><b class="" style="height:11.4vmin"></b><b class="" style="height:9.1vmin"></b><b class="" style="height:7.3vmin"></b><b class="tail" style="height:5.9vmin"></b><b class="tail" style="height:4.7vmin"></b><b class="tail" style="height:3.8vmin"></b><b class="tail" style="height:3.0vmin"></b><b class="tail" style="height:2.4vmin"></b><b class="tail" style="height:2.0vmin"></b><b class="tail" style="height:1.6vmin"></b><b class="tail" style="height:1.3vmin"></b><b class="tail" style="height:1.0vmin"></b><b class="tail" style="height:0.8vmin"></b><div class="cut" style="left:34%"><span>обрезаем здесь</span></div></div>
+        <div class="note" style="margin-top:2.4vmin">первые направления держат почти всё; хвост — шум</div>
+      </div>
     </div>
   </div>
   <div class="num">06 / 10</div>
@@ -339,6 +403,8 @@ function show(n){
   for(const v of slides[i].querySelectorAll('video')) v.play().catch(()=>{});
   for(const s of slides) if(s!==slides[i]) for(const v of s.querySelectorAll('video')) v.pause();
 }
+slides.forEach((s,k)=>s.dataset.n=String(k+1).padStart(2,'0'));
+
 addEventListener('keydown',e=>{
   if(['ArrowRight','ArrowDown',' ','PageDown','Enter'].includes(e.key)){e.preventDefault();show(i+1)}
   if(['ArrowLeft','ArrowUp','PageUp','Backspace'].includes(e.key)){e.preventDefault();show(i-1)}
