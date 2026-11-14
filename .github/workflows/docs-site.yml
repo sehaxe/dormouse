@@ -58,6 +58,8 @@ jobs:
           cp -r docs-site/dist/. out/docs/
           cp site/index.html out/index.html
           cp -r site/media out/media
+          cp -r site/pitch out/pitch
+          cp site/dormouse-pitch-*.pdf out/
           if [ -d site/assets ]; then cp -r site/assets out/assets; fi
       - uses: actions/upload-pages-artifact@v3
         with:
