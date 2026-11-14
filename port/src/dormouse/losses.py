@@ -33,6 +33,8 @@ gradient carries the caller's dtype.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .instrument import Counters, loud
@@ -213,6 +215,76 @@ def fixed_cross_entropy(
     if not logits.is_floating_point():
         loud(f"fixed_cross_entropy logits dtype {logits.dtype}: logits must be floating.")
     return _FixedCE.apply(logits, flat, reduction, counters)
+
+
+def multihot_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """TST's bag CE: `-log( (1/k) Σ_i p[b_i] )` over a bag of `k` bytes (arXiv:2605.06546v2).
+
+    `logits [N, V]`, `targets [N, k]` → `[N]` (`reduction="none"`) or a scalar.
+    This is the objective of token-superposition training: every position
+    predicts the SET of the next `k` bytes rather than one byte, so the
+    probability the model is asked to put on the bag is the MEAN of its
+    members' probabilities. Arithmetic, in fp32 (the loss's own island, as
+    `_FixedCE` has it):
+
+        log p[b_i] = z[b_i] - LSE(z)
+        loss       = -log( (1/k) Σ_i exp(z[b_i] - LSE(z)) )
+                   = LSE(z) - logsumexp_i z[b_i] + log k
+
+    the second line is the stable form (no `exp` of an unbounded difference,
+    and the total probability of a `k`-bag is far below a vocabulary sum).
+
+    **Order-invariant by construction**: the gathered logits are SORTED before
+    the `logsumexp`, so shuffling a bag returns the same bits, not merely the
+    same value — fp addition is not associative over `k ≥ 3` and the defining
+    property of a bag must be exact. Duplicates are kept: the paper's `Σ_i`
+    counts a repeated byte `k` times and the mean still lands in `[0, 1]`.
+
+    `k = 1` reduces to the ordinary CE algebraically (`log 1 = 0`, one gathered
+    entry). The TRAINER deliberately does NOT route `tst_bag=1` through this
+    function: the off value takes the historical `_byte_ce` call, whose
+    bit-identity with every number on record is the arm's gate. What this
+    function gives at `k = 1` is the same quantity `_byte_ce` computes, and
+    `tests/test_tst.py` pins that to `torch.equal`.
+    """
+    if reduction not in ("mean", "sum", "none"):
+        loud(
+            f"multihot_cross_entropy reduction={reduction!r}: known values are "
+            f"'mean', 'sum' and 'none'. Escape: one of those three."
+        )
+    if logits.ndim != 2:
+        loud(
+            f"multihot_cross_entropy logits {tuple(logits.shape)}: the function is "
+            f"the 2-D `[N, V]` head form. Escape: flatten the leading positions."
+        )
+    if targets.ndim != 2:
+        loud(
+            f"multihot_cross_entropy targets {tuple(targets.shape)}: a bag target is "
+            f"`[N, k]` (one ROW of `k` byte ids per position). Escape: "
+            f"`bag_targets.reshape(N, -1)`."
+        )
+    if targets.shape[0] != logits.shape[0]:
+        loud(
+            f"multihot_cross_entropy: {targets.shape[0]} bags for "
+            f"{logits.shape[0]} rows. Escape: one bag per row."
+        )
+    if targets.shape[1] < 1:
+        loud(
+            "multihot_cross_entropy: a bag of 0 bytes has no mean probability (0 "
+            "divides). Escape: k >= 1 (k = 1 is the ordinary CE)."
+        )
+    z = logits.float()  # the loss's arithmetic island: always fp32
+    idx = targets.reshape(z.shape[0], -1)
+    k = idx.shape[1]
+    # SORT: the bag is a SET, so its reduction order must not depend on the
+    # order the k bytes arrived in (see the docstring).
+    bag = z.gather(1, idx).sort(dim=1).values
+    rows = torch.logsumexp(z, dim=1) - torch.logsumexp(bag, dim=1) + math.log(k)
+    return _reduce(rows, reduction)
 
 
 class _FixedSoftCE(torch.autograd.Function):

@@ -2601,6 +2601,44 @@ class TrainConfig:
     #: Non-progress: flipping it changes what the run trains on, so the
     #: snapshot drift check refuses a flip on a resume.
     doc_masking: bool = False
+
+    #: TOKEN-SUPERPOSITION TRAINING (TST, arXiv:2605.06546v2) — the bag size `k`.
+    #:
+    #: `1` is OFF and is the default: the run draws one byte per position and
+    #: scores the ordinary CE, argument for argument today's program (the arm's
+    #: gate is `torch.equal` on the loss AND on the parameters against the
+    #: pre-arm step, `tests/test_tst.py`).
+    #:
+    #: `k > 1` turns the FIRST `tst_frac` of the steps into the superposition
+    #: phase: position `q` of a window carries the byte at flat offset `q·k`, and
+    #: the target is the BAG of the `k` bytes that follow it, so one window reads
+    #: `seq_len·k + 1` bytes (byte-level model, vocabulary 256, no tokenizer).
+    #: The loss is `-log((1/k) Σ_i p[b_i])` (`losses.multihot_cross_entropy`),
+    #: NOT the mean of `k` single-byte CEs: a bag of `k` bytes that covers the
+    #: distribution scores 0 where the average CE scores `log k`.
+    #:
+    #: Phase 2 (`step >= round(steps · tst_frac)`) switches to the ordinary
+    #: one-byte objective IN THE SAME RUN, which is the paper's recovery phase —
+    #: the arm is a schedule, not a different model.
+    #:
+    #: The EVAL path never sees a bag: an eval window is one byte per position,
+    #: so `bpb` stays the number it was and two arms' curves are comparable.
+    #: Refused (see `_validate_tst`, each naming its escape) with a form whose
+    #: loss is not ONE readout CE (the KDA loop's per-iteration `L_Rec` needs a
+    #: single-byte target), `use_byteflow` (patch latents are not bytes),
+    #: `doc_masking` (a bag has no document boundary), `mix_plan`
+    #: (`MixtureStream.skip_bytes` is a fixed-window replay) and `full_graph`
+    #: (the step's shapes change at the phase switch, a capture cannot).
+    #:
+    #: Non-progress: flipping it changes what the run trains on, so the snapshot
+    #: drift check refuses a flip on a resume.
+    tst_bag: int = 1
+    #: The share of `steps` that runs the superposition phase (paper: ~70 %).
+    #: The boundary is `round(steps · tst_frac)`, a PURE function of the config,
+    #: so a resume lands in the same phase the unbroken run would be in. Inert
+    #: (`tst_bag=1`): 0 is refused because a phase that never fires while the
+    #: log reported the arm on is a config that lies (ADR-0019).
+    tst_frac: float = 0.7
     out_dir: str = "checkpoints"
     timers: bool = False
     #: Host-RAM Engram tables — burn's `--engram-ram` (Qwen3.8-Flash-Next §2.3
@@ -5685,6 +5723,57 @@ def _check_act_store(mode: str) -> None:
         )
 
 
+def tst_phase1_steps(cfg: TrainConfig) -> int:
+    """The number of steps in TST's superposition phase: `round(steps · tst_frac)`.
+
+    `0` means the arm is off (`tst_bag=1`). A PURE function of the config, which
+    is the whole resume contract: the phase of a step is the same number in the
+    process that ran it and in the one that resumed into it. `validate` refuses
+    a boundary below 1 on an armed run, so `0` never means "armed, fired never".
+    """
+    if cfg.tst_bag <= 1:
+        return 0
+    return int(round(cfg.steps * cfg.tst_frac))
+
+
+def tst_bag_at(cfg: TrainConfig, step: int) -> int:
+    """The bag size of optimizer step `step` (0-based): `tst_bag` in phase 1, else 1."""
+    return cfg.tst_bag if step < tst_phase1_steps(cfg) else 1
+
+
+def tst_bytes(cfg: TrainConfig, steps: int) -> int:
+    """Bytes SCORED by `steps` optimizer steps: `batch · seq_len · k · grad_accum`.
+
+    The arm's generalization of the port's one byte-accounting constant
+    (`batch × seq_len × grad_accum`, the number the run record's `train_bytes`
+    and every JSONL `bytes_seen` on record report): a phase-1 position carries
+    `k` scored bytes, a phase-2 position one. `tst_bag = 1` returns EXACTLY that
+    product, so an unarmed run's budget is not re-priced by the arm's presence.
+
+    The stream CONSUMES one more byte per row (`tst_stream_bytes`) — the shift
+    byte of the window. They are different quantities and both are reported.
+    """
+    at_bag = min(steps, tst_phase1_steps(cfg))
+    per_micro = cfg.batch * cfg.grad_accum * cfg.seq_len
+    return per_micro * (at_bag * cfg.tst_bag + (steps - at_bag))
+
+
+def tst_stream_bytes(cfg: TrainConfig, steps: int) -> int:
+    """Bytes the training stream has SERVED after `steps` optimizer steps.
+
+    A phase-1 row is `seq_len·k + 1` bytes and a phase-2 row `seq_len + 1` (the
+    last byte of each row is the bag's/candidate's first target), so this is what
+    the trainer's resume fast-forward must skip — exactly
+    `steps · (seq_len+1) · batch · grad_accum` at `tst_bag = 1`, the expression
+    the resume has always used.
+    """
+    at_bag = min(steps, tst_phase1_steps(cfg))
+    per_micro = cfg.batch * cfg.grad_accum
+    return per_micro * (
+        at_bag * (cfg.seq_len * cfg.tst_bag + 1) + (steps - at_bag) * (cfg.seq_len + 1)
+    )
+
+
 def validate_train(tcfg: TrainConfig) -> None:
     """The train-half refusals the CLI and a hand-built `train()` share.
 
@@ -5991,6 +6080,99 @@ def validate_train(tcfg: TrainConfig) -> None:
         )
 
 
+def _validate_tst(model: ModelConfig, tcfg: TrainConfig) -> None:
+    """`tst_bag`/`tst_frac` against the form, the reader and the capture.
+
+    The bag objective is ONE multi-hot CE at the model's readout
+    (`losses.multihot_cross_entropy`), and the trainer computes it from the
+    returned logits with `targets=None` on the forward. Every row below is a
+    place where that would be a different objective or a different window, so
+    each is a LOUD refusal naming its escape rather than a silent no-op.
+    """
+    if tcfg.tst_bag < 1:
+        loud(
+            f"tst_bag={tcfg.tst_bag}: the field is a COUNT of bytes per position "
+            f"(`1` is the off value, one byte = the ordinary CE). Escape: "
+            f"tst_bag >= 1."
+        )
+    if not 0.0 < tcfg.tst_frac <= 1.0:
+        loud(
+            f"tst_frac={tcfg.tst_frac}: the superposition phase is "
+            f"`round(steps · tst_frac)` steps, so the share must be in (0, 1] — "
+            f"0 is a phase that never fires while the log reports the arm on, and "
+            f">1 would leave no recovery phase (write 1.0 for that). Escape: "
+            f"0 < tst_frac <= 1 (0.7 is the paper's share and the default)."
+        )
+    if tcfg.tst_bag <= 1:
+        return
+    if tst_phase1_steps(tcfg) < 1:
+        loud(
+            f"tst_bag={tcfg.tst_bag} with steps={tcfg.steps} and "
+            f"tst_frac={tcfg.tst_frac}: the phase boundary is "
+            f"round({tcfg.steps} · {tcfg.tst_frac}) = 0 steps, so every step would "
+            f"train on one byte while the run reported the bag arm on. Escape: "
+            f"tst_frac >= 1/steps, or tst_bag=1."
+        )
+    if model.block_form == "kda" and model.block_stack == "uniform":
+        loud(
+            f"tst_bag={tcfg.tst_bag} with block_form='kda': the loop's objective is "
+            f"`(Σ_i CE_i + CE_final)/(T+1)` — `L_Rec` is a per-iteration CE against "
+            f"ONE next byte, and a bag target has no single byte to score, so the "
+            f"deep-supervision term would be dropped (a different objective wearing "
+            f"a data flag). The bag formula is one CE at one readout, which is the "
+            f"`block_form='transformer'` form (and the hybrid stack, whose blocks "
+            f"carry no `L_Rec`). Escape: block_form='transformer' (or "
+            f"block_stack != 'uniform'), or tst_bag=1."
+        )
+    if model.use_byteflow:
+        loud(
+            f"tst_bag={tcfg.tst_bag} with use_byteflow=true: both byteflow shapes "
+            f"score PATCH latents, so a `k`-byte bag would address the decoder's "
+            f"byte positions while the forward predicts latents. Escape: "
+            f"use_byteflow=false, or tst_bag=1."
+        )
+    if tcfg.doc_masking:
+        loud(
+            f"tst_bag={tcfg.tst_bag} with doc_masking=true: the packed reader's row "
+            f"is ONE document and its loss mask is per byte position, while a bag "
+            f"straddles positions and can run past a document's end (inventing a "
+            f"target the flag exists to remove). Escape: doc_masking=false, or "
+            f"tst_bag=1."
+        )
+    if tcfg.mix_plan:
+        loud(
+            f"tst_bag={tcfg.tst_bag} with mix_plan: `MixtureStream.skip_bytes` "
+            f"replays a FIXED `batch·(seq_len+1)` window per draw, and a bag window "
+            f"is `batch·(seq_len·k+1)` in phase 1 — a resume would land on the wrong "
+            f"byte (or refuse the fast-forward). Escape: a single `data` source, or "
+            f"tst_bag=1."
+        )
+    if tcfg.full_graph:
+        loud(
+            f"tst_bag={tcfg.tst_bag} with full_graph=true: the capture fills STATIC "
+            f"(batch, seq_len) buffers and replays ONE recorded graph, but this arm "
+            f"changes the step's SHAPE at the phase switch and its loss comes from a "
+            f"second loss function. Escape: full_graph=false, or tst_bag=1."
+        )
+    for name in (
+        "dspark_weight",
+        "mtp_weight",
+        "jepa_weight",
+        "energy_weight",
+        "halt_weight",
+        "mod_aux_weight",
+    ):
+        weight = float(getattr(model, name))
+        if weight > 0.0:
+            loud(
+                f"tst_bag={tcfg.tst_bag} with {name}={weight}: this auxiliary "
+                f"objective is added to the loss INSIDE the forward, off a target "
+                f"the bag arm passes as `None` (the trainer scores the bag CE from "
+                f"the returned logits) — the term would vanish while the config "
+                f"reported it on. Escape: {name}=0.0, or tst_bag=1."
+            )
+
+
 def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
     """Cross-half refusals: a MODEL arm that a TRAIN capture cannot carry.
 
@@ -6002,6 +6184,7 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
     refused by `train.graph.full_graph_refusal`); `opt_graph` is still refused,
     and the reason names the arm.
     """
+    _validate_tst(model, tcfg)
     if tcfg.activation_offload > 0.0 and model.use_byteflow:
         loud(
             f"activation_offload={tcfg.activation_offload} with use_byteflow=true: "

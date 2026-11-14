@@ -35,10 +35,15 @@ from ..config import (
     PROGRESS_KEYS,
     RunConfig,
     TrainConfig,
+    tst_bag_at,
+    tst_bytes,
+    tst_phase1_steps,
+    tst_stream_bytes,
     validate_model_train,
     validate_train,
 )
 from ..instrument import Counters, LoudError, StepTimer, loud
+from ..losses import multihot_cross_entropy
 from ..model import kda
 from ..model.engram import (
     Engram,
@@ -169,6 +174,21 @@ def ce_field(cfg: TrainConfig, drained: dict) -> str:
     if not cfg.ce_fixed:
         return ""
     return f"ce_cliff={int(drained.get('ce_cliff_tokens', 0))}"
+
+
+def tst_field(cfg: TrainConfig, step: int) -> str:
+    """`tst_bag=k tst_phase=1|2` on the log line — empty when the arm is off.
+
+    The log line's counters SUM (a per-step `tst_bag` would read `k × steps`), so
+    the bag in force and the phase of the step the line reports are printed as
+    FIELDS, the way `kda=`/`mtp=`/`ce_cliff=` are. `step` is the 0-based index of
+    that step (`config.tst_bag_at`); the phase boundary itself gets its own line
+    at the switch. Absent on a `tst_bag=1` run, whose line is unchanged.
+    """
+    if cfg.tst_bag <= 1:
+        return ""
+    bag = tst_bag_at(cfg, step)
+    return f"tst_bag={bag} tst_phase={1 if bag > 1 else 2}"
 
 
 def ckpt_paths(cfg: TrainConfig) -> tuple[Path, Path]:
@@ -1351,8 +1371,10 @@ def eval_row(
         "event": "eval",
         "step": step,
         # `bytes_seen` is OPTIMIZER-STEP arithmetic: every step drew
-        # `grad_accum` micro-batches of `batch × seq_len` bytes.
-        "bytes_seen": step * cfg.batch * cfg.seq_len * cfg.grad_accum,
+        # `grad_accum` micro-batches, `batch · (seq_len·k+1)` bytes each in TST's
+        # superposition phase and `batch · (seq_len+1)` after it
+        # (`config.tst_bytes`; the flat product on an unarmed run).
+        "bytes_seen": tst_bytes(cfg, step),
         "bpb": bpb(fin),
         "bpb_fin": bpb(fin),
         "bpb_mean": bpb(ev),
@@ -1519,6 +1541,32 @@ def _train_impl(
             "window keeps its fixed byte geometry; when a sidecar exists beside the "
             "eval file the SAME cross-document targets are excluded there too, and "
             "`eval_docmask=` on the eval line names the policy."
+        )
+    #: TST's phase boundary, `0` when the arm is off (`tst_bag=1`). One number,
+    #: read by the banner, the per-step bag and the switch line below.
+    tst_switch = tst_phase1_steps(cfg)
+    if cfg.tst_bag > 1:
+        if isinstance(stream, MixtureStream):
+            # The same refusal `config._validate_tst` makes for `mix_plan`, held
+            # here for a hand-built stream: a mixture's `skip_bytes` replays a
+            # fixed window and a bag window is a different one.
+            loud(
+                f"tst_bag={cfg.tst_bag} with a mixture stream: `MixtureStream."
+                f"skip_bytes` replays FIXED `batch·(seq_len+1)` windows, while a bag "
+                f"window is `batch·(seq_len·k+1)` — a resume would land on the wrong "
+                f"byte. Escape: a single `data` source, or tst_bag=1."
+            )
+        # The arm's own line: the bag, the phase boundary and the byte budget, so
+        # a reader does not infer the phase from the loss curve.
+        log(
+            f"tst: positions 1..{tst_switch} carry a bag of k={cfg.tst_bag} "
+            f"consecutive bytes and train on multi-hot CE "
+            f"(`-log((1/k)Σp[b_i])`, fp32); step {tst_switch + 1} and after switch "
+            f"to one byte per position in the SAME run (the recovery phase). One "
+            f"phase-1 step reads {tst_stream_bytes(cfg, 1)} B, a phase-2 step "
+            f"{cfg.batch * (cfg.seq_len + 1) * cfg.grad_accum} B; the eval window "
+            f"is unchanged (one byte per position), so BPB stays comparable. "
+            f"Counters: tst_bytes, tst_bags, tst_bag_bytes."
         )
     model.train()
     recompute = cfg.activation_recompute
@@ -1691,6 +1739,10 @@ def _train_impl(
             "advances none of Z/X/s."
         )
     tokens_per_step = cfg.batch * cfg.seq_len * cfg.grad_accum
+    #: The bytes ONE optimizer step SCORES. Equal to `tokens_per_step` when
+    #: `tst_bag=1` (every run on record); a bag position scores `k` bytes, so a
+    #: phase-1 step is `batch·seq_len·k·grad_accum` (`config.tst_bytes`).
+    bytes_per_step = tst_bytes(cfg, 1)
     start = 0
     resumed_ema: dict | None = None
     if init_from is not None:
@@ -1767,7 +1819,11 @@ def _train_impl(
             # this prevents is re-reading (and memorizing) the corpus head.
             # `grad_accum` micro-batches were drawn per optimizer step, and
             # `MixtureStream.skip_bytes` replays exactly that many draws.
-            stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch * cfg.grad_accum)
+            # `tst_stream_bytes` is the arm's whole story
+            # (`batch·(seq_len·k+1)` in the superposition phase,
+            # `batch·(seq_len+1)` after it) and is exactly
+            # `start·(seq_len+1)·batch·grad_accum` when `tst_bag=1`.
+            stream.skip_bytes(tst_stream_bytes(cfg, start))
             if isinstance(stream, MixtureStream):
                 assert stream.step == start * cfg.grad_accum, (
                     f"resume skipped {stream.step} micro-batches, expected "
@@ -1780,6 +1836,14 @@ def _train_impl(
         # same call as the post-construction one and cannot double-lerp.
         sf("train")
         log(f"resume: step={start} opt_steps={opt.steps}")
+        if tst_switch and start >= tst_switch:
+            # A resume PAST the boundary: the switch line below would never fire,
+            # and a run that spent its superposition phase in a previous process
+            # must still say which phase this one trains in.
+            log(
+                f"tst: resumed at step {start} in the RECOVERY phase (bag=1); the "
+                f"superposition phase was steps 1..{tst_switch} (k={cfg.tst_bag})."
+            )
 
     warm = warmup_steps(cfg.warmup_tokens, cfg.batch * cfg.grad_accum, cfg.seq_len)
     decay = int(round(cfg.decay_frac * cfg.steps))
@@ -1886,7 +1950,7 @@ def _train_impl(
             # The ONE byte-accounting constant: an optimizer step draws
             # `grad_accum` micro-batches of `batch x seq_len` bytes. The old
             # "0.53 GB at step 64k" figure was this without the factor 3.
-            bytes_per_step=tokens_per_step,
+            bytes_per_step=bytes_per_step,
             ema_decay=cfg.ema_decay,
             resumed=start,
         )
@@ -1977,7 +2041,7 @@ def _train_impl(
             f"set_to_none=False so the captured ops keep their pinned .grad buffers."
         )
 
-    def micro_step(x, y, kw, n_micro: int, first: bool):
+    def micro_step(x, y, kw, n_micro: int, first: bool, bag: int = 1):
         """ONE micro-batch: forward + the DEVICE firewall + backward + the gate.
 
         The ONE definition of the step body, called by the eager accumulation
@@ -1986,8 +2050,19 @@ def _train_impl(
         (`train/graph.py`'s own rule). Returns `(counters, contribution,
         grads)`: the HOST counter merge and the loss accumulator stay with the
         caller, because they are the parts a capture cannot carry.
+
+        `bag > 1` is TST (`tst_bag`): `y` is a `[b, t, bag]` target and the loss
+        is the multi-hot CE over the bag (`losses.multihot_cross_entropy`),
+        computed HERE from the logits the model returns for `targets=None`. The
+        forward is the same call with one argument absent — the model owns no
+        bag branch, which is why `bag=1` is the historical step bit for bit.
         """
-        logits, loss, step_counters = model(x, y, **kw)
+        if bag > 1:
+            logits, _, step_counters = model(x, None, **kw)
+            assert y.ndim == 3 and y.shape[-1] == bag, (y.shape, bag)
+            loss = multihot_cross_entropy(logits, y.reshape(-1, bag))
+        else:
+            logits, loss, step_counters = model(x, y, **kw)
         assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
         # THE DEVICE FIREWALL (ADR-0018 rule 2). No host read decides this
         # step: `loss_finite` and the gradient norm stay on the device, the
@@ -2228,6 +2303,21 @@ def _train_impl(
         # shared by every micro-batch — the same objective one wide forward
         # would run, and the reason all micro-batches read the same `step`.
         depth = _sample_depth(cfg.seed, step, run.model.max_iter) if cfg.rand_depth else None
+        # TST's phase, a pure function of `(cfg, step)` (`config.tst_bag_at`):
+        # `tst_bag` inside the superposition phase, `1` after it. `1` on every
+        # step of an unarmed run, so the data call and the loss below take their
+        # historical form argument for argument.
+        bag = tst_bag_at(cfg, step)
+        if tst_switch and step == tst_switch:
+            # THE SWITCH, COUNTED: the phase boundary is a fact of the run, not
+            # something a reader infers from a loss-curve kink.
+            log(
+                f"tst: superposition phase ends at step {step} — steps "
+                f"1..{tst_switch} drew bags of k={cfg.tst_bag} "
+                f"({tst_stream_bytes(cfg, tst_switch)} B read), step {step + 1} and after "
+                f"train on one byte per position in this same run (the recovery "
+                f"phase, bag=1)."
+            )
         kw = {} if depth is None else {"depth": depth}
         if cfg.ce_fixed:
             # The fixed CE (arXiv:2610.31642 §2). Passed only when ON, so a
@@ -2285,6 +2375,12 @@ def _train_impl(
                     # a micro-batch with fewer scored bytes contributes less —
                     # the same semantics one wide masked batch would have.
                     x, y, loss_mask = stream.next_batch_masked()
+                elif bag > 1:
+                    # TST's window: `seq_len·k + 1` bytes per row, `y [b, t, k]`.
+                    # The argument is passed ONLY here, so an unarmed step's call
+                    # is the historical `next_batch()`.
+                    x, y = stream.next_batch(bag)
+                    loss_mask = None
                 else:
                     x, y = stream.next_batch()
                     loss_mask = None
@@ -2294,7 +2390,7 @@ def _train_impl(
                         loss_mask = loss_mask.to(device)
                 micro_kw = kw if loss_mask is None else {**kw, "loss_mask": loss_mask}
                 step_counters, contribution, grads = micro_step(
-                    x, y, micro_kw, n_micro, _micro == 0
+                    x, y, micro_kw, n_micro, _micro == 0, bag
                 )
                 total.merge(step_counters)
                 window.merge(step_counters)
@@ -2329,6 +2425,20 @@ def _train_impl(
         window.count_device("nan_skipped", 1 - flag_dev)
         total.count_device("nan_skipped", 1 - flag_dev)
         window_steps += 1
+        if cfg.tst_bag > 1:
+            # The arm's byte accounting, per STEP: `tst_bytes` is the whole
+            # corpus budget (throughput = it / wall time), `tst_bags` counts the
+            # steps that drew a bag (0 in the recovery phase) and
+            # `tst_bag_bytes` is their share of the bytes. All host integers, so
+            # no device read lands on a step (`Counters.count`).
+            drawn = tst_stream_bytes(cfg, step + 1) - tst_stream_bytes(cfg, step)
+            window.count("tst_bytes", drawn)
+            total.count("tst_bytes", drawn)
+            if bag > 1:
+                window.count("tst_bags", 1)
+                total.count("tst_bags", 1)
+                window.count("tst_bag_bytes", drawn)
+                total.count("tst_bag_bytes", drawn)
         if ema is not None:
             # ONCE per OPTIMIZER STEP (not per micro-batch), after the update
             # landed. `opt_graph` is legal here because this runs EAGERLY after
@@ -2419,6 +2529,7 @@ def _train_impl(
                 mtp_field(model),
                 mod_field(model),
                 ce_field(cfg, drained),
+                tst_field(cfg, step),
                 window.line(),
             ]
             # Telemetry reads the interval BEFORE any opt-in timer report —
@@ -2449,7 +2560,7 @@ def _train_impl(
                     # Optimizer-step arithmetic, `grad_accum` included: the
                     # micro-batch bytes are `batch x seq_len`; one logged step
                     # consumed `grad_accum` of them per micro-window.
-                    bytes_seen=(step + 1) * tokens_per_step,
+                    bytes_seen=tst_bytes(cfg, step + 1),
                     counters=dict(window),
                     nan_skipped=nan_skipped,
                 )

@@ -25,6 +25,11 @@ Both modes carry the same position semantics, so the trainer's resume path
 is periodic in its byte range and the shard stream is periodic in
 `sum(shard sizes)`.
 
+`next_batch(bag)` is TST's window (`train.tst_bag`): `seq_len·bag + 1` bytes per
+row, the position's byte at stride `bag` and a `[b, t, bag]` target — the same
+trainer contract one axis wider, so the loss can score a bag. `bag=1` is the
+flat window above, `_windows` argument for argument.
+
 Two properties are load-bearing because the burn history paid for them:
 
 * **the eval window is `eval_bytes` BYTES** (a legacy snapshot's
@@ -88,6 +93,25 @@ def _windows(raw: bytes, batch: int, seq_len: int) -> tuple[torch.Tensor, torch.
     # frombuffer needs a writable buffer and the stream hands out an mmap slice.
     ids = torch.frombuffer(bytearray(raw), dtype=torch.uint8).long().view(batch, seq_len + 1)
     return ids[:, :-1].contiguous(), ids[:, 1:].contiguous()
+
+
+def _bag_windows(
+    raw: bytes, batch: int, seq_len: int, bag: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`batch × (seq_len·bag + 1)` bytes → `x [b, t]` of bag STARTS, `y [b, t, bag]`.
+
+    TST's window (`train.tst_bag`), and the same one-byte shift `_windows`
+    implements: position `q` reads the byte at offset `q·k` and its target is the
+    `k` bytes that follow — the `k`-byte bag that would have been positions
+    `q·k+1 .. q·k+k` in a flat window. So one window covers `seq_len·k` bytes of
+    the stream (`+1` for the last byte's bag) and yields `seq_len` predictions,
+    `k` bytes each: the same corpus budget per STEP at `k`× fewer positions.
+
+    `bag=1` is NOT routed here — every caller keeps `_windows` for the off value,
+    bit for bit, which is the arm's gate.
+    """
+    ids = torch.frombuffer(bytearray(raw), dtype=torch.uint8).long().view(batch, seq_len * bag + 1)
+    return ids[:, :-1:bag].contiguous(), ids[:, 1:].reshape(batch, seq_len, bag).contiguous()
 
 
 def _refuse_dir(path: Path, what: str) -> None:
@@ -287,8 +311,24 @@ class ShardStream:
         del self._buf[:n]
         return out
 
-    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """One `[batch, seq_len]` window of inputs and the byte after each."""
+    def next_batch(self, bag: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+        """One `[batch, seq_len]` window of inputs and the byte after each.
+
+        `bag > 1` is TST (`tst_bag`): `seq_len·bag + 1` bytes per row and a
+        `[batch, seq_len, bag]` target (`_bag_windows`). `bag=1` is the flat
+        window, `_windows` argument for argument.
+        """
+        if bag > 1:
+            want = self.batch * (self.seq_len * bag + 1)
+            if want > self.total:
+                loud(
+                    f"shard directory {self.directory} holds {self.total} B, less "
+                    f"than one bag window of {want} (batch={self.batch}, "
+                    f"seq_len={self.seq_len}, tst_bag={bag}): `_read` could never "
+                    f"satisfy it and the ring would spin. Escape: shrink tst_bag/"
+                    f"batch, or enlarge the directory."
+                )
+            return _bag_windows(self._read(want), self.batch, self.seq_len, bag)
         want = self.batch * (self.seq_len + 1)
         return _windows(self._read(want), self.batch, self.seq_len)
 
@@ -402,8 +442,24 @@ class ByteStream:
         del self._buf[:n]
         return out
 
-    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """One `[batch, seq_len]` window of inputs and the byte after each."""
+    def next_batch(self, bag: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+        """One `[batch, seq_len]` window of inputs and the byte after each.
+
+        `bag > 1` is TST (`tst_bag`): `seq_len·bag + 1` bytes per row and a
+        `[batch, seq_len, bag]` target (`_bag_windows`). `bag=1` is the flat
+        window, `_windows` argument for argument.
+        """
+        if bag > 1:
+            want = self.batch * (self.seq_len * bag + 1)
+            if want > self.hi - self.lo:
+                loud(
+                    f"byte range [{self.lo}, {self.hi}) holds {self.hi - self.lo} B, "
+                    f"less than one bag window of {want} (batch={self.batch}, "
+                    f"seq_len={self.seq_len}, tst_bag={bag}): `_read` could never "
+                    f"satisfy it and the ring would spin. Escape: shrink tst_bag/"
+                    f"batch, or enlarge the range."
+                )
+            return _bag_windows(self._read(want), self.batch, self.seq_len, bag)
         want = self.batch * (self.seq_len + 1)
         return _windows(self._read(want), self.batch, self.seq_len)
 
