@@ -72,7 +72,6 @@ def _raw_status(req: urllib.request.Request) -> tuple[int, dict]:
 def _chat(served, **body) -> dict:
     payload = {"messages": MSG, **body}
     req = _req(served[0] + "/v1/chat/completions", payload)
-    httpd = served[1]
     with urllib.request.urlopen(req, timeout=120) as r:
         return json.loads(r.read())
 
@@ -98,7 +97,6 @@ def test_chat_completion_has_the_openai_shape(served):
 def test_stream_is_sse_and_ends_with_done(served):
     payload = {"messages": MSG, "max_tokens": CAP, "stream": True}
     req = _req(served[0] + "/v1/chat/completions", payload)
-    httpd = served[1]
     with urllib.request.urlopen(req, timeout=120) as r:
         text = r.read().decode()
     events = [e.strip() for e in text.split("\n\n") if e.strip()]
