@@ -16,6 +16,8 @@ on:
     paths:
       - 'docs-site/**'
       - 'site/index.html'
+      - 'site/pitch/**'
+      - 'site/*.pdf'
       - 'site/media/**'
       - 'site/assets/**'
       - 'docs/HANDBOOK.md'
