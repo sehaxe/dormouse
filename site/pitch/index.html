@@ -19,126 +19,88 @@ html[data-theme="stage"]{
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
-body{
-  background:var(--paper); color:var(--ink); font-family:var(--sans);
-  -webkit-font-smoothing:antialiased; overflow:hidden;
-}
+body{background:var(--paper);color:var(--ink);font-family:var(--sans);
+  -webkit-font-smoothing:antialiased;overflow:hidden;transition:background .35s,color .35s}
 .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
 
-/* ---------- stage ---------- */
 #stage{position:fixed;inset:0;display:grid;place-items:center;padding:2.2vmin}
-.slide{
-  position:relative; width:min(100%,177.7vh); aspect-ratio:16/9;
-  background:var(--paper); border-radius:14px; overflow:hidden;
-  display:none; box-shadow:0 30px 90px rgba(0,0,0,.45);
-}
+.slide{position:relative;width:min(100%,177.7vh);aspect-ratio:16/9;background:var(--paper);
+  border-radius:14px;overflow:hidden;display:none;box-shadow:0 30px 90px rgba(0,0,0,.45)}
 .slide.on{display:block}
 
-/* slide furniture */
 .pad{position:absolute;inset:0;padding:8% 8% 9%;display:flex;flex-direction:column;justify-content:center}
-.kicker{
-  font-family:var(--mono); font-size:1.05vmin; letter-spacing:.22em;
-  text-transform:uppercase; color:var(--dimmer);
-}
+.kicker{font-family:var(--mono);font-size:1.05vmin;letter-spacing:.22em;text-transform:uppercase;color:var(--dimmer)}
 .pad>.kicker{position:absolute;left:8%;top:6.6%}
 .num{position:absolute;right:8%;top:6.4%;font-family:var(--mono);font-size:1.05vmin;color:var(--dimmer);letter-spacing:.18em}
-.rule{height:1px;background:var(--line);margin:4.2vmin 0 2.6vmin}
-.foot{position:absolute;left:8%;right:8%;bottom:4.6%;display:flex;justify-content:space-between;
-  font-family:var(--mono);font-size:1vmin;letter-spacing:.16em;text-transform:uppercase;color:var(--dimmer)}
 
-/* type */
 h1{font-size:11.4vmin;line-height:.92;letter-spacing:-.045em;font-weight:650}
-h2{font-size:5.6vmin;line-height:1.04;letter-spacing:-.03em;font-weight:600;max-width:88%}
-h3{font-size:2.1vmin;line-height:1.35;letter-spacing:-.01em;font-weight:600}
-p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:64ch}
-.lede{font-size:2.5vmin;line-height:1.42;color:var(--ink);max-width:52ch}
-.big{font-size:17vmin;line-height:.86;letter-spacing:-.055em;font-weight:680;font-variant-numeric:tabular-nums}
-.big small{font-size:.24em;letter-spacing:-.01em;font-weight:500;color:var(--dim);margin-left:.5em}
+h2{font-size:5.6vmin;line-height:1.02;letter-spacing:-.03em;font-weight:600;max-width:40ch}
+p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
+.big{font-size:19vmin;line-height:.84;letter-spacing:-.055em;font-weight:680;font-variant-numeric:tabular-nums}
+.big small{font-size:.2em;letter-spacing:-.01em;font-weight:500;color:var(--dim);margin-left:.4em}
 .accent{color:var(--accent)}
-.hot{color:var(--hot)}
-.good{color:var(--good)}
-.unit{font-size:.3em;letter-spacing:0;color:var(--dim);font-weight:500}
 
-/* title slide */
+/* title */
 .title-wrap{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 8%}
-.title-sub{margin-top:2.6vmin;font-size:2.35vmin;line-height:1.45;color:var(--dim);max-width:46ch}
-.title-meta{margin-top:4.6vmin;display:flex;gap:3.4vmin;font-family:var(--mono);font-size:1.05vmin;
+.title-sub{margin-top:2.2vmin;font-size:2.5vmin;line-height:1.4;color:var(--dim);max-width:40ch}
+.title-meta{margin-top:5vmin;display:flex;gap:3.4vmin;font-family:var(--mono);font-size:1.05vmin;
   letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer)}
 .dot{color:var(--accent)}
 
-/* grids */
-.split{display:grid;grid-template-columns:1fr 1fr;gap:6%;align-items:center;height:100%}
-.cols{display:grid;gap:2.2vmin;margin-top:4vmin}
-.two{grid-template-columns:repeat(2,1fr)}
-.three{grid-template-columns:repeat(3,1fr)}
-.four{grid-template-columns:repeat(4,1fr)}
+/* statement slide */
+.statement{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;
+  padding:0 8%;gap:2.4vmin}
+.statement .line{font-size:4.4vmin;line-height:1.08;letter-spacing:-.03em;color:var(--dim);max-width:36ch}
+.statement .line strong{color:var(--ink);font-weight:650}
 
-/* bars */
-.bars{margin-top:3.4vmin;display:grid;gap:1.5vmin}
-.bar{display:grid;grid-template-columns:16vmin 1fr 9vmin;align-items:center;gap:2vmin}
-.bar .lbl{font-family:var(--mono);font-size:1.15vmin;letter-spacing:.1em;color:var(--dim)}
-.bar .track{height:1.7vmin;background:var(--line);border-radius:2px;overflow:hidden}
-.bar .fill{height:100%;background:var(--dimmer);transform-origin:left;transform:scaleX(0);transition:transform .9s cubic-bezier(.16,1,.3,1)}
-.bar .fill.ours{background:var(--accent)}
-.bar .val{font-family:var(--mono);font-size:1.25vmin;color:var(--ink);text-align:right}
-.slide.on .fill{transform:scaleX(1)}
-.slide.on .d1{transition-delay:.10s}.slide.on .d2{transition-delay:.20s}
-.slide.on .d3{transition-delay:.30s}.slide.on .d4{transition-delay:.40s}
+/* full-bleed video */
+.slide.video .vid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
+.slide.video .cap{position:absolute;left:0;right:0;bottom:0;padding:3.2vmin 8% 3.6vmin;
+  background:var(--paper);border-top:1px solid var(--line2)}
+.slide.video .cap .kicker{margin-bottom:1.8vmin}
+.slide.video .cap h2{font-size:4.6vmin}
 
-/* cards */
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:2.6vmin 2.2vmin}
-.card .k{font-family:var(--mono);font-size:.95vmin;letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer)}
-.card .v{font-size:3.6vmin;font-weight:620;letter-spacing:-.02em;margin-top:1.2vmin}
-.card .d{font-size:1.5vmin;line-height:1.48;color:var(--dim);margin-top:.9vmin}
+/* split: video right, text left */
+.split{display:grid;grid-template-columns:0.95fr 1.05fr;gap:5%;align-items:center;height:100%}
+.split .txt{padding:0 0 0 8%}
+.split .txt .kicker{margin-bottom:2vmin}
+.split .txt h2{font-size:4.6vmin}
+.split .txt p{margin-top:2.4vmin;font-size:1.8vmin;max-width:34ch}
+.split .media{height:100%;position:relative;overflow:hidden;background:var(--panel);border-left:1px solid var(--line)}
+.split .media video,.split .media .poster{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.split .media .poster,.slide.video .poster{display:none}
+.slide.video .poster{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 
-/* ladder (how) */
-.ladder{display:grid;grid-template-columns:repeat(4,1fr);gap:1.6vmin;margin-top:5vmin;align-items:stretch}
-.step{position:relative;border-top:2px solid var(--line2);padding-top:1.8vmin}
-.step .n{font-family:var(--mono);font-size:1vmin;letter-spacing:.18em;color:var(--dimmer)}
-.step .t{font-size:2.05vmin;font-weight:620;letter-spacing:-.015em;margin-top:1vmin;line-height:1.2}
-.step .d{font-size:1.3vmin;line-height:1.45;color:var(--dim);margin-top:1.1vmin}
-.step.hero{border-top-color:var(--accent)}
-.step.hero .n{color:var(--accent)}
+/* three numbers */
+.thirds{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin-top:6vmin;border-top:1px solid var(--line)}
+.third{padding:3.2vmin 2.4vmin 0 0}
+.third+.third{border-left:1px solid var(--line);padding-left:2.4vmin}
+.third .k{font-family:var(--mono);font-size:.95vmin;letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer)}
+.third .v{font-size:5.2vmin;font-weight:650;letter-spacing:-.035em;margin-top:1.4vmin;line-height:1}
+.third .d{font-size:1.45vmin;line-height:1.45;color:var(--dim);margin-top:1.4vmin;max-width:24ch}
 
-/* table */
-table{width:100%;border-collapse:collapse;margin-top:3.4vmin}
-th,td{text-align:left;padding:1.45vmin .6vmin;border-bottom:1px solid var(--line);font-size:1.5vmin}
-th{font-family:var(--mono);font-size:.95vmin;letter-spacing:.16em;text-transform:uppercase;color:var(--dimmer);font-weight:500}
-th:nth-child(2),th:nth-child(3){text-align:right}
-th:last-child,td:last-child{padding-left:2.4vmin}
-td.n{font-family:var(--mono);text-align:right;font-variant-numeric:tabular-nums}
-td.why{color:var(--dim)}
-.tag{font-family:var(--mono);font-size:1.05vmin;letter-spacing:.08em;padding:.25em .5em;border-radius:3px;border:1px solid var(--line2);color:var(--dim)}
-.tag.no{color:var(--hot);border-color:color-mix(in srgb,var(--hot) 40%,transparent)}
-.tag.ok{color:var(--good);border-color:color-mix(in srgb,var(--good) 40%,transparent)}
-
-/* roadmap */
-.road{display:grid;grid-template-columns:repeat(3,1fr);gap:2.4vmin;margin-top:5.4vmin}
-.road .r{border-left:2px solid var(--line2);padding-left:2vmin}
-.road .r.now{border-left-color:var(--accent)}
-.road .when{font-family:var(--mono);font-size:1.05vmin;letter-spacing:.18em;text-transform:uppercase;color:var(--dimmer)}
-.road .what{font-size:2.45vmin;font-weight:620;margin-top:1.3vmin;letter-spacing:-.018em;line-height:1.2}
-.road .num2{font-family:var(--mono);font-size:1.45vmin;color:var(--dim);margin-top:1.3vmin;line-height:1.5}
-
-/* closing */
+/* close */
 .close{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:0 8%}
-.close h1{font-size:7.6vmin;max-width:30ch}
-.close .three{margin-top:6vmin;max-width:70%}
+.close h1{font-size:9.2vmin;line-height:.96}
+.close .links{margin-top:6vmin;display:flex;gap:3.6vmin;font-family:var(--mono);font-size:1.15vmin;
+  letter-spacing:.14em;color:var(--dimmer)}
+.close .links b{color:var(--ink);font-weight:600}
 
-/* chrome */
-#hud{position:fixed;left:0;right:0;bottom:0;height:2px;background:var(--line);z-index:9}
-#hud .p{height:100%;width:0;background:var(--accent);transition:width .35s ease}
-#keys{position:fixed;right:14px;bottom:14px;font-family:var(--mono);font-size:10px;letter-spacing:.14em;
-  color:var(--dimmer);z-index:10;user-select:none}
+#hud{position:fixed;left:0;right:0;bottom:0;height:2px;background:color-mix(in srgb,var(--ink) 8%,transparent)}
+#hud .p{height:100%;width:0;background:var(--accent);transition:width .25s}
+#keys{position:fixed;left:50%;transform:translateX(-50%);bottom:10px;font-family:var(--mono);
+  font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--dimmer);opacity:.5}
 
-/* print → PDF, one slide per page */
-@page{size:1280px 720px;margin:0}
 @media print{
-  html,body{overflow:visible;background:#fff}
-  #stage{position:static;display:block;padding:0}
-  .slide{display:block!important;width:1280px;height:720px;border-radius:0;box-shadow:none;page-break-after:always;break-after:page}
+  @page{size:1600px 900px;margin:0}
+  .slide{-webkit-print-color-adjust:exact;print-color-adjust:exact}
   #hud,#keys{display:none}
-  .fill{transform:scaleX(1)!important}
+  body{overflow:visible}
+  #stage{position:static;display:block;padding:0}
+  .slide{display:block!important;width:100%;aspect-ratio:16/9;border-radius:0;box-shadow:none;page-break-after:always}
+  .slide video{display:none}
+  .poster{display:block!important}
+  .split .media .poster{object-fit:cover}
 }
 </style>
 </head>
@@ -146,213 +108,133 @@ td.why{color:var(--dim)}
 <div id="stage">
 
 <!-- 01 · title -->
-<section class="slide on">
+<section class="slide">
   <div class="title-wrap">
-    <div class="kicker">dormouse · byte-level · 2026</div>
-    <h1 style="margin-top:3vmin">Плотность<span class="dot">.</span></h1>
-    <div class="title-sub">Модель, которая весит как фотография —<br>и считает быстрее той, что в десять раз больше.</div>
-    <div class="title-meta">
-      <span>255 МБ</span><span>12 000 tok/s</span><span>1.19 бита на байт</span>
-    </div>
+    <div class="kicker">одна видеокарта · без токенизатора</div>
+    <h1 style="margin-top:2.4vmin">dormouse</h1>
+    <div class="title-sub">Языковая модель, которую обучают на домашнем компьютере.</div>
+    <div class="title-meta"><span>цель — <span class="dot">дешёвый и умный</span> чат-бот</span><span>16 ГБ</span><span>дни</span></div>
   </div>
   <div class="num">01 / 10</div>
 </section>
 
-<!-- 02 · the problem -->
+<!-- 02 · the number -->
 <section class="slide">
-  <div class="pad">
-    <div class="kicker">проблема</div>
-    <h2 style="margin-top:3vmin">Все идут вверх.<br>Мы пошли в другую сторону.</h2>
-    <div class="cols three" style="margin-top:6vmin">
-      <div class="card">
-        <div class="k">вес модели</div>
-        <div class="v hot">40 ГБ</div>
-        <div class="d">20B в bf16. Не влезает ни в ноутбук, ни в телефон, ни в одну потребительскую карту.</div>
-      </div>
-      <div class="card">
-        <div class="k">трафик на токен</div>
-        <div class="v hot">40 ГБ</div>
-        <div class="d">Декод упирается в память: каждый токен требует прочитать все веса.</div>
-      </div>
-      <div class="card">
-        <div class="k">цена входа</div>
-        <div class="v hot">датацентр</div>
-        <div class="d">Локально нельзя, приватно нельзя, дешево нельзя.</div>
-      </div>
-    </div>
-    <p style="margin-top:5.4vmin">Индустрия продаёт параметры. Пользователь платит байтами и секундами.</p>
+  <div class="statement">
+    <div class="kicker">плотность</div>
+    <div class="line"><strong>Ум на байт файла,<br>на флоп, на час.</strong></div>
+    <div class="big" style="margin-top:1vmin">16<small>ГБ — это вся машина</small></div>
   </div>
   <div class="num">02 / 10</div>
 </section>
 
-<!-- 03 · the number -->
-<section class="slide">
-  <div class="pad">
-    <div class="kicker">результат</div>
-    <div class="big" style="margin-top:4vmin">1.19<small>бита на байт</small></div>
-    <p class="lede" style="margin-top:3vmin">Байтовый трансформер на 95M, обученный на 2.5 ГБ собственного корпуса на одной видеокарте за 8 часов.</p>
-    <div class="bars">
-      <div class="bar"><div class="lbl">xz</div><div class="track"><div class="fill d1" style="width:96%"></div></div><div class="val">2.71</div></div>
-      <div class="bar"><div class="lbl">bz2</div><div class="track"><div class="fill d2" style="width:92%"></div></div><div class="val">2.59</div></div>
-      <div class="bar"><div class="lbl">5-gram</div><div class="track"><div class="fill d3" style="width:91%"></div></div><div class="val">2.57</div></div>
-      <div class="bar"><div class="lbl" style="color:var(--accent)">dormouse</div><div class="track"><div class="fill ours d4" style="width:42%"></div></div><div class="val accent">1.19</div></div>
-    </div>
+<!-- 03 · promo -->
+<section class="slide video">
+  <video src="../media/Promo.webm" class="vid" id="promo" muted loop playsinline autoplay
+    data-light="../media/Promo.webm" data-dark="../media/Promo_dark.webm" poster="../media/poster_Promo.jpg"></video>
+    <img class="poster" src="../media/poster_Promo.jpg" alt="">
+  <div class="scrim"></div>
+  <div class="cap">
+    <div class="kicker">весь конвейер</div>
+    <h2>Пятьдесят секунд</h2>
   </div>
   <div class="num">03 / 10</div>
 </section>
 
-<!-- 04 · what it weighs -->
+<!-- 04 · bytes -->
 <section class="slide">
-  <div class="pad">
-    <div class="kicker">что это значит на диске</div>
-    <h2 style="margin-top:2.6vmin">Вся модель — <span class="accent">255 МБ</span></h2>
-    <div class="bars" style="margin-top:4.6vmin">
-      <div class="bar"><div class="lbl">1B bf16</div><div class="track"><div class="fill d1" style="width:100%"></div></div><div class="val">2.0 ГБ</div></div>
-      <div class="bar"><div class="lbl">95M bf16</div><div class="track"><div class="fill d2" style="width:9.3%"></div></div><div class="val">190 МБ</div></div>
-      <div class="bar"><div class="lbl">95M тернар</div><div class="track"><div class="fill d3" style="width:4%"></div></div><div class="val">82 МБ</div></div>
-      <div class="bar"><div class="lbl" style="color:var(--accent)">1B / 180M активных</div><div class="track"><div class="fill ours d4" style="width:12.5%"></div></div><div class="val accent">255 МБ</div></div>
+  <div class="split">
+    <div class="txt">
+      <div class="kicker">вход</div>
+      <h2>Файл входит<br>как есть</h2>
+      <p>256 символов. Ни словаря, ни токенизатора.</p>
     </div>
-    <p style="margin-top:4.6vmin">Миллиард параметров, который умещается в письмо. И это не «урезанная» модель — это та же функция, записанная плотнее.</p>
+    <div class="media">
+      <video src="../media/Bytes.webm" id="bytes" muted loop playsinline autoplay
+        data-light="../media/Bytes.webm" data-dark="../media/Bytes_dark.webm" poster="../media/poster_Bytes.jpg"></video>
+    <img class="poster" src="../media/poster_Bytes.jpg" alt="">
+    </div>
   </div>
   <div class="num">04 / 10</div>
 </section>
 
-<!-- 05 · speed -->
+<!-- 05 · ternary -->
 <section class="slide">
-  <div class="pad">
-    <div class="kicker">скорость</div>
-    <div class="big" style="margin-top:3.6vmin">12 000<small>токенов в секунду</small></div>
-    <p class="lede" style="margin-top:3vmin">Одна потребительская видеокарта. Без батча, без сервера, без сети.</p>
-    <div class="bars" style="margin-top:4.2vmin">
-      <div class="bar"><div class="lbl">95M bf16</div><div class="track"><div class="fill d1" style="width:100%"></div></div><div class="val">190 МБ</div></div>
-      <div class="bar"><div class="lbl" style="color:var(--accent)">1B тернар</div><div class="track"><div class="fill ours d2" style="width:23.7%"></div></div><div class="val accent">45 МБ</div></div>
+  <div class="split">
+    <div class="txt">
+      <div class="kicker">формат</div>
+      <h2>Три уровня<br>на вес</h2>
+      <p>Модель учится в том виде, в котором потом уезжает.</p>
     </div>
-    <div class="cols two" style="margin-top:4vmin">
-      <div class="card">
-        <div class="k">вес одного веса</div>
-        <div class="v accent">2 бита</div>
-        <div class="d">Тернарный вес читается в два бита, распаковка в регистрах — внутри самого ядра. Декод упирается в память, поэтому меньше байт = быстрее.</div>
-      </div>
-      <div class="card">
-        <div class="k">в 10 раз больше при 4× скорости</div>
-        <div class="v good">не компромисс</div>
-        <div class="d">Обычно «больше» значит «медленнее». Здесь наоборот: ёмкость выросла, время на токен упало.</div>
-      </div>
+    <div class="media">
+      <video src="../media/Ternary.webm" id="ternary" muted loop playsinline autoplay
+        data-light="../media/Ternary.webm" data-dark="../media/Ternary_dark.webm" poster="../media/poster_Ternary.jpg"></video>
+    <img class="poster" src="../media/poster_Ternary.jpg" alt="">
     </div>
   </div>
   <div class="num">05 / 10</div>
 </section>
 
-<!-- 06 · how -->
+<!-- 06 · spectral -->
 <section class="slide">
-  <div class="pad">
-    <div class="kicker">как это устроено</div>
-    <h2 style="margin-top:2.4vmin">Четыре ступени, каждая измерена отдельно</h2>
-    <div class="ladder">
-      <div class="step">
-        <div class="n">01</div>
-        <div class="t">Байт как единица</div>
-        <div class="d">Никакой токенизации. Модель видит сырые байты — работает на любом языке и на любом коде без словаря.</div>
-      </div>
-      <div class="step">
-        <div class="n">02</div>
-        <div class="t">Низкоранговые факторы</div>
-        <div class="d">Матрицы хранятся как U·diag(s)·Vᵀ. 2.7× меньше вычислений при 5% цены качества.</div>
-      </div>
-      <div class="step hero">
-        <div class="n">03</div>
-        <div class="t">Тернарные веса</div>
-        <div class="d">Три уровня {−α, 0, +α}, два бита на вес. Анниляция от полной точности к тернару — не с первого шага.</div>
-      </div>
-      <div class="step">
-        <div class="n">04</div>
-        <div class="t">Разреженные эксперты</div>
-        <div class="d">1B хранимых, 180M активных на токен. Ёмкость растёт, вычисления — нет.</div>
-      </div>
+  <div class="split">
+    <div class="txt">
+      <div class="kicker">сжатие</div>
+      <h2>Спектр,<br>обрезанный на ранге</h2>
+      <p>Матрица весов как сумма нескольких направлений.</p>
     </div>
-    <p style="margin-top:5vmin">Ступени работают только вместе: тернар без факторов не влезает, факторы без разреженности не дают ёмкости.</p>
+    <div class="media">
+      <video src="../media/Spectral.webm" id="spectral" muted loop playsinline autoplay
+        data-light="../media/Spectral.webm" data-dark="../media/Spectral_dark.webm" poster="../media/poster_Spectral.jpg"></video>
+    <img class="poster" src="../media/poster_Spectral.jpg" alt="">
+    </div>
   </div>
   <div class="num">06 / 10</div>
 </section>
 
-<!-- 07 · the cost of training -->
+<!-- 07 · muon -->
 <section class="slide">
-  <div class="pad">
-    <div class="kicker">стоимость</div>
-    <h2 style="margin-top:2vmin">Обучение — на одной карте, за дни</h2>
-    <div class="cols three" style="margin-top:5.2vmin">
-      <div class="card">
-        <div class="k">железо</div>
-        <div class="v">16 ГБ</div>
-        <div class="d">Одна потребительская видеокарта. Не кластер и не аренда.</div>
-      </div>
-      <div class="card">
-        <div class="k">время</div>
-        <div class="v">дни</div>
-        <div class="d">Полный прогон с нуля: данные, обучение, экспорт.</div>
-      </div>
-      <div class="card">
-        <div class="k">результат</div>
-        <div class="v">один файл</div>
-        <div class="d">Скачал, запустил локально, без сети и серверов.</div>
-      </div>
+  <div class="split">
+    <div class="txt">
+      <div class="kicker">шаг</div>
+      <h2>Ортогональный<br>шаг</h2>
+      <p>Оптимизатор выравнивает обновление по всем направлениям сразу.</p>
     </div>
-    <p style="margin-top:5.5vmin">Всё, что дороже этих трёх чисел, — не наш путь. Поэтому модель учится сразу в том формате, в котором отгружается: то, что обучается, и есть то, что скачивают.</p>
+    <div class="media">
+      <video src="../media/Muon.webm" id="muon" muted loop playsinline autoplay
+        data-light="../media/Muon.webm" data-dark="../media/Muon_dark.webm" poster="../media/poster_Muon.jpg"></video>
+    <img class="poster" src="../media/poster_Muon.jpg" alt="">
+    </div>
   </div>
   <div class="num">07 / 10</div>
 </section>
 
-<!-- 08 · the product -->
+<!-- 08 · cost -->
 <section class="slide">
   <div class="pad">
-    <div class="kicker">продукт</div>
-    <h2 style="margin-top:2.4vmin">Кодер по PyTorch, который живёт на ноутбуке</h2>
-    <div class="cols three" style="margin-top:4.6vmin">
-      <div class="card">
-        <div class="k">размер</div>
-        <div class="v">255 МБ</div>
-        <div class="d">Помещается в репозиторий, в контейнер, в дистрибутив.</div>
-      </div>
-      <div class="card">
-        <div class="k">скорость</div>
-        <div class="v">12 000 tok/s</div>
-        <div class="d">Ответ на страницу — доли секунды. Без очереди и без API.</div>
-      </div>
-      <div class="card">
-        <div class="k">приватность</div>
-        <div class="v">0 сети</div>
-        <div class="d">Код не покидает машину. Работает офлайн.</div>
-      </div>
+    <div class="kicker">цена</div>
+    <h2 style="margin-top:2vmin">Всё, что дороже этих трёх чисел, — не наш путь</h2>
+    <div class="thirds">
+      <div class="third"><div class="k">железо</div><div class="v">16 ГБ</div>
+        <div class="d">Потребительская карта. Не кластер.</div></div>
+      <div class="third"><div class="k">время</div><div class="v">дни</div>
+        <div class="d">Полный прогон: данные, обучение, экспорт.</div></div>
+      <div class="third"><div class="k">результат</div><div class="v">файл</div>
+        <div class="d">Скачал, запустил локально, без сети.</div></div>
     </div>
-    <p class="lede" style="margin-top:5vmin">Цель — 40–55% HumanEval на 2B. Это уровень моделей в 10 раз крупнее: Phi-1 показал 50.6% на 1.3B, когда данные отобраны, а не сгреблены.</p>
   </div>
   <div class="num">08 / 10</div>
 </section>
 
-<!-- 09 · roadmap -->
-<section class="slide">
-  <div class="pad">
-    <div class="kicker">план</div>
-    <h2 style="margin-top:2.2vmin">Три шага, каждый с числом</h2>
-    <div class="road">
-      <div class="r now">
-        <div class="when">сейчас</div>
-        <div class="what">Корпус и дистилляция</div>
-        <div class="num2">22 ГБ отобранного кода · 6 млрд токенов</div>
-      </div>
-      <div class="r">
-        <div class="when">+4 дня карты</div>
-        <div class="what">2B / 180M активных</div>
-        <div class="num2">тернар + факторы · 255 МБ</div>
-      </div>
-      <div class="r">
-        <div class="when">+2 дня</div>
-        <div class="what">Проверка на своих тестах</div>
-        <div class="num2">300 функций из репозитория · pass@1</div>
-      </div>
-    </div>
-    <div class="rule"></div>
-    <p>Ни один шаг не требует аренды: всё считается на одной видеокарте, которая уже стоит в комнате.</p>
+<!-- 09 · curve -->
+<section class="slide video">
+  <video src="../media/Curve.webm" class="vid" id="curve" muted loop playsinline autoplay
+    data-light="../media/Curve.webm" data-dark="../media/Curve_dark.webm" poster="../media/poster_Curve.jpg"></video>
+    <img class="poster" src="../media/poster_Curve.jpg" alt="">
+  <div class="scrim"></div>
+  <div class="cap">
+    <div class="kicker">обучение</div>
+    <h2>Каждый байт текста делает модель дешевле</h2>
   </div>
   <div class="num">09 / 10</div>
 </section>
@@ -362,24 +244,43 @@ td.why{color:var(--dim)}
   <div class="close">
     <div class="kicker">итог</div>
     <h1 style="margin-top:3vmin">Меньше не значит слабее.<br><span class="accent">Плотнее — значит быстрее.</span></h1>
-    <div class="cols three" style="max-width:74%">
-      <div class="card"><div class="k">бит на байт</div><div class="v">1.19</div></div>
-      <div class="card"><div class="k">вес модели</div><div class="v">255 МБ</div></div>
-      <div class="card"><div class="k">токенов в секунду</div><div class="v">12 000</div></div>
-    </div>
+    <div class="links"><span><b>sehaxe.github.io/dormouse</b></span><span>docs</span><span>github</span></div>
   </div>
   <div class="num">10 / 10</div>
 </section>
 
 </div>
+
 <script>
 const slides=[...document.querySelectorAll('.slide')];
+const vids=[...document.querySelectorAll('video[data-light]')];
+// The poster is also the print face of the slide: a PDF cannot carry video, and a
+// blank rectangle where the animation was is worse than a still of it.
+for(const v of vids){
+  const host=v.closest('.media')||v.closest('.slide'), src=v.getAttribute('poster');
+  if(host&&src){host.style.backgroundImage=`url(${src})`;host.style.backgroundSize=host.classList.contains('media')?'contain':'cover';
+    host.style.backgroundPosition='center';host.style.backgroundRepeat='no-repeat';}
+}
 let i=0;
+
+function paint(){
+  const dark=document.documentElement.dataset.theme==='stage';
+  for(const v of vids){
+    const want=(dark?v.dataset.dark:v.dataset.light);
+    if(!v.src.endsWith(want)){
+      const t=v.currentTime, playing=!v.paused;
+      v.setAttribute('src', want); v.load();
+      v.addEventListener('loadeddata',()=>{v.currentTime=t; if(playing)v.play().catch(()=>{})},{once:true});
+    }
+  }
+}
 function show(n){
   i=Math.max(0,Math.min(slides.length-1,n));
   slides.forEach((s,k)=>s.classList.toggle('on',k===i));
   document.querySelector('#hud .p').style.width=((i+1)/slides.length*100)+'%';
-  document.title=`${i+1}/${slides.length} — Плотность`;
+  document.title=`${i+1}/${slides.length} — dormouse`;
+  for(const v of slides[i].querySelectorAll('video')) v.play().catch(()=>{});
+  for(const s of slides) if(s!==slides[i]) for(const v of s.querySelectorAll('video')) v.pause();
 }
 addEventListener('keydown',e=>{
   if(['ArrowRight','ArrowDown',' ','PageDown','Enter'].includes(e.key)){e.preventDefault();show(i+1)}
@@ -389,10 +290,15 @@ addEventListener('keydown',e=>{
   if(e.key==='t'||e.key==='T'){
     const r=document.documentElement;
     r.dataset.theme=r.dataset.theme==='stage'?'paper':'stage';
+    paint();
   }
 });
 addEventListener('click',e=>{ if(e.clientX>innerWidth*0.72)show(i+1); else if(e.clientX<innerWidth*0.28)show(i-1); });
 addEventListener('hashchange',()=>{const n=parseInt(location.hash.slice(1));if(!isNaN(n))show(n-1)});
+const qs=new URLSearchParams(location.search);
+if(qs.get('theme')==='paper') document.documentElement.dataset.theme='paper';
+if(qs.get('t')){ for(const v of vids) v.addEventListener('loadedmetadata',()=>{v.currentTime=parseFloat(qs.get('t'))},{once:true}); }
+paint();
 const h=parseInt(location.hash.slice(1));
 show(isNaN(h)?0:h-1);
 </script>
