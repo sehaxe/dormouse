@@ -1626,6 +1626,14 @@ def decode(
     ckpt_name: Annotated[str, typer.Option("--ckpt-name")] = "",
     prompt: Annotated[str, typer.Option(help="prompt text; UTF-8 bytes are the tokens")] = "",
     n: Annotated[int, typer.Option(help="new bytes to sample")] = 100,
+    stop_byte: Annotated[
+        int | None,
+        typer.Option(
+            "--stop-byte",
+            help="end the reply at this byte value (an SFT checkpoint's 0x03 = 3); "
+            "without it a fine-tuned model talks past its own answer",
+        ),
+    ] = None,
     temp: Annotated[float, typer.Option(help="sampling temperature")] = 0.8,
     spec_k: Annotated[
         int,
@@ -1752,8 +1760,9 @@ def decode(
             f" · {stats.counters.line()}"
         )
     else:
-        out = decode_bytes(model, body, n, temp=temp, device=dev, generator=gen)
-        subtitle = f"{n} bytes"
+        stop = frozenset({stop_byte}) if stop_byte is not None else None
+        out = decode_bytes(model, body, n, temp=temp, device=dev, generator=gen, stop=stop)
+        subtitle = f"{n} bytes" if stop_byte is None else f"stopped at 0x{stop_byte:02x}"
     text = out[len(body) :].decode("utf-8", "replace")
     console.print(
         Panel(

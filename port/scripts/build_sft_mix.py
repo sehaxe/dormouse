@@ -49,7 +49,7 @@ CYRILLIC = re.compile(r"[а-яА-ЯёЁ]")
 #: Per-source cap. 6k each keeps variety while stopping any one set from
 #: dominating; the mixture is ~30k rows, which at 1024-byte windows is a few
 #: thousand SFT steps for a couple of epochs.
-CAP = 6000
+CAP = 6000  # default; sources override below
 #: English gets a smaller share and its own volume: the model is used in Russian
 #: first, but a chat model that cannot answer an English question is not a chat
 #: model. ~40% of rows.
@@ -121,6 +121,25 @@ def src_alpaca_ru() -> Iterator[tuple[str, str]]:
             yield prompt, row.get("output", "")
 
 
+def src_turbo_alpaca() -> Iterator[tuple[str, str]]:
+    """RU alpaca from the Saiga family: instruction/output, short answers."""
+    for path in sorted((RAW / "ru_turbo_alpaca").glob("*.jsonl*")):
+        for row in _jsonl(path):
+            yield row.get("instruction", ""), row.get("output", "")
+
+
+def src_ultrachat() -> Iterator[tuple[str, str]]:
+    """UltraChat 200k: MIT, multi-turn, the standard English SFT base."""
+    for path in sorted((RAW / "ultrachat_200k" / "data").glob("*.parquet")):
+        for row in _parquet(path):
+            msgs = [m for m in (row.get("messages") or []) if isinstance(m, dict)]
+            user = next((m.get("content", "") for m in msgs if m.get("role") == "user"), "")
+            bot = next(
+                (m.get("content", "") for m in reversed(msgs) if m.get("role") == "assistant"), ""
+            )
+            yield user, bot
+
+
 def src_smoltalk() -> Iterator[tuple[str, str]]:
     """SmolTalk: built for sub-1B models, short turns — the English counterpart."""
     for path in sorted((RAW / "smol-smoltalk" / "data").glob("*.parquet")):
@@ -167,16 +186,20 @@ def src_oasst2() -> Iterator[tuple[str, str]]:
         yield parent[1], row["text"]
 
 
-#: (name, reader, needs_cyrillic, cap)
+#: (name, reader, needs_cyrillic, cap). The caps are ~2-8% of each source, which
+#: is where a 60M model stops gaining from more rows of the same voice and starts
+#: losing to the long tail of rambling answers.
 SOURCES = [
-    ("oasst2_ru", src_oasst2, True, CAP),
-    ("saiga", src_saiga, True, CAP),
-    ("ru_instruct_gpt4", src_gpt4, True, CAP),
-    ("russian_instructions_2", src_instr2, True, CAP),
-    ("russian_dialogues_2", src_dialogues2, True, CAP),
-    ("alpaca_cleaned_ru", src_alpaca_ru, True, CAP),
-    ("smoltalk_en", src_smoltalk, False, CAP_EN),
-    ("oasst2_en", src_oasst2_en, False, CAP_EN),
+    ("oasst2_ru", src_oasst2, True, 12000),
+    ("saiga", src_saiga, True, 25000),
+    ("ru_instruct_gpt4", src_gpt4, True, 12000),
+    ("ru_turbo_alpaca", src_turbo_alpaca, True, 20000),
+    ("russian_instructions_2", src_instr2, True, 40000),
+    ("russian_dialogues_2", src_dialogues2, True, 40000),
+    ("alpaca_cleaned_ru", src_alpaca_ru, True, 12000),
+    ("smoltalk_en", src_smoltalk, False, 40000),
+    ("ultrachat_en", src_ultrachat, False, 40000),
+    ("oasst2_en", src_oasst2_en, False, 20000),
 ]
 
 
@@ -195,10 +218,39 @@ def keep(prompt: str, response: str, needs_cyrillic: bool = True) -> bool:
     return True
 
 
+def load_voice(path: Path) -> list[tuple[str, str]]:
+    """The owner's own pairs, repeated so they survive a 200k-row corpus."""
+    pairs: list[tuple[str, str]] = []
+    if not path.exists():
+        return pairs
+    q = a = ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            if q and a:
+                pairs.append((q, a))
+                q = a = ""
+            continue
+        if line.startswith("Q:"):
+            q = line[2:].strip()
+        elif line.startswith("A:"):
+            a = line[2:].strip()
+    if q and a:
+        pairs.append((q, a))
+    return pairs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--stats", action="store_true", help="report survival, write nothing")
+    ap.add_argument(
+        "--voice",
+        type=Path,
+        default=Path(__file__).resolve().parents[2] / "data_local" / "chat" / "local-voice.qa",
+        help="hand-written pairs, repeated so they are not drowned",
+    )
+    ap.add_argument("--voice-repeat", type=int, default=40)
     args = ap.parse_args()
 
     seen_pair: set[str] = set()
@@ -232,6 +284,16 @@ def main() -> int:
         except FileNotFoundError as exc:
             print(f"{name}: missing ({exc.filename})", file=sys.stderr)
         report.append((name, seen, kept))
+
+    voice = load_voice(args.voice)
+    if voice:
+        for _ in range(args.voice_repeat):
+            for prompt, response in voice:
+                rows.append({"prompt": prompt, "response": response, "source": "voice"})
+        print(
+            f"{'voice':22s} {'':8s} {len(voice) * args.voice_repeat:6d}  "
+            f"({len(voice)} x{args.voice_repeat})"
+        )
 
     print(f"{'source':22s} {'scanned':>8s} {'kept':>6s}")
     for name, seen, kept in report:

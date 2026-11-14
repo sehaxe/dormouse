@@ -31,6 +31,7 @@ taken — say so, do not quote a table from a busy card.**
 
 from __future__ import annotations
 
+import os
 import statistics
 import subprocess
 import sys
@@ -51,7 +52,13 @@ from _lane import preflight, skip  # noqa: E402
 
 #: The port's data on this box (AGENTS §2.6) — the LOCAL copy (the /mnt drive
 #: may not be mounted; the 19.9 GB filtered corpus was copied here).
-DATA = "/home/sehaxe/dormouse/data_local/corpus_bin_filtered.bin"
+#: The corpus is a smoke input, not a benchmark: any pretrain .bin with enough
+#: bytes for the largest window will do. The old hardcoded path was deleted with
+#: `data_local/` on 2026-11-08, which turned this script into a crash until
+#: 2026-11-14 — resolve through the same env override the trainer uses.
+DATA = os.environ.get(
+    "SMOKE_DATA", "/home/sehaxe/dormouse/data_local/best/fwedu_train.bin"
+)
 
 DEV = "cuda"
 BATCH = 2

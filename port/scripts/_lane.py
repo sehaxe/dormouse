@@ -52,6 +52,14 @@ def _compute_app_gib(line: str) -> float:
         return 0.0
 
 
+#: Processes that live on the card permanently and are NOT experiments: the
+#: desktop compositor/service. A benchmark that refuses because a wallpaper
+#: daemon holds 1.2 GiB never measures anything, so these are named and allowed
+#: out loud. Anything else holding VRAM still blocks — that is the rule that
+#: stops two experiments colliding.
+ALLOWED_APPS = ("/usr/bin/hex",)
+
+
 def preflight(device: str, ceiling_gib: float = CARD_CEILING_GIB) -> str | None:
     """`None` when the card is ours, else the reason to skip.
 
@@ -80,7 +88,15 @@ def preflight(device: str, ceiling_gib: float = CARD_CEILING_GIB) -> str | None:
         capture_output=True,
         text=True,
     ).stdout.strip()
-    busy = [line for line in apps.splitlines() if line.strip() and _compute_app_gib(line) >= 0.5]
+    rows = [line for line in apps.splitlines() if line.strip() and _compute_app_gib(line) >= 0.5]
+    allowed = [r for r in rows if r.split(",")[1].strip() in ALLOWED_APPS]
+    busy = [r for r in rows if r not in allowed]
+    if allowed:
+        print(
+            "[preflight] allowing resident desktop app(s): "
+            + ", ".join(r.split(",")[1].strip() for r in allowed),
+            flush=True,
+        )
     if busy:
         return "a compute process holds the card:\n" + "\n".join(busy)
     smi = subprocess.run(
