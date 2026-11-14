@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ru" data-theme="stage">
+<html lang="ru" data-theme="paper">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -66,7 +66,7 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
 .split .txt .kicker{margin-bottom:2vmin}
 .split .txt h2{font-size:4.6vmin}
 .split .txt p{margin-top:2.4vmin;font-size:1.8vmin;max-width:34ch}
-.split .media{height:100%;position:relative;overflow:hidden;background:var(--panel);border-left:1px solid var(--line)}
+.split .media{height:100%;position:relative;overflow:hidden;background:var(--paper);border-left:1px solid var(--line)}
 .split .media video,.split .media .poster{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 .split .media .poster,.slide.video .poster{display:none}
 .slide.video .poster{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
@@ -114,8 +114,8 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
   <div class="title-wrap">
     <div class="kicker">одна видеокарта · без токенизатора</div>
     <h1 style="margin-top:2.4vmin">dormouse</h1>
-    <div class="title-sub">Языковая модель, которую обучают на домашнем компьютере.</div>
-    <div class="title-meta"><span>цель — <span class="dot">дешёвый и умный</span> чат-бот</span><span>16 ГБ</span><span>дни</span></div>
+    <div class="title-sub">Чат-бот, который живёт у вас на компьютере.</div>
+    <div class="title-meta"><span>один файл</span><span>без сети</span><span class="dot">16 ГБ</span></div>
   </div>
   <div class="num">01 / 10</div>
 </section>
@@ -123,9 +123,9 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
 <!-- 02 · the number -->
 <section class="slide">
   <div class="statement">
-    <div class="kicker">плотность</div>
-    <div class="line"><strong>Ум на байт файла,<br>на флоп, на час.</strong></div>
-    <div class="big" style="margin-top:1vmin">16<small>ГБ — это вся машина</small></div>
+    <div class="kicker">что это</div>
+    <div class="line"><strong>Не сервис.<br>Ваша модель.</strong></div>
+    <div class="big" style="margin-top:1vmin">0<small>запросов наружу</small></div>
   </div>
   <div class="num">02 / 10</div>
 </section>
@@ -148,8 +148,8 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
   <div class="split">
     <div class="txt">
       <div class="kicker">вход</div>
-      <h2>Файл входит<br>как есть</h2>
-      <p>256 символов. Ни словаря, ни токенизатора.</p>
+      <h2>Читает<br>букву за буквой</h2>
+      <p>Любой язык и любой код. Без словаря, без подготовки текста.</p>
     </div>
     <div class="media">
       <video src="../media/Bytes.webm" id="bytes" muted loop playsinline autoplay
@@ -165,8 +165,8 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
   <div class="split">
     <div class="txt">
       <div class="kicker">формат</div>
-      <h2>Три уровня<br>на вес</h2>
-      <p>Модель учится в том виде, в котором потом уезжает.</p>
+      <h2>Три значения<br>вместо тысячи</h2>
+      <p>Модель учится сразу в том сжатом виде, в котором уезжает к вам.</p>
     </div>
     <div class="media">
       <video src="../media/Ternary.webm" id="ternary" muted loop playsinline autoplay
@@ -182,8 +182,8 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
   <div class="split">
     <div class="txt">
       <div class="kicker">сжатие</div>
-      <h2>Спектр,<br>обрезанный на ранге</h2>
-      <p>Матрица весов как сумма нескольких направлений.</p>
+      <h2>Как сжатая<br>фотография</h2>
+      <p>Главное остаётся, лишнее уходит. Поэтому файл помещается в карман.</p>
     </div>
     <div class="media">
       <video src="../media/Spectral.webm" id="spectral" muted loop playsinline autoplay
@@ -194,18 +194,18 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
   <div class="num">06 / 10</div>
 </section>
 
-<!-- 07 · muon -->
+<!-- 07 · what it does today -->
 <section class="slide">
-  <div class="split">
-    <div class="txt">
-      <div class="kicker">шаг</div>
-      <h2>Ортогональный<br>шаг</h2>
-      <p>Оптимизатор выравнивает обновление по всем направлениям сразу.</p>
-    </div>
-    <div class="media">
-      <video src="../media/Muon.webm" id="muon" muted loop playsinline autoplay
-        data-light="../media/Muon.webm" data-dark="../media/Muon_dark.webm" poster="../media/poster_Muon.jpg"></video>
-    <img class="poster" src="../media/poster_Muon.jpg" alt="">
+  <div class="pad">
+    <div class="kicker">сейчас</div>
+    <h2 style="margin-top:2vmin">Отвечает на короткие вопросы.<br>Держит ваш голос.</h2>
+    <div class="thirds">
+      <div class="third"><div class="k">умеет</div><div class="v">диалог</div>
+        <div class="d">Реплика в реплику, по-русски и по-английски.</div></div>
+      <div class="third"><div class="k">умеет</div><div class="v">офлайн</div>
+        <div class="d">Ни сети, ни ключей, ни подписки.</div></div>
+      <div class="third"><div class="k">пока нет</div><div class="v">фактов</div>
+        <div class="d">Модель маленькая: знания и длинные ответы — следующий шаг.</div></div>
     </div>
   </div>
   <div class="num">07 / 10</div>
@@ -215,7 +215,7 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
 <section class="slide">
   <div class="pad">
     <div class="kicker">цена</div>
-    <h2 style="margin-top:2vmin">Всё, что дороже этих трёх чисел, — не наш путь</h2>
+    <h2 style="margin-top:2vmin">Обучается у вас, а не в чужом облаке</h2>
     <div class="thirds">
       <div class="third"><div class="k">железо</div><div class="v">16 ГБ</div>
         <div class="d">Потребительская карта. Не кластер.</div></div>
@@ -236,7 +236,7 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
   <div class="scrim"></div>
   <div class="cap">
     <div class="kicker">обучение</div>
-    <h2>Каждый байт текста делает модель дешевле</h2>
+    <h2>Каждый час на карте приближает продукт</h2>
   </div>
   <div class="num">09 / 10</div>
 </section>
@@ -263,13 +263,7 @@ p{font-size:1.85vmin;line-height:1.55;color:var(--dim);max-width:58ch}
 <script>
 const slides=[...document.querySelectorAll('.slide')];
 const vids=[...document.querySelectorAll('video[data-light]')];
-// The poster is also the print face of the slide: a PDF cannot carry video, and a
-// blank rectangle where the animation was is worse than a still of it.
-for(const v of vids){
-  const host=v.closest('.media')||v.closest('.slide'), src=v.getAttribute('poster');
-  if(host&&src){host.style.backgroundImage=`url(${src})`;host.style.backgroundSize=host.classList.contains('media')?'contain':'cover';
-    host.style.backgroundPosition='center';host.style.backgroundRepeat='no-repeat';}
-}
+
 let i=0;
 
 function paint(){
