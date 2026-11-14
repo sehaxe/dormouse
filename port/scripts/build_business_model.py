@@ -115,12 +115,13 @@ def build() -> None:
     ws.append(["product", "unit", "price, USD", "our cost, USD", "margin"])
     style_header(ws, ws.max_row, 5)
 
-    ws.append(["Local licence (one file, no network)", "per seat, one-off", 39, 0, "=C5-D5"])
+    ws.append(["Weights: open (Apache-2.0), like Qwen and DeepSeek", "free", 0, 0, "=C5-D5"])
     ws.append(["Token API, cheap tier", "per 1M bytes", 0.30, 0, "=C6-D6"])
     ws.append(["Token API, private tier", "per 1M bytes", 1.20, 0, "=C7-D7"])
     ws.append(["On-prem deployment (hospital, ministry)", "per site, one-off", 25000, "=Unit cost!B11", "=C8-D8"])
-    ws.append(["Support contract", "per site per year", 8000, 0, "=C9-D9"])
-    note(ws, "A12", "Token cost is ~0: the card is already paid for. The real cost is one build (row 8) and idle capacity.")
+    ws.append(["Fine-tune on the customer's own data", "per project", 12000, "=Unit cost!B11", "=C9-D9"])
+    ws.append(["Support contract", "per site per year", 8000, 0, "=C10-D10"])
+    note(ws, "A13", "Weights are free on purpose: Qwen and DeepSeek are Apache/MIT, so a paid licence for the file cannot be defended. What is not free is putting it inside someone's perimeter and making their data work.")
     ws.column_dimensions["A"].width = 44
     ws.column_dimensions["B"].width = 22
     ws.column_dimensions["C"].width = 14
@@ -134,10 +135,10 @@ def build() -> None:
     ws.append(["scenario", "units / year", "unit price", "revenue", "cost", "profit"])
     style_header(ws, ws.max_row, 6)
 
-    ws.append(["Local licences", 2000, "=Pricing!C5", "=B5*C5", "=B5*Pricing!D5", "=D5-E5"])
-    ws.append(["Token API, 1e4 users x 20 MB/yr", 200000, "=Pricing!C6/1e6*20", "=B6*C6", "=B6*Pricing!D6", "=D6-E6"])
-    ws.append(["On-prem sites", 4, "=Pricing!C8", "=B7*C7", "=B7*Pricing!D8", "=D7-E7"])
-    ws.append(["Support contracts", 4, "=Pricing!C9", "=B8*C8", "=B8*Pricing!D9", "=D8-E8"])
+    ws.append(["Token API, 1e4 users x 20 MB/yr", 200000, "=Pricing!C6/1e6*20", "=B5*C5", "=B5*Pricing!D6", "=D5-E5"])
+    ws.append(["On-prem sites", 4, "=Pricing!C8", "=B6*C6", "=B6*Pricing!D8", "=D6-E6"])
+    ws.append(["Fine-tune projects", 6, "=Pricing!C9", "=B7*C7", "=B7*Pricing!D9", "=D7-E7"])
+    ws.append(["Support contracts", 4, "=Pricing!C10", "=B8*C8", "=B8*Pricing!D10", "=D8-E8"])
     ws.append(["TOTAL", "", "", "=SUM(D5:D8)", "=SUM(E5:E8)", "=D9-E9"])
     ws.append([])
     ws.append(["Fixed cost: one engineer", "", "", "", "=Inputs!B14*12", ""])
