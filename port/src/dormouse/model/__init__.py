@@ -23,7 +23,7 @@ from .engram import Engram, fnv, raw_keys, table_slots
 from .experts import DualLatentGLU, SparseMoE
 from .kda import KDAAttention, fla_status
 from .loopblock import LoopBlock, memory_floor_mix
-from .model import DormouseModel, param_count
+from .model import DormouseModel, FactorizedEmbedding, param_count, refuse_vocab_mismatch
 from .tsct import DenseLinear, TSCTLinear, make_projection
 
 __all__ = [
@@ -35,6 +35,7 @@ __all__ = [
     "ConvCodec",
     "DenseLinear",
     "DormouseModel",
+    "FactorizedEmbedding",
     "DualLatentGLU",
     "Engram",
     "KDAAttention",
@@ -56,6 +57,7 @@ __all__ = [
     "marginal_gains_l2",
     "memory_floor_mix",
     "param_count",
+    "refuse_vocab_mismatch",
     "raw_keys",
     "select_positions",
     "table_slots",

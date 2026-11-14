@@ -939,6 +939,31 @@ class ModelConfig:
     #: would be inert while the snapshot reported it on). `false` is every
     #: number on record, and the off path is bit-identical.
     tie_embeddings: bool = False
+    #: THE FACTORIZED TOKEN EMBEDDING: `r = 0` is the plain `[vocab, d_model]`
+    #: row table (bit-identical to every number on record). `r > 0` builds the
+    #: same matrix as `E = U @ Vᵀ` — `U [vocab, r]` an `nn.Embedding`, `V [d, r]`
+    #: a bias-free `nn.Linear` — because a 32k BPE vocabulary at `d=832` is 27.3M
+    #: parameters read by ONE first matmul; `r=256` costs `vocab·r + r·d` = 8.6M
+    #: (`tests/test_embed_rank.py` pins both numbers).
+    #:
+    #: INIT is the A/B's licence: the plain table draws `N(0, 1)`, so `U` draws
+    #: `N(0, 1)` and `V` draws `N(0, 1/r)` — a row's dot product has variance
+    #: `r·1·(1/r) = 1`. Step 0 starts at the same scale, so a loss difference is
+    #: the factorization and not an init change.
+    #:
+    #: The head is left alone: this flag never touches `lm_head`. With
+    #: `tie_embeddings=true` the tied head reads the SAME factorization
+    #: (`TiedHead` → `(x @ V) @ Uᵀ`) — one matrix, two paths, as always. TSCT
+    #: never reaches the token embedding (`tsct.py`: `nn.Embedding` tables are
+    #: excluded from the factor format by design), so `use_tsct` composes: the
+    #: body and its head stay TSCT, only the embedding factorizes.
+    #:
+    #: REFUSED (`ModelConfig.__post_init__`): `r < 0`; `r > d_model` (a rank
+    #: above the width is not a factorization); and `r > 0` with
+    #: `use_byteflow` (both byteflow shapes build their own `embedding` and
+    #: never `self.embed`, so the flag would reach no module while the snapshot
+    #: reported it on).
+    embed_rank: int = 0
 
     # --- cheap width (2026-10-23): stop `d` from setting the dense bill ----
     #: MLA-style SHARED LATENT for KDA's four `d×d` projections (`q,k,v,g`).
@@ -1934,6 +1959,21 @@ class ModelConfig:
                 "Option B decodes with `decode_chunks`), so there is no head to tie "
                 "and the flag would be inert while the snapshot reported it on. "
                 "Escape: tie_embeddings=false, or use_byteflow=false."
+            )
+        if self.embed_rank < 0 or self.embed_rank > self.d_model:
+            loud(
+                f"embed_rank={self.embed_rank}: the token embedding is `U @ Vᵀ` with "
+                f"`U [vocab, r]` and `V [d_model, r]`, so r must be in 0..=d_model="
+                f"{self.d_model} (0 = the plain `[vocab, d_model]` table). A rank "
+                f"above the width is not a factorization. Escape: 0..=d_model."
+            )
+        if self.embed_rank > 0 and (self.use_byteflow or self.byte_patch):
+            loud(
+                "embed_rank>0 with use_byteflow/byte_patch: both byteflow shapes "
+                "build their own `embedding` table (the codec's latent width) and "
+                "never build `self.embed`, so the factorization would reach no "
+                "module while the snapshot reported it on. Escape: "
+                "use_byteflow=false, or embed_rank=0."
             )
         if self.z_loss > 0.0 and self.use_byteflow:
             loud(

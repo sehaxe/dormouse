@@ -22,7 +22,10 @@ arm to run first).
 
 from __future__ import annotations
 
+import json
 import math
+from collections.abc import Mapping
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -69,6 +72,108 @@ def mhc_readout(streams: torch.Tensor, compose: bool) -> torch.Tensor:
     """
     h = streams.float().sum(dim=-2)
     return h / streams.shape[-2] if compose else h
+
+
+def tokenizer_vocab(path: str | Path) -> int:
+    """The ID SPACE a `tokenizers` JSON claims — `max(id) + 1` over its tables.
+
+    A `tokenizers` file lists ids explicitly (`model.vocab` maps token → id, and
+    `added_tokens` carry theirs), so counting entries would under-report a
+    file with holes; the row count `nn.Embedding` needs is one past the largest
+    id in use.
+    """
+    data = json.loads(Path(path).read_text())
+    ids = list(data.get("model", {}).get("vocab", {}).values())
+    ids += [t["id"] for t in data.get("added_tokens", []) if "id" in t]
+    if not ids:
+        loud(f"tokenizer {path}: no `model.vocab` and no `added_tokens` — not a tokenizers file")
+    return max(ids) + 1
+
+
+def embedding_rows(sd: Mapping[str, torch.Tensor]) -> int | None:
+    """The token-table row count a state dict carries (`embed.weight` or the
+    factorized `embed.u.weight`), or `None` when it carries no table at all."""
+    for key, tensor in sd.items():  # stepaudit-excuse: load, once per checkpoint
+        if key.endswith(("embed.weight", "embed.u.weight")):
+            return int(tensor.shape[0])
+    return None
+
+
+def refuse_vocab_mismatch(
+    *,
+    vocab: int,
+    ckpt: Mapping[str, torch.Tensor] | None = None,
+    tokenizer: str | Path | None = None,
+) -> None:
+    """Vocabulary is IDENTITY: a mismatched table is refused, never padded.
+
+    A `[v', d]` table that loads into a `[v, d]` model is either an error
+    torch raises deep in the load or — the defect this exists for — rows
+    somebody zero-padded to make the load pass. Both are a model reading ids it
+    was never trained on. Two sources are checked: the checkpoint's own rows,
+    and the tokenizer file the ids came from when the caller has one.
+    """
+    if ckpt is not None:
+        rows = embedding_rows(ckpt)
+        if rows is not None and rows != vocab:
+            loud(
+                f"checkpoint token table has {rows} rows, model vocab={vocab}: "
+                f"the vocabulary is IDENTITY, so a tokenizer change is a new "
+                f"model (or a re-embedding pass), never a padded table. Escape: "
+                f"build the model with vocab={rows} and the checkpoint's "
+                f"tokenizer, or start from a checkpoint of this vocabulary."
+            )
+    if tokenizer is not None:
+        tok = tokenizer_vocab(tokenizer)
+        if tok != vocab:
+            loud(
+                f"tokenizer {tokenizer} has {tok} ids, model vocab={vocab}: the "
+                f"model would read ids it never embedded (and logits every "
+                f"target checks against the wrong rows). Escape: vocab={tok} to "
+                f"match the tokenizer, or a tokenizer of vocab={vocab}."
+            )
+
+
+class FactorizedEmbedding(nn.Module):
+    """The token table as `U @ Vᵀ` — `U [vocab, r]`, `V [d, r]` (`embed_rank`).
+
+    `nn.Embedding(vocab, d)` is `vocab·d` parameters that ONE first matmul
+    reads. The factorization costs `vocab·r + r·d`: 32k×256 + 256×832 = 8 601 600
+    against 27 262 976 at `d=832`, and it is a genuine rank-`r` bottleneck on
+    the input, not a widening.
+
+    INIT is what makes an A/B readable: the plain table draws `N(0, 1)`, so `U`
+    draws `N(0, 1)` and `V` draws `N(0, 1/r)` — a row's dot product has variance
+    `r · 1 · (1/r) = 1`. Step 0 therefore starts at the plain table's scale and
+    a loss difference is the factorization, not an init change.
+
+    `weight` materialises the `[vocab, d]` product for the readers that need the
+    whole matrix (the energy arm). It costs `vocab·r·d` FLOP, so nothing on the
+    training path may read it — `forward` is the lookup and `head` is the tied
+    head's transpose, both factored.
+    """
+
+    def __init__(
+        self, vocab: int, d: int, rank: int, *, device: torch.device | str | None = None
+    ) -> None:
+        super().__init__()
+        self.u = nn.Embedding(vocab, rank, device=device)
+        self.v = nn.Linear(rank, d, bias=False, device=device)
+        nn.init.normal_(self.u.weight, 0.0, 1.0)
+        nn.init.normal_(self.v.weight, 0.0, rank**-0.5)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.v(self.u(ids))
+
+    def head(self, x: torch.Tensor) -> torch.Tensor:
+        """`x @ (U Vᵀ)ᵀ` = `(x @ V) @ Uᵀ`, in fp32 (the burn head rule) — never
+        materialises `[vocab, d]`."""
+        v = self.v.weight.to(torch.float32)  # [d, r]
+        return F.linear(F.linear(x.to(torch.float32), v.T), self.u.weight.to(torch.float32))
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.u.weight @ self.v.weight.T  # [vocab, d], materialised — slow
 
 
 class DormouseModel(nn.Module):
@@ -278,7 +383,22 @@ class DormouseModel(nn.Module):
             self.last_halt = None
             self.last_breakdown = {}
             return
-        self.embed = nn.Embedding(cfg.vocab, d, device=device)
+        # The token table: plain (`embed_rank=0`, bit-identical to every run on
+        # record) or `U @ Vᵀ` (see `FactorizedEmbedding`). Built at ONE site so
+        # the off path cannot drift from the rows it replaces.
+        if cfg.embed_rank < 0 or cfg.embed_rank > d:
+            # The runtime seam a hand-built model reaches; `__post_init__` owns
+            # the same refusal (ADR-0019).
+            loud(
+                f"embed_rank={cfg.embed_rank} outside 0..=d_model={d}: a rank above "
+                f"the width is not a factorization of the token table. Escape: "
+                f"0..=d_model."
+            )
+        self.embed: nn.Module = (
+            FactorizedEmbedding(cfg.vocab, d, cfg.embed_rank, device=device)
+            if cfg.embed_rank > 0
+            else nn.Embedding(cfg.vocab, d, device=device)
+        )
         if cfg.block_stack != "uniform":
             # THE HYBRID STACK (`block_stack`): the ordered mix `[K,K,K,A]×`,
             # built from the SAME two block modules the pure forms use — a
@@ -842,6 +962,24 @@ class DormouseModel(nn.Module):
             if hasattr(m, "dense_qat_alpha"):
                 m.dense_qat_alpha = alpha
 
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        """The vocabulary check that torch's shape check cannot name.
+
+        `train`'s resume, `eval`, `decode`, `serve` and `scripts/chat.py` all
+        reach the weights through `load_state_dict` (`train/loop.py::
+        load_model_state` included), so this is the ONE seam a 32k-tokenizer
+        checkpoint meets a 256-row table at. Torch's message for that case is a
+        shape; the model's is the tokenizer migration. Padding is never legal
+        (`refuse_vocab_mismatch`).
+        """
+        refuse_vocab_mismatch(vocab=self.cfg.vocab, ckpt=state_dict)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1154,9 +1292,12 @@ class DormouseModel(nn.Module):
             f"the loop's input contract is [b, t, d_model] = "
             f"{(b_in, t_in, self.cfg.d_model)}, got {tuple(h0.shape)}"
         )
-        assert h0.dtype == self.embed.weight.dtype, (
-            f"the loop's input dtype must be the residual dtype "
-            f"{self.embed.weight.dtype}, got {h0.dtype}"
+        # The residual dtype is the embedding's PARAMETER dtype (one table or two
+        # factors — the write's dtype is the same either way); `weight` would
+        # materialise the factorized product, so it is not read here.
+        embed_dtype = next(self.embed.parameters()).dtype
+        assert h0.dtype == embed_dtype, (
+            f"the loop's input dtype must be the residual dtype {embed_dtype}, got {h0.dtype}"
         )
         # The HALT HEAD is an INFERENCE mechanism (`halt.py`): a training step
         # runs the scheduled depth, because the head's BCE needs every iteration
@@ -1708,14 +1849,21 @@ class TiedHead(nn.Module):
     forward's final logits both accumulate into `embed.weight` — which is the
     whole of what "tied" means and what `tests/test_train4.py` asserts against
     a hand-built two-path model.
+
+    A FACTORIZED table (`embed_rank > 0`) is tied the same way: the head is
+    `(x @ V) @ Uᵀ`, the transpose of the same `U @ Vᵀ`, so tying still adds no
+    parameter and the `[vocab, d]` product is never materialised.
     """
 
-    def __init__(self, embed: nn.Embedding) -> None:
+    def __init__(self, embed: nn.Module) -> None:
         super().__init__()
         self._owner = [embed]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x.to(torch.float32), self._owner[0].weight.to(torch.float32))
+        embed = self._owner[0]
+        if isinstance(embed, FactorizedEmbedding):
+            return embed.head(x)
+        return F.linear(x.to(torch.float32), embed.weight.to(torch.float32))
 
 
 def _byte_ce(
