@@ -173,3 +173,27 @@ recorded as a measured refusal. Single-seed noise on record: 0.008–0.011 BPB.
 - No GPU job without `/tmp/dormouse-gpu.lock`; no shelling around the guard.
 - Report numbers with the command that produced them; a claim without one is not
   a result.
+
+# PLAN — TST re-armed on the paper's own equations (2026-11-15)
+
+Owner: the audit (`docs/records/reviews/2026-11-15-rejection-audit.md` §1) found
+the TST arm measured MCE_Alt and an inverted schedule, so its verdict is
+inadmissible. Re-arm it honestly before any A/B is run.
+
+## T10 — the paper's loss (Eq. 3) and the paper's `r` — DONE
+- `losses.multihot_cross_entropy` = Eq. 3, `(1/|y|) Σ_{y∈y} L_CE(z, y)`; MCE_Alt
+  (App. C.2 Eq. 6, `-log((1/k) Σ_i p[b_i])`) is DELETED, not flagged: nothing
+  would ever set it, and one key for one arm is the seam this repo's rules ask
+  for.
+- `TrainConfig.tst_frac` 0.7 → **0.3** and its docstring now states which side
+  it controls (Fig. 4's `r`, the SUPERPOSITION share; Table 2 = 6 000 of
+  20 000; §6's range `r ∈ [0.2, 0.4]`).
+- Gates (`port/tests/test_tst.py`, 26 CPU tests): the hand-computed 2-byte bag
+  p = (0.8, 0.2) pins 0.9162907 (Eq. 3) vs 0.6931472 (MCE_Alt); a 200-step CPU
+  run k = 4 must go 5.545 → ≤ 1.66 and ≥ ln k, with the model's OWN per-byte CE
+  recomputed from its logits (the old code reports 1.386 in the loss column and
+  17.71 in the state — that is the number the gate reads); `tst_frac == 0.3`
+  and 6 000 steps → 1 800 superposition steps.
+- Still open, by design: the A/B. `scripts/tst_ab.sh` (arm now `tst_frac=0.3`)
+  is the re-run, and the audit's threshold stands — TST is off if it loses by
+  more than 0.02 BPB at equal wall time.

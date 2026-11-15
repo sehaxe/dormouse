@@ -1570,8 +1570,8 @@ def _train_impl(
         # a reader does not infer the phase from the loss curve.
         log(
             f"tst: positions 1..{tst_switch} carry a bag of k={cfg.tst_bag} "
-            f"consecutive bytes and train on multi-hot CE "
-            f"(`-log((1/k)Σp[b_i])`, fp32); step {tst_switch + 1} and after switch "
+            f"consecutive bytes and train on multi-hot CE = the MEAN of the k "
+            f"per-byte CEs (paper Eq. 3, fp32); step {tst_switch + 1} and after switch "
             f"to one byte per position in the SAME run (the recovery phase). One "
             f"phase-1 step reads {tst_stream_bytes(cfg, 1)} B, a phase-2 step "
             f"{cfg.batch * (cfg.seq_len + 1) * cfg.grad_accum} B; the eval window "
@@ -2076,10 +2076,11 @@ def _train_impl(
         caller, because they are the parts a capture cannot carry.
 
         `bag > 1` is TST (`tst_bag`): `y` is a `[b, t, bag]` target and the loss
-        is the multi-hot CE over the bag (`losses.multihot_cross_entropy`),
-        computed HERE from the logits the model returns for `targets=None`. The
-        forward is the same call with one argument absent — the model owns no
-        bag branch, which is why `bag=1` is the historical step bit for bit.
+        is the paper's Eq. 3 — the mean of the bag's `k` per-byte CEs
+        (`losses.multihot_cross_entropy`) — computed HERE from the logits the
+        model returns for `targets=None`. The forward is the same call with one
+        argument absent — the model owns no bag branch, which is why `bag=1` is
+        the historical step bit for bit.
         """
         if bag > 1:
             logits, _, step_counters = model(x, None, **kw)

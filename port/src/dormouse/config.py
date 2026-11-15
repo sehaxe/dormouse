@@ -2691,9 +2691,13 @@ class TrainConfig:
     #: phase: position `q` of a window carries the byte at flat offset `q·k`, and
     #: the target is the BAG of the `k` bytes that follow it, so one window reads
     #: `seq_len·k + 1` bytes (byte-level model, vocabulary 256, no tokenizer).
-    #: The loss is `-log((1/k) Σ_i p[b_i])` (`losses.multihot_cross_entropy`),
-    #: NOT the mean of `k` single-byte CEs: a bag of `k` bytes that covers the
-    #: distribution scores 0 where the average CE scores `log k`.
+    #: The loss is the paper's Eq. 3, the MEAN of the `k` per-byte CEs
+    #: (`losses.multihot_cross_entropy`): `(1/|y|) Σ_{y∈y} L_CE(z, y)`. The
+    #: per-byte CE is the same functional form the eval scores (BPB), which is why
+    #: it is the form the paper trains. It is NOT `-log((1/k) Σ_i p[b_i])`: that is
+    #: MCE_Alt (App. C.2, Eq. 6), the variant the paper investigated and did not
+    #: adopt — a bag that holds the total mass satisfies it while spreading that
+    #: mass arbitrarily inside, so it puts no pressure on the split.
     #:
     #: Phase 2 (`step >= round(steps · tst_frac)`) switches to the ordinary
     #: one-byte objective IN THE SAME RUN, which is the paper's recovery phase —
@@ -2711,12 +2715,24 @@ class TrainConfig:
     #: Non-progress: flipping it changes what the run trains on, so the snapshot
     #: drift check refuses a flip on a resume.
     tst_bag: int = 1
-    #: The share of `steps` that runs the superposition phase (paper: ~70 %).
+    #: THE PAPER'S `r`: the SUPERPOSITION share of the run. The first
+    #: `round(steps · tst_frac)` steps train bags, the remaining `1 - r` train
+    #: one byte per position (the recovery phase). `0.3` is the paper's value
+    #: (arXiv:2605.06546v2 Table 2: 6 000 of 20 000 steps at every dense scale;
+    #: Fig. 4 caption defines r as "the ratio of number of steps trained in the
+    #: superposition regime, with 1 − r trained in the normal regime") and §6
+    #: gives its robust range as `r ∈ [0.2, 0.4]`.
+    #:
+    #: It is NOT "the share of the run that is ordinary training". This field's
+    #: original default was 0.7 = the paper's r INVERTED — the run on record
+    #: (`logs/runs/20261114-191657-port`, 4 200 superposition steps of 6 000)
+    #: trained bags for 70 % of its steps and left the recovery phase 30 %.
+    #:
     #: The boundary is `round(steps · tst_frac)`, a PURE function of the config,
     #: so a resume lands in the same phase the unbroken run would be in. Inert
-    #: (`tst_bag=1`): 0 is refused because a phase that never fires while the
+    #: (`tst_bag=1`); 0 is refused because a phase that never fires while the
     #: log reported the arm on is a config that lies (ADR-0019).
-    tst_frac: float = 0.7
+    tst_frac: float = 0.3
     out_dir: str = "checkpoints"
     timers: bool = False
     #: Host-RAM Engram tables — burn's `--engram-ram` (Qwen3.8-Flash-Next §2.3
@@ -6225,7 +6241,8 @@ def _validate_tst(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"`round(steps · tst_frac)` steps, so the share must be in (0, 1] — "
             f"0 is a phase that never fires while the log reports the arm on, and "
             f">1 would leave no recovery phase (write 1.0 for that). Escape: "
-            f"0 < tst_frac <= 1 (0.7 is the paper's share and the default)."
+            f"0 < tst_frac <= 1 (0.3 is the paper's r, r ∈ [0.2, 0.4], and the "
+            f"default)."
         )
     if tcfg.tst_bag <= 1:
         return

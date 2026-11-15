@@ -1,14 +1,20 @@
 """Token-Superposition Training (arXiv:2605.06546v2) on a byte-level model.
 
 A bag is `k` consecutive BYTES and the vocabulary is 256, so one position's
-objective is
+objective is the paper's Eq. 3 (§3.2) — the MEAN of the per-byte cross-entropies:
 
-    loss = -log( (1/k) · Σ_i p[b_i] ),   p = softmax(logits over 256)
+    loss = (1/k) · Σ_i L_CE(z, b_i),   L_CE(z, y) = -log p(y),  p = softmax(logits)
+
+The variant this arm used to run, MCE_Alt (App. C.2, Eq. 6),
+`-log((1/k)·Σ_i p[b_i])`, is NOT the objective and one gate below is what keeps
+it from creeping back.
 
 `tst_bag=1` is OFF and must be today's program bit for bit. The gates below are
-the ones that make that claim checkable: the k=1 loss, the two hand-computed
-bags, the ORDER invariance (a bag is a set — the property an ordinary CE
-implementation silently loses), and the byte count the bag window reads.
+the ones that make that claim checkable: the k=1 loss, the hand-computed
+2-byte bag (where the two variants differ), the ORDER invariance (a bag is a
+set — the property an ordinary CE implementation silently loses), the
+superposition phase actually learning, the paper's schedule as the default, and
+the byte count the bag window reads.
 """
 
 from __future__ import annotations
@@ -70,31 +76,42 @@ def test_k1_is_the_ordinary_ce_bit_for_bit():
 
 
 def test_a_certain_bag_scores_zero():
-    """Two certain bytes (p = 1 each, identical) → mean p = 1 → loss exactly 0."""
+    """Two certain bytes (p = 1 each, identical) → two zero CEs → loss exactly 0."""
     logits = torch.tensor([[0.0, -1000.0, -1000.0, -1000.0]])
     loss = multihot_cross_entropy(logits, torch.tensor([[0, 0]]))
     assert float(loss) == 0.0
 
 
-def test_two_distinct_half_probability_bytes_give_minus_log_half():
-    """p = (0.5, 0.5) over two distinct bag members → `-log(0.5)`, the formula."""
+def test_eq3_is_the_mean_of_the_per_byte_ces_not_mce_alt():
+    """Hand-computed 2-byte bag, p = (0.8, 0.2): the TWO VARIANTS DIFFER.
+
+    The paper's Eq. 3 (what this arm trains), the mean of the two per-byte CEs:
+
+        (L_CE(b0) + L_CE(b1)) / 2 = (-log 0.8 - log 0.2) / 2 = 0.9162907…
+
+    MCE_Alt (App. C.2, Eq. 6 — the variant the 2026-11-14 arm ran, rejected):
+
+        -log( (p[b0] + p[b1]) / 2 ) = -log 0.5 = 0.6931472…
+
+    Both numbers are pinned here, and the gap (0.223) is the gate: a `-log Σp/k`
+    creeping back fails on `got == eq3`, and the fixture is chosen so the two
+    cannot coincide. On bytes they are different objectives — MCE_Alt is
+    satisfied (0) as soon as the bag holds the mass, with any split inside it.
+    """
+    logits = torch.tensor([[math.log(0.8), math.log(0.2)]])
+    got = float(multihot_cross_entropy(logits, torch.tensor([[0, 1]])))
+    eq3 = -(math.log(0.8) + math.log(0.2)) / 2
+    alt = -math.log((0.8 + 0.2) / 2)
+    assert got == pytest.approx(eq3, abs=1e-6)
+    assert alt == pytest.approx(math.log(2.0), abs=1e-9)
+    assert abs(got - alt) > 0.2, "the fixture must separate the two variants"
+
+
+def test_two_distinct_half_probability_bytes_cost_log_two_each():
+    """p = (0.5, 0.5) over two distinct bag members → each CE is `log 2`."""
     logits = torch.tensor([[0.0, 0.0, -1000.0, -1000.0]])
     loss = multihot_cross_entropy(logits, torch.tensor([[0, 1]]))
     assert float(loss) == pytest.approx(math.log(2.0), abs=1e-6)
-
-
-def test_the_bag_is_not_the_average_of_two_ces():
-    """The discriminating case: p = (0.8, 0.2) in one bag.
-
-    The formula: `-log((0.8 + 0.2)/2) = -log(0.5) = log 2`. The average of two
-    CEs would be `-(log 0.8 + log 0.2)/2 = 0.9163`. A bag that covers the mass
-    is easy to predict; that is the arm's whole point.
-    """
-    logits = torch.tensor([[math.log(0.8), math.log(0.2)]])
-    loss = float(multihot_cross_entropy(logits, torch.tensor([[0, 1]])))
-    average_ce = -(math.log(0.8) + math.log(0.2)) / 2
-    assert loss == pytest.approx(math.log(2.0), abs=1e-6)
-    assert abs(loss - average_ce) > 0.2, "the fixture must separate the two formulas"
 
 
 def test_the_loss_is_invariant_to_the_order_inside_a_bag():
@@ -112,8 +129,8 @@ def test_the_loss_is_invariant_to_the_order_inside_a_bag():
 
 
 def test_duplicates_are_counted_k_times_as_the_paper_writes_it():
-    """`Σ_i p[b_i]` over a bag of `k` copies of one byte is `Σ = k·p`, so the mean
-    is `p` and the loss is that byte's CE — the identity the formula implies."""
+    """`Σ_{y∈y}` over a bag of `k` copies of one byte averages that byte's CE k
+    times, so the mean is its CE — the identity the per-byte mean implies."""
     logits = torch.tensor([[0.0, 1.0]])
     twice = float(multihot_cross_entropy(logits, torch.tensor([[0, 0]])))
     once = float(multihot_cross_entropy(logits, torch.tensor([[0]])))
@@ -174,6 +191,30 @@ def test_the_phase_boundary_is_a_pure_function_of_the_config(tmp_path):
     assert tst_stream_bytes(off, 7) == 7 * 2 * (4 + 1)
 
 
+# --- the schedule: `tst_frac` is the paper's r ---------------------------------
+
+
+def test_the_default_schedule_is_the_papers_r(tmp_path):
+    """`tst_frac` is the SUPERPOSITION share, and the default is the paper's r.
+
+    arXiv:2605.06546v2 Fig. 4: "r is the ratio of number of steps trained in the
+    superposition regime, with 1 − r trained in the normal regime"; Table 2 runs
+    r = 0.3 at every dense scale (6 000 of 20 000 steps, 30 000 of 100 000) and
+    §6 gives the robust range `r ∈ [0.2, 0.4]`. The field's original default was
+    0.7 — the paper's r INVERTED, and what the 4 200-superposition-step run on
+    record was configured with. This gate pins the side of the switch.
+    """
+    assert TrainConfig().tst_frac == pytest.approx(0.3), "the paper's r, not 1 - r"
+    assert 0.2 <= TrainConfig().tst_frac <= 0.4  # §6's robust range
+    at_paper_scale = dataclasses.replace(
+        tiny_run(tmp_path).train, steps=6000, batch=2, seq_len=4, tst_bag=4
+    )
+    # Table 2: 6 000 TST steps of a 20 000-step run. Inverted, this reads 4 200.
+    assert tst_phase1_steps(at_paper_scale) == 1800
+    assert tst_bag_at(at_paper_scale, 1799) == 4
+    assert tst_bag_at(at_paper_scale, 1800) == 1
+
+
 # --- the trainer -------------------------------------------------------------
 
 
@@ -225,6 +266,68 @@ def test_the_trainer_switches_phase_mid_run(tmp_path):
     assert counters["tst_bags"] == 2
     assert counters["tst_bytes"] == 2 * 2 * (8 * 2 + 1) + 2 * 2 * (8 + 1)
     assert counters["tst_bag_bytes"] == 2 * 2 * (8 * 2 + 1)
+
+
+def test_the_superposition_phase_learns_within_200_steps(tmp_path):
+    """THE arm gate: 200 CPU steps on a tiny model must learn the objective.
+
+    The run on record (`logs/runs/20261114-191657-port`) moved held-out BPB
+    6.287 → 6.284 over 4 200 superposition steps, which is what a wrong objective
+    looks like. This gate runs the same phase on a 16-byte-cycle corpus where the
+    bag is DETERMINISTIC, for 200 steps at lr=0.01, and pins three things:
+
+    * the loss must fall from the untrained `ln 256 = 5.545` to below 30 % of it
+      (measured: 1.389 at step 200 = 4.0× down) — a stalled or detached objective
+      fails here;
+    * it must NOT fall below `ln k = 1.386`: for a bag of `k` DISTINCT bytes the
+      mean per-byte CE is `≥ ln k` (the `k` members share one softmax, so
+      `Σ_i p[b_i] ≤ 1`), and Eq. 3's optimum is the uniform `1/k` inside the bag;
+    * THE MODEL'S OWN per-byte CE — recomputed here from its logits, never read off
+      the trainer's loss — must be that same number. This is what catches the
+      rejected variant, which cannot be caught by the loss column: with the old
+      `+ log k` constant its reported loss also reads `ln k`, while its STATE is
+      the opposite one (a bag member at p = 0.91, the rest ~0, per-byte CE 17.7).
+      Measured on this fixture: Eq. 3 → 1.389, MCE_Alt → 17.71.
+
+    Measured at seed 0, k=4: 5.545 (untrained) → 2.323 (step 25) → 1.389 (step 200).
+    """
+    k = 4
+    corpus = _corpus(tmp_path / "learn.bin", n_bytes=8192, cycle=16)
+    run = _dense_run(
+        tmp_path,
+        steps=200,
+        batch=2,
+        seq_len=64,
+        lr=0.01,
+        log_every=25,
+        tst_bag=k,
+        tst_frac=1.0,
+        data=str(corpus),
+    )
+    lines: list[str] = []
+    torch.manual_seed(0)
+    model = DormouseModel(run.model)
+    report = train(model, run, log=lines.append)
+    assert any("tst_bag=4 tst_phase=1" in line for line in lines), lines[-3:]
+    final = float(report["loss"])
+    assert final <= 0.30 * math.log(256), f"the phase did not learn: {final:.4f}"
+    assert final >= math.log(k) - 1e-3, (
+        f"{final:.4f} is below ln k = {math.log(k):.4f}: a bag of k distinct bytes "
+        f"cannot get a per-byte mean below ln k, so this is another objective"
+    )
+    # The state, from the model alone: the mean per-byte CE of the bytes the bag
+    # names. The rejected mass-only variant sits at ~17.7 here, not at ln k.
+    stream = ByteStream(corpus, 2, 64)
+    x, y = stream.next_batch(k)
+    with torch.no_grad():
+        logits, _, _ = model(x, None)
+    p = torch.softmax(logits.float(), dim=-1).gather(1, y.reshape(-1, k))
+    mean_ce = float(-p.log().mean())
+    assert mean_ce <= 0.30 * math.log(256), (
+        f"the model's own per-byte CE is {mean_ce:.4f}: the bag's mass is where the "
+        f"objective put it, not the per-byte probability (spread ≈ 1/k ≈ {1 / k})"
+    )
+    assert mean_ce >= math.log(k) - 1e-2
 
 
 def test_bag_1_is_todays_step_and_todays_loss(tmp_path, monkeypatch):
