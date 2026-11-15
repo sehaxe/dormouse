@@ -314,14 +314,14 @@ def test_the_predictable_arm_counters_equal_their_config_formula():
     assert c["depth"] == c["iter"] == c["kda_sdpa"] == c["engram_arms"] == cfg.max_iter
     assert c["engram_rows"] == BATCH * SEQ * orders * cfg.max_iter
     assert c["moe_tokens"] == BATCH * SEQ * cfg.max_iter
-    assert kda_field(c) == f"kda=sdpa,n={cfg.max_iter}"
+    assert kda_field(c, model) == f"kda=sdpa,n={cfg.max_iter},b=0"
 
     # Those are the same numbers for a full-attention arm, under a different
     # name: `kda=full` means the KDA arm did NOT run (the field is an arm label).
     _m, full = _run_once(tiny_cfg(max_iter=3, attn_kind="full"), ids, targets)
     assert full["attn_full_forward"] == cfg.max_iter
     assert "kda_sdpa" not in full
-    assert kda_field(full) == f"kda=full,n={cfg.max_iter}"
+    assert kda_field(full, _m) == f"kda=full,n={cfg.max_iter}"
 
     # Composition counters: one per window/forward, `mhc` once per iteration.
     _m, both = _run_once(tiny_cfg(max_iter=3, use_mhc=True, use_attnres=True), ids, targets)

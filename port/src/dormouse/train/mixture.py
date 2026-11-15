@@ -537,9 +537,18 @@ class MixtureStream:
         seed: int | None = None,
         ring_bytes: int = DEFAULT_RING,
         doc_masking: bool = False,
+        item_bytes: int = 1,
     ) -> None:
         if not plan.stages:
             loud("MixtureStream: the plan has no stages")
+        if doc_masking and item_bytes != 1:
+            loud(
+                f"doc_masking with item_bytes={item_bytes}: the packed reader reads "
+                f"a document's BYTES at a sidecar offset, so a 2-byte token stream "
+                f"would be sliced on a token boundary. Escape: doc_masking=false, "
+                f"or item_bytes=1."
+            )
+        self.item_bytes = item_bytes
         self.plan = plan
         self.batch, self.seq_len = batch, seq_len
         self.steps = steps
@@ -571,6 +580,7 @@ class MixtureStream:
                     seq_len,
                     seed=_stream_seed(self.seed, name),
                     ring_bytes=ring_bytes,
+                    item_bytes=item_bytes,
                 )
             self._streams[name] = stream
         self._step = 0
@@ -682,6 +692,35 @@ class MixtureStream:
             stream.close()
 
 
+def _refuse_mixed_tokenizers(plan: MixPlan) -> None:
+    """Every source that HAS a manifest must name the same tokenizer, or refuse.
+
+    A plan over two tokenizations is two alphabets under one vocabulary: the
+    loss stays finite and the model learns garbage. Sources with no manifest (a
+    plain byte corpus, a `*.txt` shard directory) are outside the claim and are
+    not counted as a disagreement.
+    """
+    shas: dict[str, str] = {}
+    for name, path in plan.sources.items():
+        side = Path(str(path) + ".json")
+        if not side.is_file():
+            continue
+        try:
+            man = json.loads(side.read_text())
+        except (OSError, ValueError):
+            continue
+        if man.get("tokenizer_sha"):
+            shas[name] = str(man["tokenizer_sha"])
+    if len(set(shas.values())) > 1:
+        loud(
+            f"the plan's sources were tokenized with DIFFERENT tokenizers "
+            f"{shas}: the same id means a different string in each stream, so "
+            f"the model would learn an alphabet that does not exist. Escape: "
+            f"re-run `scripts/corpus.py build` with ONE tokenizer, then "
+            f"`assemble`."
+        )
+
+
 def open_mixture(
     plan_path: str | Path,
     *,
@@ -692,6 +731,7 @@ def open_mixture(
     max_epochs: float | None = None,
     ring_bytes: int = DEFAULT_RING,
     doc_masking: bool = False,
+    item_bytes: int = 1,
 ) -> MixtureStream:
     """Load a plan, run the epoch-cap guard, and build the stream — one call.
 
@@ -703,6 +743,7 @@ def open_mixture(
     which is the part a caller must not be able to forget.
     """
     plan = load_mix_plan(plan_path)
+    _refuse_mixed_tokenizers(plan)
     check_epoch_cap(plan, steps=steps, batch=batch, seq_len=seq_len, max_epochs=max_epochs)
     return MixtureStream(
         plan,
@@ -712,4 +753,5 @@ def open_mixture(
         seed=seed,
         ring_bytes=ring_bytes,
         doc_masking=doc_masking,
+        item_bytes=item_bytes,
     )

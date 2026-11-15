@@ -34,7 +34,7 @@ from conftest import tiny_cfg
 
 from dormouse.instrument import Counters
 from dormouse.model import DormouseModel
-from dormouse.model.kda import KDAAttention, fla_status
+from dormouse.model.kda import KDAAttention, backward_calls, fla_status, reset_backward_calls
 from dormouse.train import kda_field
 
 #: `find_spec`, not an import: a warmup call at collection time would be GPU work
@@ -82,10 +82,14 @@ def test_fused_arm_gradients_reach_every_kda_parameter():
     attn = KDAAttention(tiny_cfg(**ANCHOR), device=DEV)
     x = torch.randn(2, 64, 512, device=DEV)
     counters = Counters()
+    reset_backward_calls(attn)
     out = attn(x, counters)
     assert counters["kda_fla"] == 1 and "kda_sdpa" not in counters
-    assert kda_field(counters) == "kda=fla,n=1"
+    # No backward yet: the field's `b=` is the count of forwards whose
+    # gradient HAS arrived, so it is 0 until the `.backward()` below.
+    assert kda_field(counters, attn) == "kda=fla,n=1,b=0"
     out.float().pow(2).mean().backward()
+    assert backward_calls(attn) == 1, "the fused arm ran no backward"
     dead = [
         n
         for n, p in attn.named_parameters()

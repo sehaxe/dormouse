@@ -122,6 +122,27 @@ _OWN_GRID_FORMATS = ("v2_int4", "v2_int8")
 #: The scale guard: an all-zero block must quantize to zeros, not to NaN.
 _EPS = 1e-8
 
+#: The formats whose value is exactly `level · scale` — one integer/table level per
+#: element and ONE fp32 block scale — and can therefore be stored as 4-bit CODES
+#: and rebuilt bit for bit in the backward ([`pack_codes`]/[`unpack_codes`]).
+#: `v2_int4`/`v2_int8` are NOT here: their dequantize is a Hadamard round trip,
+#: not a per-block multiply, so a code is not a value until the FWHT is re-run.
+CODE_FORMATS = ("e2m1", "int4")
+
+#: The e2m1 magnitudes ascending — the codebook a code's low 3 bits index, and
+#: the same `_E2M1` tuple `_e2m1_round` rounds onto (one grid, one place to fix).
+_CODE_MAGS = torch.tensor(_E2M1, dtype=torch.float32)
+#: The same table per device: the codec runs at every coded seam, and an 8-float
+#: H2D copy per call would be a per-expert sync on the hot path.
+_CODE_MAGS_DEV: dict[torch.device, torch.Tensor] = {}
+
+
+def _code_mags(device: torch.device) -> torch.Tensor:
+    table = _CODE_MAGS_DEV.get(device)
+    if table is None:
+        table = _CODE_MAGS_DEV[device] = _CODE_MAGS.to(device)
+    return table
+
 
 def max_value(fmt: str) -> float:
     """The format's largest magnitude, and therefore what a block max maps ONTO.
@@ -291,25 +312,112 @@ def quantize_act(x: torch.Tensor, fmt: str, group: int = 0) -> torch.Tensor:
     if fmt in _OWN_GRID_FORMATS:
         return v2_quantize(x, 4 if fmt == "v2_int4" else 8)
     xf = x.float()
+    q, scale = _levels(xf, fmt, group)
+    xq = q * _spread(scale, group, xf.shape)
+    assert xq.shape == x.shape, "the quantizer must not change the activation shape"
+    return xq.to(x.dtype)
+
+
+def _levels(xf: torch.Tensor, fmt: str, group: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """`(levels, compact block scale)` — the ONE estimator value and codes share.
+
+    `levels` is the format's own level in fp32 (an e2m1 magnitude with sign, or an
+    integer in ±max_value) and `scale` is the fp32 block scale in its COMPACT
+    shape (`[..., 1]` per token, `[..., d//group, 1]` per group).
+    [`quantize_act`] multiplies them for the forward and [`pack_codes`] stores
+    them; a second estimator would be a "bit-identical" arm that is not one.
+    """
     d = xf.shape[-1]
     fmax = max_value(fmt)
     if group == 0:
-        block_max = xf.abs().amax(dim=-1, keepdim=True)  # [..., 1]
+        scale = (xf.abs().amax(dim=-1, keepdim=True) / fmax).clamp_min(_EPS)
+        full = scale
     else:
-        # [..., d/g, g] → max over the block → broadcast back inside the block.
+        # [..., d/g, g] → max over the block. Each element of the scale is the
+        # same `max/fmax` either way (elementwise), so expanding AFTER the divide
+        # is the same arithmetic as dividing the expanded max.
         blocks = xf.reshape(*xf.shape[:-1], d // group, group)
-        block_max = blocks.abs().amax(dim=-1, keepdim=True)  # [..., d/g, 1]
-        block_max = block_max.expand(*block_max.shape[:-1], group).reshape(xf.shape)
-    scale = (block_max / fmax).clamp_min(_EPS)
-    norm = xf / scale  # in [−fmax, fmax]
+        scale = (blocks.abs().amax(dim=-1, keepdim=True) / fmax).clamp_min(_EPS)
+        full = scale.expand(*scale.shape[:-1], group).reshape(xf.shape)
+    norm = xf / full  # in [−fmax, fmax]
     if fmt == "e2m1":
-        q = _e2m1_round(norm)
-    else:
-        limit = max_value(fmt)
-        q = norm.round().clamp(-limit, limit)
-    xq = q * scale
-    assert xq.shape == x.shape, "the quantizer must not change the activation shape"
-    return xq.to(x.dtype)
+        return _e2m1_round(norm), scale
+    limit = max_value(fmt)
+    return norm.round().clamp(-limit, limit), scale
+
+
+def _spread(scale: torch.Tensor, group: int, shape: torch.Size) -> torch.Tensor:
+    """The compact scale at `shape` — the multiply [`_levels`] divided by."""
+    if group == 0:
+        return scale
+    return scale.expand(*scale.shape[:-1], group).reshape(shape)
+
+
+def pack_codes(x: torch.Tensor, fmt: str, group: int = 0) -> tuple[torch.Tensor, ...]:
+    """`x` as 4-bit codes: `(packed, scale, k)` — `unpack_codes` rebuilds `quantize_act(x)`.
+
+    `packed` is `uint8 [..., ceil(k/2)]` with two codes per byte (the EVEN column in
+    the high nibble), `scale` is [`_levels`]'s fp32 block scale and `k` is the real
+    last dim (an odd `k` pads one zero code — value 0, so slicing it off is exact).
+    The pair `(levels, scale)` is the one the FORWARD multiplied, which is what makes
+    the rebuilt tensor the same one the matmul read rather than a second rounding
+    of it (`tests/test_act_store_codes.py` pins `torch.equal`).
+    """
+    if fmt not in CODE_FORMATS:
+        loud(
+            f"act_quant pack_codes({fmt!r}): this format has no `level · scale` "
+            f"dequantize, so a 4-bit code would not rebuild the forward's value. "
+            f"Known codes: {list(CODE_FORMATS)}. Escape: an `act_qat` in "
+            f"{list(CODE_FORMATS)}, or act_store='bf16'."
+        )
+    _check(x, fmt, group)
+    q, scale = _levels(x.float(), fmt, group)
+    code = _encode(q, fmt)
+    k = x.shape[-1]
+    if k % 2:
+        code = torch.nn.functional.pad(code, (0, 1))
+    packed = (code[..., 0::2] << 4) | code[..., 1::2]
+    return packed, scale, k
+
+
+def unpack_codes(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    k: int,
+    fmt: str,
+    group: int = 0,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """The inverse of [`pack_codes`], at `dtype` — the forward's own `x_q`."""
+    code = torch.empty(
+        *packed.shape[:-1], packed.shape[-1] * 2, dtype=torch.uint8, device=packed.device
+    )
+    code[..., 0::2] = (packed >> 4) & 0xF
+    code[..., 1::2] = packed & 0xF
+    q = _decode(code[..., :k], fmt)
+    return (q * _spread(scale, group, (*packed.shape[:-1], k))).to(dtype)
+
+
+def _encode(q: torch.Tensor, fmt: str) -> torch.Tensor:
+    """`levels → uint8 code`. `int4` → `q + 7` (0..14); `e2m1` → magnitude | sign<<3.
+
+    `q` is ALWAYS a level [`_levels`] produced (never an arbitrary float): `int4`'s
+    is an integer in ±7, which `+7` carries exactly, and e2m1's is one of the eight
+    `_CODE_MAGS` with a sign, which `searchsorted` finds exactly because the table
+    is what `_e2m1_round` assigned from.
+    """
+    if fmt == "int4":
+        return (q + 7).to(torch.uint8)
+    idx = torch.searchsorted(_code_mags(q.device), q.abs().contiguous()).to(torch.uint8)
+    return idx | (((q < 0).to(torch.uint8)) << 3)
+
+
+def _decode(code: torch.Tensor, fmt: str) -> torch.Tensor:
+    """The inverse of [`_encode`]: a level in fp32, exactly the value it came from."""
+    if fmt == "int4":
+        return (code.to(torch.int16) - 7).to(torch.float32)
+    mag = _code_mags(code.device)[(code & 7).long()]
+    return torch.where((code & 8) != 0, -mag, mag)
 
 
 class _ActQuantSTE(torch.autograd.Function):

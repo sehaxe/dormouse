@@ -122,7 +122,7 @@ def run_arm(name: str, model_over: dict, train_over: dict) -> dict:
         "peak_gib": torch.cuda.max_memory_allocated() / 2**30,
         "nan_skipped": report["nan_skipped"],
         "opt_steps": report["opt_steps"],
-        "kda": kda_field(counters),
+        "kda": kda_field(counters, model),
         "moe": moe_mode(counters),
         "dropped": counters.get("moe_dropped_assignments", 0),
         "eval": evals[-1] if evals else "",

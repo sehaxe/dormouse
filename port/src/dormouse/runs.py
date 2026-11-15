@@ -273,6 +273,10 @@ def start(
     `--runs-dir` (default `logs/runs`) so many runs share one index.
     """
     cfg = run.train
+    # Local on purpose: `config` pulls torch through `instrument`, and this module
+    # is the run REGISTRY a report reads without a model (`runs.py`'s own rule).
+    from .config import tst_bytes
+
     root = Path(runs_dir).expanduser() if runs_dir is not None else Path(cfg.out_dir) / "runs"
     root.mkdir(parents=True, exist_ok=True)
     now = time.time()
@@ -293,10 +297,12 @@ def start(
             "train": dataclasses.asdict(cfg),
         },
         "params": params,
-        # The byte BUDGET the run asked for (`steps x batch x seq_len x
+        # The byte BUDGET the run asked for (`steps × batch × seq_len ×
         # grad_accum`), not the corpus size: two runs on the same corpus with
         # different step counts saw different bytes and are different numbers.
-        "train_bytes": cfg.steps * cfg.batch * cfg.seq_len * cfg.grad_accum,
+        # TST's bag phase draws `batch·(seq_len·k+1)` per step, so the budget is
+        # `config.tst_bytes` — the same product on an unarmed run.
+        "train_bytes": tst_bytes(cfg, cfg.steps),
         "data": data,
         "data_bytes": sum(r["bytes"] or 0 for r in data if r["role"] != "mix_plan"),
         "host": host_info(device),

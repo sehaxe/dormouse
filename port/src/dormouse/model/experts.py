@@ -702,6 +702,11 @@ class DualLatentGLU(nn.Module):
         #: activation identically (per-row/group scale, expert-independent).
         self.act_quant = act_quant
         self.act_group = act_group
+        #: WHERE the graph keeps `act_qat`'s fake-quantized operand (`act_store`,
+        #: set once by `SparseMoE.set_act_store`): `bf16` keeps `x_q` at 2 B,
+        #: `codes` saves it as 4-bit codes and rebuilds it in the backward
+        #: (`packed_acts.coded_act_mm`). Default is the historical graph.
+        self.act_store = "bf16"
         #: PACKED BANK (`SparseMoE.tsct_packed`, OFF by default): this expert
         #: owns no `v`/`s` (and no `u` when the parent shares one). The parent
         #: owns ONE buffer per site and binds per-expert VIEWS through
@@ -826,13 +831,32 @@ class DualLatentGLU(nn.Module):
             up_u = up_u @ w.T
         return gate_u, up_u
 
+    def set_act_store(self, mode: str) -> None:
+        """The `act_store` rung on ONE expert (`SparseMoE.set_act_store` calls this).
+
+        `codes` needs the fake-quant seam it stores: without `act_qat` the saved
+        operand is exact and coding it would change the gradients.
+        """
+        from .packed_acts import check_store
+
+        check_store(mode)
+        if mode == "codes" and self.act_quant == "none":
+            loud(
+                "act_store='codes' on an expert with act_quant='none': this seam "
+                "does not fake-quantize, so there is no `x_q` for the codes to "
+                "rebuild — the backward would read a rounded copy of an operand "
+                "the forward used exactly. Escape: act_qat='e2m1', or "
+                "act_store='bf16'."
+            )
+        self.act_store = mode
+
     def forward(self, x: torch.Tensor, glu=None) -> torch.Tensor:
         dt = self.compute_dtype
-        if self.act_quant != "none":
+        codes = self.act_store == "codes" and self.act_quant != "none"
+        if self.act_quant != "none" and not codes:
             # a4.8: the activation feeding the factor matmuls, quantized in the
             # dtype it arrives in (fp32 masters, cast to `dt` after) with an STE.
             x = fake_quant_act(x, self.act_quant, self.act_group)
-        xu = x if x.dtype == dt else x.to(dt)
         gate_u, up_u = self._bases()
         v = self.v
         if self.factor_qat != "none":
@@ -848,8 +872,19 @@ class DualLatentGLU(nn.Module):
                 gate_u = q(gate_u, self.factor_qat, self.factor_qat_alpha, cache=cache)
                 up_u = q(up_u, self.factor_qat, self.factor_qat_alpha, cache=cache)
             v = q(v, self.factor_qat, self.factor_qat_alpha, cache=cache)
-        g = (xu @ gate_u.to(dt)) * self.gate_s.to(dt)
-        u = (xu @ up_u.to(dt)) * self.up_s.to(dt)
+        if codes:
+            # ONE pack for gate and up: `coded_act_mm` owns the quantize AND both
+            # products, so the graph keeps the 4-bit codes of the operand it read
+            # instead of the bf16 `x_q` each `@` would have saved.
+            from .packed_acts import coded_act_mm
+
+            g, u = coded_act_mm(x, self.act_quant, self.act_group, dt, gate_u, up_u)
+            g = g * self.gate_s.to(dt)
+            u = u * self.up_s.to(dt)
+        else:
+            xu = x if x.dtype == dt else x.to(dt)
+            g = (xu @ gate_u.to(dt)) * self.gate_s.to(dt)
+            u = (xu @ up_u.to(dt)) * self.up_s.to(dt)
         h = F.silu(g) * u if glu is None else glu(g, u)
         y = h @ v.to(dt)
         return y if dt == torch.float32 else y.to(torch.float32)
@@ -2307,6 +2342,54 @@ class SparseMoE(nn.Module):
         self._shared_select_cache = (key, gate, up)
         return gate, up
 
+    def set_act_store(self, mode: str) -> int:
+        """The `act_store` rung on this bank; returns how many experts it switched.
+
+        `codes` is the FAKE-QUANT seam's store: the per-expert GEMM operand is
+        `quantize_act(x)`, so the backward rebuilds it from 4-bit codes
+        (`packed_acts.coded_act_mm`) at ~1/4 the bytes and bit for bit.
+
+        The routed BANK arms (`_bank_dispatch`, `_triton_dispatch`, `_gather_dispatch`
+        and the `topk=0` dense blend) multiply `[E, cap, ·]` banks with `bmm` or a
+        fused kernel and NEVER run `DualLatentGLU.forward`, where the codes are
+        packed — the arm would store nothing coded while the log reported it on.
+        LOUD, with the escape, instead of an inert switch (ADR-0019).
+        """
+        from .packed_acts import check_store
+
+        check_store(mode)
+        if mode == "codes":
+            bypass = []
+            if self.topk == 0:
+                bypass.append("the topk=0 dense blend (one banked bmm per projection)")
+            if self.moe_kernel != "naive":
+                bypass.append(f"moe_kernel={self.moe_kernel!r} (a banked/kernel GEMM)")
+            if self.moe_gather == "kernel":
+                bypass.append("moe_gather='kernel' (the fused gather)")
+            if bypass:
+                loud(
+                    f"act_store='codes' with {', '.join(bypass)}: the per-expert "
+                    f"forward (`DualLatentGLU`) is where the fake-quantized operand is "
+                    f"packed, and this arm computes the projections without it — the "
+                    f"switch would store nothing coded while the log reported it on. "
+                    f"Escape: moe_kernel='naive', moe_topk > 0 and moe_gather != 'kernel' "
+                    f"(the reference loop the other arms are gated against), or "
+                    f"act_store='bf16'."
+                )
+            if self.act_quant == "none":
+                loud(
+                    "act_store='codes' on a bank with act_quant='none': the experts "
+                    "do not fake-quantize, so there is no `x_q` for the codes to "
+                    "rebuild — storing an exact operand as codes would move the "
+                    "gradients. Escape: act_qat='e2m1', or act_store='bf16'."
+                )
+        n = 0
+        for expert in (*self.experts, self.shared):
+            expert.set_act_store(mode)
+            n += 1
+        self.act_store = mode
+        return n if mode == "codes" else 0
+
     def _gather_rows(self, x: torch.Tensor, owner: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
         """`x[owner]` in `dt` — one gather copy, and a cast ONLY when one is needed.
 
@@ -2369,6 +2452,29 @@ class SparseMoE(nn.Module):
             self._bank_cache = None
 
     # -- packed bank: one buffer per site, and a checkpoint readable both ways --
+    def _apply(self, fn, recurse=True):
+        """A `.to(...)`/`.cuda()` moves the buffers and RE-BINDS the views.
+
+        `nn.Module._apply` replaces the DATA of a registered parameter (or, under
+        `torch.__future__.overwrite_module_params_on_conversion`, the parameter
+        itself). The per-expert views bound by [`_bind_packed`] are plain tensors
+        over the OLD storage, so they do not follow: the bank rebuilds from the
+        moved `packed_*` buffers while a per-expert call (`_naive_dispatch`, the
+        standalone path) multiplies a moved `x` by a CPU `gate_u` — measured
+        2026-11-14 as `RuntimeError: ... mat2 is on cpu` on the first step of a
+        packed run, because `cli.py` builds on CPU and calls `.to(cuda)`.
+        The cached bank is on the old device/dtype too, so it goes with the
+        conversion (the load hook drops it for the same reason).
+        """
+        out = super()._apply(fn, recurse)
+        if self.tsct_packed:
+            self._bind_packed()
+            extra = (self.packed_gate_u, self.packed_up_u) if hasattr(self, "packed_gate_u") else ()
+            self._packed_params = (self.packed_v, self.packed_s, *extra)
+            self._bank_cache = None
+            self._bank_epoch += 1
+        return out
+
     def _bind_packed(self) -> None:
         """Point every expert at its row of the parent's buffers (views)."""
         gate_u = getattr(self, "packed_gate_u", None)

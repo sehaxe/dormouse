@@ -452,6 +452,14 @@ class TransformerBlock(nn.Module):
         config reaches; `config.validate_model_train` owns the same refusals.
         """
         check_store(mode)
+        if mode == "codes":
+            loud(
+                "act_store='codes' on a `TransformerBlock`: this block's packed "
+                "sites are the store-only `nvfp4` lane, and where `act_qat` is on "
+                "its FFN operands are ALREADY saved as codes. The `codes` rung "
+                "lives on the MoE expert seam (`block_form='kda'`). Escape: "
+                "act_store='nvfp4' (or 'bf16'), or block_form='kda'."
+            )
         if mode != "bf16":
             if self.act_qat != "none":
                 loud(

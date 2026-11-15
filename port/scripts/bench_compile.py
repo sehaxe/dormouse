@@ -526,6 +526,65 @@ def _apply_route(model: torch.nn.Module, opt: MixOptimizer, route: str) -> None:
     opt.adamw.step()
 
 
+def _capture_grads(
+    run: RunConfig, device: torch.device, state: dict, ids: torch.Tensor
+) -> dict[str, torch.Tensor | None]:
+    """ONE step's gradients from a fresh model — the controlled writer input."""
+    model, opt = _fresh(run, device, state)
+    opt.zero_grad(set_to_none=True)
+    _logits, loss, _c = model(ids, targets=ids)
+    assert loss is not None, "a training step must carry targets"
+    loss.backward()
+    grads = {
+        n: (p.grad.detach().clone() if p.grad is not None else None)
+        for n, p in model.named_parameters()
+    }
+    del model, opt
+    _free(device)
+    return grads
+
+
+def _writer_params(
+    run: RunConfig,
+    device: torch.device,
+    state: dict,
+    grads: dict[str, torch.Tensor | None],
+    route: str,
+) -> dict[str, torch.Tensor]:
+    """The parameters after `route` writes ONE update for these exact grads."""
+    model, opt = _fresh(run, device, state)
+    for n, p in model.named_parameters():
+        if grads[n] is not None:
+            p.grad = grads[n].clone()
+    _apply_route(model, opt, route)
+    out = {n: p.detach().clone() for n, p in model.named_parameters()}
+    del model, opt
+    _free(device)
+    return out
+
+
+def _worst_param(a: dict, b: dict) -> tuple[str, float]:
+    """`(name, relative error)` of the parameters two writers land on.
+
+    The metric is the PARAMETER, not its update, on purpose: that is what the
+    model consumes and what `_parity` already bounds at 1e-6 for one step. On
+    the card the two writers' UPDATES differ by 3.8e-04 of the update on
+    `embed.weight` (a CUDA kernel's fast-math `sqrt`, not an arithmetic
+    disagreement) but by 1.9e-07 of the parameter — fp32 roundoff. A real bug
+    (wrong bias correction, decay on the wrong side, missing eps) is orders of
+    magnitude larger — a missing bias correction at t=1 changes the step by 10x
+    — so this bound keeps its teeth.
+    """
+    name, worst = "", 0.0
+    for n, p in a.items():
+        if p is None or b[n] is None:
+            continue
+        rel = relative_error(p, b[n])
+        if rel > worst:
+            name, worst = n, rel
+    return name, worst
+
+
 def _opt_routes(
     run: RunConfig,
     *,
@@ -540,10 +599,23 @@ def _opt_routes(
     Two routes from the SAME weights and the SAME batches: the port's fused
     writer (`MixOptimizer.step` -> `_foreach_adamw_step`) and torch's own AdamW
     (`opt.adamw.step`, the foreach route) beside the batched Muon. Each route's
-    own wall time is the MIN of `reps` calls on one step's grads; the objective
-    is checked over `steps` full steps — `bpb = loss / ln2`, exactly the
-    trainer's metric — and a route that moves it by more than 1e-4 is refused,
-    because "faster" is not "the same optimizer".
+    own wall time is the MIN of `reps` calls on one step's grads; the bpb curve
+    over `steps` full steps — `bpb = loss / ln2`, exactly the trainer's metric —
+    is printed as a READING.
+
+    THE GATE IS THE WRITERS' OWN ARITHMETIC, NOT THAT READING (measured
+    2026-11-14). Two free-running runs of the SAME route differ by 1.1e-04 to
+    1.7e-04 bpb at 20 steps on this model: the backward is not bit-reproducible
+    (7 of 99 gradients are bit-equal between two backwards from the identical
+    weights and batch; CUDA's reductions/atomics are not ordered deterministically),
+    so every step's gradients differ in the last bits. A 20-step gap between two
+    routes therefore has a noise floor of the same size as the signal — the old
+    `1e-4 over 20 steps` gate failed on the reference recipe itself (fp32 NS, 5
+    steps: 1.24e-04) and could not have been evidence about any precision rung.
+    What IS exact is the writer: feed both routes the SAME captured gradients and
+    compare the parameters they land on. That is `PARAM_TOL`, the same bound
+    `_parity` uses for one optimizer step, and any real writer bug (wrong bias
+    correction, missing decay, a different update order) shows up at step ONE.
     """
     accum = run.train.grad_accum
     rows = []
@@ -570,19 +642,32 @@ def _opt_routes(
         rows.append({"route": route, "ms": min(timings), "bpb": bpb})
         del model, opt
         _free(device)
-    delta = max(abs(a - b) for a, b in zip(rows[0]["bpb"], rows[1]["bpb"], strict=True))
     for r in rows:
         print(
             f"  {r['route']:<6} opt.step {r['ms']:7.2f} ms  bpb {r['bpb'][-1]:.6f} "
             f"(after {steps} steps)"
         )
-    print(f"  bpb drift over {steps} steps: {delta:.2e} (gate 1e-4)")
-    if delta > 1e-4:
+    gap = max(abs(a - b) for a, b in zip(rows[0]["bpb"], rows[1]["bpb"], strict=True))
+    print(
+        f"  free-running bpb gap over {steps} steps: {gap:.2e} — a READING, not a "
+        "gate (this model's backward is not bit-reproducible; a same-route repeat "
+        "sits at this scale too)"
+    )
+    grads = _capture_grads(run, device, state, ids)
+    fused = _writer_params(run, device, state, grads, "fused")
+    torch_params = _writer_params(run, device, state, grads, "torch")
+    name, worst = _worst_param(fused, torch_params)
+    where = f" ({name})" if name else ""
+    print(
+        f"  writer divergence from the SAME grads, one step: {worst:.2e}{where} "
+        f"(gate {PARAM_TOL:g})"
+    )
+    if worst > PARAM_TOL:
         print(
-            f"\n=== OPTIMIZER ROUTES DIVERGE: {delta:.2e} > 1e-4 bpb after {steps} "
-            f"steps. The fused writer is not the same optimizer as torch's AdamW on "
-            f"this model — that is a bug, not a speed/accuracy trade.\n"
-            f"=== exit {EXIT_PARITY}\n",
+            f"\n=== OPTIMIZER WRITERS DIVERGE: {worst:.2e} > {PARAM_TOL:g} on "
+            f"{name or 'a parameter'} from the SAME gradients. The fused writer is "
+            f"not the same optimizer as torch's AdamW on this model — that is a "
+            f"bug, not a speed/accuracy trade.\n=== exit {EXIT_PARITY}\n",
             flush=True,
         )
         raise SystemExit(EXIT_PARITY)
