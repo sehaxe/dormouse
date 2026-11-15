@@ -79,19 +79,26 @@ DEFAULT_REFILL = 8 << 20  # refilled in 8 MB chunks
 DOC_SIDECAR_SUFFIX = ".docs.json"
 
 
-def _windows(raw: bytes, batch: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """`batch × (seq_len+1)` bytes → one `[b, t]` window of inputs and the byte after each.
+def _windows(
+    raw: bytes, batch: int, seq_len: int, item_bytes: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`batch × (seq_len+1)` items → one `[b, t]` window of inputs and the item after each.
 
-    ONE definition of the next-byte shift, shared by both stream modes: the
-    target at position `q` is the byte that follows the input's, which is what
-    makes a window `batch × seq_len` PREDICTIONS and not `batch × seq_len` bytes
+    ONE definition of the next-item shift, shared by both stream modes: the
+    target at position `q` is the item that follows the input's, which is what
+    makes a window `batch × seq_len` PREDICTIONS and not `batch × seq_len` items
     of context.
+
+    `item_bytes=1` is a byte corpus (vocabulary 256); `2` is a uint16 TOKEN
+    stream (`scripts/corpus.py`'s `mix.bin`, vocabulary 32k). The shift is the
+    same expression either way -- only the decode changes.
     """
     # `list(raw)` builds one PyLong per byte (0.74 ms per b=8 batch, 6.0 ms at
     # b=32, measured 2026-11-08); frombuffer copies the bytes once and lets the
     # cast do the widening: 85 us at b=8, 9-40x. One `bytearray` copy because
     # frombuffer needs a writable buffer and the stream hands out an mmap slice.
-    ids = torch.frombuffer(bytearray(raw), dtype=torch.uint8).long().view(batch, seq_len + 1)
+    dtype = torch.uint8 if item_bytes == 1 else torch.uint16
+    ids = torch.frombuffer(bytearray(raw), dtype=dtype).long().view(batch, seq_len + 1)
     return ids[:, :-1].contiguous(), ids[:, 1:].contiguous()
 
 
@@ -388,8 +395,16 @@ class ByteStream:
         ring_bytes: int = DEFAULT_RING,
         refill_bytes: int = DEFAULT_REFILL,
         check_min: bool = True,
+        item_bytes: int = 1,
     ) -> None:
         self.path = Path(path)
+        if item_bytes not in (1, 2):
+            loud(
+                f"item_bytes={item_bytes}: a stream item is 1 B (bytes, vocabulary "
+                f"256) or 2 B (uint16 tokens, `scripts/corpus.py`'s .bin). "
+                f"Escape: 1 or 2."
+            )
+        self.item_bytes = item_bytes
         _refuse_dir(self.path, "data file")
         if not self.path.is_file():
             loud(f"data file {self.path} does not exist (mount the drive, or fix the path)")
@@ -407,7 +422,7 @@ class ByteStream:
         if not 0 <= self.lo < self.hi <= size:
             loud(f"byte range [{self.lo}, {self.hi}) is not inside {self.path} ({size} B)")
         self.tokens_per_batch = batch * seq_len
-        if check_min and self.hi - self.lo < self.tokens_per_batch + 1:
+        if check_min and self.hi - self.lo < (self.tokens_per_batch + 1) * item_bytes:
             loud(
                 f"byte range [{self.lo}, {self.hi}) holds {self.hi - self.lo} B, less than one "
                 f"batch of {self.tokens_per_batch + 1}: enlarge the range or shrink the batch"
@@ -415,11 +430,48 @@ class ByteStream:
         self._buf = bytearray()
         self._pos = self.lo
         self._rng_lo = self.lo
+        self._check_manifest()
         #: `(requested, granted)` when `open_streams` capped the eval tail at
         #: 1 MiB; `None` is the uncapped path (no line, no changed number).
         self.eval_tail_capped: tuple[int, int] | None = None
 
     # -- ring -----------------------------------------------------------
+    def _check_manifest(self) -> None:
+        """`<file>.json` (the corpus manifest) must describe THIS file, or refuse.
+
+        A truncated stream, a half-copied token file, or a token stream read as
+        bytes is invisible to the training loop and trains anyway — the one
+        failure a corpus cannot be re-derived from. `scripts/corpus.py` writes a
+        manifest beside every stream; a file without one is a plain byte corpus
+        and gets no check.
+        """
+        side = Path(str(self.path) + ".json")
+        if not side.is_file():
+            return
+        try:
+            man = json.loads(side.read_text())
+        except (OSError, ValueError):
+            return
+        if man.get("bytes") is not None and int(man["bytes"]) != self.size:
+            loud(
+                f"{side} says {man['bytes']} B, {self.path} is {self.size} B: the "
+                f"manifest and the stream disagree (truncated, or a re-tokenize "
+                f"that did not finish). Escape: re-run `scripts/corpus.py assemble`."
+            )
+        dtype = man.get("dtype")
+        if dtype == "uint16" and self.item_bytes != 2:
+            loud(
+                f"{self.path} is a uint16 TOKEN stream per its manifest, but "
+                f"item_bytes=1: the trainer would read two tokens per position "
+                f"and learn the byte layout. Escape: data_item_bytes=2, or a "
+                f"byte corpus."
+            )
+        if dtype not in (None, "uint16") and self.item_bytes == 2:
+            loud(
+                f"{self.path}: its manifest says dtype={dtype!r}, a 2-byte item "
+                f"was asked for. Escape: item_bytes=1, or the uint16 stream."
+            )
+
     def _refill(self) -> None:
         want = min(self.refill_bytes, self.ring_bytes - len(self._buf))
         assert want > 0, "the ring is full and still cannot satisfy the request"
@@ -450,6 +502,12 @@ class ByteStream:
         window, `_windows` argument for argument.
         """
         if bag > 1:
+            if self.item_bytes != 1:
+                loud(
+                    f"tst_bag={bag} with item_bytes={self.item_bytes}: the bag arm is "
+                    f"defined over BYTES (`docs/records/research` TST). Escape: "
+                    f"tst_bag=1 on a token stream."
+                )
             want = self.batch * (self.seq_len * bag + 1)
             if want > self.hi - self.lo:
                 loud(
@@ -461,7 +519,9 @@ class ByteStream:
                 )
             return _bag_windows(self._read(want), self.batch, self.seq_len, bag)
         want = self.batch * (self.seq_len + 1)
-        return _windows(self._read(want), self.batch, self.seq_len)
+        return _windows(
+            self._read(want * self.item_bytes), self.batch, self.seq_len, self.item_bytes
+        )
 
     # -- positioning ----------------------------------------------------
     def rewind(self) -> None:
@@ -880,17 +940,27 @@ def open_source(
     *,
     seed: int = 1,
     ring_bytes: int = DEFAULT_RING,
+    item_bytes: int = 1,
 ) -> ByteStream | ShardStream:
     """A source path → the stream its SHAPE names: a directory is a `ShardStream`.
 
     ONE definition of the rule, so the mixture and any other caller cannot
     disagree about which mode a path opens. `seed` is the shard order's; a file
     ignores it.
+
+    A shard DIRECTORY is `*.txt` bytes and has no 2-byte mode: `item_bytes=2` on
+    a directory is refused rather than decoding text as tokens.
     """
     p = Path(path)
     if p.is_dir():
+        if item_bytes != 1:
+            loud(
+                f"item_bytes={item_bytes} on the shard DIRECTORY {p}: a `*.txt` "
+                f"shard is bytes, not a uint16 token stream. Escape: a `.bin` "
+                f"token file, or item_bytes=1."
+            )
         return ShardStream(p, batch, seq_len, seed=seed, ring_bytes=ring_bytes)
-    return ByteStream(p, batch, seq_len, ring_bytes=ring_bytes)
+    return ByteStream(p, batch, seq_len, ring_bytes=ring_bytes, item_bytes=item_bytes)
 
 
 #: The floor of a defensible eval window lives in `config.py`, beside the field
@@ -1124,7 +1194,7 @@ def open_streams(
         # The PINNED range: `batches` full `batch × (seq_len + 1)` reads from
         # `lo`. A window that runs off the file would wrap and re-score its
         # head while printing a distinct-bytes count — refuse instead.
-        span = batches * tr.batch * (tr.seq_len + 1)
+        span = batches * tr.batch * (tr.seq_len + 1) * tr.data_item_bytes
         if lo + span > size:
             loud(
                 f"eval_offset={lo} + eval window ({batches} x {tr.batch} x "
@@ -1139,6 +1209,7 @@ def open_streams(
             tr.seq_len,
             lo=lo,
             ring_bytes=min(ring_bytes, max(1 << 20, window)),
+            item_bytes=tr.data_item_bytes,
         )
         ev = _mask_eval(ev, tr.eval_data, tr.doc_masking)
         if eval_only:
@@ -1153,7 +1224,12 @@ def open_streams(
         # shard mode lives in the mixture, so the escape is the plan.
         _refuse_dir(Path(tr.data), "data")
         train = ByteStream(
-            tr.data, tr.batch, tr.seq_len, ring_bytes=ring_bytes, check_min=not tr.doc_masking
+            tr.data,
+            tr.batch,
+            tr.seq_len,
+            ring_bytes=ring_bytes,
+            check_min=not tr.doc_masking,
+            item_bytes=tr.data_item_bytes,
         )
         if tr.doc_masking:
             return DocPackedStream(train, load_doc_starts(tr.data)), ev
@@ -1174,7 +1250,13 @@ def open_streams(
             f"eval_offset={tr.eval_offset} starts at byte {lo}, at/after the end of "
             f"{tr.data} ({size} B). Escape: a smaller offset."
         )
-    ev = ByteStream(tr.data, tr.batch, tr.seq_len, lo=lo, ring_bytes=1 << 20) if tr.eval else None
+    ev = (
+        ByteStream(
+            tr.data, tr.batch, tr.seq_len, lo=lo, ring_bytes=1 << 20, item_bytes=tr.data_item_bytes
+        )
+        if tr.eval
+        else None
+    )
     if ev is not None and ev_bytes < requested:
         # COUNTED, never silent: the request is larger than the tail this
         # stream may read, so the stream wraps and the eval re-scores bytes it
@@ -1198,6 +1280,7 @@ def open_streams(
         hi=hi_train,
         ring_bytes=ring_bytes,
         check_min=not tr.doc_masking,
+        item_bytes=tr.data_item_bytes,
     )
     if tr.doc_masking:
         train = DocPackedStream(train, load_doc_starts(tr.data))

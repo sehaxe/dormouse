@@ -130,6 +130,79 @@ PROGRESS_KEYS = (
 PRESET_TRAIN_DEFAULTS: dict[str, dict[str, object]] = {
     "m400": {"muon_state_dtype": "bf16", "muon_chunk_elems": 1 << 26},
     "medium": {"muon_state_dtype": "bf16", "muon_chunk_elems": 1 << 26},
+    # THE 1B LAUNCH. `dorm train configs/dormouse_1b.toml` is the whole command:
+    # a preset PATH gets its train defaults from here (keyed on the stem), so the
+    # data half and the measured recipe live in ONE place instead of on a long
+    # `--set` line someone has to retype. Every number is measured, and the
+    # measurement is named:
+    #   * batch 2 x seq 1024 — the VRAM ladder on the 16 GB card (2026-11-16):
+    #     b4 and above OOM at s1024 even with bf16 optimizer state, b2 peaks at
+    #     12.94 GiB; `grad_accum=12` makes the OPTIMIZER batch 24 576 tokens
+    #     (the b24 x 1024 of the data plan) while the activation peak stays b2's.
+    #   * muon_state_dtype/ns_dtype bf16 — the ~2.3 GiB that makes b2 fit at all
+    #     (`scripts/probe_vram.py --levers`).
+    #   * engram_ram — 402M n-gram rows in host RAM; the model cannot hold them.
+    #   * lr 3e-4 with muon_lr_mult=1.0 — MEASURED on this config (60-step smoke,
+    #     2026-11-16): mult=1.0 falls 10.69 -> 9.33 nats and eval bpb 2.89;
+    #     mult=12 (the 2026-11-07 audit's optimum at the SHAPES THAT AUDIT RAN)
+    #     RISES 11.66 -> 20.15, i.e. diverges here. The b1 script leaves it at 1.0
+    #     for the same reason. lr is still the first knob to sweep: 3e-4 at
+    #     24 576 tokens/step is the b1 recipe's value for 4096, not tuned.
+    #   * data_item_bytes 2 + data_bytes_per_token — the uint16 mixture and the
+    #     manifest's own BPB conversion (`data_local/pre/mix.bin.json`).
+    "dormouse_1b": {
+        "mix_plan": "configs/mix_1b.toml",
+        "data_item_bytes": 2,
+        "data_bytes_per_token": 4.717789094290279,
+        "eval_data": "../data_local/pre/holdout.bin",
+        "eval": True,
+        "eval_batches": 32,
+        "eval_every": 1000,
+        "batch": 2,
+        "grad_accum": 12,
+        "seq_len": 1024,
+        "steps": 161206,
+        "lr": 3e-4,
+        "muon_lr_mult": 1.0,
+        "muon_state_dtype": "bf16",
+        "ns_dtype": "bf16",
+        "tf32": True,
+        "engram_ram": True,
+        "torch_compile": False,
+        "log_every": 10,
+        "ckpt_every": 2000,
+        "ckpt_name": "d1b",
+        "out_dir": "checkpoints/dormouse1b",
+        "json_log": "/home/sehaxe/logs/d1b.jsonl",
+    },
+    # The same recipe on the 200 MB slice: identical model, identical flags, the
+    # only differences are the data (a slice) and a step budget that finishes in
+    # minutes, so the exact launch config is rehearsed before it is committed to.
+    "dormouse_1b_smoke": {
+        "mix_plan": "configs/mix_1b_smoke.toml",
+        "data_item_bytes": 2,
+        "data_bytes_per_token": 4.717789094290279,
+        "eval_data": "../data_local/pre/holdout.bin",
+        "eval": True,
+        "eval_batches": 8,
+        "eval_every": 40,
+        "batch": 2,
+        "grad_accum": 2,
+        "seq_len": 1024,
+        "steps": 60,
+        "lr": 3e-4,
+        "muon_lr_mult": 1.0,
+        "muon_state_dtype": "bf16",
+        "ns_dtype": "bf16",
+        "tf32": True,
+        "engram_ram": True,
+        "torch_compile": False,
+        "log_every": 5,
+        "ckpt_every": 30,
+        "ckpt_name": "d1bsmoke",
+        "out_dir": "/tmp/opencode/dormouse1b_smoke",
+        "json_log": "/tmp/opencode/d1bsmoke.jsonl",
+    },
 }
 
 #: The commit that removed the stubs below (`port(cleanup): delete the six dead
@@ -2692,6 +2765,22 @@ class TrainConfig:
     json_log: str = ""
     data: str = ""
     eval_data: str = ""
+    #: How many BYTES one stream item is: `1` is a byte corpus (vocabulary 256,
+    #: every number on record); `2` is a uint16 TOKEN stream -- exactly what
+    #: `scripts/corpus.py` assembles (`mix.bin`, a 32k BPE vocabulary). The
+    #: stream still seeks in FILE bytes (offsets, the eval window and the resume
+    #: fast-forward are unchanged); only the window decode differs, so a 2-byte
+    #: run reads `batch × seq_len` TOKENS per step where a 1-byte run reads
+    #: bytes. Refused with `doc_masking` and `tst_bag>1`, whose both readers are
+    #: defined over byte boundaries. Non-progress: the drift check refuses a
+    #: flip on a resume.
+    data_item_bytes: int = 1
+    #: TEXT bytes per stream item, for the BPB conversion only. `bpb` divides a
+    #: natural-log CE by this (a byte run's 1.0 keeps every number bit-identical);
+    #: a uint16 token run sets the manifest's `bytes_per_token` so its BPB is
+    #: still BITS PER BYTE OF TEXT and comparable to a byte run's. Nothing else
+    #: reads it: the schedule and the step budget are in steps.
+    data_bytes_per_token: float = 1.0
     #: The staged-mixture plan (`train/mixture.py`, TOML): when set, the train
     #: side reads N sources interleaved by per-stage weights instead of the one
     #: `data` file (the eval side is unchanged). Empty = off = every number on
@@ -6003,6 +6092,32 @@ def validate_train(tcfg: TrainConfig) -> None:
     hand-built `TrainConfig` that skips `load_run` must not be able to run a
     zero-micro-batch step or an EMA outside [0,1) either.
     """
+    if tcfg.data_item_bytes not in (1, 2):
+        loud(
+            f"data_item_bytes={tcfg.data_item_bytes}: a stream item is 1 B (a byte "
+            f"corpus, vocabulary 256) or 2 B (a uint16 TOKEN stream, "
+            f"`scripts/corpus.py`'s `mix.bin`). Escape: 1 or 2."
+        )
+    if tcfg.data_item_bytes == 2 and tcfg.doc_masking:
+        loud(
+            "data_item_bytes=2 with doc_masking: the packed reader slices a "
+            "document's BYTES at a sidecar offset, so a 2-byte stream would be "
+            "cut on a token boundary. Escape: doc_masking=false on a token "
+            "stream, or data_item_bytes=1."
+        )
+    if tcfg.data_item_bytes == 2 and tcfg.tst_bag > 1:
+        loud(
+            f"data_item_bytes=2 with tst_bag={tcfg.tst_bag}: TST's superposition "
+            f"is defined over bytes (`\u0071\u00b7k` offsets). Escape: tst_bag=1 on a "
+            f"token stream."
+        )
+    if not tcfg.data_bytes_per_token > 0:
+        loud(
+            f"data_bytes_per_token={tcfg.data_bytes_per_token}: the BPB "
+            f"conversion divides the CE by it, so it is a positive byte count per "
+            f"stream item (1.0 on a byte corpus). Escape: the manifest's "
+            f"`bytes_per_token`."
+        )
     if tcfg.grad_accum < 1:
         loud(
             f"grad_accum={tcfg.grad_accum}: the field is a COUNT of micro-batches "
@@ -6749,6 +6864,14 @@ def load_run(
             f"mix_plan={tcfg.mix_plan!r} is not a file. Escape: a path to an "
             f"existing plan TOML (the shape is documented in `train/mixture.py`), "
             f"or leave it empty to read the single `data` file."
+        )
+    if tcfg.data_item_bytes == 2 and model.vocab <= 256:
+        loud(
+            f"data_item_bytes=2 (a uint16 TOKEN stream) with vocab={model.vocab}: "
+            f"the ids run to 32767, so an embedding sized for a byte vocabulary "
+            f"has no row for them and the first gather is out of range. Escape: a "
+            f"preset whose `vocab` is the tokenizer's size (32768), or "
+            f"data_item_bytes=1 for a byte corpus."
         )
     if tcfg.ns_kind not in NS_KINDS:
         loud(

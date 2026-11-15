@@ -136,10 +136,29 @@ def _param_ulp(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> float:
 
 
 def test_the_measured_presets_carry_the_optimizer_recipe():
-    assert PRESET_TRAIN_DEFAULTS == {
-        "m400": {"muon_state_dtype": "bf16", "muon_chunk_elems": 1 << 26},
-        "medium": {"muon_state_dtype": "bf16", "muon_chunk_elems": 1 << 26},
+    #: Every preset that ships TRAIN defaults, pinned BY NAME: adding one is a
+    #: deliberate act (a different optimizer regime is a different program).
+    assert set(PRESET_TRAIN_DEFAULTS) == {
+        "m400",
+        "medium",
+        "dormouse_1b",
+        "dormouse_1b_smoke",
     }
+    assert (
+        PRESET_TRAIN_DEFAULTS["m400"]
+        == PRESET_TRAIN_DEFAULTS["medium"]
+        == {
+            "muon_state_dtype": "bf16",
+            "muon_chunk_elems": 1 << 26,
+        }
+    )
+    # The 1B launch: bf16 Muon state is the ~2.3 GiB that makes batch 2 x 1024
+    # fit the 16 GB card (`scripts/probe_vram.py --levers`), and the same rung
+    # on the Newton-Schulz chain. Both smoke and run ship it, or the rehearsal
+    # would prove nothing about the run.
+    for name in ("dormouse_1b", "dormouse_1b_smoke"):
+        assert PRESET_TRAIN_DEFAULTS[name]["muon_state_dtype"] == "bf16"
+        assert PRESET_TRAIN_DEFAULTS[name]["ns_dtype"] == "bf16"
     for preset, path in (("m400", "m400"), ("m400", "configs/m400.toml"), ("medium", "medium")):
         run = load_run(path)
         assert run.train.muon_state_dtype == "bf16", (preset, path)

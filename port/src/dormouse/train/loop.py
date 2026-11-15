@@ -71,9 +71,17 @@ from .mixture import MixtureStream, load_mix_plan, open_mixture, source_size
 from .optim import MixOptimizer, agc_clip, clip_grads, grad_norm
 
 
-def bpb(loss: float) -> float:
-    """Bits per byte from a natural-log CE (burn's `dormouse_train::bpb`)."""
-    return loss / math.log(2)
+def bpb(loss: float, bytes_per_token: float = 1.0) -> float:
+    """Bits per BYTE OF TEXT from a natural-log CE (burn's `dormouse_train::bpb`).
+
+    A byte corpus has one item per byte, so `bytes_per_token=1.0` is the
+    historical number, bit for bit. A uint16 TOKEN stream scores one prediction
+    per TOKEN, so its CE must be divided by the tokenizer's bytes-per-token
+    before it can be compared with a byte run's BPB -- the manifest carries it
+    (`data_bytes_per_token`), and leaving it at 1.0 on a token run would report
+    bits per token under the name of bits per byte.
+    """
+    return loss / (math.log(2) * bytes_per_token)
 
 
 def _host_scalar(value: torch.Tensor) -> float:
@@ -1347,9 +1355,10 @@ def _eval_line(
     # a reader learns the eval ran a memory-disabled forward, which is the defect
     # that retracted the Engram arm's numbers (AGENTS §3.2). It is printed on
     # both substrates — the host path counts the same rows in `Engram._read`.
+    bpt = cfg.data_bytes_per_token
     line = (
-        f"eval step={step} off={stream.lo} bpb_fin={bpb(fin):.3f} "
-        f"bpb_mean={bpb(ev):.3f} fin={fin:.4f} loss={ev:.4f} over {scored} B "
+        f"eval step={step} off={stream.lo} bpb_fin={bpb(fin, bpt):.3f} "
+        f"bpb_mean={bpb(ev, bpt):.3f} fin={fin:.4f} loss={ev:.4f} over {scored} B "
         f"({batches} x {cfg.batch} x {cfg.seq_len}) "
         f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)}"
     )
@@ -1400,9 +1409,9 @@ def eval_row(
         # superposition phase and `batch · (seq_len+1)` after it
         # (`config.tst_bytes`; the flat product on an unarmed run).
         "bytes_seen": tst_bytes(cfg, step),
-        "bpb": bpb(fin),
-        "bpb_fin": bpb(fin),
-        "bpb_mean": bpb(ev),
+        "bpb": bpb(fin, cfg.data_bytes_per_token),
+        "bpb_fin": bpb(fin, cfg.data_bytes_per_token),
+        "bpb_mean": bpb(ev, cfg.data_bytes_per_token),
         "loss": ev,
         "fin": fin,
         "scored": scored,
@@ -1530,13 +1539,15 @@ def _train_impl(
                 seed=run.train.seed,
                 max_epochs=run.train.max_epochs,
                 doc_masking=run.train.doc_masking,
+                item_bytes=run.train.data_item_bytes,
             )
             _, eval_stream = open_streams(run, eval_only=True)
             log(
                 f"mix_plan={run.train.mix_plan}: {len(stream.plan.sources)} sources, "
                 f"{len(stream.plan.stages)} stage(s), steps={micro_steps} micro-batches "
                 f"({run.train.steps} x grad_accum={run.train.grad_accum}), "
-                f"max_epochs={run.train.max_epochs}"
+                f"max_epochs={run.train.max_epochs}, "
+                f"item_bytes={run.train.data_item_bytes}"
             )
         else:
             stream, eval_stream = open_streams(run)
@@ -2636,7 +2647,7 @@ def _train_impl(
                 )
             sf("train")
             log(line)
-            last_eval = (line, bpb(fin))
+            last_eval = (line, bpb(fin, cfg.data_bytes_per_token))
             if sink is not None:
                 _row(
                     **eval_row(
@@ -2677,7 +2688,7 @@ def _train_impl(
             )
         sf("train")
         log(line)
-        last_eval = (line, bpb(fin))
+        last_eval = (line, bpb(fin, cfg.data_bytes_per_token))
     return {
         "steps": cfg.steps,
         # `None`, not `nan`: a resume at the finished step runs ZERO iterations,
