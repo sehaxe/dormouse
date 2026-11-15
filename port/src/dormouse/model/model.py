@@ -38,6 +38,7 @@ from ..instrument import Counters, loud
 from ..losses import fixed_cross_entropy, logit_softcap
 from .act_mem import ActivationOffload
 from .attnres import FullDepthAttnRes
+from .aux import build_aux
 from .byteflow import (
     BfChannel,
     ByteFlowNet,
@@ -741,6 +742,29 @@ class DormouseModel(nn.Module):
                     f"Escape: one weight per run."
                 )
             self.energy = EnergyHead(d, cfg.energy_rank, device=device)
+        # THE AUX SEAM (`aux.py`, `aux_objective`): ONE head, LightMTP or FSP,
+        # built IFF the objective is named — `aux_objective="none"` adds no
+        # parameter, no op and no branch, so the off path is bit-identical.
+        # The head reads the loop's readout and never writes it: the token loss
+        # is untouched by construction (the logits below are the same tensor).
+        if cfg.aux_objective != "none" and cfg.use_byteflow:
+            loud(
+                f"aux_objective={cfg.aux_objective!r} with use_byteflow=true: the "
+                f"byteflow shapes run no byte-level loop, so the head's targets "
+                f"(`h[p+h]`, or the bytes at `p+2..p+τ`) have no byte position to "
+                f"read and the term would never be added while the config named "
+                f"it. Escape: aux_objective='none', or use_byteflow=false."
+            )
+        self.aux_head: nn.Module | None = build_aux(
+            cfg.aux_objective,
+            d_model=d,
+            vocab=cfg.vocab,
+            horizon=cfg.aux_horizon,
+            dim=cfg.aux_dim,
+            device=device,
+        )
+        #: The detached aux term the log line reads (`train/loop.py:aux_field`).
+        self.last_aux: torch.Tensor | None = None
         # The QAT cost fix's wiring seam: modules whose switch is on built their
         # own `QuantCache`; every plain `nn.Linear` gets one here when
         # `dense_qat` is on (`qat_linear` reads it). A model built with both
@@ -750,6 +774,24 @@ class DormouseModel(nn.Module):
         #: (`configure_actmem`): a model built and forwarded without it keeps
         #: `None`, and `forward` takes no branch and installs no hooks.
         self._act_offload: ActivationOffload | None = None
+        # THE BUDGET GATE (`aux.py`): LightMTP's published cost is <= 1% of the
+        # model's parameters (arXiv:2610.06031), so the head is priced against
+        # the tree it was just built beside — with the escape named, because
+        # `aux_dim` is the knob and a silent overrun would be a different arm.
+        if self.aux_head is not None:
+            n_head = sum(p.numel() for p in self.aux_head.parameters())
+            n_model = param_count(self)
+            if cfg.aux_objective == "lightmtp":
+                assert n_head <= 0.01 * n_model, (
+                    f"aux head {n_head} params > 1% of the model ({n_model}): the "
+                    f"LightMTP budget (arXiv:2610.06031) is at most 1%. Escape: "
+                    f"aux_dim below {cfg.aux_dim} (0 = d//24, the auto width), or "
+                    f"aux_objective='none'."
+                )
+            print(
+                f"aux={cfg.aux_objective} params={n_head} "
+                f"({100.0 * n_head / n_model:.3f}% of {n_model})"
+            )
 
     def set_iter_checkpoint(self, on: bool) -> int:
         """Enable per-iteration checkpointing on every loop block; return the count.
@@ -1389,6 +1431,15 @@ class DormouseModel(nn.Module):
                 f"— a state from a different window is a different objective. "
                 f"Escape: segment_len=0, or jepa_weight=0.0."
             )
+        if self.aux_head is not None and segment_len:
+            loud(
+                f"segment_len={segment_len} with aux_objective="
+                f"{self.cfg.aux_objective!r}: both aux targets read positions "
+                f"`t+1..t+horizon` of the SAME window, and the segmented forward "
+                f"cuts it — the target would be a state (or a summary) from a "
+                f"different window. Escape: segment_len=0, or "
+                f"aux_objective='none'."
+            )
         # The routing controller's PER-FORWARD state: the `aux` arm accumulates
         # one term per routed forward (the loop's T iterations) and the loss
         # below reads the sum. Cleared here, before the loop, so a recompute's
@@ -1614,6 +1665,21 @@ class DormouseModel(nn.Module):
                 # config. The counter is the seam's void check, as sigreg's is.
                 counters.count("jepa")
                 loss = loss + self.cfg.jepa_weight * self.jepa(out.to(torch.float32))
+            if not pure and self.aux_head is not None:
+                # THE AUX SEAM (`aux.py`) — the ONE call site that names it.
+                # LightMTP: cosine against the trunk's OWN detached `h[p+h]`.
+                # FSP: a bag-of-words of `x[p+2..p+τ]` (handcrafted, no graph).
+                # Both read `out` and neither writes it, so the logits above and
+                # the CE computed from them are the token loss, unchanged; the
+                # counter is the arm's void check, as `jepa`'s is.
+                counters.count("aux")
+                aux_term = self.aux_head(out.to(torch.float32), input_ids)
+                loss = loss + self.cfg.aux_weight * aux_term
+                # Detached and NOT read here: the log cadence owns the read
+                # (`train/loop.py:aux_field`, ADR-0018 rule 2).
+                self.last_aux = aux_term.detach()
+                if breakdown:
+                    self.last_breakdown["aux"] = float(aux_term.detach())
             if not pure and self.energy is not None:
                 # The ENERGY term (EBT arXiv:2507.02092, `energy.py`): the target
                 # byte's energy must beat `energy_negs` negatives sampled from

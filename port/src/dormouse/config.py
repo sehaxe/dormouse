@@ -240,6 +240,11 @@ MOE_COMBINES = ("torch", "fused")
 #: `bf16` writes the routed activation in the compute dtype, so the caller's
 #: `weighted.to(dt)` disappears. Only meaningful with `moe_combine="fused"`.
 MOE_COMBINE_DTYPES = ("fp32", "bf16")
+#: The `aux_objective` literals — the swappable auxiliary objective (`model/aux.py`):
+#: `none` builds no head (the default), `lightmtp` predicts the trunk's own hidden
+#: state at `p+h` (arXiv:2610.06031) and `fsp` predicts a bag-of-words of the
+#: future window (arXiv:2510.14751). A name that is not here is LOUD.
+AUX_OBJECTIVES = ("none", "lightmtp", "fsp")
 #: The `share_u_mode` literals — how the routed experts' INPUT basis is shaped
 #: (`experts.py`'s module docstring): `off` is one `U` per expert, `plane` is
 #: one `U` for the bank, `dict` is one dictionary plus a per-expert column
@@ -1723,6 +1728,33 @@ class ModelConfig:
     #: the value `tests/test_jepa.py`'s collapse gate justifies (the predicted
     #: latents stay spread at 0.1 and collapse at 0.0).
     jepa_reg_weight: float = 0.1
+    #: ---- the swappable AUXILIARY OBJECTIVE (`model/aux.py`) ----
+    #: ONE seam for the newest auxiliary training objectives, each a head on the
+    #: loop's own readout with a STOP-GRADIENT target, each OFF unless named:
+    #:   "none"     — no head, no parameter, no compute (the default); the step
+    #:                is bit-identical to the pre-flag model.
+    #:   "lightmtp" — LightMTP (arXiv:2610.06031): predict the trunk's OWN hidden
+    #:                state at `p+aux_horizon`, cosine loss (Eq. 1).
+    #:   "fsp"      — future summary prediction (arXiv:2510.14751 §3.2, the
+    #:                handcrafted variant): predict the bag-of-words of the byte
+    #:                window `x[p+2 .. p+aux_horizon]` as `vocab` logits.
+    #: The token loss is NEVER touched: `aux_weight` scales a term ADDED to the
+    #: CE, so a negative result costs the head and nothing else. Unknown
+    #: literals, a weight with "none", and an objective with weight 0 are LOUD.
+    aux_objective: str = "none"
+    #: λ on the auxiliary term: `loss = CE + aux_weight · J`. `0.0` (the default)
+    #: builds no head and adds no op.
+    aux_weight: float = 0.0
+    #: WHICH future positions the target covers, and it means the same thing to
+    #: both arms only at the endpoints: for `lightmtp` it is the STEP (`h[p+h]`,
+    #: 1 = the next position); for `fsp` it is the window's END (`x[p+2 .. p+τ]`,
+    #: >= 2). Refused below 1 (lightmtp) / 2 (fsp) and above `seq_len // 8`.
+    aux_horizon: int = 1
+    #: The head's latent width `w`. `0` (the default) asks for `d_model // 24`,
+    #: the width that measures ~0.5% of the model at both the tiny and the small
+    #: shapes (the head and the trunk both scale as `d²`). A LightMTP head over
+    #: 1% of the model — the paper's own budget — is refused in the constructor.
+    aux_dim: int = 0
     #: ---- energy-based scoring (EBT, arXiv:2507.02092; `model/energy.py`) ----
     #: `energy_weight` = λ on the margin-InfoNCE term: the target byte's energy
     #: must beat `energy_negs` negatives sampled from the `lm_head` softmax by
@@ -1901,6 +1933,27 @@ class ModelConfig:
                 f"inert), and a weight with the switch off is a key that lies about "
                 f"what the run computes (model/jepa.py). Escape: `jepa=true` + a "
                 f"positive `jepa_weight`, or `jepa=false` + `jepa_weight=0.0`."
+            )
+        # The AUX SEAM's objective↔weight agreement (`model/aux.py`): one key
+        # names the arm, the other is λ, and a run must not report an arm it does
+        # not add (or add a term no key named).
+        if self.aux_objective not in AUX_OBJECTIVES:
+            loud(
+                f"aux_objective={self.aux_objective!r} is not an arm. Known: "
+                f"{list(AUX_OBJECTIVES)} — `none` builds nothing, `lightmtp` "
+                f"predicts the trunk's own future hidden state (arXiv:2610.06031), "
+                f"`fsp` predicts a bag-of-words of the future window "
+                f"(arXiv:2510.14751). Escape: name one of those."
+            )
+        if (self.aux_objective == "none") != (self.aux_weight == 0.0):
+            loud(
+                f"aux_objective={self.aux_objective!r} with aux_weight="
+                f"{self.aux_weight}: the arm and its weight must agree — `none` "
+                f"takes weight 0.0, and a named objective takes a POSITIVE weight. "
+                f"A weight with `none` is a term no head computes; a named arm at "
+                f"weight 0 builds a head that never reaches the loss "
+                f"(model/aux.py). Escape: aux_weight=0.0 + aux_objective='none', "
+                f"or a named objective + a positive aux_weight."
             )
         if self.share_u_mode not in SHARE_U_MODES:
             loud(
@@ -3391,6 +3444,7 @@ _LOOP_ONLY_LOSS_WEIGHTS = (
     "dspark_weight",
     "mtp_weight",
     "energy_weight",
+    "aux_weight",
 )
 
 
@@ -5080,6 +5134,33 @@ def validate(model: ModelConfig) -> None:
             f"of positions to look ahead (1 = the next position). Escape: >= 1, "
             f"and <= seq_len // 8 (the load path checks the window)."
         )
+    # The AUX SEAM's own coherence (`model/aux.py`): the objective↔weight
+    # agreement is in `__post_init__` (every construction passes), these are the
+    # range checks the head would silently misuse.
+    if model.aux_weight < 0.0:
+        loud(
+            f"aux_weight={model.aux_weight} is negative: it is λ, the multiplier "
+            f"on the auxiliary term the objective ADDS to the token loss, so a "
+            f"negative value subtracts a term not published for that arm "
+            f"(model/aux.py). Escape: a positive weight with a named "
+            f"aux_objective, or 0.0 with 'none'."
+        )
+    if model.aux_dim < 0:
+        loud(
+            f"aux_dim={model.aux_dim}: it is the head's latent width, a count. "
+            f"0 means `d_model // 24` (the auto width, ~0.5% of the model), so a "
+            f"negative value is a typo. Escape: >= 0."
+        )
+    if model.aux_objective != "none":
+        floor = 2 if model.aux_objective == "fsp" else 1
+        if model.aux_horizon < floor:
+            loud(
+                f"aux_horizon={model.aux_horizon} with aux_objective="
+                f"{model.aux_objective!r}: the horizon is at least {floor} for "
+                f"this arm — `lightmtp` predicts `h[p+h]` (1 = the next position) "
+                f"and `fsp` summarises `x[p+2 .. p+τ]`, which is empty below 2. "
+                f"Escape: aux_horizon >= {floor}, and <= seq_len // 8."
+            )
     # The ENERGY head's own coherence (`model/energy.py`, EBT arXiv:2507.02092):
     # the weight gates the module (0 builds nothing), and every other field is
     # a count/scale the loss would silently misuse. The two INTERACTIONS
@@ -5546,7 +5627,14 @@ def _validate_doc(model: ModelConfig, tcfg: TrainConfig) -> None:
             "positions, not patch latents. Escape: use_byteflow=false, or "
             "doc_masking=false."
         )
-    for name in ("dspark_weight", "mtp_weight", "jepa_weight", "energy_weight", "halt_weight"):
+    for name in (
+        "dspark_weight",
+        "mtp_weight",
+        "jepa_weight",
+        "energy_weight",
+        "halt_weight",
+        "aux_weight",
+    ):
         weight = float(getattr(model, name))
         if weight > 0.0:
             loud(
@@ -5706,6 +5794,35 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"padded bank has no cap, so the grouped GEMM takes the static row-block "
             f"bound and exits on-device on an empty block — no sync, ADR-0018 rule 2) "
             f"— or moe_topk=0 (the dense blend `small` ships), or segment_len=0."
+        )
+
+
+def _validate_aux(model: ModelConfig, tcfg: TrainConfig) -> None:
+    """The AUX SEAM against the window and the segmented path (`model/aux.py`).
+
+    Same two refusals `_validate_jepa` owns, for the same reasons: the horizon
+    crosses SEGMENT boundaries (the target would be a state from a different
+    window, i.e. a different objective), and a horizon at the window's scale
+    leaves too few positions for the A/B to tell the arm from off.
+    """
+    if model.aux_objective == "none":
+        return
+    if tcfg.segment_len > 0:
+        loud(
+            f"aux_objective={model.aux_objective!r} with segment_len="
+            f"{tcfg.segment_len}: both aux targets read positions `t+1..t+horizon` "
+            f"of the SAME window, and the segmented forward cuts it per segment — "
+            f"the target would be a state (or a summary) from a different window. "
+            f"Escape: segment_len=0, or aux_objective='none'."
+        )
+    cap = tcfg.seq_len // 8
+    if model.aux_horizon > cap:
+        loud(
+            f"aux_horizon={model.aux_horizon} > seq_len // 8 = {cap} "
+            f"(seq_len={tcfg.seq_len}): the horizon must fit the training window "
+            f"with room for a predicted sample, otherwise the term reads a handful "
+            f"of positions (or none) and the A/B cannot tell it apart from off. "
+            f"Escape: a horizon <= {cap}, or aux_objective='none'."
         )
 
 
@@ -6302,6 +6419,7 @@ def _validate_tst(model: ModelConfig, tcfg: TrainConfig) -> None:
         "energy_weight",
         "halt_weight",
         "mod_aux_weight",
+        "aux_weight",
     ):
         weight = float(getattr(model, name))
         if weight > 0.0:
@@ -6752,6 +6870,7 @@ def load_run(
     _validate_segment(model, tcfg)
     _validate_doc(model, tcfg)
     _validate_jepa(model, tcfg)
+    _validate_aux(model, tcfg)
     # The RL lane's keys. The advantage arm is a literal list (checked here, the
     # way `opt` and `mm_dtype` are); the reward and penalty knobs are checked by
     # BUILDING the `RLConfig` they describe, whose `__post_init__` is LOUD — one

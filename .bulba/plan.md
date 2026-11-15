@@ -174,6 +174,48 @@ recorded as a measured refusal. Single-seed noise on record: 0.008–0.011 BPB.
 - Report numbers with the command that produced them; a claim without one is not
   a result.
 
+# PLAN — the swappable auxiliary objective (2026-11-15)
+
+Owner: the architecture must be component-swappable, and the two NEWEST
+auxiliary objectives get implemented behind one flag. Both OFF by default; no
+preset on record moves, and the token loss is untouched by construction.
+
+## T9 — `aux_objective` = none | lightmtp | fsp + one shared seam — DONE
+(commit `port(aux): swappable auxiliary objectives (lightmtp, fsp)`)
+
+- **One seam**: `aux_objective` (`"none"` | `"lightmtp"` | `"fsp"`),
+  `aux_weight` (λ), `aux_horizon` (which future positions), `aux_dim` (latent
+  width, `0` = `d/24`). `src/dormouse/model/aux.py` holds both heads and
+  `build_aux`; `model.py` has ONE call site (`counters.count("aux")`), and
+  `train/loop.py:aux_field` logs `aux_loss=` separately from `loss=`.
+- **LightMTP** (arXiv:2610.06031): `1 − cos(g(h[p]), sg(h[p+h]))`, multi-horizon
+  capable (`LightMTPHead(horizons=(1,2,4))`), stop-grad target = the trunk's own
+  hidden state. Cosine, not MSE: a scale-free target is not a magnitude race.
+- **FSP** (arXiv:2510.14751 §3.2, HANDCRAFTED variant): `V` logits ≈ the 0/1
+  bag-of-words of `x[p+2 .. p+τ]`, balanced BCE (mean-pos + mean-neg)/2. The
+  learned variant needs a reverse LM = second trunk, so it is not implemented.
+- **Refusals** (LOUD, naming the escape): an unknown literal, `aux_weight > 0`
+  with `"none"` (and the reverse), a negative weight, `aux_horizon` below 1
+  (below 2 for fsp) or above `seq_len // 8`, `aux_dim < 0`, `segment_len > 0`,
+  `use_byteflow`, `block_form="transformer"`, `doc_masking`, `tst_bag`.
+- **Budget**: a LightMTP head over 1% of the model is refused at construction
+  (the paper's own ceiling) and the built head's count is PRINTED. Measured:
+  tiny (d=64) 322 (`auto`, 0.49%) / 580 (`aux_dim=4`, 0.89%); small (d=768,
+  9,476,993 params) 49,952 (`auto`) = **0.527%**; FSP at the same width 33,056
+  = 0.349%.
+- **Gates** (`port/tests/test_aux.py`, 11 CPU tests): the off arm is the MTP
+  golden bit for bit (params 64,881, logits sha, loss 6.119609); logits
+  `torch.equal` between the off and on runs; the term recomputed line by line
+  for each paper; non-zero head grads AND a trunk gradient that differs with
+  the weight on by exactly `λ·term`; target positions receive zero gradient and
+  the attached-target comparison shows what `detach` buys; corrupting `h[p+h]`
+  moves the loss but not the prediction at `p`; 5 CPU steps per arm with the
+  aux term finite and logged separately.
+- **Prior, named**: `2026-11-15-component-catalogue.md` §2 keeps this class OFF
+  (22 aux objectives on Llama-3.2-1B, none survives Bonferroni; this repo's JEPA
+  tied at +0.0017). Both papers are positive at 3B/8B only, so the A/B decides
+  and a tie deletes the arm — the seam exists so that test is one key away.
+
 # PLAN — TST re-armed on the paper's own equations (2026-11-15)
 
 Owner: the audit (`docs/records/reviews/2026-11-15-rejection-audit.md` §1) found

@@ -147,6 +147,21 @@ def mtp_field(model: torch.nn.Module) -> str:
     return "" if value is None else f"mtp={float(value):.4f}"
 
 
+def aux_field(model: torch.nn.Module) -> str:
+    """`aux_loss=<term>` — the swappable auxiliary objective's value, on the log cadence.
+
+    `aux.py` leaves the term DETACHED on the model (`last_aux`) and never reads
+    it; this is the one declared read, once per log window, so the aux loss is
+    reported SEPARATELY from the token loss the `loss=` column carries (ADR-0018
+    rule 2 — the same shape as `mtp_field`). Empty when the arm never ran
+    (`aux_objective='none'`, a decode forward, a pure eval): a zero would claim a
+    term that was not added. The name carries `_loss` so it cannot be read as the
+    `aux=<n>` COUNTER the same line prints (steps the arm ran).
+    """
+    value = getattr(model, "last_aux", None)
+    return "" if value is None else f"aux_loss={float(value):.4f}"
+
+
 def halt_field(model: torch.nn.Module) -> str:
     """`halt=<BCE>` — the halt objective's value, on the log cadence.
 
@@ -2560,6 +2575,7 @@ def _train_impl(
                 kda_field(window, model),
                 halt_field(model),
                 mtp_field(model),
+                aux_field(model),
                 mod_field(model),
                 ce_field(cfg, drained),
                 tst_field(cfg, step),
