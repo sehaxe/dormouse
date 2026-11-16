@@ -543,9 +543,18 @@ def host_step_all(model: nn.Module, lr: float, scale: float = 1.0) -> tuple[int,
     return (updates, rows)
 
 
-def host_state(model: nn.Module) -> dict:
-    """The `<ckpt>.ngram` payload: tables + momentum + step + counts, per Engram."""
+def host_state(model: nn.Module, step: int) -> dict:
+    """The `<ckpt>.ngram` payload, stamped with the weights' training `step`.
+
+    Each Engram's own `step` is its host-update counter — it can lag the global
+    step, because eval and NaN-skipped steps never touch the tables. The
+    TOP-LEVEL `step` is the checkpoint's, passed by `save_ckpt`: it is the resume
+    gate's other half. `save_ckpt` writes the weights first and this sibling
+    second, so a crash between the two leaves new weights with an old sidecar;
+    `load_ckpt` refuses when this stamp differs from the weights' `ck["step"]`.
+    """
     return {
+        "step": int(step),
         "engrams": [
             {
                 "rows": m.host.rows,
@@ -554,7 +563,7 @@ def host_state(model: nn.Module) -> dict:
                 "counts": m.host.counts,
             }
             for m in host_engrams(model)
-        ]
+        ],
     }
 
 

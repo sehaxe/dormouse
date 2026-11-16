@@ -1116,12 +1116,15 @@ def _fake_grouped_nt(a, w, offs, cap, n, k, tiles, out_dtype, out=None):
     return res
 
 
-def _fake_wgrad(a, b, offs, e, cap, k, n, tiles, out_dtype):
+def _fake_wgrad(a, b, offs, e, cap, k, n, tiles, out_dtype, out=None):
     res = torch.zeros(e, k, n, dtype=out_dtype)
     for i in range(e):
         s, t = int(offs[i]), int(offs[i + 1])
         if t > s:
             res[i] = (a[s:t].double().T @ b[s:t].double()).to(out_dtype)
+    if out is not None:
+        out.copy_(res)
+        return out
     return res
 
 

@@ -47,6 +47,9 @@ arm ns_bf16          --set ns_dtype=bf16
 arm ns3              --set ns_steps=3
 arm ns_bf16_3        --set ns_dtype=bf16 --set ns_steps=3
 arm state_bf16       --set muon_state_dtype=bf16
+# ns_steps=3 is NOT a free rung: measured 2026-11-14, held-out BPB at 16.4 MB,
+# fp32/3 +0.205 and bf16/3 +0.215 against fp32/5; bf16 NS at 5 steps is +0.0008.
+# `muon_fast` stays an arm because the SECONDS are real; it does not ship.
 arm muon_fast        --set ns_dtype=bf16 --set ns_steps=3 --set muon_state_dtype=bf16
 
 # --- the launch rungs -------------------------------------------------------

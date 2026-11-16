@@ -372,6 +372,44 @@ def test_a_non_numeric_value_is_loud_not_a_ValueError():
         loads_mix_plan(_plan_toml(stages=[(1.0, 'a = "x"')], sources_table='a = "a.bin"'))
 
 
+def test_resume_fasts_forward_disk_bytes_not_items(tmp_path):
+    """With data_item_bytes=2 the fast-forward advances 2x the ITEM window.
+
+    `window = batch*(seq_len+1)` is a token count; `ByteStream._pos` is a DISK
+    byte. The old resume passed items straight to `ByteStream.skip_bytes` and
+    re-read half the trained tokens. `replay_bytes`/`per_source_bytes` now
+    carry `item_bytes`, and every stream lands on `lo + 2*served_items`.
+    """
+    srcs = sources(tmp_path, n=8192)
+    plan = plan_of([(1.0, {"web": 0.5, "code": 0.5})], srcs)
+    steps = 12
+    kw = dict(steps=steps, batch=BATCH, seq_len=SEQ, seed=plan.seed)
+    served_items = replay_bytes(plan, **kw)  # old, item units
+    served_bytes = replay_bytes(plan, **kw, item_bytes=2)  # new, disk bytes
+    for name in plan.sources:
+        assert served_bytes[name] == 2 * served_items[name]
+    expected = per_source_bytes(plan, steps, BATCH, SEQ, item_bytes=2)
+    assert expected == served_bytes  # single-stage: expectation == draw
+
+    stream = MixtureStream(plan, BATCH, SEQ, steps=steps, item_bytes=2)
+    stream.skip_bytes(steps * WINDOW)  # the trainer's ITEM fast-forward
+    assert stream.step == steps
+    for name, sub in stream._streams.items():
+        lo = sub.lo
+        assert sub._pos == lo + 2 * served_items[name], (
+            f"{name}: resumed at byte {sub._pos}, expected {lo + 2 * served_items[name]}"
+        )
+
+    # The proof that matters: an unbroken run and a resumed run read the SAME
+    # next bytes, so no trained token is re-read on the relaunch.
+    whole = MixtureStream(plan, BATCH, SEQ, steps=steps, item_bytes=2)
+    for _ in range(steps):
+        whole.next_batch()
+    for _ in range(4):
+        a, b = whole.next_batch(), stream.next_batch()
+        assert (a[0] == b[0]).all() and (a[1] == b[1]).all()
+
+
 # --- helpers -----------------------------------------------------------------
 
 

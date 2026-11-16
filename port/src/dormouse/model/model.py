@@ -22,18 +22,23 @@ arm to run first).
 
 from __future__ import annotations
 
+import json
 import math
+from collections.abc import Mapping
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from .. import stepaudit
+from ..chunk_ce import chunked_cross_entropy
 from ..config import ModelConfig, block_kinds, hybrid_ratio, validate_block_form
 from ..instrument import Counters, loud
 from ..losses import fixed_cross_entropy, logit_softcap
 from .act_mem import ActivationOffload
 from .attnres import FullDepthAttnRes
+from .aux import build_aux
 from .byteflow import (
     BfChannel,
     ByteFlowNet,
@@ -71,10 +76,118 @@ def mhc_readout(streams: torch.Tensor, compose: bool) -> torch.Tensor:
     return h / streams.shape[-2] if compose else h
 
 
+def tokenizer_vocab(path: str | Path) -> int:
+    """The ID SPACE a `tokenizers` JSON claims — `max(id) + 1` over its tables.
+
+    A `tokenizers` file lists ids explicitly (`model.vocab` maps token → id, and
+    `added_tokens` carry theirs), so counting entries would under-report a
+    file with holes; the row count `nn.Embedding` needs is one past the largest
+    id in use.
+    """
+    data = json.loads(Path(path).read_text())
+    ids = list(data.get("model", {}).get("vocab", {}).values())
+    ids += [t["id"] for t in data.get("added_tokens", []) if "id" in t]
+    if not ids:
+        loud(f"tokenizer {path}: no `model.vocab` and no `added_tokens` — not a tokenizers file")
+    return max(ids) + 1
+
+
+def embedding_rows(sd: Mapping[str, torch.Tensor]) -> int | None:
+    """The token-table row count a state dict carries (`embed.weight` or the
+    factorized `embed.u.weight`), or `None` when it carries no table at all."""
+    for key, tensor in sd.items():  # stepaudit-excuse: load, once per checkpoint
+        if key.endswith(("embed.weight", "embed.u.weight")):
+            return int(tensor.shape[0])
+    return None
+
+
+def refuse_vocab_mismatch(
+    *,
+    vocab: int,
+    ckpt: Mapping[str, torch.Tensor] | None = None,
+    tokenizer: str | Path | None = None,
+) -> None:
+    """Vocabulary is IDENTITY: a mismatched table is refused, never padded.
+
+    A `[v', d]` table that loads into a `[v, d]` model is either an error
+    torch raises deep in the load or — the defect this exists for — rows
+    somebody zero-padded to make the load pass. Both are a model reading ids it
+    was never trained on. Two sources are checked: the checkpoint's own rows,
+    and the tokenizer file the ids came from when the caller has one.
+    """
+    if ckpt is not None:
+        rows = embedding_rows(ckpt)
+        if rows is not None and rows != vocab:
+            loud(
+                f"checkpoint token table has {rows} rows, model vocab={vocab}: "
+                f"the vocabulary is IDENTITY, so a tokenizer change is a new "
+                f"model (or a re-embedding pass), never a padded table. Escape: "
+                f"build the model with vocab={rows} and the checkpoint's "
+                f"tokenizer, or start from a checkpoint of this vocabulary."
+            )
+    if tokenizer is not None:
+        tok = tokenizer_vocab(tokenizer)
+        if tok != vocab:
+            loud(
+                f"tokenizer {tokenizer} has {tok} ids, model vocab={vocab}: the "
+                f"model would read ids it never embedded (and logits every "
+                f"target checks against the wrong rows). Escape: vocab={tok} to "
+                f"match the tokenizer, or a tokenizer of vocab={vocab}."
+            )
+
+
+class FactorizedEmbedding(nn.Module):
+    """The token table as `U @ Vᵀ` — `U [vocab, r]`, `V [d, r]` (`embed_rank`).
+
+    `nn.Embedding(vocab, d)` is `vocab·d` parameters that ONE first matmul
+    reads. The factorization costs `vocab·r + r·d`: 32k×256 + 256×832 = 8 601 600
+    against 27 262 976 at `d=832`, and it is a genuine rank-`r` bottleneck on
+    the input, not a widening.
+
+    INIT is what makes an A/B readable: the plain table draws `N(0, 1)`, so `U`
+    draws `N(0, 1)` and `V` draws `N(0, 1/r)` — a row's dot product has variance
+    `r · 1 · (1/r) = 1`. Step 0 therefore starts at the plain table's scale and
+    a loss difference is the factorization, not an init change.
+
+    `weight` materialises the `[vocab, d]` product for the readers that need the
+    whole matrix (the energy arm). It costs `vocab·r·d` FLOP, so nothing on the
+    training path may read it — `forward` is the lookup and `head` is the tied
+    head's transpose, both factored.
+    """
+
+    def __init__(
+        self, vocab: int, d: int, rank: int, *, device: torch.device | str | None = None
+    ) -> None:
+        super().__init__()
+        self.u = nn.Embedding(vocab, rank, device=device)
+        self.v = nn.Linear(rank, d, bias=False, device=device)
+        nn.init.normal_(self.u.weight, 0.0, 1.0)
+        nn.init.normal_(self.v.weight, 0.0, rank**-0.5)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.v(self.u(ids))
+
+    def head(self, x: torch.Tensor) -> torch.Tensor:
+        """`x @ (U Vᵀ)ᵀ` = `(x @ V) @ Uᵀ`, in fp32 (the burn head rule) — never
+        materialises `[vocab, d]`."""
+        v = self.v.weight.to(torch.float32)  # [d, r]
+        return F.linear(F.linear(x.to(torch.float32), v.T), self.u.weight.to(torch.float32))
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.u.weight @ self.v.weight.T  # [vocab, d], materialised — slow
+
+
 class DormouseModel(nn.Module):
     def __init__(self, cfg: ModelConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
         self.cfg = cfg
+        #: `TrainConfig.ce_chunk` for the CURRENT forward (0 = off). Set by
+        #: `forward` from its kwarg, read by `_readout` two dispatch hops below:
+        #: one field, rewritten on every forward, so it cannot go stale against
+        #: the caller's config (the `ce_fixed` kwarg is threaded instead because
+        #: it predates this — same rule, one hop).
+        self._ce_chunk = 0
         # The runtime seam a hand-built/mutated config reaches; `__post_init__`
         # and `config.validate` own the same refusals (ADR-0019).
         validate_block_form(cfg)
@@ -278,7 +391,22 @@ class DormouseModel(nn.Module):
             self.last_halt = None
             self.last_breakdown = {}
             return
-        self.embed = nn.Embedding(cfg.vocab, d, device=device)
+        # The token table: plain (`embed_rank=0`, bit-identical to every run on
+        # record) or `U @ Vᵀ` (see `FactorizedEmbedding`). Built at ONE site so
+        # the off path cannot drift from the rows it replaces.
+        if cfg.embed_rank < 0 or cfg.embed_rank > d:
+            # The runtime seam a hand-built model reaches; `__post_init__` owns
+            # the same refusal (ADR-0019).
+            loud(
+                f"embed_rank={cfg.embed_rank} outside 0..=d_model={d}: a rank above "
+                f"the width is not a factorization of the token table. Escape: "
+                f"0..=d_model."
+            )
+        self.embed: nn.Module = (
+            FactorizedEmbedding(cfg.vocab, d, cfg.embed_rank, device=device)
+            if cfg.embed_rank > 0
+            else nn.Embedding(cfg.vocab, d, device=device)
+        )
         if cfg.block_stack != "uniform":
             # THE HYBRID STACK (`block_stack`): the ordered mix `[K,K,K,A]×`,
             # built from the SAME two block modules the pure forms use — a
@@ -614,6 +742,29 @@ class DormouseModel(nn.Module):
                     f"Escape: one weight per run."
                 )
             self.energy = EnergyHead(d, cfg.energy_rank, device=device)
+        # THE AUX SEAM (`aux.py`, `aux_objective`): ONE head, LightMTP or FSP,
+        # built IFF the objective is named — `aux_objective="none"` adds no
+        # parameter, no op and no branch, so the off path is bit-identical.
+        # The head reads the loop's readout and never writes it: the token loss
+        # is untouched by construction (the logits below are the same tensor).
+        if cfg.aux_objective != "none" and cfg.use_byteflow:
+            loud(
+                f"aux_objective={cfg.aux_objective!r} with use_byteflow=true: the "
+                f"byteflow shapes run no byte-level loop, so the head's targets "
+                f"(`h[p+h]`, or the bytes at `p+2..p+τ`) have no byte position to "
+                f"read and the term would never be added while the config named "
+                f"it. Escape: aux_objective='none', or use_byteflow=false."
+            )
+        self.aux_head: nn.Module | None = build_aux(
+            cfg.aux_objective,
+            d_model=d,
+            vocab=cfg.vocab,
+            horizon=cfg.aux_horizon,
+            dim=cfg.aux_dim,
+            device=device,
+        )
+        #: The detached aux term the log line reads (`train/loop.py:aux_field`).
+        self.last_aux: torch.Tensor | None = None
         # The QAT cost fix's wiring seam: modules whose switch is on built their
         # own `QuantCache`; every plain `nn.Linear` gets one here when
         # `dense_qat` is on (`qat_linear` reads it). A model built with both
@@ -623,6 +774,24 @@ class DormouseModel(nn.Module):
         #: (`configure_actmem`): a model built and forwarded without it keeps
         #: `None`, and `forward` takes no branch and installs no hooks.
         self._act_offload: ActivationOffload | None = None
+        # THE BUDGET GATE (`aux.py`): LightMTP's published cost is <= 1% of the
+        # model's parameters (arXiv:2610.06031), so the head is priced against
+        # the tree it was just built beside — with the escape named, because
+        # `aux_dim` is the knob and a silent overrun would be a different arm.
+        if self.aux_head is not None:
+            n_head = sum(p.numel() for p in self.aux_head.parameters())
+            n_model = param_count(self)
+            if cfg.aux_objective == "lightmtp":
+                assert n_head <= 0.01 * n_model, (
+                    f"aux head {n_head} params > 1% of the model ({n_model}): the "
+                    f"LightMTP budget (arXiv:2610.06031) is at most 1%. Escape: "
+                    f"aux_dim below {cfg.aux_dim} (0 = d//24, the auto width), or "
+                    f"aux_objective='none'."
+                )
+            print(
+                f"aux={cfg.aux_objective} params={n_head} "
+                f"({100.0 * n_head / n_model:.3f}% of {n_model})"
+            )
 
     def set_iter_checkpoint(self, on: bool) -> int:
         """Enable per-iteration checkpointing on every loop block; return the count.
@@ -690,23 +859,49 @@ class DormouseModel(nn.Module):
         return n
 
     def set_act_store(self, mode: str) -> int:
-        """Set `act_store` on every transformer block; return the count.
+        """Set `act_store` on the model's sites; return the count.
 
-        The arm is the STORE-ONLY lane (`model/packed_acts.py`): the forward runs
+        `nvfp4` is the STORE-ONLY lane (`model/packed_acts.py`): the forward runs
         bf16, bit for bit, and only what the backward keeps is packed — a memory
         arm, not a numerics one, hence a `TrainConfig` field applied here like
         `activation_recompute` rather than a build-time arch flag.
 
+        `codes` is the other side of the same idea: where the forward ALREADY
+        fake-quantizes (`act_qat`, the MoE expert seam), the backward rebuilds the
+        very same `x_q` from 4-bit codes, so the memory falls 4x with NO change to
+        any value or gradient — see `packed_acts.coded_act_mm`. It is a no-op on
+        the transformer block, whose `act_qat` FFN already stores packed.
+
         The historical arm ("bf16") takes no branch: it is the default every
         snapshot carries. A non-default mode refuses when the stack is not the
-        unique transformer form — the hybrid stack's KDA blocks save through the
+        form that owns its sites — the hybrid stack's KDA blocks save through the
         loop's seam and would keep their bf16 set while the log said the arm was
         on (the same reason `activation_offload` refuses there) — and when the
-        model builds no transformer block at all.
+        model builds no site at all.
         """
         from .packed_acts import check_store
 
         check_store(mode)
+        if mode == "codes":
+            # The codes rung lives on the MoE expert seam (`experts.SparseMoE`),
+            # not on the transformer block: its `act_qat` FFN already saves its
+            # operands packed. The hybrid-stack rule below is about the packed
+            # GEMM sites, so it does not apply to this rung.
+            from .experts import SparseMoE
+
+            n = 0
+            for module in self.modules():
+                if isinstance(module, SparseMoE):
+                    n += module.set_act_store(mode)
+            if n == 0:
+                loud(
+                    f"act_store={mode!r} but this model builds no `SparseMoE` "
+                    f"(block_form='kda' is where the fake-quantized per-expert GEMM "
+                    f"operand lives), so the arm would store nothing coded while the "
+                    f"log reported it on. Escape: block_form='kda', or "
+                    f"act_store='bf16'."
+                )
+            return n
         if mode != "bf16" and self.cfg.block_stack != "uniform":
             loud(
                 f"act_store={mode!r} with block_stack={self.cfg.block_stack!r}: "
@@ -816,6 +1011,24 @@ class DormouseModel(nn.Module):
             if hasattr(m, "dense_qat_alpha"):
                 m.dense_qat_alpha = alpha
 
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        """The vocabulary check that torch's shape check cannot name.
+
+        `train`'s resume, `eval`, `decode`, `serve` and `scripts/chat.py` all
+        reach the weights through `load_state_dict` (`train/loop.py::
+        load_model_state` included), so this is the ONE seam a 32k-tokenizer
+        checkpoint meets a 256-row table at. Torch's message for that case is a
+        shape; the model's is the tokenizer migration. Padding is never legal
+        (`refuse_vocab_mismatch`).
+        """
+        refuse_vocab_mismatch(vocab=self.cfg.vocab, ckpt=state_dict)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -827,6 +1040,7 @@ class DormouseModel(nn.Module):
         segment_len: int = 0,
         loss_mask: torch.Tensor | None = None,
         ce_fixed: bool = False,
+        ce_chunk: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`input_ids [b,t]` (+ `targets [b,t]`) → (logits `[b*t,vocab]`, loss, counters).
 
@@ -862,6 +1076,15 @@ class DormouseModel(nn.Module):
         TRAIN half's (`TrainConfig.ce_fixed`), which is why it is threaded here
         rather than stored on `ModelConfig`: a checkpoint's snapshot pairs a
         model with the objective it was trained on.
+
+        `ce_chunk` (`TrainConfig.ce_chunk`, `chunk_ce.chunked_cross_entropy`) is
+        the CHUNKED final CE: the readout hands the loss the hidden states and the
+        head instead of `[b·t, vocab]` logits, and the loss projects `ce_chunk`
+        positions at a time — so the 805M-value tensor at b24·s1024 with a 32k
+        vocabulary never exists. The returned logits are `None` for that forward
+        (the arm's contract: nothing reads what was never built), and the loss
+        and gradient are the un-chunked ones to fp32 summation order. `0` (the
+        default) is the historical readout, bit for bit.
         """
         counters = Counters() if counters is None else counters
         assert input_ids.dtype in (torch.long, torch.int64), "input_ids must be integer ids"
@@ -882,6 +1105,41 @@ class DormouseModel(nn.Module):
                     "latents, not byte positions, so a [b,t] byte mask addresses a "
                     "different sequence. Escape: use_byteflow=false, or loss_mask=None."
                 )
+        if ce_chunk and ce_fixed:
+            # `config.validate_train` refuses the pair; a hand-built forward
+            # reaches here instead (ADR-0019: the runtime seam owns the same
+            # refusal as the config).
+            loud(
+                f"ce_chunk={ce_chunk} with ce_fixed=true: the chunked CE is the "
+                f"historical `log_softmax → NLL` arithmetic and there is no chunked "
+                f"fixed CE yet, so the pair would report a loss arm it did not run. "
+                f"Escape: ce_fixed=false (with ce_chunk>0), or ce_chunk=0."
+            )
+        if ce_chunk:
+            if self.bf_net is not None or self.bf is not None:
+                loud(
+                    f"ce_chunk={ce_chunk} with use_byteflow=true: the byteflow shapes "
+                    f"score PATCH LATENTS from their own head, not byte/token "
+                    f"positions, so `_readout` is never reached and the flag would be "
+                    f"inert while the run reported it on. Escape: use_byteflow=false, "
+                    f"or ce_chunk=0."
+                )
+            if targets is None:
+                loud(
+                    f"ce_chunk={ce_chunk} with targets=None: a no-labels forward has "
+                    f"no loss to chunk and its caller reads the logits. Escape: "
+                    f"ce_chunk=0 on a decode forward."
+                )
+            if self.cfg.z_loss > 0.0 or self.cfg.mtp_weight > 0.0:
+                loud(
+                    f"ce_chunk={ce_chunk} with z_loss={self.cfg.z_loss:g}/"
+                    f"mtp_weight={self.cfg.mtp_weight:g}: both add a term on the "
+                    f"FINAL `[b·t, vocab]` logits — the tensor the chunked CE exists "
+                    f"to not build — so the arm would either silently drop the term "
+                    f"or build the tensor anyway. Escape: z_loss=0.0 and mtp_weight=0.0, "
+                    f"or ce_chunk=0."
+                )
+        self._ce_chunk = int(ce_chunk)
         if self.cfg.dense_qat != "none":
             # The dense path ran (the per-site proof is the coverage gate,
             # tests/test_dense_qat.py: every nn.Linear/DenseLinear weight in the
@@ -1128,9 +1386,12 @@ class DormouseModel(nn.Module):
             f"the loop's input contract is [b, t, d_model] = "
             f"{(b_in, t_in, self.cfg.d_model)}, got {tuple(h0.shape)}"
         )
-        assert h0.dtype == self.embed.weight.dtype, (
-            f"the loop's input dtype must be the residual dtype "
-            f"{self.embed.weight.dtype}, got {h0.dtype}"
+        # The residual dtype is the embedding's PARAMETER dtype (one table or two
+        # factors — the write's dtype is the same either way); `weight` would
+        # materialise the factorized product, so it is not read here.
+        embed_dtype = next(self.embed.parameters()).dtype
+        assert h0.dtype == embed_dtype, (
+            f"the loop's input dtype must be the residual dtype {embed_dtype}, got {h0.dtype}"
         )
         # The HALT HEAD is an INFERENCE mechanism (`halt.py`): a training step
         # runs the scheduled depth, because the head's BCE needs every iteration
@@ -1170,6 +1431,15 @@ class DormouseModel(nn.Module):
                 f"— a state from a different window is a different objective. "
                 f"Escape: segment_len=0, or jepa_weight=0.0."
             )
+        if self.aux_head is not None and segment_len:
+            loud(
+                f"segment_len={segment_len} with aux_objective="
+                f"{self.cfg.aux_objective!r}: both aux targets read positions "
+                f"`t+1..t+horizon` of the SAME window, and the segmented forward "
+                f"cuts it — the target would be a state (or a summary) from a "
+                f"different window. Escape: segment_len=0, or "
+                f"aux_objective='none'."
+            )
         # The routing controller's PER-FORWARD state: the `aux` arm accumulates
         # one term per routed forward (the loop's T iterations) and the loss
         # below reads the sum. Cleared here, before the loop, so a recompute's
@@ -1200,13 +1470,32 @@ class DormouseModel(nn.Module):
         # cast is the identity on the fp32 path (`residual_dtype="fp32"`), and
         # it is what keeps the readout's storage dtype from reaching the head.
         hn = self.norm(out.to(torch.float32))
-        logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
-        if self.cfg.logit_softcap > 0.0:
-            # Gemma-2's final-logit cap (`losses.logit_softcap`): applied to
-            # the head output BEFORE the final CE, z-loss and the returned
-            # logits, so a training step and the held-out objective score the
-            # same bounded distribution. `0.0` enters no branch.
-            logits = logit_softcap(logits, self.cfg.logit_softcap)
+        # CHUNKED FINAL CE (`TrainConfig.ce_chunk`, `chunk_ce.py`): with the flag
+        # on, the head is applied INSIDE the loss, one slice of positions at a
+        # time, so the `[b·t, vocab]` logits — and the NLL backward's copy of
+        # them — are never built. `logits is None` is the arm's contract (the
+        # trainer's step never reads them). `z_loss` and MTP DO read the final
+        # logits, so `forward` refuses the flag with either; the loop's own
+        # per-iteration L_Rec (`loopblock._iter_ce`) is a separate site.
+        if self._ce_chunk and targets is not None:
+            logits = None
+            ce_final = chunked_cross_entropy(
+                hn.reshape(-1, self.cfg.d_model),
+                self.lm_head,
+                targets,
+                self._ce_chunk,
+                mask=loss_mask,
+                softcap=self.cfg.logit_softcap,
+            )
+        else:
+            logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
+            if self.cfg.logit_softcap > 0.0:
+                # Gemma-2's final-logit cap (`losses.logit_softcap`): applied to
+                # the head output BEFORE the final CE, z-loss and the returned
+                # logits, so a training step and the held-out objective score the
+                # same bounded distribution. `0.0` enters no branch.
+                logits = logit_softcap(logits, self.cfg.logit_softcap)
+            ce_final = None
         loss = None
         # Set only on the soft-MTP arm; the hard path leaves it None and keeps
         # its MTP call exactly where it was, so `mtp_soft=false` is the old
@@ -1279,18 +1568,20 @@ class DormouseModel(nn.Module):
             else:
                 logits_ntp = logits
             flat = targets.reshape(-1, 1)
-            if ce_fixed:
-                ce_final = fixed_cross_entropy(
-                    logits_ntp, targets, reduction="none", counters=counters
-                ).reshape(-1, 1)
-            else:
-                ce_final = -F.log_softmax(logits_ntp, dim=-1).gather(1, flat)
-            if loss_mask is not None:
-                # doc_masking: padding and cross-document targets carry no loss
-                # and no gradient — the same selected mean the loop used.
-                ce_final = masked_ce_mean(ce_final, loss_mask)
-            else:
-                ce_final = ce_final.mean()
+            if ce_final is None:
+                # The un-chunked branch: the head's own logits, one reduction.
+                if ce_fixed:
+                    ce_final = fixed_cross_entropy(
+                        logits_ntp, targets, reduction="none", counters=counters
+                    ).reshape(-1, 1)
+                else:
+                    ce_final = -F.log_softmax(logits_ntp, dim=-1).gather(1, flat)
+                if loss_mask is not None:
+                    # doc_masking: padding and cross-document targets carry no loss
+                    # and no gradient — the same selected mean the loop used.
+                    ce_final = masked_ce_mean(ce_final, loss_mask)
+                else:
+                    ce_final = ce_final.mean()
             if breakdown:
                 # Eval-only host reads (called under `torch.no_grad()` by
                 # `evaluate(..., breakdown=True)`; NEVER in the training path —
@@ -1374,6 +1665,21 @@ class DormouseModel(nn.Module):
                 # config. The counter is the seam's void check, as sigreg's is.
                 counters.count("jepa")
                 loss = loss + self.cfg.jepa_weight * self.jepa(out.to(torch.float32))
+            if not pure and self.aux_head is not None:
+                # THE AUX SEAM (`aux.py`) — the ONE call site that names it.
+                # LightMTP: cosine against the trunk's OWN detached `h[p+h]`.
+                # FSP: a bag-of-words of `x[p+2..p+τ]` (handcrafted, no graph).
+                # Both read `out` and neither writes it, so the logits above and
+                # the CE computed from them are the token loss, unchanged; the
+                # counter is the arm's void check, as `jepa`'s is.
+                counters.count("aux")
+                aux_term = self.aux_head(out.to(torch.float32), input_ids)
+                loss = loss + self.cfg.aux_weight * aux_term
+                # Detached and NOT read here: the log cadence owns the read
+                # (`train/loop.py:aux_field`, ADR-0018 rule 2).
+                self.last_aux = aux_term.detach()
+                if breakdown:
+                    self.last_breakdown["aux"] = float(aux_term.detach())
             if not pure and self.energy is not None:
                 # The ENERGY term (EBT arXiv:2507.02092, `energy.py`): the target
                 # byte's energy must beat `energy_negs` negatives sampled from
@@ -1597,8 +1903,30 @@ class DormouseModel(nn.Module):
         the two forms differ only in the blocks, so a second copy of the head or
         the masked/fixed CE would be a second set of rules for the same number.
         `breakdown` is the eval-only host read (never in a training step).
+
+        `self._ce_chunk > 0` takes the chunked branch: no logits tensor is built,
+        and the return is `(None, loss)`. That is why `forward` refuses the flag
+        with a no-labels forward and with the byteflow shapes.
         """
         hn = self.norm(h.to(torch.float32))
+        if targets is not None and self._ce_chunk:
+            # THE CHUNKED CE (`TrainConfig.ce_chunk`): the head is applied INSIDE
+            # the loss, one slice of positions at a time, so the `[b·t, vocab]`
+            # logits — and the NLL backward's copy of them — are never built. The
+            # softcap goes with the projection for the same reason (it is a
+            # transform of the logits the CE reads). `logits is None` is the arm's
+            # contract, not a fallback: the trainer's step never reads them.
+            loss = chunked_cross_entropy(
+                hn.reshape(-1, self.cfg.d_model),
+                self.lm_head,
+                targets,
+                self._ce_chunk,
+                mask=loss_mask,
+                softcap=self.cfg.logit_softcap,
+            )
+            if breakdown:
+                self.last_breakdown = {"fin": float(loss.detach()), "per_iter": []}
+            return None, loss
         logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
         if self.cfg.logit_softcap > 0.0:
             logits = logit_softcap(logits, self.cfg.logit_softcap)
@@ -1682,14 +2010,21 @@ class TiedHead(nn.Module):
     forward's final logits both accumulate into `embed.weight` — which is the
     whole of what "tied" means and what `tests/test_train4.py` asserts against
     a hand-built two-path model.
+
+    A FACTORIZED table (`embed_rank > 0`) is tied the same way: the head is
+    `(x @ V) @ Uᵀ`, the transpose of the same `U @ Vᵀ`, so tying still adds no
+    parameter and the `[vocab, d]` product is never materialised.
     """
 
-    def __init__(self, embed: nn.Embedding) -> None:
+    def __init__(self, embed: nn.Module) -> None:
         super().__init__()
         self._owner = [embed]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x.to(torch.float32), self._owner[0].weight.to(torch.float32))
+        embed = self._owner[0]
+        if isinstance(embed, FactorizedEmbedding):
+            return embed.head(x)
+        return F.linear(x.to(torch.float32), embed.weight.to(torch.float32))
 
 
 def _byte_ce(

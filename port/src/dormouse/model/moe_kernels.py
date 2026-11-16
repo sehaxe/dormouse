@@ -1310,7 +1310,7 @@ def _grouped_nt_pair(a1, w1, a2, w2, offs, cap, n, k, tiles, out_dtype):
     return out
 
 
-def _wgrad(a, b, offs, e, cap, k, n, tiles, out_dtype):
+def _wgrad(a, b, offs, e, cap, k, n, tiles, out_dtype, out=None):
     """`out [E, K, N]` = `a[group]ᵀ @ b[group]`.
 
     `num_stages` is load-bearing, not taste: the row-loop body stages a
@@ -1319,8 +1319,19 @@ def _wgrad(a, b, offs, e, cap, k, n, tiles, out_dtype):
     The two-byte measure of this kernel is 16384 B at BN=128 and 32768 B at
     BN=256 (`metadata.shared`, see `smem_estimate`), so 128 is the shipped N and
     the GUARD no longer claims 256 cannot fit.
+
+    `out` is the caller-owned grow-only destination (`BwdWorkspace.slot`), the
+    same seam `_grouped_nt` already carries. Passing it makes the wide wgrad
+    (at b1 `dv` is `[1024, 64, 5461]` bf16 = 682.5 MiB) a PRE-SIZED allocation:
+    the kernel writes into a buffer reserved once at startup, never a fresh
+    682.5 MiB `torch.empty` in the middle of a step. `None` keeps the old
+    allocate-per-call behaviour for the reference arm and its parity gates.
     """
-    out = torch.empty(e, k, n, dtype=out_dtype, device=a.device)
+    if out is None:
+        out = torch.empty(e, k, n, dtype=out_dtype, device=a.device)
+    else:
+        assert out.shape == (e, k, n), f"out {tuple(out.shape)} != [{e}, {k}, {n}]"
+        assert out.dtype == out_dtype and out.is_contiguous(), "out must be the caller's buffer"
     _launch(
         _wgrad_kernel,
         (e, triton.cdiv(k, tiles["BLOCK_K"]), triton.cdiv(n, tiles["BLOCK_N"])),
@@ -1450,6 +1461,40 @@ def _glu_backward(
     return dx, dgate_u, dup_u, dgate_s, dup_s, dv
 
 
+def _grad_leaves(*tensors):
+    """Leaf nn.Parameters whose .grad the grads of `tensors` flow into.
+
+    The bank hands the kernels a torch.stack([t.to(dt) ...]), a NON-leaf: the
+    stack backward unbinds the returned grad into per-expert views and
+    AccumulateGrad ALIASES the first view into leaf.grad. A pre-sized wgrad
+    buffer cannot go to autograd unguarded - a second micro-batch overwrites the
+    buffer the first one's grad lives in (2*g2 instead of g1+g2, measured).
+    Walking grad_fn once lets the caller clone on the step's FIRST backward only.
+    """
+    out: list = []
+    seen: set[int] = set()
+    stack: list = []
+    for t in tensors:
+        if isinstance(t, torch.Tensor) and t.grad_fn is not None:
+            stack.append(t.grad_fn)
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        var = getattr(node, "variable", None)
+        if (
+            isinstance(var, torch.nn.Parameter)
+            and var.requires_grad
+            and all(v is not var for v in out)
+        ):
+            out.append(var)
+        for sub, _ in getattr(node, "next_functions", ()):
+            if sub is not None and hasattr(sub, "next_functions"):
+                stack.append(sub)
+    return out
+
+
 def _glu_backward_fused(
     xg, gate_u, up_u, gate_s, up_s, v, offs, cap, gpre, upre, h, dy, tiles, seg, ws
 ):
@@ -1534,9 +1579,47 @@ def _glu_backward_fused(
     torch.mul(du, us_row, out=tmp)
     du_l.copy_(tmp)
 
-    dgate_u = _wgrad(xg, dg_l, offs, e, cap, d, r, t_rank_n, xg.dtype)
-    dup_u = _wgrad(xg, du_l, offs, e, cap, d, r, t_rank_n, xg.dtype)
-    dv = _wgrad(h, dyc, offs, e, cap, r, f, t_wide, xg.dtype)
+    # Pre-sized, caller-owned wgrad destinations. The wide one is
+    # [E, r, f] = 682.5 MiB at b1: it used to be a fresh torch.empty in _wgrad
+    # on EVERY backward, the exact allocation that OOM'd the pilot mid-step.
+    # The slot is reserved once and reused; see _ExpertGemmGlu.backward for the
+    # step-boundary clone that keeps autograd from aliasing it into leaf.grad.
+    dgate_u = _wgrad(
+        xg,
+        dg_l,
+        offs,
+        e,
+        cap,
+        d,
+        r,
+        t_rank_n,
+        xg.dtype,
+        out=ws.slot("wg_dgate_u", (e, d, r), xg.dtype, dev),
+    )
+    dup_u = _wgrad(
+        xg,
+        du_l,
+        offs,
+        e,
+        cap,
+        d,
+        r,
+        t_rank_n,
+        xg.dtype,
+        out=ws.slot("wg_dup_u", (e, d, r), xg.dtype, dev),
+    )
+    dv = _wgrad(
+        h,
+        dyc,
+        offs,
+        e,
+        cap,
+        r,
+        f,
+        t_wide,
+        xg.dtype,
+        out=ws.slot("wg_dv", (e, r, f), xg.dtype, dev),
+    )
     dx = _grouped_nt_pair(dg_l, gate_u, du_l, up_u, offs, cap, d, r, t_wide, xg.dtype)
 
     torch.mul(dg, gpre, out=tmp)
@@ -1797,7 +1880,25 @@ class _ExpertGemmGlu(torch.autograd.Function):
         args = (xg, gate_u, up_u, gate_s, up_s, v, offs, ctx.cap, gpre, upre, h, dy, ctx.tiles)
         try:
             if ctx.fused_bwd:
-                grads = _glu_backward_fused(*args, ctx.seg, ctx.ws)
+                # The fused adjoint writes its three wgrads into pre-sized workspace
+                # slots, reserved once and reused across steps. Autograd aliases the
+                # first returned grad into each NON-LEAF bank's leaf.grad; a later
+                # micro-batch would overwrite that storage and corrupt accumulation.
+                # Clone on the step's FIRST backward only (grad_accum's other
+                # micro-batches then accumulate into the independent clone).
+                leaves = _grad_leaves(gate_u, up_u, v)
+                if leaves and any(leaf.grad is None for leaf in leaves):
+                    grads = _glu_backward_fused(*args, ctx.seg, ctx.ws)
+                    grads = (
+                        grads[0],
+                        grads[1].clone(),
+                        grads[2].clone(),
+                        grads[3],
+                        grads[4],
+                        grads[5].clone(),
+                    )
+                else:
+                    grads = _glu_backward_fused(*args, ctx.seg, ctx.ws)
             else:
                 grads = _glu_backward(*args)
         except LaunchRefused as e:

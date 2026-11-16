@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
+import pytest
 from conftest import BATCH, SEQ, tiny_run, write_corpus
 
+from dormouse.instrument import LoudError
 from dormouse.model import DormouseModel
 from dormouse.train import ByteStream, eval_window_bytes, split_points, train
 from dormouse.train.data import open_streams
@@ -174,3 +177,44 @@ def test_the_window_is_bit_identical_to_the_pylong_path():
     hi = bytes([200, 201, 255, 0] * 16)
     a, _ = _windows(hi, batch=2, seq_len=31)
     assert int(a.max()) == 255 and int(a.min()) == 0
+
+
+def test_uint16_stream_reads_tokens_not_bytes(tmp_path):
+    """`item_bytes=2` is a TOKEN stream: the shift is over items, not bytes.
+
+    A byte reader on this file would see the low/high halves as two positions
+    and the target at `q` would be the token's high byte — the failure that
+    trains on a stream nobody tokenized.
+    """
+    n = BATCH * (SEQ + 1) + 8
+    vals = [100 + (i * 37) % 30000 for i in range(n)]
+    path = tmp_path / "tok.bin"
+    path.write_bytes(b"".join(v.to_bytes(2, "little") for v in vals))
+    stream = ByteStream(path, BATCH, SEQ, item_bytes=2)
+    ids, targets = stream.next_batch()
+    assert ids.shape == (BATCH, SEQ) == targets.shape
+    assert ids[0, 0].item() == vals[0]
+    assert ids[0, -1].item() == vals[SEQ - 1]
+    assert targets[0, -1].item() == vals[SEQ]
+    assert (targets[:, :-1] == ids[:, 1:]).all()
+
+
+def test_manifest_disagreeing_with_the_file_is_refused(tmp_path):
+    """A truncated stream trains anyway unless the manifest is checked."""
+    path = write_corpus(tmp_path / "c.bin", 4096)
+    size = path.stat().st_size
+    side = tmp_path / "c.bin.json"
+    side.write_text(json.dumps({"dtype": "uint8", "bytes": size}))
+    ByteStream(path, BATCH, SEQ)  # agrees -> no refusal
+    side.write_text(json.dumps({"dtype": "uint8", "bytes": size - 2048}))
+    with pytest.raises(LoudError, match="manifest and the stream disagree"):
+        ByteStream(path, BATCH, SEQ)
+
+
+def test_token_stream_read_as_bytes_is_refused(tmp_path):
+    """The manifest says uint16 and the config says 1 B: refuse, do not decode."""
+    path = write_corpus(tmp_path / "tok.bin", 4096)
+    size = path.stat().st_size
+    (tmp_path / "tok.bin.json").write_text(json.dumps({"dtype": "uint16", "bytes": size}))
+    with pytest.raises(LoudError, match="uint16 TOKEN stream"):
+        ByteStream(path, BATCH, SEQ)  # item_bytes defaults to 1

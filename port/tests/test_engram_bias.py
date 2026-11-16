@@ -174,7 +174,7 @@ def test_save_load_carries_the_counter_and_tables_bit_for_bit():
 
     fresh = tiny_model()
     assert enable_host_tables(fresh) == 1
-    load_host_state(fresh, host_state(model))
+    load_host_state(fresh, host_state(model, 0))
     src, dst = engram.host, fresh.loop.engram.host
     assert torch.equal(dst.rows, src.rows)
     assert torch.equal(dst.momentum, src.momentum)
@@ -195,14 +195,14 @@ def test_a_ngram_without_counts_is_refused_loudly():
     enable_host_tables(model)
     fresh = tiny_model()
     enable_host_tables(fresh)
-    state = host_state(model)
+    state = host_state(model, 0)
     del state["engrams"][0]["counts"]
     with pytest.raises(LoudError) as e:
         load_host_state(fresh, state)
     msg = str(e.value)
     assert "counts" in msg and "bias correction" in msg and "ckpt_name" in msg
     # The counter must also be the right SHAPE and dtype: one int32 per row.
-    state = host_state(model)
+    state = host_state(model, 0)
     state["engrams"][0]["counts"] = torch.zeros(3, dtype=torch.int32)
     with pytest.raises(LoudError) as e:
         load_host_state(fresh, state)

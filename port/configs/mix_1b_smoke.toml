@@ -1,0 +1,18 @@
+# mix_1b_smoke — the 200 MB slice of `mix.bin`, for the launch rehearsal.
+#
+# One source, one stage: the slice is a PREFIX of the assembled mixture (the
+# same interleave, the same tokenizer), so a smoke run exercises the model, the
+# optimizer, the uint16 stream and the eval path without carrying the staging
+# schedule it is not long enough to reach. `configs/mix_1b.toml` is the real
+# plan; `tests/test_b1_launch.py` pins the two recipe halves to one model.
+#
+# Cut (after `scripts/corpus.py assemble`):
+#   head -c 200000000 data_local/pre/mix.bin > data_local/pre/mix_smoke.bin
+
+[sources]
+mix = "../../data_local/pre/mix_smoke.bin"
+
+[[stage]]
+until_frac = 1.0
+[stage.weights]
+mix = 1.0

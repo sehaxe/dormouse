@@ -409,19 +409,26 @@ def source_size(name: str, path: Path) -> int:
     return size
 
 
-def per_source_bytes(plan: MixPlan, steps: int, batch: int, seq_len: int) -> dict[str, int]:
-    """Expected bytes per source: `steps_in_stage × window × weight`, summed over stages.
+def per_source_bytes(
+    plan: MixPlan, steps: int, batch: int, seq_len: int, item_bytes: int = 1
+) -> dict[str, int]:
+    """Expected DISK bytes per source: `steps_in_stage × window × weight × item_bytes`.
 
     `steps` is the number of `next_batch()` calls the run will make — MICRO-
     batches, i.e. `train.steps × grad_accum` — because that is what the stream
     counts. `train/loop.py` passes exactly that, so the schedule and this
     expectation cannot disagree about how much of each source is read.
 
+    `item_bytes` is the stream's item width (2 for the uint16 mixture). A window
+    is `batch × (seq_len+1)` ITEMS, and the epoch cap divides by a DISK size, so
+    the expectation must be in disk bytes. The default 1 keeps the byte-mixture
+    arms bit-identical.
+
     The draw is i.i.d. per step, so a realized count differs from this by
     `O(sqrt(n))` windows — it is the EXPECTATION the epoch cap is argued from,
     exactly as the research doc's table computes it.
     """
-    window = batch * (seq_len + 1)
+    window = batch * (seq_len + 1) * item_bytes
     bounds = stage_bounds(plan, steps)
     out = {name: 0 for name in plan.sources}
     for i, st in enumerate(plan.stages):
@@ -439,15 +446,19 @@ def replay_bytes(
     seq_len: int,
     upto: int | None = None,
     seed: int | None = None,
+    item_bytes: int = 1,
 ) -> dict[str, int]:
-    """EXACT bytes each source serves in steps `[0, upto)` — the draw, replayed.
+    """EXACT DISK bytes each source serves in steps `[0, upto)` — the draw, replayed.
 
     `steps` is the run's budget (it decides the stage schedule), `upto` is how
     far to replay (default: the whole budget). `per_source_bytes` is the
     expectation the epoch cap is argued from; this is what a run with THIS seed
     actually reads, and it is what a resume must reproduce (`skip_bytes`).
+
+    `item_bytes` converts the ITEM window to the DISK bytes `ByteStream` counts.
+    With a uint16 stream (2) the old code advanced half the trained tokens.
     """
-    window = batch * (seq_len + 1)
+    window = batch * (seq_len + 1) * item_bytes
     served = dict.fromkeys(plan.sources, 0)
     for step in range(steps if upto is None else upto):
         served[source_for_step(plan, step, steps, seed)] += window
@@ -482,14 +493,16 @@ def check_epoch_cap(
     batch: int,
     seq_len: int,
     max_epochs: float | None = None,
+    item_bytes: int = 1,
 ) -> dict[str, float]:
     """Per-source epochs = bytes_to_consume / source_size; over the cap is LOUD.
 
     `max_epochs=None` takes the plan's own value (default 4.0); `0` disables the
-    guard. Returns the epochs per source so a caller can log them.
+    guard. Returns the epochs per source so a caller can log them. `item_bytes`
+    keeps the numerator in DISK bytes, the same unit as the denominator.
     """
     cap = plan.max_epochs if max_epochs is None else max_epochs
-    wanted = per_source_bytes(plan, steps, batch, seq_len)
+    wanted = per_source_bytes(plan, steps, batch, seq_len, item_bytes)
     epochs = {name: wanted[name] / source_size(name, path) for name, path in plan.sources.items()}
     if cap > 0:
         over = sorted((n, e) for n, e in epochs.items() if e > cap)
@@ -537,9 +550,18 @@ class MixtureStream:
         seed: int | None = None,
         ring_bytes: int = DEFAULT_RING,
         doc_masking: bool = False,
+        item_bytes: int = 1,
     ) -> None:
         if not plan.stages:
             loud("MixtureStream: the plan has no stages")
+        if doc_masking and item_bytes != 1:
+            loud(
+                f"doc_masking with item_bytes={item_bytes}: the packed reader reads "
+                f"a document's BYTES at a sidecar offset, so a 2-byte token stream "
+                f"would be sliced on a token boundary. Escape: doc_masking=false, "
+                f"or item_bytes=1."
+            )
+        self.item_bytes = item_bytes
         self.plan = plan
         self.batch, self.seq_len = batch, seq_len
         self.steps = steps
@@ -571,6 +593,7 @@ class MixtureStream:
                     seq_len,
                     seed=_stream_seed(self.seed, name),
                     ring_bytes=ring_bytes,
+                    item_bytes=item_bytes,
                 )
             self._streams[name] = stream
         self._step = 0
@@ -629,18 +652,20 @@ class MixtureStream:
         self._step = 0
 
     def skip_bytes(self, n: int) -> None:
-        """Fast-forward the whole mixture `n` bytes (resume), per source exactly.
+        """Fast-forward the whole mixture `n` ITEMS (resume), per source exactly.
 
-        The trainer passes `start × (seq_len + 1) × batch` bytes. Because the
-        source of every step is a pure function of the step index, each source is
-        advanced by the bytes IT would have served — so a resumed run continues on
-        unseen bytes and lands on the same mixture as an unbroken one.
+        The trainer passes `start × (seq_len + 1) × batch × grad_accum` ITEMS —
+        one window is `batch × (seq_len+1)` tokens, not disk bytes. `replay_bytes`
+        replays the draw and converts each source's share to DISK bytes with
+        `item_bytes` (2 for the uint16 mixture), which is the unit
+        `ByteStream.skip_bytes` advances. Passing items straight through used to
+        re-read half the tokens on every resume.
         """
         if n < 0:
             loud(f"skip_bytes({n}): a negative fast-forward is a rewind")
         if n % self.window:
             loud(
-                f"skip_bytes({n}): not a whole number of {self.window}-byte windows "
+                f"skip_bytes({n}): not a whole number of {self.window}-item windows "
                 f"(batch={self.batch}, seq_len={self.seq_len}). Escape: pass "
                 f"steps × (seq_len + 1) × batch."
             )
@@ -664,22 +689,53 @@ class MixtureStream:
             batch=self.batch,
             seq_len=self.seq_len,
             seed=self.seed,
+            item_bytes=self.item_bytes,
         )
         for name, stream in self._streams.items():
             stream.skip_bytes(served[name])
         self._step = steps
         # The resume contract: `steps` micro-batches were replayed, so the next
         # draw is the one an unbroken run would make (the stage and source are
-        # pure functions of this index), and every source got exactly its share.
+        # pure functions of this index), every source advanced by its exact disk
+        # bytes, and the whole fast-forward (in items) is accounted for.
         assert self._step == steps
-        assert sum(served.values()) == n, (
-            f"skip_bytes({n}): the replay served {sum(served.values())} B, not the "
-            f"whole fast-forward"
+        assert sum(served.values()) == n * self.item_bytes, (
+            f"skip_bytes({n} items): the replay served {sum(served.values())} B, "
+            f"not the whole fast-forward ({n * self.item_bytes} B)"
         )
 
     def close(self) -> None:
         for stream in self._streams.values():
             stream.close()
+
+
+def _refuse_mixed_tokenizers(plan: MixPlan) -> None:
+    """Every source that HAS a manifest must name the same tokenizer, or refuse.
+
+    A plan over two tokenizations is two alphabets under one vocabulary: the
+    loss stays finite and the model learns garbage. Sources with no manifest (a
+    plain byte corpus, a `*.txt` shard directory) are outside the claim and are
+    not counted as a disagreement.
+    """
+    shas: dict[str, str] = {}
+    for name, path in plan.sources.items():
+        side = Path(str(path) + ".json")
+        if not side.is_file():
+            continue
+        try:
+            man = json.loads(side.read_text())
+        except (OSError, ValueError):
+            continue
+        if man.get("tokenizer_sha"):
+            shas[name] = str(man["tokenizer_sha"])
+    if len(set(shas.values())) > 1:
+        loud(
+            f"the plan's sources were tokenized with DIFFERENT tokenizers "
+            f"{shas}: the same id means a different string in each stream, so "
+            f"the model would learn an alphabet that does not exist. Escape: "
+            f"re-run `scripts/corpus.py build` with ONE tokenizer, then "
+            f"`assemble`."
+        )
 
 
 def open_mixture(
@@ -692,6 +748,7 @@ def open_mixture(
     max_epochs: float | None = None,
     ring_bytes: int = DEFAULT_RING,
     doc_masking: bool = False,
+    item_bytes: int = 1,
 ) -> MixtureStream:
     """Load a plan, run the epoch-cap guard, and build the stream — one call.
 
@@ -703,7 +760,15 @@ def open_mixture(
     which is the part a caller must not be able to forget.
     """
     plan = load_mix_plan(plan_path)
-    check_epoch_cap(plan, steps=steps, batch=batch, seq_len=seq_len, max_epochs=max_epochs)
+    _refuse_mixed_tokenizers(plan)
+    check_epoch_cap(
+        plan,
+        steps=steps,
+        batch=batch,
+        seq_len=seq_len,
+        max_epochs=max_epochs,
+        item_bytes=item_bytes,
+    )
     return MixtureStream(
         plan,
         batch,
@@ -712,4 +777,5 @@ def open_mixture(
         seed=seed,
         ring_bytes=ring_bytes,
         doc_masking=doc_masking,
+        item_bytes=item_bytes,
     )

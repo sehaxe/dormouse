@@ -130,6 +130,90 @@ PROGRESS_KEYS = (
 PRESET_TRAIN_DEFAULTS: dict[str, dict[str, object]] = {
     "m400": {"muon_state_dtype": "bf16", "muon_chunk_elems": 1 << 26},
     "medium": {"muon_state_dtype": "bf16", "muon_chunk_elems": 1 << 26},
+    # THE 1B LAUNCH. `dorm train configs/dormouse_1b.toml` is the whole command:
+    # a preset PATH gets its train defaults from here (keyed on the stem), so the
+    # data half and the measured recipe live in ONE place instead of on a long
+    # `--set` line someone has to retype. Every number is measured, and the
+    # measurement is named:
+    #   * batch 2 x seq 1024 — the VRAM ladder on the 16 GB card (2026-11-16):
+    #     b4 and above OOM at s1024 even with bf16 optimizer state, b2 peaks at
+    #     12.94 GiB; `grad_accum=12` makes the OPTIMIZER batch 24 576 tokens
+    #     (the b24 x 1024 of the data plan) while the activation peak stays b2's.
+    #   * muon_state_dtype/ns_dtype bf16 — the ~2.3 GiB that makes b2 fit at all
+    #     (`scripts/probe_vram.py --levers`).
+    #   * engram_ram — 402M n-gram rows in host RAM; the model cannot hold them.
+    #   * lr 3e-4 with muon_lr_mult=1.0 — MEASURED on this config (60-step smoke,
+    #     2026-11-16): mult=1.0 falls 10.69 -> 9.33 nats and eval bpb 2.89;
+    #     mult=12 (the 2026-11-07 audit's optimum at the SHAPES THAT AUDIT RAN)
+    #     RISES 11.66 -> 20.15, i.e. diverges here. The b1 script leaves it at 1.0
+    #     for the same reason. lr is still the first knob to sweep: 3e-4 at
+    #     24 576 tokens/step is the b1 recipe's value for 4096, not tuned.
+    #   * data_item_bytes 2 + data_bytes_per_token — the uint16 mixture and the
+    #     manifest's own BPB conversion (`data_local/pre/mix.bin.json`).
+    "dormouse_1b": {
+        "mix_plan": "configs/mix_1b.toml",
+        "data_item_bytes": 2,
+        "data_bytes_per_token": 4.717789094290279,
+        "eval_data": "../data_local/pre/holdout.bin",
+        "eval": True,
+        "eval_batches": 32,
+        "eval_every": 1000,
+        "batch": 2,
+        "grad_accum": 12,
+        "seq_len": 1024,
+        "steps": 161206,
+        "lr": 3e-4,
+        "muon_lr_mult": 1.0,
+        "muon_state_dtype": "bf16",
+        "ns_dtype": "bf16",
+        "tf32": True,
+        "engram_ram": True,
+        "torch_compile": False,
+        "log_every": 10,
+        "ckpt_every": 2000,
+        "ckpt_name": "d1b",
+        "out_dir": "checkpoints/dormouse1b",
+        "json_log": "/home/sehaxe/logs/d1b.jsonl",
+    },
+    # The same recipe on the 200 MB slice: identical model, identical flags, the
+    # only differences are the data (a slice) and a step budget that finishes in
+    # minutes, so the exact launch config is rehearsed before it is committed to.
+    "dormouse_1b_smoke": {
+        "mix_plan": "configs/mix_1b_smoke.toml",
+        "data_item_bytes": 2,
+        "data_bytes_per_token": 4.717789094290279,
+        "eval_data": "../data_local/pre/holdout.bin",
+        "eval": True,
+        "eval_batches": 8,
+        "eval_every": 40,
+        "batch": 2,
+        "grad_accum": 2,
+        "seq_len": 1024,
+        "steps": 60,
+        "lr": 3e-4,
+        "muon_lr_mult": 1.0,
+        "muon_state_dtype": "bf16",
+        "ns_dtype": "bf16",
+        "tf32": True,
+        "engram_ram": True,
+        "torch_compile": False,
+        "log_every": 5,
+        "ckpt_every": 30,
+        "ckpt_name": "d1bsmoke",
+        "out_dir": "/tmp/opencode/dormouse1b_smoke",
+        "json_log": "/tmp/opencode/d1bsmoke.jsonl",
+    },
+}
+
+#: The RELAUNCH recipe: the finished pilot's recipe verbatim (same preset path
+#: model, same data plan, same batch/accum/lr/optimizer) with ONE measured fix —
+#: warmup_tokens=46,700,000 (~1 900 optimizer steps at 24 576 tok/step), so the
+#: 1B no longer opens at peak 3e-4 from step 1. `configs/dormouse_1b_relaunch.toml`
+#: is the model table; this is its train half. The finished run's config and
+#: `PRESET_TRAIN_DEFAULTS["dormouse_1b"]` are untouched.
+PRESET_TRAIN_DEFAULTS["dormouse_1b_relaunch"] = {
+    **PRESET_TRAIN_DEFAULTS["dormouse_1b"],
+    "warmup_tokens": 46_700_000,
 }
 
 #: The commit that removed the stubs below (`port(cleanup): delete the six dead
@@ -240,6 +324,11 @@ MOE_COMBINES = ("torch", "fused")
 #: `bf16` writes the routed activation in the compute dtype, so the caller's
 #: `weighted.to(dt)` disappears. Only meaningful with `moe_combine="fused"`.
 MOE_COMBINE_DTYPES = ("fp32", "bf16")
+#: The `aux_objective` literals — the swappable auxiliary objective (`model/aux.py`):
+#: `none` builds no head (the default), `lightmtp` predicts the trunk's own hidden
+#: state at `p+h` (arXiv:2610.06031) and `fsp` predicts a bag-of-words of the
+#: future window (arXiv:2510.14751). A name that is not here is LOUD.
+AUX_OBJECTIVES = ("none", "lightmtp", "fsp")
 #: The `share_u_mode` literals — how the routed experts' INPUT basis is shaped
 #: (`experts.py`'s module docstring): `off` is one `U` per expert, `plane` is
 #: one `U` for the bank, `dict` is one dictionary plus a per-expert column
@@ -358,15 +447,18 @@ def _refuse_removed_quant(field: str, value: str, survivors: tuple[str, ...]) ->
 #: "e2m1", 16)`); the packed kernel is the bench/inference lane and is COUNTED.
 #: Two activation quantizers on one forward is refused (see `validate`).
 ACT_QATS = ("none", "e2m1")
-#: The `act_store` literals — WHERE the autograd graph keeps the transformer
-#: block's saved activations (`model/packed_acts.py`'s store-only lane). A
-#: MEMORY arm, not a numerics one: `bf16` is today's graph, bit for bit;
-#: `nvfp4` keeps the same tensors as e2m1 nibbles with one e4m3 scale per 16,
-#: so the FORWARD still runs bf16 and only the backward's `grad_W` reads the
-#: rounded copy of the saved operand. It uses `act_qat`'s codec and refuses it
-#: (one save set, two names), and it is refused with `torch_compile`, with
-#: `mm_dtype='fp8'` and on every block form it does not reach.
-ACT_STORES = ("bf16", "nvfp4")
+#: The `act_store` literals — WHERE the autograd graph keeps the saved
+#: activations. A MEMORY arm, not a numerics one: `bf16` is today's graph, bit for
+#: bit; `nvfp4` keeps the transformer block's GEMM inputs as e2m1 nibbles with one
+#: e4m3 scale per 16, so the FORWARD still runs bf16 and only the backward's
+#: `grad_W` reads the rounded copy of the saved operand. `codes` is the same idea
+#: on a seam that ALREADY fake-quantizes (`act_qat`, the MoE expert GEMM): its
+#: operand is a function of 4-bit codes and one fp32 block scale, so the backward
+#: rebuilds that operand EXACTLY — identical loss, grads and weights, ~1/4 the
+#: bytes (`model/packed_acts.coded_act_mm`). `nvfp4` refuses `act_qat` (one save
+#: set, two names); `codes` requires it. Both are refused with `torch_compile`,
+#: and on every block form whose sites they do not reach.
+ACT_STORES = ("bf16", "nvfp4", "codes")
 #: The `ns_kind` literals — the Newton–Schulz arms the Muon group runs
 #: (`optim.NS_KINDS`, which is where they are executed; the list is duplicated
 #: here the way `MOE_KERNELS` is, so the config layer does not import the
@@ -936,6 +1028,31 @@ class ModelConfig:
     #: would be inert while the snapshot reported it on). `false` is every
     #: number on record, and the off path is bit-identical.
     tie_embeddings: bool = False
+    #: THE FACTORIZED TOKEN EMBEDDING: `r = 0` is the plain `[vocab, d_model]`
+    #: row table (bit-identical to every number on record). `r > 0` builds the
+    #: same matrix as `E = U @ Vᵀ` — `U [vocab, r]` an `nn.Embedding`, `V [d, r]`
+    #: a bias-free `nn.Linear` — because a 32k BPE vocabulary at `d=832` is 27.3M
+    #: parameters read by ONE first matmul; `r=256` costs `vocab·r + r·d` = 8.6M
+    #: (`tests/test_embed_rank.py` pins both numbers).
+    #:
+    #: INIT is the A/B's licence: the plain table draws `N(0, 1)`, so `U` draws
+    #: `N(0, 1)` and `V` draws `N(0, 1/r)` — a row's dot product has variance
+    #: `r·1·(1/r) = 1`. Step 0 starts at the same scale, so a loss difference is
+    #: the factorization and not an init change.
+    #:
+    #: The head is left alone: this flag never touches `lm_head`. With
+    #: `tie_embeddings=true` the tied head reads the SAME factorization
+    #: (`TiedHead` → `(x @ V) @ Uᵀ`) — one matrix, two paths, as always. TSCT
+    #: never reaches the token embedding (`tsct.py`: `nn.Embedding` tables are
+    #: excluded from the factor format by design), so `use_tsct` composes: the
+    #: body and its head stay TSCT, only the embedding factorizes.
+    #:
+    #: REFUSED (`ModelConfig.__post_init__`): `r < 0`; `r > d_model` (a rank
+    #: above the width is not a factorization); and `r > 0` with
+    #: `use_byteflow` (both byteflow shapes build their own `embedding` and
+    #: never `self.embed`, so the flag would reach no module while the snapshot
+    #: reported it on).
+    embed_rank: int = 0
 
     # --- cheap width (2026-10-23): stop `d` from setting the dense bill ----
     #: MLA-style SHARED LATENT for KDA's four `d×d` projections (`q,k,v,g`).
@@ -1503,6 +1620,16 @@ class ModelConfig:
     #: builds no expert bank (the switch would be inert while the snapshot
     #: reported it on). OFF by default and bit-identical when off: no parameter
     #: is replaced, no RNG is drawn and no state-dict key appears.
+    #: OFF IS MEASURED, NOT ASSUMED (2026-11-14, cfg32 = d 2048 · E 32 · rank 710 ·
+    #: batch 8 x seq 512 · 60 steps · `opt=mix muon_lr_mult=12` ·
+    #: `torch_compile=false` · RTX 5070 Ti 16 GB, `timers=true`, one run per arm,
+    #: each arm run twice): packed costs **+11 % step time and +2.0 GB peak VRAM** —
+    #: 542 / 552 -> 597 / 616 ms/step and 11.7 / 12.1 -> 13.7 / 13.8 GB, at an
+    #: IDENTICAL parameter count (251 156 039) and the same loss curve. The arm's
+    #: premise (521 -> 5 launches per `_banks` build) is an E=512 claim; at E=32
+    #: there are 32 casts, so the launch win is ~27 launches and the step pays
+    #: more than it saves. It stays OFF until a shape where it wins is the live
+    #: one; the owner rule (2026-11-14) is "on, or measured off with the numbers".
     #: COMPOSES WITH TSCT-2: with `tsct_expert_basis` on, the shared plane is
     #: still folded per expert (`gate_u @ w_j.T`) — the selector is not a packed
     #: site — while the packed `v`/`packed_s` supply the write and the scales.
@@ -1685,6 +1812,33 @@ class ModelConfig:
     #: the value `tests/test_jepa.py`'s collapse gate justifies (the predicted
     #: latents stay spread at 0.1 and collapse at 0.0).
     jepa_reg_weight: float = 0.1
+    #: ---- the swappable AUXILIARY OBJECTIVE (`model/aux.py`) ----
+    #: ONE seam for the newest auxiliary training objectives, each a head on the
+    #: loop's own readout with a STOP-GRADIENT target, each OFF unless named:
+    #:   "none"     — no head, no parameter, no compute (the default); the step
+    #:                is bit-identical to the pre-flag model.
+    #:   "lightmtp" — LightMTP (arXiv:2610.06031): predict the trunk's OWN hidden
+    #:                state at `p+aux_horizon`, cosine loss (Eq. 1).
+    #:   "fsp"      — future summary prediction (arXiv:2510.14751 §3.2, the
+    #:                handcrafted variant): predict the bag-of-words of the byte
+    #:                window `x[p+2 .. p+aux_horizon]` as `vocab` logits.
+    #: The token loss is NEVER touched: `aux_weight` scales a term ADDED to the
+    #: CE, so a negative result costs the head and nothing else. Unknown
+    #: literals, a weight with "none", and an objective with weight 0 are LOUD.
+    aux_objective: str = "none"
+    #: λ on the auxiliary term: `loss = CE + aux_weight · J`. `0.0` (the default)
+    #: builds no head and adds no op.
+    aux_weight: float = 0.0
+    #: WHICH future positions the target covers, and it means the same thing to
+    #: both arms only at the endpoints: for `lightmtp` it is the STEP (`h[p+h]`,
+    #: 1 = the next position); for `fsp` it is the window's END (`x[p+2 .. p+τ]`,
+    #: >= 2). Refused below 1 (lightmtp) / 2 (fsp) and above `seq_len // 8`.
+    aux_horizon: int = 1
+    #: The head's latent width `w`. `0` (the default) asks for `d_model // 24`,
+    #: the width that measures ~0.5% of the model at both the tiny and the small
+    #: shapes (the head and the trunk both scale as `d²`). A LightMTP head over
+    #: 1% of the model — the paper's own budget — is refused in the constructor.
+    aux_dim: int = 0
     #: ---- energy-based scoring (EBT, arXiv:2507.02092; `model/energy.py`) ----
     #: `energy_weight` = λ on the margin-InfoNCE term: the target byte's energy
     #: must beat `energy_negs` negatives sampled from the `lm_head` softmax by
@@ -1864,6 +2018,27 @@ class ModelConfig:
                 f"what the run computes (model/jepa.py). Escape: `jepa=true` + a "
                 f"positive `jepa_weight`, or `jepa=false` + `jepa_weight=0.0`."
             )
+        # The AUX SEAM's objective↔weight agreement (`model/aux.py`): one key
+        # names the arm, the other is λ, and a run must not report an arm it does
+        # not add (or add a term no key named).
+        if self.aux_objective not in AUX_OBJECTIVES:
+            loud(
+                f"aux_objective={self.aux_objective!r} is not an arm. Known: "
+                f"{list(AUX_OBJECTIVES)} — `none` builds nothing, `lightmtp` "
+                f"predicts the trunk's own future hidden state (arXiv:2610.06031), "
+                f"`fsp` predicts a bag-of-words of the future window "
+                f"(arXiv:2510.14751). Escape: name one of those."
+            )
+        if (self.aux_objective == "none") != (self.aux_weight == 0.0):
+            loud(
+                f"aux_objective={self.aux_objective!r} with aux_weight="
+                f"{self.aux_weight}: the arm and its weight must agree — `none` "
+                f"takes weight 0.0, and a named objective takes a POSITIVE weight. "
+                f"A weight with `none` is a term no head computes; a named arm at "
+                f"weight 0 builds a head that never reaches the loss "
+                f"(model/aux.py). Escape: aux_weight=0.0 + aux_objective='none', "
+                f"or a named objective + a positive aux_weight."
+            )
         if self.share_u_mode not in SHARE_U_MODES:
             loud(
                 f"share_u_mode={self.share_u_mode!r} is not an arm. Known: "
@@ -1921,6 +2096,21 @@ class ModelConfig:
                 "Option B decodes with `decode_chunks`), so there is no head to tie "
                 "and the flag would be inert while the snapshot reported it on. "
                 "Escape: tie_embeddings=false, or use_byteflow=false."
+            )
+        if self.embed_rank < 0 or self.embed_rank > self.d_model:
+            loud(
+                f"embed_rank={self.embed_rank}: the token embedding is `U @ Vᵀ` with "
+                f"`U [vocab, r]` and `V [d_model, r]`, so r must be in 0..=d_model="
+                f"{self.d_model} (0 = the plain `[vocab, d_model]` table). A rank "
+                f"above the width is not a factorization. Escape: 0..=d_model."
+            )
+        if self.embed_rank > 0 and (self.use_byteflow or self.byte_patch):
+            loud(
+                "embed_rank>0 with use_byteflow/byte_patch: both byteflow shapes "
+                "build their own `embedding` table (the codec's latent width) and "
+                "never build `self.embed`, so the factorization would reach no "
+                "module while the snapshot reported it on. Escape: "
+                "use_byteflow=false, or embed_rank=0."
             )
         if self.z_loss > 0.0 and self.use_byteflow:
             loud(
@@ -2046,6 +2236,22 @@ class TrainConfig:
     #: No refusal against `mm_dtype=fp8`: that names the 2-D GEMM's compute
     #: mode, not the logits the loss reads.
     ce_fixed: bool = False
+    #: THE CHUNKED FINAL CE (`chunk_ce.chunked_cross_entropy`): the readout's
+    #: loss runs `ce_chunk` POSITIONS at a time and projects each slice to
+    #: logits inside the loss, so the `[b·t, vocab]` tensor is never
+    #: materialised — at b24·s1024 with the 32k tokenizer that tensor is 805M
+    #: values (3.22 GB fp32) and the NLL backward keeps a second copy, 3.2-6.4 GB
+    #: of peak that exists only because of the vocabulary. `0` (the default,
+    #: every number on record) is the historical un-chunked loss, bit for bit.
+    #: `> 0` is exact, not an approximation: the loss and the gradient w.r.t. the
+    #: hidden state and the head match the un-chunked path to fp32 summation
+    #: order, and `tests/test_chunk_ce.py` pins parity against `F.cross_entropy`,
+    #: invariance across three chunk sizes, `ignore_index`/`loss_mask`, and the
+    #: peak-allocation ratio at T=8192·V=32768. It reaches the STACK forms'
+    #: final readout only (`model.model._readout`); the EVAL path keeps the
+    #: un-chunked readout (no_grad, one logits copy) so held-out numbers stay
+    #: comparable, and SFT/RL refuse the field (`sft.refuse_unwired`).
+    ce_chunk: int = 0
     #: GRADIENT ACCUMULATION: micro-batch count per optimizer step. `1` (the
     #: default and every number on record) runs one forward/backward per step.
     #: `k > 1` runs `k` micro-batches of `batch` rows, divides EACH micro-loss
@@ -2253,6 +2459,41 @@ class TrainConfig:
     #: NS chain is per slice; `tests/test_opt_region.py` gates the bit-equality
     #: across caps), so the only thing a resume changes is the launch count.
     muon_chunk_elems: int = 1 << 25
+
+    #: Apply the expert bank's optimizer update INSIDE the backward pass, at the
+    #: moment its gradient is final (`optim.Muon.arm_in_backward`), instead of in
+    #: the end-of-step pass over the bank — the trick of Sonar-MoE
+    #: (arXiv:2611.03577), which reports -19…-22 % memory and 17…-23 % step time on
+    #: OLMoE-1B-7B with BITWISE IDENTICAL results. The mechanism that makes it
+    #: bit-identical here is that the relocation runs the SAME shape-group program
+    #: (`batched_step_from_model(only={...})`) on the same buffers; what it buys is
+    #: that a bank buffer's GRADIENT is dropped at the hook, so it does not have to
+    #: survive until the end of the step.
+    #:
+    #: `false` (the default) registers no hook, marks no parameter and changes no
+    #: bit. `true` REFUSES, loudly, every consumer that needs the bank's gradient
+    #: AFTER backward — a gradient is not final until the last micro-batch, so
+    #: `grad_accum > 1` is out; clipping needs the global norm over all gradients,
+    #: so `grad_clip`/`agc_clip` must be 0; and a CUDA-graph capture replays device
+    #: ops, not a Python hook, so `opt_graph`/`full_graph` are out. The Muon arms
+    #: whose tail needs host state (`muon_sf`) or a per-step device vector
+    #: (`tsct_expert_lr`) are refused at the optimizer.
+    #:
+    #: Counters: `optbwd_params` / `optbwd_bytes` (parameters updated at their hook
+    #: and the gradient bytes dropped there) and `optbwd_tail` (parameters the
+    #: end-of-step pass still served). A run whose `optbwd_params` is 0 did not run
+    #: the arm.
+    #:
+    #: MEASURED 2026-11-14, on the packed arm it REQUIRES (cfg32, 60 steps,
+    #: `grad_clip=0` because the arm refuses a clip, `optbwd_params=30` = 3 buffers
+    #: x 10 steps, `optbwd_bytes` 8.69 GB per window): `false` 608.7 ms/step /
+    #: 13 713 MiB peak -> `true` 602.7 ms/step / 12 124 MiB peak — **-1.0 % time,
+    #: -1.59 GB VRAM**, same loss. The arm itself is free-to-better, and it stays
+    #: OFF anyway because its PRECONDITION (`tsct_packed`) costs +11 % time and
+    #: +2.0 GB at this shape (see that field): switching the pair on would be a net
+    #: loss of ~66 ms/step. Flip it the day the packed arm wins on its own.
+    opt_in_backward: bool = False
+
     #: The Muon half's LR as a MULTIPLE of `lr` (the AdamW half's). Measured
     #: 2026-11-06 (`docs/records/reviews/2026-11-06-optimizer-audit.md`): at a shared LR
     #: the Muon update is 8x-52x smaller in RMS than AdamW's on this model's
@@ -2535,6 +2776,22 @@ class TrainConfig:
     json_log: str = ""
     data: str = ""
     eval_data: str = ""
+    #: How many BYTES one stream item is: `1` is a byte corpus (vocabulary 256,
+    #: every number on record); `2` is a uint16 TOKEN stream -- exactly what
+    #: `scripts/corpus.py` assembles (`mix.bin`, a 32k BPE vocabulary). The
+    #: stream still seeks in FILE bytes (offsets, the eval window and the resume
+    #: fast-forward are unchanged); only the window decode differs, so a 2-byte
+    #: run reads `batch × seq_len` TOKENS per step where a 1-byte run reads
+    #: bytes. Refused with `doc_masking` and `tst_bag>1`, whose both readers are
+    #: defined over byte boundaries. Non-progress: the drift check refuses a
+    #: flip on a resume.
+    data_item_bytes: int = 1
+    #: TEXT bytes per stream item, for the BPB conversion only. `bpb` divides a
+    #: natural-log CE by this (a byte run's 1.0 keeps every number bit-identical);
+    #: a uint16 token run sets the manifest's `bytes_per_token` so its BPB is
+    #: still BITS PER BYTE OF TEXT and comparable to a byte run's. Nothing else
+    #: reads it: the schedule and the step budget are in steps.
+    data_bytes_per_token: float = 1.0
     #: The staged-mixture plan (`train/mixture.py`, TOML): when set, the train
     #: side reads N sources interleaved by per-stage weights instead of the one
     #: `data` file (the eval side is unchanged). Empty = off = every number on
@@ -2575,6 +2832,60 @@ class TrainConfig:
     #: Non-progress: flipping it changes what the run trains on, so the
     #: snapshot drift check refuses a flip on a resume.
     doc_masking: bool = False
+
+    #: TOKEN-SUPERPOSITION TRAINING (TST, arXiv:2605.06546v2) — the bag size `k`.
+    #:
+    #: `1` is OFF and is the default: the run draws one byte per position and
+    #: scores the ordinary CE, argument for argument today's program (the arm's
+    #: gate is `torch.equal` on the loss AND on the parameters against the
+    #: pre-arm step, `tests/test_tst.py`).
+    #:
+    #: `k > 1` turns the FIRST `tst_frac` of the steps into the superposition
+    #: phase: position `q` of a window carries the byte at flat offset `q·k`, and
+    #: the target is the BAG of the `k` bytes that follow it, so one window reads
+    #: `seq_len·k + 1` bytes (byte-level model, vocabulary 256, no tokenizer).
+    #: The loss is the paper's Eq. 3, the MEAN of the `k` per-byte CEs
+    #: (`losses.multihot_cross_entropy`): `(1/|y|) Σ_{y∈y} L_CE(z, y)`. The
+    #: per-byte CE is the same functional form the eval scores (BPB), which is why
+    #: it is the form the paper trains. It is NOT `-log((1/k) Σ_i p[b_i])`: that is
+    #: MCE_Alt (App. C.2, Eq. 6), the variant the paper investigated and did not
+    #: adopt — a bag that holds the total mass satisfies it while spreading that
+    #: mass arbitrarily inside, so it puts no pressure on the split.
+    #:
+    #: Phase 2 (`step >= round(steps · tst_frac)`) switches to the ordinary
+    #: one-byte objective IN THE SAME RUN, which is the paper's recovery phase —
+    #: the arm is a schedule, not a different model.
+    #:
+    #: The EVAL path never sees a bag: an eval window is one byte per position,
+    #: so `bpb` stays the number it was and two arms' curves are comparable.
+    #: Refused (see `_validate_tst`, each naming its escape) with a form whose
+    #: loss is not ONE readout CE (the KDA loop's per-iteration `L_Rec` needs a
+    #: single-byte target), `use_byteflow` (patch latents are not bytes),
+    #: `doc_masking` (a bag has no document boundary), `mix_plan`
+    #: (`MixtureStream.skip_bytes` is a fixed-window replay) and `full_graph`
+    #: (the step's shapes change at the phase switch, a capture cannot).
+    #:
+    #: Non-progress: flipping it changes what the run trains on, so the snapshot
+    #: drift check refuses a flip on a resume.
+    tst_bag: int = 1
+    #: THE PAPER'S `r`: the SUPERPOSITION share of the run. The first
+    #: `round(steps · tst_frac)` steps train bags, the remaining `1 - r` train
+    #: one byte per position (the recovery phase). `0.3` is the paper's value
+    #: (arXiv:2605.06546v2 Table 2: 6 000 of 20 000 steps at every dense scale;
+    #: Fig. 4 caption defines r as "the ratio of number of steps trained in the
+    #: superposition regime, with 1 − r trained in the normal regime") and §6
+    #: gives its robust range as `r ∈ [0.2, 0.4]`.
+    #:
+    #: It is NOT "the share of the run that is ordinary training". This field's
+    #: original default was 0.7 = the paper's r INVERTED — the run on record
+    #: (`logs/runs/20261114-191657-port`, 4 200 superposition steps of 6 000)
+    #: trained bags for 70 % of its steps and left the recovery phase 30 %.
+    #:
+    #: The boundary is `round(steps · tst_frac)`, a PURE function of the config,
+    #: so a resume lands in the same phase the unbroken run would be in. Inert
+    #: (`tst_bag=1`); 0 is refused because a phase that never fires while the
+    #: log reported the arm on is a config that lies (ADR-0019).
+    tst_frac: float = 0.3
     out_dir: str = "checkpoints"
     timers: bool = False
     #: Host-RAM Engram tables — burn's `--engram-ram` (Qwen3.8-Flash-Next §2.3
@@ -2724,6 +3035,14 @@ class TrainConfig:
     #: packed lane is not compiler-safe), with `mm_dtype='fp8'` (a different
     #: compute lane, unmeasured with the packed store) and outside
     #: `block_form='transformer'` / `block_stack='uniform'`.
+    #:
+    #: `codes` is the OTHER rung and the opposite contract: it is exact. It stores
+    #: the operand of a seam that ALREADY fake-quantizes (`act_qat`'s expert GEMM)
+    #: as 4-bit codes plus that seam's own fp32 block scale, so the backward
+    #: rebuilds the forward's `x_q` bit for bit at ~1/4 the bytes — identical loss,
+    #: gradients and weights. It therefore REQUIRES `act_qat` (and refuses a seam
+    #: that does not quantize: coding an exact operand is the `nvfp4` trade) and
+    #: lives on `block_form='kda'` (the MoE experts' per-expert GEMM).
     act_store: str = "bf16"
 
     # --- the RL lane (`post/rl.py` + `post/rl_train.py`) ----------------
@@ -3225,6 +3544,7 @@ _LOOP_ONLY_LOSS_WEIGHTS = (
     "dspark_weight",
     "mtp_weight",
     "energy_weight",
+    "aux_weight",
 )
 
 
@@ -4914,6 +5234,33 @@ def validate(model: ModelConfig) -> None:
             f"of positions to look ahead (1 = the next position). Escape: >= 1, "
             f"and <= seq_len // 8 (the load path checks the window)."
         )
+    # The AUX SEAM's own coherence (`model/aux.py`): the objective↔weight
+    # agreement is in `__post_init__` (every construction passes), these are the
+    # range checks the head would silently misuse.
+    if model.aux_weight < 0.0:
+        loud(
+            f"aux_weight={model.aux_weight} is negative: it is λ, the multiplier "
+            f"on the auxiliary term the objective ADDS to the token loss, so a "
+            f"negative value subtracts a term not published for that arm "
+            f"(model/aux.py). Escape: a positive weight with a named "
+            f"aux_objective, or 0.0 with 'none'."
+        )
+    if model.aux_dim < 0:
+        loud(
+            f"aux_dim={model.aux_dim}: it is the head's latent width, a count. "
+            f"0 means `d_model // 24` (the auto width, ~0.5% of the model), so a "
+            f"negative value is a typo. Escape: >= 0."
+        )
+    if model.aux_objective != "none":
+        floor = 2 if model.aux_objective == "fsp" else 1
+        if model.aux_horizon < floor:
+            loud(
+                f"aux_horizon={model.aux_horizon} with aux_objective="
+                f"{model.aux_objective!r}: the horizon is at least {floor} for "
+                f"this arm — `lightmtp` predicts `h[p+h]` (1 = the next position) "
+                f"and `fsp` summarises `x[p+2 .. p+τ]`, which is empty below 2. "
+                f"Escape: aux_horizon >= {floor}, and <= seq_len // 8."
+            )
     # The ENERGY head's own coherence (`model/energy.py`, EBT arXiv:2507.02092):
     # the weight gates the module (0 builds nothing), and every other field is
     # a count/scale the loss would silently misuse. The two INTERACTIONS
@@ -5380,7 +5727,14 @@ def _validate_doc(model: ModelConfig, tcfg: TrainConfig) -> None:
             "positions, not patch latents. Escape: use_byteflow=false, or "
             "doc_masking=false."
         )
-    for name in ("dspark_weight", "mtp_weight", "jepa_weight", "energy_weight", "halt_weight"):
+    for name in (
+        "dspark_weight",
+        "mtp_weight",
+        "jepa_weight",
+        "energy_weight",
+        "halt_weight",
+        "aux_weight",
+    ):
         weight = float(getattr(model, name))
         if weight > 0.0:
             loud(
@@ -5543,6 +5897,35 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
         )
 
 
+def _validate_aux(model: ModelConfig, tcfg: TrainConfig) -> None:
+    """The AUX SEAM against the window and the segmented path (`model/aux.py`).
+
+    Same two refusals `_validate_jepa` owns, for the same reasons: the horizon
+    crosses SEGMENT boundaries (the target would be a state from a different
+    window, i.e. a different objective), and a horizon at the window's scale
+    leaves too few positions for the A/B to tell the arm from off.
+    """
+    if model.aux_objective == "none":
+        return
+    if tcfg.segment_len > 0:
+        loud(
+            f"aux_objective={model.aux_objective!r} with segment_len="
+            f"{tcfg.segment_len}: both aux targets read positions `t+1..t+horizon` "
+            f"of the SAME window, and the segmented forward cuts it per segment — "
+            f"the target would be a state (or a summary) from a different window. "
+            f"Escape: segment_len=0, or aux_objective='none'."
+        )
+    cap = tcfg.seq_len // 8
+    if model.aux_horizon > cap:
+        loud(
+            f"aux_horizon={model.aux_horizon} > seq_len // 8 = {cap} "
+            f"(seq_len={tcfg.seq_len}): the horizon must fit the training window "
+            f"with room for a predicted sample, otherwise the term reads a handful "
+            f"of positions (or none) and the A/B cannot tell it apart from off. "
+            f"Escape: a horizon <= {cap}, or aux_objective='none'."
+        )
+
+
 def _validate_jepa(model: ModelConfig, tcfg: TrainConfig) -> None:
     """The JEPA arm against the window and the segmented path — both halves.
 
@@ -5655,8 +6038,62 @@ def _check_act_store(mode: str) -> None:
             f"{list(ACT_STORES)} — `bf16` keeps every activation at 2 B (the "
             f"historical graph, bit for bit); `nvfp4` stores the block's GEMM "
             f"inputs and GLU operands as e2m1 nibbles with one e4m3 scale per "
-            f"16, while the FORWARD still runs bf16. Escape: name one of those."
+            f"16, while the FORWARD still runs bf16; `codes` stores the "
+            f"fake-quantized operand of an `act_qat` seam as 4-bit codes plus its "
+            f"own fp32 block scale, so the backward rebuilds it exactly. Escape: "
+            f"name one of those."
         )
+
+
+def tst_phase1_steps(cfg: TrainConfig) -> int:
+    """The number of steps in TST's superposition phase: `round(steps · tst_frac)`.
+
+    `0` means the arm is off (`tst_bag=1`). A PURE function of the config, which
+    is the whole resume contract: the phase of a step is the same number in the
+    process that ran it and in the one that resumed into it. `validate` refuses
+    a boundary below 1 on an armed run, so `0` never means "armed, fired never".
+    """
+    if cfg.tst_bag <= 1:
+        return 0
+    return int(round(cfg.steps * cfg.tst_frac))
+
+
+def tst_bag_at(cfg: TrainConfig, step: int) -> int:
+    """The bag size of optimizer step `step` (0-based): `tst_bag` in phase 1, else 1."""
+    return cfg.tst_bag if step < tst_phase1_steps(cfg) else 1
+
+
+def tst_bytes(cfg: TrainConfig, steps: int) -> int:
+    """Bytes SCORED by `steps` optimizer steps: `batch · seq_len · k · grad_accum`.
+
+    The arm's generalization of the port's one byte-accounting constant
+    (`batch × seq_len × grad_accum`, the number the run record's `train_bytes`
+    and every JSONL `bytes_seen` on record report): a phase-1 position carries
+    `k` scored bytes, a phase-2 position one. `tst_bag = 1` returns EXACTLY that
+    product, so an unarmed run's budget is not re-priced by the arm's presence.
+
+    The stream CONSUMES one more byte per row (`tst_stream_bytes`) — the shift
+    byte of the window. They are different quantities and both are reported.
+    """
+    at_bag = min(steps, tst_phase1_steps(cfg))
+    per_micro = cfg.batch * cfg.grad_accum * cfg.seq_len
+    return per_micro * (at_bag * cfg.tst_bag + (steps - at_bag))
+
+
+def tst_stream_bytes(cfg: TrainConfig, steps: int) -> int:
+    """Bytes the training stream has SERVED after `steps` optimizer steps.
+
+    A phase-1 row is `seq_len·k + 1` bytes and a phase-2 row `seq_len + 1` (the
+    last byte of each row is the bag's/candidate's first target), so this is what
+    the trainer's resume fast-forward must skip — exactly
+    `steps · (seq_len+1) · batch · grad_accum` at `tst_bag = 1`, the expression
+    the resume has always used.
+    """
+    at_bag = min(steps, tst_phase1_steps(cfg))
+    per_micro = cfg.batch * cfg.grad_accum
+    return per_micro * (
+        at_bag * (cfg.seq_len * cfg.tst_bag + 1) + (steps - at_bag) * (cfg.seq_len + 1)
+    )
 
 
 def validate_train(tcfg: TrainConfig) -> None:
@@ -5666,6 +6103,32 @@ def validate_train(tcfg: TrainConfig) -> None:
     hand-built `TrainConfig` that skips `load_run` must not be able to run a
     zero-micro-batch step or an EMA outside [0,1) either.
     """
+    if tcfg.data_item_bytes not in (1, 2):
+        loud(
+            f"data_item_bytes={tcfg.data_item_bytes}: a stream item is 1 B (a byte "
+            f"corpus, vocabulary 256) or 2 B (a uint16 TOKEN stream, "
+            f"`scripts/corpus.py`'s `mix.bin`). Escape: 1 or 2."
+        )
+    if tcfg.data_item_bytes == 2 and tcfg.doc_masking:
+        loud(
+            "data_item_bytes=2 with doc_masking: the packed reader slices a "
+            "document's BYTES at a sidecar offset, so a 2-byte stream would be "
+            "cut on a token boundary. Escape: doc_masking=false on a token "
+            "stream, or data_item_bytes=1."
+        )
+    if tcfg.data_item_bytes == 2 and tcfg.tst_bag > 1:
+        loud(
+            f"data_item_bytes=2 with tst_bag={tcfg.tst_bag}: TST's superposition "
+            f"is defined over bytes (`\u0071\u00b7k` offsets). Escape: tst_bag=1 on a "
+            f"token stream."
+        )
+    if not tcfg.data_bytes_per_token > 0:
+        loud(
+            f"data_bytes_per_token={tcfg.data_bytes_per_token}: the BPB "
+            f"conversion divides the CE by it, so it is a positive byte count per "
+            f"stream item (1.0 on a byte corpus). Escape: the manifest's "
+            f"`bytes_per_token`."
+        )
     if tcfg.grad_accum < 1:
         loud(
             f"grad_accum={tcfg.grad_accum}: the field is a COUNT of micro-batches "
@@ -5708,6 +6171,41 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"zero on a coordinate whose second moment is 0 and NaN is not a floor. "
             f"Escape: adam_eps > 0 (torch's 1e-8 is the default)."
         )
+    if tcfg.ce_chunk < 0:
+        loud(
+            f"ce_chunk={tcfg.ce_chunk}: the field is a COUNT of positions per "
+            f"chunk of the final CE, so 0 is OFF and a negative value would make the "
+            f"chunk loop empty and the loss 0/0. Escape: ce_chunk >= 0 "
+            f"(0 = the un-chunked loss)."
+        )
+    if tcfg.ce_chunk > 0 and tcfg.ce_fixed:
+        loud(
+            f"ce_chunk={tcfg.ce_chunk} with ce_fixed=true: the two are different "
+            f"LOSS ARITHMETICS — the fixed CE keeps the target logit out of the "
+            f"denominator sum and DEFINES the target gradient as `-(sum of the "
+            f"others)`, and there is no chunked form of that yet, so the pair would "
+            f"run whichever branch the readout tested first and report the other flag "
+            f"as on. Escape: ce_fixed=false (with ce_chunk>0), or ce_chunk=0."
+        )
+    if tcfg.ce_chunk > 0 and tcfg.tst_bag > 1:
+        loud(
+            f"ce_chunk={tcfg.ce_chunk} with tst_bag={tcfg.tst_bag}: the bag CE "
+            f"(`losses.multihot_cross_entropy`) is computed by the TRAINER from the "
+            f"`[b·t, vocab]` logits the forward returns, so the chunked readout — "
+            f"which returns none — has nothing to hand it. Escape: tst_bag=1, or "
+            f"ce_chunk=0."
+        )
+    for capture, why in (
+        ("full_graph", "a capture records ONE launch sequence and cannot see a recompute"),
+        ("opt_graph", "the captured stage would be fed gradients from a different graph"),
+    ):
+        if tcfg.ce_chunk > 0 and getattr(tcfg, capture):
+            loud(
+                f"ce_chunk={tcfg.ce_chunk} with {capture}=true: the arm recomputes "
+                f"each chunk's logits in the backward (`torch.utils.checkpoint`), and "
+                f"{why} that a replayed graph never ran. Escape: {capture}=false, or "
+                f"ce_chunk=0."
+            )
     if not 0.0 <= tcfg.decay_frac <= 1.0:
         loud(
             f"decay_frac={tcfg.decay_frac}: it is a FRACTION of the whole run "
@@ -5722,6 +6220,48 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"to zero and >1 would make the 'decay' an increase. "
             f"Escape: 0 <= min_lr_frac <= 1 (0.1 is the default, 0.0 is a full "
             f"anneal to zero)."
+        )
+    if tcfg.opt_in_backward and tcfg.grad_accum > 1:
+        loud(
+            f"opt_in_backward=true with grad_accum={tcfg.grad_accum}: the arm "
+            f"applies a parameter's update at its post-accumulate-grad HOOK, and "
+            f"that hook fires on the FIRST micro-batch's contribution — the "
+            f"gradient is not final until the last one. An accumulated step would "
+            f"step the bank on partial gradients and the run would be a different "
+            f"algorithm. Escape: grad_accum=1 (the arm's requirement, and the shape "
+            f"every number on record ran), or opt_in_backward=false."
+        )
+    if tcfg.opt_in_backward and tcfg.grad_clip > 0:
+        loud(
+            f"opt_in_backward=true with grad_clip={tcfg.grad_clip}: clipping is one "
+            f"global coefficient `max_norm / ||all gradients||`, and the arm's bank "
+            f"gradients are CONSUMED and dropped at their hook — the coefficient "
+            f"would be computed from a strictly smaller norm, i.e. a different clip "
+            f"on every other parameter, not a relocated one. Escape: grad_clip=0, or "
+            f"opt_in_backward=false."
+        )
+    if tcfg.opt_in_backward and tcfg.agc_clip > 0.0:
+        loud(
+            f"opt_in_backward=true with agc_clip={tcfg.agc_clip}: AGC rescales each "
+            f"parameter's OWN gradient before the step, and the arm's bank gradients "
+            f"are consumed at their hook — the AGC pass would find them gone (`None`) "
+            f"and silently clip nothing while the run reported the arm on. Escape: "
+            f"agc_clip=0, or opt_in_backward=false."
+        )
+    if tcfg.opt_in_backward and (tcfg.opt_graph or tcfg.full_graph):
+        loud(
+            f"opt_in_backward=true with opt_graph={tcfg.opt_graph}/"
+            f"full_graph={tcfg.full_graph}: a capture replays DEVICE ops, and this "
+            f"arm is a Python post-accumulate-grad hook — a replay would run no hook "
+            f"at all, so the bank would be skipped by the captured tail pass too and "
+            f"the experts would freeze mid-run. Escape: opt_graph=false and "
+            f"full_graph=false, or opt_in_backward=false."
+        )
+    if tcfg.opt_in_backward and tcfg.opt != "mix":
+        loud(
+            f"opt_in_backward=true with opt={tcfg.opt!r}: the arm IS Muon's "
+            f"shape-group step applied to the expert bank, and this optimizer routes "
+            f"every parameter to AdamW. Escape: opt='mix', or opt_in_backward=false."
         )
     if tcfg.grad_accum > 1 and tcfg.opt_graph:
         loud(
@@ -5923,6 +6463,125 @@ def validate_train(tcfg: TrainConfig) -> None:
         )
 
 
+#: A model above this many parameters that launches with warmup_tokens=0
+#: starts at the full lr on step 1 — the 1B pilot's measured defect.
+MIN_WARMUP_PARAMS = 100_000_000
+
+
+def validate_warmup(params: int, warmup_tokens: int) -> None:
+    """Refuse a zero-warmup launch above 100M parameters.
+
+    The 1B pilot opened at peak lr (3e-4) from step 1 because its config left
+    `warmup_tokens=0`. Below the cap — and for the many tiny CPU test models —
+    warmup is optional, so this gate never touches those runs. It is called
+    with the REAL built model's `param_count`, at the same train boundary as
+    `validate_model_train`.
+    """
+    if params > MIN_WARMUP_PARAMS and warmup_tokens <= 0:
+        loud(
+            f"warmup_tokens={warmup_tokens} with {params:,} parameters "
+            f"(> {MIN_WARMUP_PARAMS:,}): the model would start at the full lr with "
+            f"no ramp — the 1B pilot opened at 3e-4 from step 1. "
+            f"Escape: set warmup_tokens to a positive token budget "
+            f"(the relaunch uses 46,700,000), or train a <=100M-parameter model."
+        )
+
+
+def _validate_tst(model: ModelConfig, tcfg: TrainConfig) -> None:
+    """`tst_bag`/`tst_frac` against the form, the reader and the capture.
+
+    The bag objective is ONE multi-hot CE at the model's readout
+    (`losses.multihot_cross_entropy`), and the trainer computes it from the
+    returned logits with `targets=None` on the forward. Every row below is a
+    place where that would be a different objective or a different window, so
+    each is a LOUD refusal naming its escape rather than a silent no-op.
+    """
+    if tcfg.tst_bag < 1:
+        loud(
+            f"tst_bag={tcfg.tst_bag}: the field is a COUNT of bytes per position "
+            f"(`1` is the off value, one byte = the ordinary CE). Escape: "
+            f"tst_bag >= 1."
+        )
+    if not 0.0 < tcfg.tst_frac <= 1.0:
+        loud(
+            f"tst_frac={tcfg.tst_frac}: the superposition phase is "
+            f"`round(steps · tst_frac)` steps, so the share must be in (0, 1] — "
+            f"0 is a phase that never fires while the log reports the arm on, and "
+            f">1 would leave no recovery phase (write 1.0 for that). Escape: "
+            f"0 < tst_frac <= 1 (0.3 is the paper's r, r ∈ [0.2, 0.4], and the "
+            f"default)."
+        )
+    if tcfg.tst_bag <= 1:
+        return
+    if tst_phase1_steps(tcfg) < 1:
+        loud(
+            f"tst_bag={tcfg.tst_bag} with steps={tcfg.steps} and "
+            f"tst_frac={tcfg.tst_frac}: the phase boundary is "
+            f"round({tcfg.steps} · {tcfg.tst_frac}) = 0 steps, so every step would "
+            f"train on one byte while the run reported the bag arm on. Escape: "
+            f"tst_frac >= 1/steps, or tst_bag=1."
+        )
+    if model.block_form == "kda" and model.block_stack == "uniform":
+        loud(
+            f"tst_bag={tcfg.tst_bag} with block_form='kda': the loop's objective is "
+            f"`(Σ_i CE_i + CE_final)/(T+1)` — `L_Rec` is a per-iteration CE against "
+            f"ONE next byte, and a bag target has no single byte to score, so the "
+            f"deep-supervision term would be dropped (a different objective wearing "
+            f"a data flag). The bag formula is one CE at one readout, which is the "
+            f"`block_form='transformer'` form (and the hybrid stack, whose blocks "
+            f"carry no `L_Rec`). Escape: block_form='transformer' (or "
+            f"block_stack != 'uniform'), or tst_bag=1."
+        )
+    if model.use_byteflow:
+        loud(
+            f"tst_bag={tcfg.tst_bag} with use_byteflow=true: both byteflow shapes "
+            f"score PATCH latents, so a `k`-byte bag would address the decoder's "
+            f"byte positions while the forward predicts latents. Escape: "
+            f"use_byteflow=false, or tst_bag=1."
+        )
+    if tcfg.doc_masking:
+        loud(
+            f"tst_bag={tcfg.tst_bag} with doc_masking=true: the packed reader's row "
+            f"is ONE document and its loss mask is per byte position, while a bag "
+            f"straddles positions and can run past a document's end (inventing a "
+            f"target the flag exists to remove). Escape: doc_masking=false, or "
+            f"tst_bag=1."
+        )
+    if tcfg.mix_plan:
+        loud(
+            f"tst_bag={tcfg.tst_bag} with mix_plan: `MixtureStream.skip_bytes` "
+            f"replays a FIXED `batch·(seq_len+1)` window per draw, and a bag window "
+            f"is `batch·(seq_len·k+1)` in phase 1 — a resume would land on the wrong "
+            f"byte (or refuse the fast-forward). Escape: a single `data` source, or "
+            f"tst_bag=1."
+        )
+    if tcfg.full_graph:
+        loud(
+            f"tst_bag={tcfg.tst_bag} with full_graph=true: the capture fills STATIC "
+            f"(batch, seq_len) buffers and replays ONE recorded graph, but this arm "
+            f"changes the step's SHAPE at the phase switch and its loss comes from a "
+            f"second loss function. Escape: full_graph=false, or tst_bag=1."
+        )
+    for name in (
+        "dspark_weight",
+        "mtp_weight",
+        "jepa_weight",
+        "energy_weight",
+        "halt_weight",
+        "mod_aux_weight",
+        "aux_weight",
+    ):
+        weight = float(getattr(model, name))
+        if weight > 0.0:
+            loud(
+                f"tst_bag={tcfg.tst_bag} with {name}={weight}: this auxiliary "
+                f"objective is added to the loss INSIDE the forward, off a target "
+                f"the bag arm passes as `None` (the trainer scores the bag CE from "
+                f"the returned logits) — the term would vanish while the config "
+                f"reported it on. Escape: {name}=0.0, or tst_bag=1."
+            )
+
+
 def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
     """Cross-half refusals: a MODEL arm that a TRAIN capture cannot carry.
 
@@ -5934,6 +6593,7 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
     refused by `train.graph.full_graph_refusal`); `opt_graph` is still refused,
     and the reason names the arm.
     """
+    _validate_tst(model, tcfg)
     if tcfg.activation_offload > 0.0 and model.use_byteflow:
         loud(
             f"activation_offload={tcfg.activation_offload} with use_byteflow=true: "
@@ -5969,7 +6629,43 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"that is not. Escape: torch_compile=false, or act_qat='none'."
         )
     _check_act_store(tcfg.act_store)
-    if tcfg.act_store != "bf16":
+    if tcfg.act_store == "codes":
+        if model.act_qat == "none":
+            loud(
+                f"act_store='codes' with act_qat={model.act_qat!r}: the codes rebuild "
+                f"the FORWARD's own `quantize_act(x)`, so this rung needs a seam that "
+                f"fake-quantizes. On an exact operand the 4-bit store would round "
+                f"the backward's `grad_W` input — that is the lossy `act_store='nvfp4'` "
+                f"trade, under a name that promises bit-identity. Escape: "
+                f"act_qat='e2m1', or act_store='bf16'."
+            )
+        if model.block_form != "kda":
+            loud(
+                f"act_store='codes' with block_form={model.block_form!r}: the "
+                f"fake-quantized operand is the MoE experts' GEMM input "
+                f"(`DualLatentGLU`), which the not-factored loop block builds and no "
+                f"other form does — the arm would store nothing coded while the log "
+                f"reported it on. Escape: block_form='kda', or act_store='bf16'."
+            )
+        if model.moe_topk == 0 or model.moe_kernel != "naive" or model.moe_gather == "kernel":
+            loud(
+                f"act_store='codes' with moe_kernel={model.moe_kernel!r}, "
+                f"moe_topk={model.moe_topk}, moe_gather={model.moe_gather!r}: the "
+                f"packed seam is the per-expert forward (`DualLatentGLU`), and the "
+                f"banked / fused-kernel arms compute those projections without it — "
+                f"the switch would store nothing coded while the log reported it on. "
+                f"Escape: moe_kernel='naive', moe_topk > 0 and moe_gather != 'kernel' "
+                f"(the reference loop), or act_store='bf16'."
+            )
+        if tcfg.torch_compile:
+            loud(
+                "act_store='codes' with torch_compile=true: the codes lane packs "
+                "through `searchsorted` and a uint8 shift/OR pair, none of it "
+                "compiler-verified — a compiled run would silently ride the eager "
+                "fallback while reporting a compiled step. Escape: "
+                "torch_compile=false, or act_store='bf16'."
+            )
+    elif tcfg.act_store != "bf16":
         if model.block_form != "transformer":
             loud(
                 f"act_store={tcfg.act_store!r} with block_form={model.block_form!r}: "
@@ -6204,6 +6900,14 @@ def load_run(
             f"existing plan TOML (the shape is documented in `train/mixture.py`), "
             f"or leave it empty to read the single `data` file."
         )
+    if tcfg.data_item_bytes == 2 and model.vocab <= 256:
+        loud(
+            f"data_item_bytes=2 (a uint16 TOKEN stream) with vocab={model.vocab}: "
+            f"the ids run to 32767, so an embedding sized for a byte vocabulary "
+            f"has no row for them and the first gather is out of range. Escape: a "
+            f"preset whose `vocab` is the tokenizer's size (32768), or "
+            f"data_item_bytes=1 for a byte corpus."
+        )
     if tcfg.ns_kind not in NS_KINDS:
         loud(
             f"ns_kind={tcfg.ns_kind!r} is not an arm. Known: {list(NS_KINDS)} — "
@@ -6324,6 +7028,7 @@ def load_run(
     _validate_segment(model, tcfg)
     _validate_doc(model, tcfg)
     _validate_jepa(model, tcfg)
+    _validate_aux(model, tcfg)
     # The RL lane's keys. The advantage arm is a literal list (checked here, the
     # way `opt` and `mm_dtype` are); the reward and penalty knobs are checked by
     # BUILDING the `RLConfig` they describe, whose `__post_init__` is LOUD — one

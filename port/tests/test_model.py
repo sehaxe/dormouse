@@ -59,7 +59,7 @@ def test_every_arm_counts(model, tiny, byte_tensor):
     assert c["rezero_write"] == tiny.max_iter
     assert "attnres_write" not in c
     # The log field a reader uses to tell which attention arm produced a loss.
-    assert kda_field(c) == f"kda=sdpa,n={tiny.max_iter}"
+    assert kda_field(c, model) == f"kda=sdpa,n={tiny.max_iter},b=0"
 
 
 def test_a_cuda_box_does_not_make_a_cpu_tensor_run_on_the_fused_arm():
@@ -116,7 +116,7 @@ def test_no_engram_and_no_kda_arms_are_off_not_faked(byte_tensor):
     _, loss, c = m(ids, targets)
     assert torch.isfinite(loss)
     assert "engram_rows" not in c and "kda_sdpa" not in c
-    assert kda_field(c) == "kda=off,n=0"
+    assert kda_field(c, m) == "kda=off,n=0,b=0"
 
 
 def test_lfb_moves_the_bias_and_never_carries_grad(byte_tensor):

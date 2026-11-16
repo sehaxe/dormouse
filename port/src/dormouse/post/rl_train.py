@@ -673,7 +673,7 @@ def rl_train(
                         f"adv={adv:.4f}",
                         f"rl_samples={window.get('rl_samples', 0)}",
                         f"nan_skipped={nan_skipped}",
-                        kda_field(window),
+                        kda_field(window, model),
                         ce_field(cfg, drained),
                         window.line(),
                     ]

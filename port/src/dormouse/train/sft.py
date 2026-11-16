@@ -1031,6 +1031,14 @@ def refuse_unwired(cfg, loop: str) -> None:
             f"neither, so the flag would silently serve the raw weights. Escape: "
             f"ema_decay=0.0 (the default), or run `dormouse train` for the arm."
         )
+    if cfg.ce_chunk:
+        loud(
+            f"{loop}: train.ce_chunk={cfg.ce_chunk} is the chunked final CE "
+            f"(`chunk_ce.chunked_cross_entropy`), which this loop does not pass to "
+            f"its forward — this loop's head is projected before its own masked CE "
+            f"(`sft_loss`), so the flag would be inert while the run reported it on. "
+            f"Escape: ce_chunk=0 (the default), or run `dormouse train` for the arm."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1353,7 +1361,7 @@ def sft_train(
                 f"sft step={step + 1}",
                 f"loss={last_loss:.4f}",
                 f"lr={lr:.3e}",
-                kda_field(window),
+                kda_field(window, model),
                 ce_field(cfg, drained),
                 window.line(),
             ]
@@ -1413,7 +1421,8 @@ def sft_train(
                 else:
                     ece = F.cross_entropy(elogits[flat], ey.reshape(-1)[flat])
                 ce_total += float(ece)
-                batches += 1
+                # `batches` is set to `eval_batches_for(cfg)` above; incrementing
+                # it here doubled the divisor and HALVED every reported CE/BPB.
                 # The conditioning metric: at the assistant marker's
                 # position the model predicts the FIRST answer byte — the
                 # one byte that cannot be guessed from the answer alone.
