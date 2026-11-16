@@ -143,6 +143,7 @@ def test_the_measured_presets_carry_the_optimizer_recipe():
         "medium",
         "dormouse_1b",
         "dormouse_1b_smoke",
+        "dormouse_1b_relaunch",  # same optimizer regime, warmup fixed
     }
     assert (
         PRESET_TRAIN_DEFAULTS["m400"]
@@ -159,6 +160,11 @@ def test_the_measured_presets_carry_the_optimizer_recipe():
     for name in ("dormouse_1b", "dormouse_1b_smoke"):
         assert PRESET_TRAIN_DEFAULTS[name]["muon_state_dtype"] == "bf16"
         assert PRESET_TRAIN_DEFAULTS[name]["ns_dtype"] == "bf16"
+    # The relaunch is the finished recipe with ONE deliberate difference — the
+    # warmup — not a new optimizer regime hiding under a new name.
+    relaunch = dict(PRESET_TRAIN_DEFAULTS["dormouse_1b_relaunch"])
+    assert relaunch.pop("warmup_tokens") == 46_700_000
+    assert relaunch == PRESET_TRAIN_DEFAULTS["dormouse_1b"]
     for preset, path in (("m400", "m400"), ("m400", "configs/m400.toml"), ("medium", "medium")):
         run = load_run(path)
         assert run.train.muon_state_dtype == "bf16", (preset, path)
