@@ -205,6 +205,17 @@ PRESET_TRAIN_DEFAULTS: dict[str, dict[str, object]] = {
     },
 }
 
+#: The RELAUNCH recipe: the finished pilot's recipe verbatim (same preset path
+#: model, same data plan, same batch/accum/lr/optimizer) with ONE measured fix —
+#: warmup_tokens=46,700,000 (~1 900 optimizer steps at 24 576 tok/step), so the
+#: 1B no longer opens at peak 3e-4 from step 1. `configs/dormouse_1b_relaunch.toml`
+#: is the model table; this is its train half. The finished run's config and
+#: `PRESET_TRAIN_DEFAULTS["dormouse_1b"]` are untouched.
+PRESET_TRAIN_DEFAULTS["dormouse_1b_relaunch"] = {
+    **PRESET_TRAIN_DEFAULTS["dormouse_1b"],
+    "warmup_tokens": 46_700_000,
+}
+
 #: The commit that removed the stubs below (`port(cleanup): delete the six dead
 #: config stubs and the `_unsupported` machinery`, 2026-10-17).
 DEAD_SNAPSHOT_COMMIT = "0e7d25a"
@@ -6449,6 +6460,30 @@ def validate_train(tcfg: TrainConfig) -> None:
             "has no `retract_tsct` call site at all, so with muon_sf=false the flag "
             "would be inert too. Escape: muon_sf_retract=false (the default, and "
             "the legal arm)."
+        )
+
+
+#: A model above this many parameters that launches with warmup_tokens=0
+#: starts at the full lr on step 1 — the 1B pilot's measured defect.
+MIN_WARMUP_PARAMS = 100_000_000
+
+
+def validate_warmup(params: int, warmup_tokens: int) -> None:
+    """Refuse a zero-warmup launch above 100M parameters.
+
+    The 1B pilot opened at peak lr (3e-4) from step 1 because its config left
+    `warmup_tokens=0`. Below the cap — and for the many tiny CPU test models —
+    warmup is optional, so this gate never touches those runs. It is called
+    with the REAL built model's `param_count`, at the same train boundary as
+    `validate_model_train`.
+    """
+    if params > MIN_WARMUP_PARAMS and warmup_tokens <= 0:
+        loud(
+            f"warmup_tokens={warmup_tokens} with {params:,} parameters "
+            f"(> {MIN_WARMUP_PARAMS:,}): the model would start at the full lr with "
+            f"no ramp — the 1B pilot opened at 3e-4 from step 1. "
+            f"Escape: set warmup_tokens to a positive token budget "
+            f"(the relaunch uses 46,700,000), or train a <=100M-parameter model."
         )
 
 

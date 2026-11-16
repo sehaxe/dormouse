@@ -41,10 +41,11 @@ from ..config import (
     tst_stream_bytes,
     validate_model_train,
     validate_train,
+    validate_warmup,
 )
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..losses import multihot_cross_entropy
-from ..model import kda
+from ..model import kda, param_count
 from ..model.engram import (
     Engram,
     enable_host_tables,
@@ -1545,6 +1546,8 @@ def _train_impl(
     # The MODEL×TRAIN capture refusals (LayerRoPE with full_graph/opt_graph),
     # the same second caller (`config.validate_model_train`).
     validate_model_train(run.model, cfg)
+    # A >100M-parameter model must not open at peak LR (the 1B pilot's defect).
+    validate_warmup(param_count(model), cfg.warmup_tokens)
     if cfg.tf32:
         # The knob the b1 opt bench measured (2026-10-16): 1399 -> 1201 ms/step.
         torch.set_float32_matmul_precision("high")
