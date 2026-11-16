@@ -1421,7 +1421,8 @@ def sft_train(
                 else:
                     ece = F.cross_entropy(elogits[flat], ey.reshape(-1)[flat])
                 ce_total += float(ece)
-                batches += 1
+                # `batches` is set to `eval_batches_for(cfg)` above; incrementing
+                # it here doubled the divisor and HALVED every reported CE/BPB.
                 # The conditioning metric: at the assistant marker's
                 # position the model predicts the FIRST answer byte — the
                 # one byte that cannot be guessed from the answer alone.
