@@ -806,6 +806,43 @@ def test_sft_eval_reports_first_byte_agreement(tmp_path):
     assert built["holdout"] == 4
 
 
+def test_sft_eval_ce_is_not_halved(tmp_path, monkeypatch):
+    """The reported eval CE is a MEAN over `eval_batches`, not over 2x that.
+
+    A model with uniform logits scores log(vocab) nats at every supervised
+    position, so the eval CE is exactly log(vocab) whatever the mask. Before the
+    fix the stray `batches += 1` doubled the divisor and reported half of that.
+    """
+    from dormouse.instrument import Counters
+
+    corpus = tmp_path / "sft.bin"
+    build_sft_corpus(corpus, seed=1, seq_len=SEQ, n_tasks=32, holdout=4)
+    hold = tmp_path / "sft.bin.holdout"
+    run = sft_run(
+        tmp_path,
+        corpus=corpus,
+        steps=1,
+        log_every=1,
+        eval=True,
+        eval_every=1,
+        eval_batches=2,
+        eval_data=str(hold),
+    )
+    vocab = run.model.vocab
+
+    def uniform_forward(self, ex, *_args, **_kwargs):
+        logits = torch.zeros(ex.shape[0] * ex.shape[1], vocab, requires_grad=True)
+        return logits, None, Counters()
+
+    monkeypatch.setattr(DormouseModel, "forward", uniform_forward)
+    lines: list[str] = []
+    sft_train(DormouseModel(run.model), run, log=lines.append)
+    evals = [ln for ln in lines if ln.startswith("sft eval")]
+    assert evals, lines
+    ce = float(evals[-1].split("ce=")[1].split()[0])
+    assert abs(ce - math.log(vocab)) < 1e-3, (ce, math.log(vocab))
+
+
 def test_ru_bank_is_broad_and_fits_one_window():
     """The RU bank must stay deterministic, wide (>= 200 pairs) and every pair
     must render into a 512-byte window — it is the fix for an English-drift

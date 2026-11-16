@@ -577,6 +577,14 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+# Degradations on the LOAD path have no per-run `Counters` to ride (a resume
+# returns its dict before the trainer's window counter exists), so legacy
+# sidecars are COUNTED here and the count is printed in the warning. The count
+# is cumulative for the process — a reader of the log sees both the fact and how
+# many times it happened, which is the `COUNTED` mark from instrument.py.
+LOAD_WARNINGS = Counters()
+
+
 def _atomic_save(dest: Path, write) -> None:
     """Write `dest` through `<dest>.tmp`, fsync, `os.replace`, fsync the dir.
 
@@ -707,7 +715,7 @@ def save_ckpt(
         # that restored the model without its memory would be a different
         # network at the same step count (AGENTS §3.3).
         ng = ngram_path(run.train)
-        host = host_state(model)
+        host = host_state(model, step)
         _atomic_save(ng, lambda f: torch.save(host, f))
     text = run.snapshot_toml()
     _atomic_save(snapshot, lambda f: f.write(text.encode()))
@@ -805,6 +813,46 @@ def require_ngram(cfg: TrainConfig) -> None:
         f"and use a different network under this step count. Escape: restore the "
         f".ngram, start fresh under a new ckpt_name, or set engram_ram=false."
     )
+
+
+def require_ngram_step(cfg: TrainConfig, step: int) -> None:
+    """Refuse a sidecar whose top-level `step` != the weights' `ck["step"]`.
+
+    `save_ckpt` writes weights, then the `.ngram`, then the snapshot. A crash in
+    the first gap leaves new weights with the OLD host rows/momentum/counts/step
+    (and the snapshot gate sees only the config, so it cannot catch it). The
+    sidecar's stamp is the pairing proof: a resume must refuse when it disagrees
+    with the weights, or it would train a different memory under this step
+    count — the `7adda92` class, now with a checkable stamp.
+
+    A sidecar WITHOUT a stamp predates this gate. It is read (the live pilot's
+    checkpoints are such files), but COUNTED and warned, never silent: the log
+    names the gap and the running count, with the escape.
+    """
+    ng_step = load_ngram(cfg).get("step")
+    if ng_step is None:
+        LOAD_WARNINGS.count("ngram_no_step")
+        print(
+            f"ckpt: {ngram_path(cfg)} has no top-level `step` (written before the "
+            f"sidecar step gate): its host rows/momentum/counts cannot be checked "
+            f"against the weights at step {step}. COUNTED "
+            f"LOAD_WARNINGS[ngram_no_step]={LOAD_WARNINGS['ngram_no_step']}. "
+            f"Escape: resume on the build that wrote it, or write a new checkpoint "
+            f"with this build (which stamps the sidecar's step)."
+        )
+        return
+    if int(ng_step) != int(step):
+        weights, _ = ckpt_paths(cfg)
+        loud(
+            f"resume refused: {weights} is at step {step} but its sibling "
+            f"{ngram_path(cfg)} is stamped step {ng_step}. `save_ckpt` writes the "
+            f"weights before the sidecar, so a crash between them left this pair "
+            f"mismatched: the host rows, momentum, counts and host step belong to "
+            f"a different iterate than these weights, and resuming would train a "
+            f"different network under step {step}. Escape: restore the .ngram "
+            f"stamped step {step}, resume from a checkpoint whose two halves were "
+            f"written together by this build, or start fresh under a new ckpt_name."
+        )
 
 
 def init_cfg(cfg: TrainConfig, path: Path, sd: dict, model: torch.nn.Module) -> TrainConfig:
@@ -1005,6 +1053,11 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
             f"legal — the config snapshot gates what the model computes — but this file "
             f"cannot prove which corpus produced its step count."
         )
+    # The sidecar carries the weights' step, written in the same `save_ckpt`
+    # call: refuse a stale pair before the model is touched. A legacy file with
+    # no stamp is COUNTED and warned, never silently accepted.
+    if run.train.engram_ram:
+        require_ngram_step(run.train, int(ck["step"]))
     # Storage rungs: the model half unpacks to fp32 masters (eval/decode/
     # resume all ride the same path) — and the `_orig_mod.` prefix of a
     # pre-strip torch.compile file is dropped there too, so ONE function is the
@@ -2689,6 +2742,18 @@ def _train_impl(
         sf("train")
         log(line)
         last_eval = (line, bpb(fin, cfg.data_bytes_per_token))
+    # The final eval above scores the returned iterate X at `cfg.steps`, but the
+    # cadence only saved at the last multiple of `ckpt_every` — so a run whose
+    # last step is OFF cadence (the pilot: 15462 steps, ckpt_every 3000) ends
+    # with a verdict whose weights were never written. Write one final
+    # checkpoint at X so the final eval has a matching pair. No `final.pt`
+    # convention exists here: every save overwrites `<ckpt_name>.pt`, so this is
+    # the same file re-stamped with the last step. Guard `start < cfg.steps`:
+    # a resume that ran ZERO steps has nothing new to save.
+    if cfg.steps % cfg.ckpt_every != 0 and start < cfg.steps:
+        sf("eval")
+        save_ckpt(run, model, opt, cfg.steps - 1, ema=ema)
+        sf("train")
     return {
         "steps": cfg.steps,
         # `None`, not `nan`: a resume at the finished step runs ZERO iterations,
