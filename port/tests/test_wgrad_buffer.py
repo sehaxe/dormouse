@@ -10,6 +10,7 @@ caller-owned `BwdWorkspace` slots. This module gates three things:
 * autograd never aliases a reused slot into a non-leaf bank's leaf.grad —
   two micro-batches must sum to g1+g2, not 2*g2 (the measured corruption).
 """
+
 import torch
 
 from dormouse.model import moe_kernels as mk
@@ -107,9 +108,7 @@ def test_grad_accumulation_does_not_alias_the_reused_wgrad(monkeypatch):
         rows = int(counts.sum())
         offs = torch.zeros(e + 1, dtype=torch.int32)
         offs[1:] = torch.cumsum(counts, 0)
-        seg = torch.repeat_interleave(
-            torch.arange(e, dtype=torch.int32), counts.to(torch.int64)
-        )
+        seg = torch.repeat_interleave(torch.arange(e, dtype=torch.int32), counts.to(torch.int64))
         gu_leaves = [torch.nn.Parameter(torch.randn(d, r) / d**0.5) for _ in range(e)]
         uu_leaves = [torch.nn.Parameter(torch.randn(d, r) / d**0.5) for _ in range(e)]
         v_leaves = [torch.nn.Parameter(torch.randn(r, f) / r**0.5) for _ in range(e)]
@@ -135,8 +134,19 @@ def test_grad_accumulation_does_not_alias_the_reused_wgrad(monkeypatch):
         )
         for seed in (1, 2):
             out = mk._ExpertGemmGlu.apply(
-                xg, gu, uu, gs, us, v, offs, int(counts.max()), mk.TILES,
-                fused, seg, ws, None,
+                xg,
+                gu,
+                uu,
+                gs,
+                us,
+                v,
+                offs,
+                int(counts.max()),
+                mk.TILES,
+                fused,
+                seg,
+                ws,
+                None,
             )
             # A DIFFERENT grad_output per micro-batch: with equal dy the two
             # contributions are identical and the aliasing bug (2*g2 instead of
@@ -145,8 +155,8 @@ def test_grad_accumulation_does_not_alias_the_reused_wgrad(monkeypatch):
             (out * w).sum().backward()
         return [p.grad.clone() for p in gu_leaves + uu_leaves + v_leaves]
 
-    ref = run(False)   # reference adjoint: fresh grads, packs g1+g2
-    got = run(True)    # fused adjoint: pre-sized slots + step-boundary clone
+    ref = run(False)  # reference adjoint: fresh grads, packs g1+g2
+    got = run(True)  # fused adjoint: pre-sized slots + step-boundary clone
     for i, (a, b) in enumerate(zip(got, ref, strict=True)):
         assert torch.equal(a, b), f"leaf {i}: grad accumulation corrupted by slot reuse"
 

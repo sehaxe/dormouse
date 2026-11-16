@@ -1,4 +1,5 @@
 """The >100M-parameter zero-warmup gate (the 1B pilot opened at peak LR)."""
+
 import pytest
 
 from dormouse.config import MIN_WARMUP_PARAMS, validate_warmup
@@ -13,9 +14,9 @@ def test_zero_warmup_refused_above_100m_params():
 
 
 def test_the_cap_boundary_and_small_models_are_allowed():
-    validate_warmup(MIN_WARMUP_PARAMS, 0)        # == cap, not above
-    validate_warmup(5_000_000, 0)                # the tiny CPU test models
-    validate_warmup(MIN_WARMUP_PARAMS + 1, 1)    # any positive warmup passes
+    validate_warmup(MIN_WARMUP_PARAMS, 0)  # == cap, not above
+    validate_warmup(5_000_000, 0)  # the tiny CPU test models
+    validate_warmup(MIN_WARMUP_PARAMS + 1, 1)  # any positive warmup passes
 
 
 def test_zero_warmup_still_legal_below_the_cap():

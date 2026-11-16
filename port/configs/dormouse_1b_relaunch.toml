@@ -12,8 +12,8 @@
 # asserts the two model tables differ ONLY in `vocab`. A diff that is not `vocab`
 # is a different model wearing a launch name.
 #
-# Why vocab 32768: the corpus is a byte-level-BPE stream (`scripts/corpus.py`,
-# `docs/records/research/2026-11-14-tokenizer-choice.md` — 32k is within 8 % of
+# Why vocab 32768: the corpus is a byte-level-BPE stream (`scripts/corpus.py`;
+# see the tokenizer-choice research note — 32k is within 8 % of
 # 64k on this mix and costs a third of its head FLOPs). The stream is uint16
 # (`data_item_bytes=2`), so ids run to 32767; the byte vocabulary (256) has no
 # row for them. Price: embed 0.52M -> 67.1M, TSCT head 0.15M -> 2.2M, so the

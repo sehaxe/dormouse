@@ -1585,15 +1585,39 @@ def _glu_backward_fused(
     # The slot is reserved once and reused; see _ExpertGemmGlu.backward for the
     # step-boundary clone that keeps autograd from aliasing it into leaf.grad.
     dgate_u = _wgrad(
-        xg, dg_l, offs, e, cap, d, r, t_rank_n, xg.dtype,
+        xg,
+        dg_l,
+        offs,
+        e,
+        cap,
+        d,
+        r,
+        t_rank_n,
+        xg.dtype,
         out=ws.slot("wg_dgate_u", (e, d, r), xg.dtype, dev),
     )
     dup_u = _wgrad(
-        xg, du_l, offs, e, cap, d, r, t_rank_n, xg.dtype,
+        xg,
+        du_l,
+        offs,
+        e,
+        cap,
+        d,
+        r,
+        t_rank_n,
+        xg.dtype,
         out=ws.slot("wg_dup_u", (e, d, r), xg.dtype, dev),
     )
     dv = _wgrad(
-        h, dyc, offs, e, cap, r, f, t_wide, xg.dtype,
+        h,
+        dyc,
+        offs,
+        e,
+        cap,
+        r,
+        f,
+        t_wide,
+        xg.dtype,
         out=ws.slot("wg_dv", (e, r, f), xg.dtype, dev),
     )
     dx = _grouped_nt_pair(dg_l, gate_u, du_l, up_u, offs, cap, d, r, t_wide, xg.dtype)
@@ -1866,8 +1890,12 @@ class _ExpertGemmGlu(torch.autograd.Function):
                 if leaves and any(leaf.grad is None for leaf in leaves):
                     grads = _glu_backward_fused(*args, ctx.seg, ctx.ws)
                     grads = (
-                        grads[0], grads[1].clone(), grads[2].clone(),
-                        grads[3], grads[4], grads[5].clone(),
+                        grads[0],
+                        grads[1].clone(),
+                        grads[2].clone(),
+                        grads[3],
+                        grads[4],
+                        grads[5].clone(),
                     )
                 else:
                     grads = _glu_backward_fused(*args, ctx.seg, ctx.ws)

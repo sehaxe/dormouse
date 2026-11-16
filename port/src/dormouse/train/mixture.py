@@ -762,7 +762,11 @@ def open_mixture(
     plan = load_mix_plan(plan_path)
     _refuse_mixed_tokenizers(plan)
     check_epoch_cap(
-        plan, steps=steps, batch=batch, seq_len=seq_len, max_epochs=max_epochs,
+        plan,
+        steps=steps,
+        batch=batch,
+        seq_len=seq_len,
+        max_epochs=max_epochs,
         item_bytes=item_bytes,
     )
     return MixtureStream(

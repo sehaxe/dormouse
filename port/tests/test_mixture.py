@@ -384,8 +384,8 @@ def test_resume_fasts_forward_disk_bytes_not_items(tmp_path):
     plan = plan_of([(1.0, {"web": 0.5, "code": 0.5})], srcs)
     steps = 12
     kw = dict(steps=steps, batch=BATCH, seq_len=SEQ, seed=plan.seed)
-    served_items = replay_bytes(plan, **kw)                 # old, item units
-    served_bytes = replay_bytes(plan, **kw, item_bytes=2)   # new, disk bytes
+    served_items = replay_bytes(plan, **kw)  # old, item units
+    served_bytes = replay_bytes(plan, **kw, item_bytes=2)  # new, disk bytes
     for name in plan.sources:
         assert served_bytes[name] == 2 * served_items[name]
     expected = per_source_bytes(plan, steps, BATCH, SEQ, item_bytes=2)
