@@ -1495,6 +1495,28 @@ def _grad_leaves(*tensors):
     return out
 
 
+def _leaf_wgrad_slot(ws, name, grad):
+    """Stable, workspace-owned home for an accumulated wgrad.
+
+    Autograd aliases the first returned grad into each non-leaf bank's leaf.grad;
+    the fused kernel's wgrad slot is overwritten on the next micro-batch. That
+    first backward therefore needs an independent copy, which PR #14 made with
+    `Tensor.clone()` — a fresh [E,r,f] buffer (at b1 dv is 684 MiB) on top of
+    the reserved slot, the allocation that OOM'd pilot4 at step 1090. Copy into
+    a grow-only workspace slot instead: reserved once, reused every step, zero
+    fresh allocation during the backward.
+
+    `ponytail:` two wgrad copies live (kernel slot + leaf slot). A single buffer
+    accumulated in place would halve that, but it is the buffer autograd aliases
+    into leaf.grad, so grad_accum needs a separate stable copy. Consume the grad
+    per micro-batch (opt_in_backward) to drop the second copy; that arm is
+    refused with grad_accum>1, so it is not available to this recipe.
+    """
+    out = ws.slot(name, tuple(grad.shape), grad.dtype, grad.device)
+    out.copy_(grad)
+    return out
+
+
 def _glu_backward_fused(
     xg, gate_u, up_u, gate_s, up_s, v, offs, cap, gpre, upre, h, dy, tiles, seg, ws
 ):
@@ -1884,18 +1906,20 @@ class _ExpertGemmGlu(torch.autograd.Function):
                 # slots, reserved once and reused across steps. Autograd aliases the
                 # first returned grad into each NON-LEAF bank's leaf.grad; a later
                 # micro-batch would overwrite that storage and corrupt accumulation.
-                # Clone on the step's FIRST backward only (grad_accum's other
-                # micro-batches then accumulate into the independent clone).
+                # Copy into a SECOND reserved slot on the step's FIRST backward only
+                # (grad_accum's other micro-batches then accumulate into it). Never
+                # clone here: a fresh [E,r,f] on top of the reserved slot is what
+                # OOM'd at step 1090.
                 leaves = _grad_leaves(gate_u, up_u, v)
                 if leaves and any(leaf.grad is None for leaf in leaves):
                     grads = _glu_backward_fused(*args, ctx.seg, ctx.ws)
                     grads = (
                         grads[0],
-                        grads[1].clone(),
-                        grads[2].clone(),
+                        _leaf_wgrad_slot(ctx.ws, "leaf_wg_dgate_u", grads[1]),
+                        _leaf_wgrad_slot(ctx.ws, "leaf_wg_dup_u", grads[2]),
                         grads[3],
                         grads[4],
-                        grads[5].clone(),
+                        _leaf_wgrad_slot(ctx.ws, "leaf_wg_dv", grads[5]),
                     )
                 else:
                     grads = _glu_backward_fused(*args, ctx.seg, ctx.ws)

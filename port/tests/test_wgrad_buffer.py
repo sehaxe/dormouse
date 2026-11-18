@@ -177,3 +177,119 @@ def test_old_size_and_new_fresh_allocation(monkeypatch):
     mk._glu_backward_fused(*args, seg, ws)
     after = {k: t.data_ptr() for k, t in ws._flat.items()}
     assert before == after, "every workspace slot must be reused on the 2nd backward"
+
+
+def _fake_wgrad_inplace(a, b, offs, e, cap, k, n, tiles, out_dtype, out=None):
+    """The no-fresh-allocation stand-in used by the allocator gate.
+
+    `_glu_backward_fused` always supplies `out`; this writes straight into it,
+    so the fake kernel cannot mask a fresh wgrad in the code under test.
+    """
+    assert out is not None
+    out.zero_()
+    for i in range(e):
+        s, t = int(offs[i]), int(offs[i + 1])
+        if t > s:
+            out[i] = (a[s:t].double().T @ b[s:t].double()).to(out_dtype)
+    return out
+
+
+def _leaf_fixture(monkeypatch, *, e=16, d=32, r=8, f=64, fake_wgrad=None):
+    """A CPU `_ExpertGemmGlu` fixture with real leaf Parameters and stack inputs."""
+    torch.manual_seed(5)
+    counts = torch.ones(e, dtype=torch.int32)
+    rows = int(counts.sum())
+    offs = torch.zeros(e + 1, dtype=torch.int32)
+    offs[1:] = torch.cumsum(counts, 0)
+    seg = torch.repeat_interleave(torch.arange(e, dtype=torch.int32), counts.to(torch.int64))
+    gu_leaves = [torch.nn.Parameter(torch.randn(d, r) / d**0.5) for _ in range(e)]
+    uu_leaves = [torch.nn.Parameter(torch.randn(d, r) / d**0.5) for _ in range(e)]
+    v_leaves = [torch.nn.Parameter(torch.randn(r, f) / r**0.5) for _ in range(e)]
+    gu, uu, v = (torch.stack(x) for x in (gu_leaves, uu_leaves, v_leaves))
+    gs = torch.randn(e, r) * 0.1 + 1.0
+    us = torch.randn(e, r) * 0.1 + 1.0
+    xg = torch.randn(rows, d)
+    gpre, upre, h = (torch.randn(rows, r) for _ in range(3))
+    dy = torch.randn(rows, f)
+    ws = mk.BwdWorkspace()
+
+    def fake_head(_xg, _gu, _uu, _gs, _us, _v, *_rest, **_kw):
+        return _xg.new_zeros(_xg.shape[0], _v.shape[2]), (gpre, upre, h)
+
+    monkeypatch.setattr(mk, "_glu_fused_or_head", fake_head)
+    monkeypatch.setattr(
+        mk, "expert_gemm", lambda hh, vv, oo, **kw: hh.new_zeros(hh.shape[0], vv.shape[2])
+    )
+    monkeypatch.setattr(mk, "_grouped_nt", _fake_nt)
+    monkeypatch.setattr(mk, "_wgrad", fake_wgrad or _fake_wgrad)
+    monkeypatch.setattr(mk, "_grouped_nt_pair", _fake_pair)
+    args = (xg, gu, uu, gs, us, v, offs, 1, mk.TILES, None, seg, ws, None)
+    bwd_args = (xg, gu, uu, gs, us, v, offs, 1, gpre, upre, h, dy, mk.TILES, seg, ws)
+    return args, bwd_args, ws, gu_leaves + uu_leaves + v_leaves, (e, d, r, f)
+
+
+def test_step_boundary_wgrad_copy_is_bit_identical(monkeypatch):
+    """The first-backward leaf copy carries the SAME bits as the clone it replaced."""
+    _patch(monkeypatch)
+
+    def run(fused):
+        args, _bwd, _ws, leaves, _shape = _leaf_fixture(monkeypatch, e=4, d=12, r=4, f=16)
+        out = mk._ExpertGemmGlu.apply(*args[:9], fused, *args[10:])
+        (out * torch.full_like(out, 1.5)).sum().backward()
+        return [p.grad.clone() for p in leaves]
+
+    ref = run(False)
+    got = run(True)
+    for i, (a, b) in enumerate(zip(got, ref, strict=True)):
+        assert torch.equal(a, b), f"leaf {i}: step-boundary wgrad copy changed the gradient"
+
+
+def test_backward_allocates_no_fresh_wgrad(monkeypatch):
+    """THE missing gate: no backward path may allocate a fresh [E,r,f] wgrad.
+
+    Bound = one wgrad's bytes. Slots are reserved before the spy (startup), so
+    any allocation at or above the bound during backward is a fresh wgrad — the
+    `grads[5].clone()` that OOM'd pilot4 at step 1090 is red on this test.
+    """
+    args, bwd_args, ws, _leaves, (e, d, r, f) = _leaf_fixture(
+        monkeypatch, fake_wgrad=_fake_wgrad_inplace
+    )
+    bound = e * r * f * torch.empty((), dtype=torch.float32).element_size()
+
+    # Startup reservation (the grow-only workspace, one per SparseMoE).
+    with torch.no_grad():
+        mk._glu_backward_fused(*bwd_args)
+    for name, shape in (
+        ("leaf_wg_dgate_u", (e, d, r)),
+        ("leaf_wg_dup_u", (e, d, r)),
+        ("leaf_wg_dv", (e, r, f)),
+    ):
+        ws.slot(name, shape, torch.float32, torch.device("cpu"))
+
+    allocations: list[int] = []
+    real_empty, real_zeros, real_clone = torch.empty, torch.zeros, torch.Tensor.clone
+
+    def spy_empty(*a, **kw):
+        t = real_empty(*a, **kw)
+        allocations.append(t.numel() * t.element_size())
+        return t
+
+    def spy_zeros(*a, **kw):
+        t = real_zeros(*a, **kw)
+        allocations.append(t.numel() * t.element_size())
+        return t
+
+    def spy_clone(self, *a, **kw):
+        t = real_clone(self, *a, **kw)
+        allocations.append(t.numel() * t.element_size())
+        return t
+
+    monkeypatch.setattr(torch, "empty", spy_empty)
+    monkeypatch.setattr(torch, "zeros", spy_zeros)
+    monkeypatch.setattr(torch.Tensor, "clone", spy_clone)
+    for seed in (1, 2):
+        out = mk._ExpertGemmGlu.apply(*args[:9], True, *args[10:])
+        (out * torch.full_like(out, float(seed))).sum().backward()
+
+    big = [n for n in allocations if n >= bound]
+    assert not big, f"fresh wgrad-sized allocation(s) in backward: {big} (bound {bound} B)"
